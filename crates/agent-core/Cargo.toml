@@ -1,0 +1,13 @@
+[package]
+name = "agent-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+agent-model = { workspace = true }
+agent-protocol = { workspace = true }
+futures-util = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
