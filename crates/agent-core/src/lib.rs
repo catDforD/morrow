@@ -1,9 +1,8 @@
 use agent_model::{ChatCompletionStream, ModelError, ModelEvent, OpenAiCompatClient};
-use agent_protocol::{AgentEvent, Conversation, Message};
+use agent_protocol::{AgentEvent, Conversation, Message, Thread, Turn};
 use futures_util::Stream;
 use std::collections::VecDeque;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use thiserror::Error;
 
@@ -11,7 +10,6 @@ use thiserror::Error;
 pub struct Agent {
     client: OpenAiCompatClient,
     system_prompt: String,
-    last_conversation: Arc<Mutex<Option<Conversation>>>,
 }
 
 #[derive(Debug, Error)]
@@ -25,52 +23,56 @@ impl Agent {
         Self {
             client,
             system_prompt: system_prompt.into(),
-            last_conversation: Arc::new(Mutex::new(None)),
         }
     }
 
-    pub async fn run_once(&self, prompt: impl Into<String>) -> Result<AgentRunStream, AgentError> {
+    pub async fn run_turn<'a>(
+        &self,
+        thread: &'a mut Thread,
+        prompt: impl Into<String>,
+    ) -> Result<AgentTurnStream<'a>, AgentError> {
+        let user_message = Message::user(prompt.into());
         let mut conversation = Conversation::with_system_prompt(self.system_prompt.clone());
-        conversation.push(Message::user(prompt.into()));
+        conversation.messages.extend(thread.messages.clone());
+        conversation.push(user_message.clone());
 
         let model_stream = self.client.stream_chat(&conversation).await?;
 
-        Ok(AgentRunStream {
+        Ok(AgentTurnStream {
             model_stream,
-            conversation,
-            last_conversation: Arc::clone(&self.last_conversation),
+            thread,
+            turn: Turn::running(user_message),
             assistant_text: String::new(),
             pending: VecDeque::from([AgentEvent::TurnStarted]),
             finished: false,
         })
     }
-
-    pub fn last_conversation(&self) -> Option<Conversation> {
-        self.last_conversation
-            .lock()
-            .expect("last conversation lock poisoned")
-            .clone()
-    }
 }
 
-pub struct AgentRunStream {
+pub struct AgentTurnStream<'a> {
     model_stream: ChatCompletionStream,
-    conversation: Conversation,
-    last_conversation: Arc<Mutex<Option<Conversation>>>,
+    thread: &'a mut Thread,
+    turn: Turn,
     assistant_text: String,
     pending: VecDeque<AgentEvent>,
     finished: bool,
 }
 
-impl AgentRunStream {
+impl AgentTurnStream<'_> {
+    pub fn turn(&self) -> &Turn {
+        &self.turn
+    }
+
+    pub fn into_turn(self) -> Turn {
+        self.turn
+    }
+
     fn complete_turn(&mut self) {
         let assistant_text = self.assistant_text.clone();
-        self.conversation
-            .push(Message::assistant(assistant_text.clone()));
-        *self
-            .last_conversation
-            .lock()
-            .expect("last conversation lock poisoned") = Some(self.conversation.clone());
+        let assistant_message = Message::assistant(assistant_text.clone());
+        self.thread.push(self.turn.user_message.clone());
+        self.thread.push(assistant_message.clone());
+        self.turn.complete(assistant_message);
         self.pending
             .push_back(AgentEvent::AgentMessage(assistant_text));
         self.pending.push_back(AgentEvent::TurnCompleted);
@@ -78,14 +80,16 @@ impl AgentRunStream {
     }
 
     fn fail_turn(&mut self, error: impl ToString) {
-        self.pending.push_back(AgentEvent::Error(error.to_string()));
+        let error = error.to_string();
+        self.turn.fail(error.clone());
+        self.pending.push_back(AgentEvent::Error(error));
         self.finished = true;
     }
 }
 
-impl Unpin for AgentRunStream {}
+impl Unpin for AgentTurnStream<'_> {}
 
-impl Stream for AgentRunStream {
+impl Stream for AgentTurnStream<'_> {
     type Item = AgentEvent;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -125,7 +129,9 @@ impl Stream for AgentRunStream {
 mod tests {
     use super::*;
     use agent_model::OpenAiCompatConfig;
+    use agent_protocol::TurnStatus;
     use futures_util::StreamExt;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -149,28 +155,70 @@ mod tests {
         format!("http://{addr}/v1")
     }
 
+    async fn spawn_recording_sse_server(
+        bodies: Vec<&'static str>,
+    ) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind server");
+        let addr = listener.local_addr().expect("server addr");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured_requests = Arc::clone(&requests);
+        tokio::spawn(async move {
+            for body in bodies {
+                let (mut socket, _) = listener.accept().await.expect("accept request");
+                let mut request = vec![0_u8; 8192];
+                let read = socket.read(&mut request).await.expect("read request");
+                captured_requests
+                    .lock()
+                    .expect("requests lock poisoned")
+                    .push(String::from_utf8_lossy(&request[..read]).to_string());
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write response");
+            }
+        });
+        (format!("http://{addr}/v1"), requests)
+    }
+
+    fn client(base_url: String) -> OpenAiCompatClient {
+        OpenAiCompatClient::new_without_proxy(OpenAiCompatConfig {
+            base_url,
+            model: "test-model".to_string(),
+            api_key: "test-key".to_string(),
+            timeout: Duration::from_secs(5),
+        })
+        .expect("client")
+    }
+
+    async fn collect_events(mut stream: AgentTurnStream<'_>) -> (Vec<AgentEvent>, Turn) {
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            events.push(event);
+        }
+        let turn = stream.into_turn();
+        (events, turn)
+    }
+
     #[tokio::test]
-    async fn run_once_emits_events_and_records_conversation() {
+    async fn run_turn_emits_events_and_updates_thread() {
         let body = concat!(
             "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n",
             "data: {\"choices\":[{\"delta\":{\"content\":\" world\"},\"finish_reason\":null}]}\n\n",
             "data: [DONE]\n\n"
         );
         let base_url = spawn_sse_server(body).await;
-        let client = OpenAiCompatClient::new_without_proxy(OpenAiCompatConfig {
-            base_url,
-            model: "test-model".to_string(),
-            api_key: "test-key".to_string(),
-            timeout: Duration::from_secs(5),
-        })
-        .expect("client");
-        let agent = Agent::new(client, "You are helpful.");
+        let agent = Agent::new(client(base_url), "You are helpful.");
+        let mut thread = Thread::new();
 
-        let mut stream = agent.run_once("Say hi").await.expect("run once");
-        let mut events = Vec::new();
-        while let Some(event) = stream.next().await {
-            events.push(event);
-        }
+        let stream = agent
+            .run_turn(&mut thread, "Say hi")
+            .await
+            .expect("run turn");
+        let (events, turn) = collect_events(stream).await;
 
         assert_eq!(
             events,
@@ -183,13 +231,87 @@ mod tests {
             ]
         );
 
-        let conversation = agent.last_conversation().expect("conversation recorded");
+        assert_eq!(turn.status, TurnStatus::Completed);
         assert_eq!(
-            conversation.messages,
+            turn.assistant_message,
+            Some(Message::assistant("Hello world"))
+        );
+        assert_eq!(turn.steps[0].status, TurnStatus::Completed);
+        assert_eq!(
+            thread.messages,
+            vec![Message::user("Say hi"), Message::assistant("Hello world"),]
+        );
+    }
+
+    #[tokio::test]
+    async fn run_turn_sends_prior_thread_messages_to_second_model_call() {
+        let first_body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"First answer\"},\"finish_reason\":null}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let second_body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Second answer\"},\"finish_reason\":null}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (base_url, requests) = spawn_recording_sse_server(vec![first_body, second_body]).await;
+        let agent = Agent::new(client(base_url), "You are helpful.");
+        let mut thread = Thread::new();
+
+        let stream = agent
+            .run_turn(&mut thread, "First question")
+            .await
+            .expect("first turn");
+        let _ = collect_events(stream).await;
+        let stream = agent
+            .run_turn(&mut thread, "Second question")
+            .await
+            .expect("second turn");
+        let _ = collect_events(stream).await;
+
+        let requests = requests.lock().expect("requests lock poisoned");
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains(r#""content":"First question""#));
+        assert!(!requests[0].contains(r#""content":"First answer""#));
+        assert!(requests[1].contains(r#""content":"You are helpful.""#));
+        assert!(requests[1].contains(r#""content":"First question""#));
+        assert!(requests[1].contains(r#""content":"First answer""#));
+        assert!(requests[1].contains(r#""content":"Second question""#));
+        assert_eq!(
+            thread.messages,
             vec![
-                Message::system("You are helpful."),
-                Message::user("Say hi"),
-                Message::assistant("Hello world"),
+                Message::user("First question"),
+                Message::assistant("First answer"),
+                Message::user("Second question"),
+                Message::assistant("Second answer"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_turn_emits_error_and_does_not_update_thread() {
+        let base_url = spawn_sse_server("data: {not-json}\n\n").await;
+        let agent = Agent::new(client(base_url), "You are helpful.");
+        let mut thread = Thread::new();
+        thread.push(Message::user("Earlier question"));
+        thread.push(Message::assistant("Earlier answer"));
+
+        let stream = agent
+            .run_turn(&mut thread, "Broken question")
+            .await
+            .expect("run turn");
+        let (events, turn) = collect_events(stream).await;
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0], AgentEvent::TurnStarted);
+        assert!(matches!(events[1], AgentEvent::Error(_)));
+        assert_eq!(turn.status, TurnStatus::Failed);
+        assert!(turn.error.is_some());
+        assert_eq!(turn.steps[0].status, TurnStatus::Failed);
+        assert_eq!(
+            thread.messages,
+            vec![
+                Message::user("Earlier question"),
+                Message::assistant("Earlier answer"),
             ]
         );
     }
