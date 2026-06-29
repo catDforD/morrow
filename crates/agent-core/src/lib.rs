@@ -1,15 +1,21 @@
 use agent_model::{ChatCompletionStream, ModelError, ModelEvent, OpenAiCompatClient};
-use agent_protocol::{AgentEvent, Conversation, Message, Thread, Turn};
+use agent_protocol::{AgentEvent, Conversation, Message, Thread, ToolCall, Turn, TurnStep};
+use agent_tools::{ToolExecution, ToolRegistry};
 use futures_util::Stream;
+use futures_util::future::{BoxFuture, FutureExt};
 use std::collections::VecDeque;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use thiserror::Error;
 
+const DEFAULT_MAX_TOOL_ROUNDS: usize = 8;
+
 #[derive(Debug, Clone)]
 pub struct Agent {
     client: OpenAiCompatClient,
     system_prompt: String,
+    tools: ToolRegistry,
+    max_tool_rounds: usize,
 }
 
 #[derive(Debug, Error)]
@@ -23,6 +29,21 @@ impl Agent {
         Self {
             client,
             system_prompt: system_prompt.into(),
+            tools: ToolRegistry::empty(),
+            max_tool_rounds: DEFAULT_MAX_TOOL_ROUNDS,
+        }
+    }
+
+    pub fn with_tools(
+        client: OpenAiCompatClient,
+        system_prompt: impl Into<String>,
+        tools: ToolRegistry,
+    ) -> Self {
+        Self {
+            client,
+            system_prompt: system_prompt.into(),
+            tools,
+            max_tool_rounds: DEFAULT_MAX_TOOL_ROUNDS,
         }
     }
 
@@ -36,26 +57,52 @@ impl Agent {
         conversation.messages.extend(thread.messages.clone());
         conversation.push(user_message.clone());
 
-        let model_stream = self.client.stream_chat(&conversation).await?;
+        let model_stream = self
+            .client
+            .stream_chat(&conversation, self.tools.definitions())
+            .await?;
 
         Ok(AgentTurnStream {
-            model_stream,
+            client: self.client.clone(),
+            tools: self.tools.clone(),
+            max_tool_rounds: self.max_tool_rounds,
+            conversation,
+            model_stream: Some(model_stream),
+            model_start: None,
+            pending_tool_calls: VecDeque::new(),
+            tool_future: None,
             thread,
-            turn: Turn::running(user_message),
+            turn: Turn::running(user_message.clone()),
+            turn_messages: vec![user_message.clone()],
             assistant_text: String::new(),
+            assistant_deltas: VecDeque::new(),
             pending: VecDeque::from([AgentEvent::TurnStarted]),
             finished: false,
+            tool_rounds: 0,
         })
     }
 }
 
+type ModelStartFuture = BoxFuture<'static, Result<ChatCompletionStream, ModelError>>;
+type ToolCallFuture = BoxFuture<'static, (ToolCall, ToolExecution)>;
+
 pub struct AgentTurnStream<'a> {
-    model_stream: ChatCompletionStream,
+    client: OpenAiCompatClient,
+    tools: ToolRegistry,
+    max_tool_rounds: usize,
+    conversation: Conversation,
+    model_stream: Option<ChatCompletionStream>,
+    model_start: Option<ModelStartFuture>,
+    pending_tool_calls: VecDeque<ToolCall>,
+    tool_future: Option<ToolCallFuture>,
     thread: &'a mut Thread,
     turn: Turn,
+    turn_messages: Vec<Message>,
     assistant_text: String,
+    assistant_deltas: VecDeque<String>,
     pending: VecDeque<AgentEvent>,
     finished: bool,
+    tool_rounds: usize,
 }
 
 impl AgentTurnStream<'_> {
@@ -70,9 +117,12 @@ impl AgentTurnStream<'_> {
     fn complete_turn(&mut self) {
         let assistant_text = self.assistant_text.clone();
         let assistant_message = Message::assistant(assistant_text.clone());
-        self.thread.push(self.turn.user_message.clone());
-        self.thread.push(assistant_message.clone());
+        self.turn_messages.push(assistant_message.clone());
+        self.thread.messages.extend(self.turn_messages.clone());
         self.turn.complete(assistant_message);
+        for text in self.assistant_deltas.drain(..) {
+            self.pending.push_back(AgentEvent::TextDelta(text));
+        }
         self.pending
             .push_back(AgentEvent::AgentMessage(assistant_text));
         self.pending.push_back(AgentEvent::TurnCompleted);
@@ -84,6 +134,97 @@ impl AgentTurnStream<'_> {
         self.turn.fail(error.clone());
         self.pending.push_back(AgentEvent::Error(error));
         self.finished = true;
+    }
+
+    fn handle_tool_calls(&mut self, tool_calls: Vec<ToolCall>) {
+        if self.tool_rounds >= self.max_tool_rounds {
+            self.fail_turn(format!(
+                "tool call round limit exceeded ({})",
+                self.max_tool_rounds
+            ));
+            return;
+        }
+        if tool_calls.is_empty() {
+            self.fail_turn("model requested tool_calls but did not provide any tool call");
+            return;
+        }
+
+        if let Some(step) = self.turn.steps.last_mut() {
+            step.complete();
+        }
+        self.tool_rounds += 1;
+        self.assistant_text.clear();
+        self.assistant_deltas.clear();
+
+        let assistant_message = Message::assistant_tool_calls(tool_calls.clone());
+        self.conversation.push(assistant_message.clone());
+        self.turn_messages.push(assistant_message);
+        self.pending_tool_calls = VecDeque::from(tool_calls);
+        self.start_next_tool_call();
+    }
+
+    fn start_next_tool_call(&mut self) {
+        let Some(tool_call) = self.pending_tool_calls.pop_front() else {
+            self.start_next_model_call();
+            return;
+        };
+
+        let id = tool_call.id.clone();
+        let name = tool_call.function.name.clone();
+        self.turn
+            .steps
+            .push(TurnStep::running_tool_call(name.clone(), id.clone()));
+        self.pending.push_back(AgentEvent::ToolCallStarted {
+            id: id.clone(),
+            name: name.clone(),
+        });
+
+        let tools = self.tools.clone();
+        let call_for_result = tool_call.clone();
+        self.tool_future = Some(
+            async move {
+                let call_for_execution = call_for_result.clone();
+                let execution =
+                    tokio::task::spawn_blocking(move || tools.execute(&call_for_execution))
+                        .await
+                        .unwrap_or_else(|err| {
+                            ToolExecution::error(format!("tool execution task failed: {err}"))
+                        });
+                (call_for_result, execution)
+            }
+            .boxed(),
+        );
+    }
+
+    fn finish_tool_call(&mut self, tool_call: ToolCall, execution: ToolExecution) {
+        let id = tool_call.id.clone();
+        let name = tool_call.function.name.clone();
+        let ok = execution.ok;
+        let error = execution.error.clone();
+        let tool_message = Message::tool_result(id.clone(), execution.content);
+        self.conversation.push(tool_message.clone());
+        self.turn_messages.push(tool_message);
+
+        if let Some(step) = self.turn.steps.last_mut() {
+            if ok {
+                step.complete();
+            } else {
+                step.fail(error.unwrap_or_else(|| "tool call failed".to_string()));
+            }
+        }
+
+        self.pending
+            .push_back(AgentEvent::ToolCallFinished { id, name, ok });
+        self.start_next_tool_call();
+    }
+
+    fn start_next_model_call(&mut self) {
+        self.turn.steps.push(TurnStep::running_model_call());
+        let client = self.client.clone();
+        let conversation = self.conversation.clone();
+        let tools = self.tools.definitions().to_vec();
+        self.model_start =
+            Some(async move { client.stream_chat(&conversation, &tools).await }.boxed());
     }
 }
 
@@ -103,24 +244,73 @@ impl Stream for AgentTurnStream<'_> {
             return Poll::Ready(None);
         }
 
-        match Pin::new(&mut this.model_stream).poll_next(cx) {
-            Poll::Ready(Some(Ok(ModelEvent::TextDelta(text)))) => {
-                this.assistant_text.push_str(&text);
-                Poll::Ready(Some(AgentEvent::TextDelta(text)))
+        loop {
+            if let Some(future) = this.tool_future.as_mut() {
+                match future.as_mut().poll(cx) {
+                    Poll::Ready((tool_call, execution)) => {
+                        this.tool_future = None;
+                        this.finish_tool_call(tool_call, execution);
+                        if let Some(event) = this.pending.pop_front() {
+                            return Poll::Ready(Some(event));
+                        }
+                        continue;
+                    }
+                    Poll::Pending => return Poll::Pending,
+                }
             }
-            Poll::Ready(Some(Ok(ModelEvent::Completed))) => {
-                this.complete_turn();
-                Poll::Ready(this.pending.pop_front())
+
+            if let Some(future) = this.model_start.as_mut() {
+                match future.as_mut().poll(cx) {
+                    Poll::Ready(Ok(model_stream)) => {
+                        this.model_start = None;
+                        this.model_stream = Some(model_stream);
+                        continue;
+                    }
+                    Poll::Ready(Err(err)) => {
+                        this.model_start = None;
+                        this.fail_turn(err);
+                        return Poll::Ready(this.pending.pop_front());
+                    }
+                    Poll::Pending => return Poll::Pending,
+                }
             }
-            Poll::Ready(Some(Err(err))) => {
-                this.fail_turn(err);
-                Poll::Ready(this.pending.pop_front())
+
+            if let Some(model_stream) = this.model_stream.as_mut() {
+                match Pin::new(model_stream).poll_next(cx) {
+                    Poll::Ready(Some(Ok(ModelEvent::TextDelta(text)))) => {
+                        this.assistant_text.push_str(&text);
+                        this.assistant_deltas.push_back(text);
+                        continue;
+                    }
+                    Poll::Ready(Some(Ok(ModelEvent::ToolCalls(tool_calls)))) => {
+                        this.model_stream = None;
+                        this.handle_tool_calls(tool_calls);
+                        if let Some(event) = this.pending.pop_front() {
+                            return Poll::Ready(Some(event));
+                        }
+                        continue;
+                    }
+                    Poll::Ready(Some(Ok(ModelEvent::Completed))) => {
+                        this.model_stream = None;
+                        this.complete_turn();
+                        return Poll::Ready(this.pending.pop_front());
+                    }
+                    Poll::Ready(Some(Err(err))) => {
+                        this.model_stream = None;
+                        this.fail_turn(err);
+                        return Poll::Ready(this.pending.pop_front());
+                    }
+                    Poll::Ready(None) => {
+                        this.model_stream = None;
+                        this.fail_turn("model stream ended before completion");
+                        return Poll::Ready(this.pending.pop_front());
+                    }
+                    Poll::Pending => return Poll::Pending,
+                }
             }
-            Poll::Ready(None) => {
-                this.fail_turn("model stream ended before completion");
-                Poll::Ready(this.pending.pop_front())
-            }
-            Poll::Pending => Poll::Pending,
+
+            this.fail_turn("agent turn has no active model or tool work");
+            return Poll::Ready(this.pending.pop_front());
         }
     }
 }
@@ -129,10 +319,14 @@ impl Stream for AgentTurnStream<'_> {
 mod tests {
     use super::*;
     use agent_model::OpenAiCompatConfig;
-    use agent_protocol::TurnStatus;
+    use agent_protocol::{ToolCallKind, TurnStatus, TurnStepKind};
+    use agent_tools::ToolRegistry;
     use futures_util::StreamExt;
+    use serde_json::json;
+    use std::fs;
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -192,6 +386,49 @@ mod tests {
             timeout: Duration::from_secs(5),
         })
         .expect("client")
+    }
+
+    fn unique_dir(name: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("morrow-core-{name}-{stamp}"));
+        fs::create_dir_all(&path).expect("create temp dir");
+        path
+    }
+
+    fn tool_call_body(id: &str, name: &str, arguments: serde_json::Value) -> &'static str {
+        let body = format!(
+            "data: {}\n\ndata: {}\n\n",
+            json!({
+                "choices": [{
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": id,
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": arguments.to_string()
+                            }
+                        }]
+                    },
+                    "finish_reason": null
+                }]
+            }),
+            json!({
+                "choices": [{
+                    "delta": {},
+                    "finish_reason": "tool_calls"
+                }]
+            })
+        );
+        Box::leak(body.into_boxed_str())
+    }
+
+    fn tools(root: &Path) -> ToolRegistry {
+        ToolRegistry::built_in(root).expect("tools")
     }
 
     async fn collect_events(mut stream: AgentTurnStream<'_>) -> (Vec<AgentEvent>, Turn) {
@@ -314,5 +551,141 @@ mod tests {
                 Message::assistant("Earlier answer"),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn run_turn_executes_tool_calls_and_sends_results_to_next_model_call() {
+        let root = unique_dir("tool-success");
+        fs::write(root.join("note.txt"), "tool result\n").expect("write note");
+        let first_body = tool_call_body(
+            "call_1",
+            "read_file",
+            json!({"path": "note.txt", "max_lines": 5}),
+        );
+        let second_body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Read it\"},\"finish_reason\":null}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (base_url, requests) = spawn_recording_sse_server(vec![first_body, second_body]).await;
+        let agent = Agent::with_tools(client(base_url), "You are helpful.", tools(&root));
+        let mut thread = Thread::new();
+
+        let stream = agent
+            .run_turn(&mut thread, "Read note.txt")
+            .await
+            .expect("run turn");
+        let (events, turn) = collect_events(stream).await;
+
+        assert_eq!(
+            events,
+            vec![
+                AgentEvent::TurnStarted,
+                AgentEvent::ToolCallStarted {
+                    id: "call_1".to_string(),
+                    name: "read_file".to_string()
+                },
+                AgentEvent::ToolCallFinished {
+                    id: "call_1".to_string(),
+                    name: "read_file".to_string(),
+                    ok: true
+                },
+                AgentEvent::TextDelta("Read it".to_string()),
+                AgentEvent::AgentMessage("Read it".to_string()),
+                AgentEvent::TurnCompleted,
+            ]
+        );
+        assert_eq!(turn.status, TurnStatus::Completed);
+        assert_eq!(turn.steps.len(), 3);
+        assert_eq!(turn.steps[0].kind, TurnStepKind::ModelCall);
+        assert_eq!(turn.steps[1].kind, TurnStepKind::ToolCall);
+        assert_eq!(turn.steps[1].tool_name.as_deref(), Some("read_file"));
+        assert_eq!(turn.steps[2].kind, TurnStepKind::ModelCall);
+        assert_eq!(thread.messages.len(), 4);
+        assert_eq!(thread.messages[0], Message::user("Read note.txt"));
+        assert_eq!(
+            thread.messages[1].tool_calls.as_ref().expect("tool calls")[0].kind,
+            ToolCallKind::Function
+        );
+        assert_eq!(thread.messages[2].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(thread.messages[3], Message::assistant("Read it"));
+
+        let requests = requests.lock().expect("requests lock poisoned");
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains(r#""tools":[{"type":"function""#));
+        assert!(requests[1].contains(r#""role":"tool""#));
+        assert!(requests[1].contains(r#""tool_call_id":"call_1""#));
+        assert!(requests[1].contains("tool result"));
+    }
+
+    #[tokio::test]
+    async fn tool_errors_are_returned_to_model_without_failing_turn() {
+        let root = unique_dir("tool-error");
+        let first_body = tool_call_body("call_1", "read_file", json!({"path": "missing.txt"}));
+        let second_body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Missing\"},\"finish_reason\":null}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (base_url, requests) = spawn_recording_sse_server(vec![first_body, second_body]).await;
+        let agent = Agent::with_tools(client(base_url), "You are helpful.", tools(&root));
+        let mut thread = Thread::new();
+
+        let stream = agent
+            .run_turn(&mut thread, "Read missing.txt")
+            .await
+            .expect("run turn");
+        let (events, turn) = collect_events(stream).await;
+
+        assert_eq!(turn.status, TurnStatus::Completed);
+        assert!(matches!(
+            events.as_slice(),
+            [
+                AgentEvent::TurnStarted,
+                AgentEvent::ToolCallStarted { .. },
+                AgentEvent::ToolCallFinished { ok: false, .. },
+                AgentEvent::TextDelta(_),
+                AgentEvent::AgentMessage(_),
+                AgentEvent::TurnCompleted,
+            ]
+        ));
+        assert_eq!(turn.steps[1].status, TurnStatus::Failed);
+        assert_eq!(thread.messages.len(), 4);
+
+        let requests = requests.lock().expect("requests lock poisoned");
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].contains(r#"\"ok\":false"#));
+        assert!(requests[1].contains("missing.txt"));
+    }
+
+    #[tokio::test]
+    async fn too_many_tool_rounds_fails_without_updating_thread() {
+        let root = unique_dir("tool-limit");
+        let bodies = (0..=DEFAULT_MAX_TOOL_ROUNDS)
+            .map(|index| {
+                tool_call_body(
+                    &format!("call_{index}"),
+                    "list_files",
+                    json!({"path": ".", "max_entries": 1}),
+                )
+            })
+            .collect::<Vec<_>>();
+        let (base_url, requests) = spawn_recording_sse_server(bodies).await;
+        let agent = Agent::with_tools(client(base_url), "You are helpful.", tools(&root));
+        let mut thread = Thread::new();
+
+        let stream = agent.run_turn(&mut thread, "Loop").await.expect("run turn");
+        let (events, turn) = collect_events(stream).await;
+
+        assert_eq!(turn.status, TurnStatus::Failed);
+        assert!(
+            turn.error
+                .as_deref()
+                .expect("error")
+                .contains("tool call round limit exceeded")
+        );
+        assert!(matches!(events.last(), Some(AgentEvent::Error(_))));
+        assert_eq!(thread.messages, Vec::<Message>::new());
+
+        let requests = requests.lock().expect("requests lock poisoned");
+        assert_eq!(requests.len(), DEFAULT_MAX_TOOL_ROUNDS + 1);
     }
 }

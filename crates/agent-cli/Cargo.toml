@@ -8,6 +8,7 @@ agent-config = { workspace = true }
 agent-core = { workspace = true }
 agent-model = { workspace = true }
 agent-protocol = { workspace = true }
+agent-tools = { workspace = true }
 clap = { workspace = true }
 dirs = { workspace = true }
 futures-util = { workspace = true }

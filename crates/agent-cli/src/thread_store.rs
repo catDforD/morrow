@@ -93,7 +93,8 @@ impl ThreadStore {
             }
         })?;
 
-        if document.schema_version != THREAD_DOCUMENT_SCHEMA_VERSION {
+        if document.schema_version != 1 && document.schema_version != THREAD_DOCUMENT_SCHEMA_VERSION
+        {
             return Err(ThreadStoreError::UnsupportedSchemaVersion {
                 path: self.path.clone(),
                 version: document.schema_version,
@@ -243,6 +244,30 @@ mod tests {
             .expect("load saved thread");
 
         assert_eq!(loaded, thread);
+    }
+
+    #[test]
+    fn loads_v1_thread_documents_for_compatibility() {
+        let root = unique_dir("v1-root");
+        let cwd = unique_dir("v1-cwd");
+        let store = make_store(&root, &cwd, "default");
+        let path = store.path().to_path_buf();
+        fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
+        let content = json!({
+            "schema_version": 1,
+            "thread": {
+                "messages": [
+                    {"role": "user", "content": "Hello"},
+                    {"role": "assistant", "content": "Hi"}
+                ]
+            }
+        })
+        .to_string();
+        fs::write(&path, content).expect("write v1 document");
+
+        let loaded = store.load().expect("load v1 document");
+
+        assert_eq!(loaded, sample_thread());
     }
 
     #[test]
