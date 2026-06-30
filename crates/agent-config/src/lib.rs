@@ -1,3 +1,4 @@
+use agent_protocol::{PermissionMode, PermissionProfile, ShellPolicy};
 use serde::Deserialize;
 use std::env;
 use std::fs;
@@ -13,6 +14,7 @@ const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful assistant.";
 pub struct AppConfig {
     pub model: ModelConfig,
     pub agent: AgentConfig,
+    pub permissions: PermissionProfile,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +66,7 @@ pub enum ConfigError {
 struct RawAppConfig {
     model: Option<RawModelConfig>,
     agent: Option<RawAgentConfig>,
+    permissions: Option<RawPermissionsConfig>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -81,6 +84,13 @@ struct RawModelConfig {
 #[serde(deny_unknown_fields)]
 struct RawAgentConfig {
     system_prompt: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPermissionsConfig {
+    mode: Option<PermissionMode>,
+    shell: Option<ShellPolicy>,
 }
 
 pub fn load_config(explicit_path: Option<&Path>) -> Result<LoadedConfig, ConfigError> {
@@ -172,6 +182,12 @@ impl TryFrom<RawAppConfig> for AppConfig {
             .ok_or(ConfigError::MissingModel)?;
 
         let agent = value.agent.unwrap_or_default();
+        let permissions = value.permissions.unwrap_or_default();
+        let mode = permissions.mode.unwrap_or_default();
+        let mut permissions_profile = PermissionProfile::for_mode(mode);
+        if let Some(shell) = permissions.shell {
+            permissions_profile.shell = shell;
+        }
 
         Ok(Self {
             model: ModelConfig {
@@ -189,6 +205,7 @@ impl TryFrom<RawAppConfig> for AppConfig {
                     .system_prompt
                     .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string()),
             },
+            permissions: permissions_profile,
         })
     }
 }
@@ -236,6 +253,27 @@ api_key_env = "{api_key_env}"
 [model]
 model = "{model}"
 OPENAI_API_KEY = "inline-secret"
+"#
+            ),
+        )
+        .expect("write config");
+    }
+
+    fn write_permissions_config(path: &Path, model: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create config parent");
+        }
+        fs::write(
+            path,
+            format!(
+                r#"
+[model]
+model = "{model}"
+api_key_env = "MORROW_PERMISSIONS_KEY"
+
+[permissions]
+mode = "workspace_write"
+shell = "deny"
 "#
             ),
         )
@@ -351,5 +389,27 @@ OPENAI_API_KEY = "inline-secret"
         assert_eq!(loaded.config.model.base_url, DEFAULT_BASE_URL);
         assert_eq!(loaded.config.model.timeout_secs, DEFAULT_TIMEOUT_SECS);
         assert_eq!(loaded.config.agent.system_prompt, DEFAULT_SYSTEM_PROMPT);
+        assert_eq!(
+            loaded.config.permissions,
+            PermissionProfile::for_mode(PermissionMode::ReadOnly)
+        );
+    }
+
+    #[test]
+    fn loads_permissions_config() {
+        let root = unique_dir("permissions");
+        let config = root.join("morrow.toml");
+        write_permissions_config(&config, "test-model");
+        set_env("MORROW_PERMISSIONS_KEY", "secret");
+
+        let loaded = load_config_from_locations(Some(&config), &root, None).expect("load config");
+
+        assert_eq!(
+            loaded.config.permissions,
+            PermissionProfile {
+                mode: PermissionMode::WorkspaceWrite,
+                shell: ShellPolicy::Deny,
+            }
+        );
     }
 }

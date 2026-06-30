@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -193,6 +194,126 @@ impl ThreadDocument {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionMode {
+    #[default]
+    ReadOnly,
+    WorkspaceWrite,
+    DangerFullAccess,
+}
+
+impl PermissionMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read_only",
+            Self::WorkspaceWrite => "workspace_write",
+            Self::DangerFullAccess => "danger_full_access",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellPolicy {
+    Deny,
+    Prompt,
+    Allow,
+}
+
+impl ShellPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Deny => "deny",
+            Self::Prompt => "prompt",
+            Self::Allow => "allow",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub struct PermissionProfile {
+    pub mode: PermissionMode,
+    pub shell: ShellPolicy,
+}
+
+impl PermissionProfile {
+    pub fn for_mode(mode: PermissionMode) -> Self {
+        Self {
+            mode,
+            shell: match mode {
+                PermissionMode::ReadOnly | PermissionMode::WorkspaceWrite => ShellPolicy::Prompt,
+                PermissionMode::DangerFullAccess => ShellPolicy::Allow,
+            },
+        }
+    }
+}
+
+impl Default for PermissionProfile {
+    fn default() -> Self {
+        Self::for_mode(PermissionMode::ReadOnly)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ApprovalAction {
+    ShellCommand {
+        command: String,
+        cwd: PathBuf,
+        timeout_secs: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ApprovalRequest {
+    pub id: String,
+    pub action: ApprovalAction,
+    pub reason: String,
+}
+
+impl ApprovalRequest {
+    pub fn shell_command(
+        id: impl Into<String>,
+        command: impl Into<String>,
+        cwd: impl Into<PathBuf>,
+        timeout_secs: u64,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            action: ApprovalAction::ShellCommand {
+                command: command.into(),
+                cwd: cwd.into(),
+                timeout_secs,
+            },
+            reason: reason.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ApprovalDecision {
+    pub request_id: String,
+    pub approved: bool,
+}
+
+impl ApprovalDecision {
+    pub fn approve(request_id: impl Into<String>) -> Self {
+        Self {
+            request_id: request_id.into(),
+            approved: true,
+        }
+    }
+
+    pub fn deny(request_id: impl Into<String>) -> Self {
+        Self {
+            request_id: request_id.into(),
+            approved: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnStatus {
@@ -302,6 +423,8 @@ pub enum AgentEvent {
     AgentMessage(String),
     ToolCallStarted { id: String, name: String },
     ToolCallFinished { id: String, name: String, ok: bool },
+    ApprovalRequested(ApprovalRequest),
+    ApprovalResolved(ApprovalDecision),
     TurnCompleted,
     Error(String),
 }
@@ -375,6 +498,69 @@ mod tests {
 
         assert_eq!(decoded.schema_version, THREAD_DOCUMENT_SCHEMA_VERSION);
         assert_eq!(decoded.thread, thread);
+    }
+
+    #[test]
+    fn permission_profile_defaults_shell_policy_by_mode() {
+        assert_eq!(
+            PermissionProfile::default(),
+            PermissionProfile {
+                mode: PermissionMode::ReadOnly,
+                shell: ShellPolicy::Prompt,
+            }
+        );
+        assert_eq!(
+            PermissionProfile::for_mode(PermissionMode::WorkspaceWrite).shell,
+            ShellPolicy::Prompt
+        );
+        assert_eq!(
+            PermissionProfile::for_mode(PermissionMode::DangerFullAccess).shell,
+            ShellPolicy::Allow
+        );
+    }
+
+    #[test]
+    fn serializes_approval_events() {
+        let request = ApprovalRequest::shell_command(
+            "approval-call_1",
+            "cargo test",
+            "/repo",
+            30,
+            "shell command requires approval",
+        );
+        let decision = ApprovalDecision::approve("approval-call_1");
+        let events = vec![
+            AgentEvent::ApprovalRequested(request),
+            AgentEvent::ApprovalResolved(decision),
+        ];
+
+        let value = serde_json::to_value(&events).expect("serialize approval events");
+
+        assert_eq!(
+            value,
+            json!([
+                {
+                    "type": "approval_requested",
+                    "data": {
+                        "id": "approval-call_1",
+                        "action": {
+                            "kind": "shell_command",
+                            "command": "cargo test",
+                            "cwd": "/repo",
+                            "timeout_secs": 30
+                        },
+                        "reason": "shell command requires approval"
+                    }
+                },
+                {
+                    "type": "approval_resolved",
+                    "data": {
+                        "request_id": "approval-call_1",
+                        "approved": true
+                    }
+                }
+            ])
+        );
     }
 
     #[test]

@@ -1,6 +1,9 @@
 use agent_model::{ChatCompletionStream, ModelError, ModelEvent, OpenAiCompatClient};
-use agent_protocol::{AgentEvent, Conversation, Message, Thread, ToolCall, Turn, TurnStep};
-use agent_tools::{ToolExecution, ToolRegistry};
+use agent_protocol::{
+    AgentEvent, ApprovalDecision, ApprovalRequest, Conversation, Message, Thread, ToolCall, Turn,
+    TurnStep,
+};
+use agent_tools::{ToolExecution, ToolRegistry, ToolResult};
 use futures_util::Stream;
 use futures_util::future::{BoxFuture, FutureExt};
 use std::collections::VecDeque;
@@ -22,6 +25,8 @@ pub struct Agent {
 pub enum AgentError {
     #[error("{0}")]
     Model(#[from] ModelError),
+    #[error("{0}")]
+    Approval(String),
 }
 
 impl Agent {
@@ -71,6 +76,7 @@ impl Agent {
             model_start: None,
             pending_tool_calls: VecDeque::new(),
             tool_future: None,
+            pending_approval: None,
             thread,
             turn: Turn::running(user_message.clone()),
             turn_messages: vec![user_message.clone()],
@@ -86,6 +92,12 @@ impl Agent {
 type ModelStartFuture = BoxFuture<'static, Result<ChatCompletionStream, ModelError>>;
 type ToolCallFuture = BoxFuture<'static, (ToolCall, ToolExecution)>;
 
+#[derive(Debug, Clone)]
+struct PendingApproval {
+    tool_call: ToolCall,
+    request: ApprovalRequest,
+}
+
 pub struct AgentTurnStream<'a> {
     client: OpenAiCompatClient,
     tools: ToolRegistry,
@@ -95,6 +107,7 @@ pub struct AgentTurnStream<'a> {
     model_start: Option<ModelStartFuture>,
     pending_tool_calls: VecDeque<ToolCall>,
     tool_future: Option<ToolCallFuture>,
+    pending_approval: Option<PendingApproval>,
     thread: &'a mut Thread,
     turn: Turn,
     turn_messages: Vec<Message>,
@@ -112,6 +125,35 @@ impl AgentTurnStream<'_> {
 
     pub fn into_turn(self) -> Turn {
         self.turn
+    }
+
+    pub fn resolve_approval(&mut self, decision: ApprovalDecision) -> Result<(), AgentError> {
+        let Some(pending_approval) = self.pending_approval.take() else {
+            return Err(AgentError::Approval(
+                "received approval decision but no approval is pending".to_string(),
+            ));
+        };
+
+        if decision.request_id != pending_approval.request.id {
+            let expected = pending_approval.request.id.clone();
+            self.pending_approval = Some(pending_approval);
+            return Err(AgentError::Approval(format!(
+                "approval decision {} does not match pending approval {expected}",
+                decision.request_id
+            )));
+        }
+
+        self.pending
+            .push_back(AgentEvent::ApprovalResolved(decision.clone()));
+
+        if decision.approved {
+            self.start_approved_tool_call(pending_approval.tool_call, decision);
+        } else {
+            let result = ToolResult::error("approval denied");
+            self.finish_tool_call(pending_approval.tool_call, result);
+        }
+
+        Ok(())
     }
 
     fn complete_turn(&mut self) {
@@ -196,12 +238,45 @@ impl AgentTurnStream<'_> {
         );
     }
 
-    fn finish_tool_call(&mut self, tool_call: ToolCall, execution: ToolExecution) {
+    fn start_approved_tool_call(&mut self, tool_call: ToolCall, decision: ApprovalDecision) {
+        let tools = self.tools.clone();
+        let call_for_result = tool_call.clone();
+        self.tool_future = Some(
+            async move {
+                let call_for_execution = call_for_result.clone();
+                let execution = tokio::task::spawn_blocking(move || {
+                    tools.execute_approved(&call_for_execution, &decision)
+                })
+                .await
+                .unwrap_or_else(|err| {
+                    ToolExecution::error(format!("tool execution task failed: {err}"))
+                });
+                (call_for_result, execution)
+            }
+            .boxed(),
+        );
+    }
+
+    fn finish_tool_execution(&mut self, tool_call: ToolCall, execution: ToolExecution) {
+        match execution {
+            ToolExecution::Completed(result) => self.finish_tool_call(tool_call, result),
+            ToolExecution::ApprovalRequired(request) => {
+                self.pending_approval = Some(PendingApproval {
+                    tool_call,
+                    request: request.clone(),
+                });
+                self.pending
+                    .push_back(AgentEvent::ApprovalRequested(request));
+            }
+        }
+    }
+
+    fn finish_tool_call(&mut self, tool_call: ToolCall, result: ToolResult) {
         let id = tool_call.id.clone();
         let name = tool_call.function.name.clone();
-        let ok = execution.ok;
-        let error = execution.error.clone();
-        let tool_message = Message::tool_result(id.clone(), execution.content);
+        let ok = result.ok;
+        let error = result.error.clone();
+        let tool_message = Message::tool_result(id.clone(), result.content);
         self.conversation.push(tool_message.clone());
         self.turn_messages.push(tool_message);
 
@@ -249,7 +324,7 @@ impl Stream for AgentTurnStream<'_> {
                 match future.as_mut().poll(cx) {
                     Poll::Ready((tool_call, execution)) => {
                         this.tool_future = None;
-                        this.finish_tool_call(tool_call, execution);
+                        this.finish_tool_execution(tool_call, execution);
                         if let Some(event) = this.pending.pop_front() {
                             return Poll::Ready(Some(event));
                         }
@@ -257,6 +332,10 @@ impl Stream for AgentTurnStream<'_> {
                     }
                     Poll::Pending => return Poll::Pending,
                 }
+            }
+
+            if this.pending_approval.is_some() {
+                return Poll::Pending;
             }
 
             if let Some(future) = this.model_start.as_mut() {
@@ -319,7 +398,9 @@ impl Stream for AgentTurnStream<'_> {
 mod tests {
     use super::*;
     use agent_model::OpenAiCompatConfig;
-    use agent_protocol::{ToolCallKind, TurnStatus, TurnStepKind};
+    use agent_protocol::{
+        ApprovalDecision, PermissionMode, PermissionProfile, ToolCallKind, TurnStatus, TurnStepKind,
+    };
     use agent_tools::ToolRegistry;
     use futures_util::StreamExt;
     use serde_json::json;
@@ -428,7 +509,11 @@ mod tests {
     }
 
     fn tools(root: &Path) -> ToolRegistry {
-        ToolRegistry::built_in(root).expect("tools")
+        ToolRegistry::built_in(
+            root,
+            PermissionProfile::for_mode(PermissionMode::WorkspaceWrite),
+        )
+        .expect("tools")
     }
 
     async fn collect_events(mut stream: AgentTurnStream<'_>) -> (Vec<AgentEvent>, Turn) {
@@ -438,6 +523,10 @@ mod tests {
         }
         let turn = stream.into_turn();
         (events, turn)
+    }
+
+    async fn next_event(stream: &mut AgentTurnStream<'_>) -> AgentEvent {
+        stream.next().await.expect("next agent event")
     }
 
     #[tokio::test]
@@ -654,6 +743,76 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert!(requests[1].contains(r#"\"ok\":false"#));
         assert!(requests[1].contains("missing.txt"));
+    }
+
+    #[tokio::test]
+    async fn shell_tool_approval_denial_is_returned_to_model() {
+        let root = unique_dir("shell-approval-denied");
+        let first_body = tool_call_body(
+            "call_1",
+            "shell_command",
+            json!({"command": "pwd", "timeout_secs": 5}),
+        );
+        let second_body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Denied\"},\"finish_reason\":null}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (base_url, requests) = spawn_recording_sse_server(vec![first_body, second_body]).await;
+        let agent = Agent::with_tools(client(base_url), "You are helpful.", tools(&root));
+        let mut thread = Thread::new();
+
+        let mut stream = agent
+            .run_turn(&mut thread, "Run pwd")
+            .await
+            .expect("run turn");
+
+        assert_eq!(next_event(&mut stream).await, AgentEvent::TurnStarted);
+        assert_eq!(
+            next_event(&mut stream).await,
+            AgentEvent::ToolCallStarted {
+                id: "call_1".to_string(),
+                name: "shell_command".to_string()
+            }
+        );
+        let AgentEvent::ApprovalRequested(request) = next_event(&mut stream).await else {
+            panic!("expected approval request");
+        };
+
+        stream
+            .resolve_approval(ApprovalDecision::deny(request.id.clone()))
+            .expect("resolve approval");
+
+        assert_eq!(
+            next_event(&mut stream).await,
+            AgentEvent::ApprovalResolved(ApprovalDecision::deny(request.id))
+        );
+        assert_eq!(
+            next_event(&mut stream).await,
+            AgentEvent::ToolCallFinished {
+                id: "call_1".to_string(),
+                name: "shell_command".to_string(),
+                ok: false,
+            }
+        );
+        assert_eq!(
+            next_event(&mut stream).await,
+            AgentEvent::TextDelta("Denied".to_string())
+        );
+        assert_eq!(
+            next_event(&mut stream).await,
+            AgentEvent::AgentMessage("Denied".to_string())
+        );
+        assert_eq!(next_event(&mut stream).await, AgentEvent::TurnCompleted);
+        assert_eq!(stream.next().await, None);
+
+        let turn = stream.into_turn();
+        assert_eq!(turn.status, TurnStatus::Completed);
+        assert_eq!(turn.steps[1].status, TurnStatus::Failed);
+        assert_eq!(thread.messages.len(), 4);
+
+        let requests = requests.lock().expect("requests lock poisoned");
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].contains("approval denied"));
     }
 
     #[tokio::test]
