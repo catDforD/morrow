@@ -6,35 +6,138 @@ pub enum Role {
     System,
     User,
     Assistant,
+    Tool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Message {
     pub role: Role,
-    pub content: String,
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 impl Message {
     pub fn system(content: impl Into<String>) -> Self {
         Self {
             role: Role::System,
-            content: content.into(),
+            content: Some(content.into()),
+            tool_calls: None,
+            tool_call_id: None,
         }
     }
 
     pub fn user(content: impl Into<String>) -> Self {
         Self {
             role: Role::User,
-            content: content.into(),
+            content: Some(content.into()),
+            tool_calls: None,
+            tool_call_id: None,
         }
     }
 
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
             role: Role::Assistant,
-            content: content.into(),
+            content: Some(content.into()),
+            tool_calls: None,
+            tool_call_id: None,
         }
     }
+
+    pub fn assistant_tool_calls(tool_calls: Vec<ToolCall>) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: None,
+            tool_calls: Some(tool_calls),
+            tool_call_id: None,
+        }
+    }
+
+    pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: Role::Tool,
+            content: Some(content.into()),
+            tool_calls: None,
+            tool_call_id: Some(tool_call_id.into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct ToolDefinition {
+    #[serde(rename = "type")]
+    pub kind: ToolDefinitionKind,
+    pub function: ToolFunctionDefinition,
+}
+
+impl ToolDefinition {
+    pub fn function(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        parameters: serde_json::Value,
+    ) -> Self {
+        Self {
+            kind: ToolDefinitionKind::Function,
+            function: ToolFunctionDefinition {
+                name: name.into(),
+                description: description.into(),
+                parameters,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolDefinitionKind {
+    Function,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct ToolFunctionDefinition {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: ToolCallKind,
+    pub function: ToolFunctionCall,
+}
+
+impl ToolCall {
+    pub fn function(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        arguments: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            kind: ToolCallKind::Function,
+            function: ToolFunctionCall {
+                name: name.into(),
+                arguments: arguments.into(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolCallKind {
+    Function,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ToolFunctionCall {
+    pub name: String,
+    pub arguments: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -73,7 +176,7 @@ impl Thread {
     }
 }
 
-pub const THREAD_DOCUMENT_SCHEMA_VERSION: u32 = 1;
+pub const THREAD_DOCUMENT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ThreadDocument {
@@ -102,12 +205,17 @@ pub enum TurnStatus {
 #[serde(rename_all = "snake_case")]
 pub enum TurnStepKind {
     ModelCall,
+    ToolCall,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct TurnStep {
     pub kind: TurnStepKind,
     pub status: TurnStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
     pub error: Option<String>,
 }
 
@@ -116,6 +224,22 @@ impl TurnStep {
         Self {
             kind,
             status: TurnStatus::Running,
+            tool_name: None,
+            tool_call_id: None,
+            error: None,
+        }
+    }
+
+    pub fn running_model_call() -> Self {
+        Self::running(TurnStepKind::ModelCall)
+    }
+
+    pub fn running_tool_call(name: impl Into<String>, id: impl Into<String>) -> Self {
+        Self {
+            kind: TurnStepKind::ToolCall,
+            status: TurnStatus::Running,
+            tool_name: Some(name.into()),
+            tool_call_id: Some(id.into()),
             error: None,
         }
     }
@@ -146,7 +270,7 @@ impl Turn {
             status: TurnStatus::Running,
             user_message,
             assistant_message: None,
-            steps: vec![TurnStep::running(TurnStepKind::ModelCall)],
+            steps: vec![TurnStep::running_model_call()],
             error: None,
         }
     }
@@ -176,6 +300,8 @@ pub enum AgentEvent {
     TurnStarted,
     TextDelta(String),
     AgentMessage(String),
+    ToolCallStarted { id: String, name: String },
+    ToolCallFinished { id: String, name: String, ok: bool },
     TurnCompleted,
     Error(String),
 }
@@ -234,7 +360,7 @@ mod tests {
         assert_eq!(
             value,
             json!({
-                "schema_version": 1,
+                "schema_version": 2,
                 "thread": {
                     "messages": [
                         {"role": "user", "content": "Hello"},
@@ -249,6 +375,40 @@ mod tests {
 
         assert_eq!(decoded.schema_version, THREAD_DOCUMENT_SCHEMA_VERSION);
         assert_eq!(decoded.thread, thread);
+    }
+
+    #[test]
+    fn serializes_assistant_tool_call_and_tool_result_messages() {
+        let tool_call = ToolCall::function("call_1", "read_file", r#"{"path":"Cargo.toml"}"#);
+        let messages = vec![
+            Message::assistant_tool_calls(vec![tool_call]),
+            Message::tool_result("call_1", r#"{"ok":true}"#),
+        ];
+
+        let value = serde_json::to_value(&messages).expect("serialize messages");
+
+        assert_eq!(
+            value,
+            json!([
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": "{\"path\":\"Cargo.toml\"}"
+                        }
+                    }]
+                },
+                {
+                    "role": "tool",
+                    "content": "{\"ok\":true}",
+                    "tool_call_id": "call_1"
+                }
+            ])
+        );
     }
 
     #[test]

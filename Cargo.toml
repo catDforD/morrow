@@ -15,6 +15,7 @@ agent-config = { path = "crates/agent-config" }
 agent-core = { path = "crates/agent-core" }
 agent-model = { path = "crates/agent-model" }
 agent-protocol = { path = "crates/agent-protocol" }
+agent-tools = { path = "crates/agent-tools" }
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
 dirs = "6"

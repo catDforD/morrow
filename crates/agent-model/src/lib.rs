@@ -1,9 +1,9 @@
-use agent_protocol::Conversation;
+use agent_protocol::{Conversation, ToolCall, ToolDefinition};
 use bytes::Bytes;
 use futures_util::stream::BoxStream;
 use futures_util::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -26,6 +26,7 @@ pub struct OpenAiCompatClient {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelEvent {
     TextDelta(String),
+    ToolCalls(Vec<ToolCall>),
     Completed,
 }
 
@@ -49,6 +50,8 @@ pub enum ModelError {
     EmptyResponse,
     #[error("model requested a tool call, but tools are not supported in this version")]
     UnsupportedToolCall,
+    #[error("model returned an invalid tool call: {0}")]
+    InvalidToolCall(String),
 }
 
 #[derive(Debug, Serialize)]
@@ -56,6 +59,14 @@ struct ChatCompletionRequest<'a> {
     model: &'a str,
     messages: &'a [agent_protocol::Message],
     stream: bool,
+    #[serde(skip_serializing_if = "is_empty_tools")]
+    tools: &'a [ToolDefinition],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<&'static str>,
+}
+
+fn is_empty_tools(tools: &[ToolDefinition]) -> bool {
+    tools.is_empty()
 }
 
 #[derive(Debug, Deserialize)]
@@ -72,8 +83,23 @@ struct ChatCompletionChoice {
 #[derive(Debug, Default, Deserialize)]
 struct ChatCompletionDelta {
     content: Option<String>,
-    tool_calls: Option<serde_json::Value>,
+    tool_calls: Option<Vec<ChatCompletionToolCallDelta>>,
     function_call: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatCompletionToolCallDelta {
+    index: usize,
+    id: Option<String>,
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    function: Option<ChatCompletionFunctionCallDelta>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatCompletionFunctionCallDelta {
+    name: Option<String>,
+    arguments: Option<String>,
 }
 
 impl OpenAiCompatClient {
@@ -97,11 +123,14 @@ impl OpenAiCompatClient {
     pub async fn stream_chat(
         &self,
         conversation: &Conversation,
+        tools: &[ToolDefinition],
     ) -> Result<ChatCompletionStream, ModelError> {
         let request = ChatCompletionRequest {
             model: &self.config.model,
             messages: &conversation.messages,
             stream: true,
+            tools,
+            tool_choice: (!tools.is_empty()).then_some("auto"),
         };
         let response = self
             .http
@@ -139,6 +168,7 @@ pub struct ChatCompletionStream {
     inner: BoxStream<'static, Result<Bytes, reqwest::Error>>,
     buffer: String,
     pending: VecDeque<Result<ModelEvent, ModelError>>,
+    tool_calls: BTreeMap<usize, ToolCallAccumulator>,
     done: bool,
     saw_text: bool,
 }
@@ -149,6 +179,7 @@ impl ChatCompletionStream {
             inner,
             buffer: String::new(),
             pending: VecDeque::new(),
+            tool_calls: BTreeMap::new(),
             done: false,
             saw_text: false,
         }
@@ -207,15 +238,20 @@ impl ChatCompletionStream {
         };
 
         for choice in chunk.choices {
-            if choice.delta.tool_calls.is_some()
-                || choice.delta.function_call.is_some()
-                || matches!(
-                    choice.finish_reason.as_deref(),
-                    Some("tool_calls" | "function_call")
-                )
+            if choice.delta.function_call.is_some()
+                || matches!(choice.finish_reason.as_deref(), Some("function_call"))
             {
                 self.finish_with_error(ModelError::UnsupportedToolCall);
                 return;
+            }
+
+            if let Some(tool_calls) = choice.delta.tool_calls {
+                for tool_call in tool_calls {
+                    self.accumulate_tool_call(tool_call);
+                    if self.done {
+                        return;
+                    }
+                }
             }
 
             if let Some(content) = choice.delta.content
@@ -224,13 +260,86 @@ impl ChatCompletionStream {
                 self.saw_text = true;
                 self.pending.push_back(Ok(ModelEvent::TextDelta(content)));
             }
+
+            if matches!(choice.finish_reason.as_deref(), Some("tool_calls")) {
+                self.finish_with_tool_calls();
+                return;
+            }
         }
+    }
+
+    fn accumulate_tool_call(&mut self, delta: ChatCompletionToolCallDelta) {
+        if let Some(kind) = delta.kind.as_deref()
+            && kind != "function"
+        {
+            self.finish_with_error(ModelError::InvalidToolCall(format!(
+                "unsupported tool call type {kind:?}"
+            )));
+            return;
+        }
+
+        let accumulator = self.tool_calls.entry(delta.index).or_default();
+        if let Some(id) = delta.id {
+            accumulator.id = Some(id);
+        }
+        if let Some(function) = delta.function {
+            if let Some(name) = function.name {
+                accumulator.name.push_str(&name);
+            }
+            if let Some(arguments) = function.arguments {
+                accumulator.arguments.push_str(&arguments);
+            }
+        }
+    }
+
+    fn finish_with_tool_calls(&mut self) {
+        if self.tool_calls.is_empty() {
+            self.finish_with_error(ModelError::InvalidToolCall(
+                "finish_reason was tool_calls but no tool calls were streamed".to_string(),
+            ));
+            return;
+        }
+
+        let mut tool_calls = Vec::with_capacity(self.tool_calls.len());
+        for (index, accumulator) in std::mem::take(&mut self.tool_calls) {
+            let id = match accumulator.id {
+                Some(id) if !id.is_empty() => id,
+                _ => {
+                    self.finish_with_error(ModelError::InvalidToolCall(format!(
+                        "tool call at index {index} is missing id"
+                    )));
+                    return;
+                }
+            };
+            if accumulator.name.is_empty() {
+                self.finish_with_error(ModelError::InvalidToolCall(format!(
+                    "tool call {id} is missing function name"
+                )));
+                return;
+            }
+            tool_calls.push(ToolCall::function(
+                id,
+                accumulator.name,
+                accumulator.arguments,
+            ));
+        }
+
+        self.pending
+            .push_back(Ok(ModelEvent::ToolCalls(tool_calls)));
+        self.done = true;
     }
 
     fn finish_with_error(&mut self, error: ModelError) {
         self.pending.push_back(Err(error));
         self.done = true;
     }
+}
+
+#[derive(Debug, Default)]
+struct ToolCallAccumulator {
+    id: Option<String>,
+    name: String,
+    arguments: String,
 }
 
 impl Unpin for ChatCompletionStream {}
@@ -277,9 +386,10 @@ impl Stream for ChatCompletionStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_protocol::Message;
+    use agent_protocol::{Message, ToolCall, ToolDefinition};
     use futures_util::StreamExt;
     use serde_json::json;
+    use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -301,6 +411,31 @@ mod tests {
                 .expect("write response");
         });
         format!("http://{addr}/v1")
+    }
+
+    async fn spawn_recording_server(body: &'static str) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind server");
+        let addr = listener.local_addr().expect("server addr");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured_requests = Arc::clone(&requests);
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept request");
+            let mut request = vec![0_u8; 8192];
+            let read = socket.read(&mut request).await.expect("read request");
+            captured_requests
+                .lock()
+                .expect("requests lock poisoned")
+                .push(String::from_utf8_lossy(&request[..read]).to_string());
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+        });
+        (format!("http://{addr}/v1"), requests)
     }
 
     fn conversation() -> Conversation {
@@ -339,7 +474,7 @@ mod tests {
         );
         let client = client_for(body).await;
         let stream = client
-            .stream_chat(&conversation())
+            .stream_chat(&conversation(), &[])
             .await
             .expect("stream chat");
 
@@ -368,7 +503,7 @@ mod tests {
         })
         .expect("client");
 
-        let err = match client.stream_chat(&conversation()).await {
+        let err = match client.stream_chat(&conversation(), &[]).await {
             Ok(_) => panic!("stream_chat must fail"),
             Err(err) => err,
         };
@@ -380,7 +515,7 @@ mod tests {
     async fn malformed_json_is_reported() {
         let client = client_for("data: {not-json}\n\n").await;
         let stream = client
-            .stream_chat(&conversation())
+            .stream_chat(&conversation(), &[])
             .await
             .expect("stream chat");
 
@@ -391,34 +526,103 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_calls_are_rejected() {
+    async fn parses_fragmented_tool_calls() {
         let body = format!(
-            "data: {}\n\n",
+            "data: {}\n\ndata: {}\n\ndata: {}\n\n",
             json!({
                 "choices": [{
-                    "delta": {"tool_calls": []},
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": "{\"pa"
+                            }
+                        }]
+                    },
                     "finish_reason": null
                 }]
-            })
+            }),
+            json!({
+                "choices": [{
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "function": {
+                                "arguments": "th\":\"Cargo.toml\"}"
+                            }
+                        }]
+                    },
+                    "finish_reason": null
+                }]
+            }),
+            json!({
+                "choices": [{
+                    "delta": {},
+                    "finish_reason": "tool_calls"
+                }]
+            }),
         );
         let body: &'static str = Box::leak(body.into_boxed_str());
         let client = client_for(body).await;
         let stream = client
-            .stream_chat(&conversation())
+            .stream_chat(&conversation(), &[])
             .await
             .expect("stream chat");
 
         let events = collect_events(stream).await;
 
         assert_eq!(events.len(), 1);
-        assert!(matches!(events[0], Err(ModelError::UnsupportedToolCall)));
+        assert_eq!(
+            events[0].as_ref().expect("tool calls"),
+            &ModelEvent::ToolCalls(vec![ToolCall::function(
+                "call_1",
+                "read_file",
+                r#"{"path":"Cargo.toml"}"#
+            )])
+        );
+    }
+
+    #[tokio::test]
+    async fn sends_tools_and_auto_tool_choice_when_tools_are_available() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (base_url, requests) = spawn_recording_server(body).await;
+        let client = OpenAiCompatClient::new_without_proxy(OpenAiCompatConfig {
+            base_url,
+            model: "test-model".to_string(),
+            api_key: "test-key".to_string(),
+            timeout: Duration::from_secs(5),
+        })
+        .expect("client");
+        let tools = vec![ToolDefinition::function(
+            "read_file",
+            "Read a file",
+            json!({"type": "object", "properties": {}}),
+        )];
+
+        let stream = client
+            .stream_chat(&conversation(), &tools)
+            .await
+            .expect("stream chat");
+        let _ = collect_events(stream).await;
+
+        let requests = requests.lock().expect("requests lock poisoned");
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains(r#""tool_choice":"auto""#));
+        assert!(requests[0].contains(r#""tools":[{"type":"function""#));
+        assert!(requests[0].contains(r#""name":"read_file""#));
     }
 
     #[tokio::test]
     async fn stream_end_before_done_is_reported() {
         let client = client_for("data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n").await;
         let stream = client
-            .stream_chat(&conversation())
+            .stream_chat(&conversation(), &[])
             .await
             .expect("stream chat");
 
@@ -436,7 +640,7 @@ mod tests {
     async fn done_without_text_is_reported_as_empty_response() {
         let client = client_for("data: [DONE]\n\n").await;
         let stream = client
-            .stream_chat(&conversation())
+            .stream_chat(&conversation(), &[])
             .await
             .expect("stream chat");
 
