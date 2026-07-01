@@ -5,12 +5,13 @@ use agent_sandbox::{PermissionDecision, PermissionEvaluator, PermissionEvaluator
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 const DEFAULT_READ_LINES: usize = 200;
@@ -97,6 +98,9 @@ impl ToolRegistry {
             "read_file" => self.read_file(call).map(tool_ok),
             "list_files" => self.list_files(call).map(tool_ok),
             "search_text" => self.search_text(call).map(tool_ok),
+            "edit_file" => self.edit_file(call).map(tool_ok),
+            "write_file" => self.write_file(call).map(tool_ok),
+            "apply_patch" => self.apply_patch(call).map(tool_ok),
             "shell_command" => return self.shell_command(call, approval),
             name => Err(format!("unknown tool {name:?}")),
         };
@@ -212,6 +216,101 @@ impl ToolRegistry {
         }))
     }
 
+    fn edit_file(&self, call: &ToolCall) -> Result<Value, String> {
+        let args = parse_args::<EditFileArgs>(call)?;
+        if args.old_text.is_empty() {
+            return Err("old_text must not be empty".to_string());
+        }
+
+        let path = self.resolve_write_path(&args.path)?;
+        let metadata = fs::metadata(&path)
+            .map_err(|err| format!("failed to inspect {}: {err}", self.display_path(&path)))?;
+        if !metadata.is_file() {
+            return Err(format!("{} is not a file", self.display_path(&path)));
+        }
+
+        let content = fs::read_to_string(&path).map_err(|err| {
+            format!(
+                "failed to read {} as UTF-8 text: {err}",
+                self.display_path(&path)
+            )
+        })?;
+        let replacements = content.matches(&args.old_text).count();
+        if replacements != 1 {
+            return Err(format!(
+                "old_text must match exactly once in {}; found {replacements}",
+                self.display_path(&path)
+            ));
+        }
+
+        let updated = content.replacen(&args.old_text, &args.new_text, 1);
+        write_atomic(&path, &updated, Some(metadata.permissions()), self)?;
+
+        Ok(json!({
+            "path": self.display_path(&path),
+            "replacements": 1,
+            "created": false,
+            "overwritten": true,
+        }))
+    }
+
+    fn write_file(&self, call: &ToolCall) -> Result<Value, String> {
+        let args = parse_args::<WriteFileArgs>(call)?;
+        let overwrite = args.overwrite.unwrap_or(false);
+        let path = self.resolve_write_path(&args.path)?;
+        let existing = match fs::metadata(&path) {
+            Ok(metadata) => Some(metadata),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => {
+                return Err(format!(
+                    "failed to inspect {}: {err}",
+                    self.display_path(&path)
+                ));
+            }
+        };
+
+        if let Some(metadata) = existing.as_ref() {
+            if !metadata.is_file() {
+                return Err(format!("{} is not a file", self.display_path(&path)));
+            }
+            if !overwrite {
+                return Err(format!(
+                    "{} already exists; set overwrite to true to replace it",
+                    self.display_path(&path)
+                ));
+            }
+        }
+
+        let created = existing.is_none();
+        let overwritten = existing.is_some();
+        let permissions = existing.map(|metadata| metadata.permissions());
+
+        write_atomic(&path, &args.content, permissions, self)?;
+
+        Ok(json!({
+            "path": self.display_path(&path),
+            "replacements": 0,
+            "created": created,
+            "overwritten": overwritten,
+        }))
+    }
+
+    fn apply_patch(&self, call: &ToolCall) -> Result<Value, String> {
+        let args = parse_args::<ApplyPatchArgs>(call)?;
+        let operations = parse_patch(&args.patch)?;
+        let changes = self.plan_patch_changes(operations)?;
+        let files = changes
+            .iter()
+            .map(|change| change.result.clone())
+            .collect::<Vec<_>>();
+        commit_patch_changes(changes, self)?;
+
+        Ok(json!({
+            "changed_files": files.len(),
+            "files": files,
+        }))
+    }
+
     fn shell_command(&self, call: &ToolCall, approval: Option<&ApprovalDecision>) -> ToolExecution {
         let args = match parse_args::<ShellCommandArgs>(call) {
             Ok(args) => args,
@@ -262,6 +361,134 @@ impl ToolRegistry {
 
     fn resolve_existing_path(&self, input: &str) -> Result<PathBuf, String> {
         self.evaluator()?.resolve_existing_path(input)
+    }
+
+    fn resolve_write_path(&self, input: &str) -> Result<PathBuf, String> {
+        self.evaluator()?.resolve_write_path(input)
+    }
+
+    fn plan_patch_changes(
+        &self,
+        operations: Vec<ParsedPatchOperation>,
+    ) -> Result<Vec<StagedPatchChange>, String> {
+        let mut paths = HashSet::new();
+        let mut changes = Vec::with_capacity(operations.len());
+
+        for operation in operations {
+            let path = self.resolve_write_path(operation.path())?;
+            if !paths.insert(path.clone()) {
+                return Err(format!(
+                    "patch modifies {} more than once",
+                    self.display_path(&path)
+                ));
+            }
+
+            let change = match operation {
+                ParsedPatchOperation::Add { path: _, content } => {
+                    match fs::metadata(&path) {
+                        Ok(_) => {
+                            return Err(format!(
+                                "{} already exists; add file cannot overwrite it",
+                                self.display_path(&path)
+                            ));
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(err) => {
+                            return Err(format!(
+                                "failed to inspect {}: {err}",
+                                self.display_path(&path)
+                            ));
+                        }
+                    }
+                    StagedPatchChange::write(
+                        path.clone(),
+                        PatchOperationKind::Add,
+                        content,
+                        None,
+                        json!({
+                            "path": self.display_path(&path),
+                            "operation": "add",
+                            "replacements": 0,
+                            "created": true,
+                            "overwritten": false,
+                            "deleted": false,
+                        }),
+                    )
+                }
+                ParsedPatchOperation::Update { path: _, hunks } => {
+                    let metadata = fs::metadata(&path).map_err(|err| {
+                        format!("failed to inspect {}: {err}", self.display_path(&path))
+                    })?;
+                    if !metadata.is_file() {
+                        return Err(format!("{} is not a file", self.display_path(&path)));
+                    }
+
+                    let original = fs::read_to_string(&path).map_err(|err| {
+                        format!(
+                            "failed to read {} as UTF-8 text: {err}",
+                            self.display_path(&path)
+                        )
+                    })?;
+                    let mut updated = original.clone();
+                    let mut replacements = 0;
+                    for hunk in hunks {
+                        let matches = updated.matches(&hunk.old_text).count();
+                        if matches != 1 {
+                            return Err(format!(
+                                "patch hunk for {} must match exactly once; found {matches}",
+                                self.display_path(&path)
+                            ));
+                        }
+                        updated = updated.replacen(&hunk.old_text, &hunk.new_text, 1);
+                        replacements += 1;
+                    }
+                    if updated == original {
+                        return Err(format!(
+                            "patch update for {} did not change file content",
+                            self.display_path(&path)
+                        ));
+                    }
+
+                    StagedPatchChange::write(
+                        path.clone(),
+                        PatchOperationKind::Update,
+                        updated,
+                        Some(metadata.permissions()),
+                        json!({
+                            "path": self.display_path(&path),
+                            "operation": "update",
+                            "replacements": replacements,
+                            "created": false,
+                            "overwritten": true,
+                            "deleted": false,
+                        }),
+                    )
+                }
+                ParsedPatchOperation::Delete { path: _ } => {
+                    let metadata = fs::metadata(&path).map_err(|err| {
+                        format!("failed to inspect {}: {err}", self.display_path(&path))
+                    })?;
+                    if !metadata.is_file() {
+                        return Err(format!("{} is not a file", self.display_path(&path)));
+                    }
+
+                    StagedPatchChange::delete(
+                        path.clone(),
+                        json!({
+                            "path": self.display_path(&path),
+                            "operation": "delete",
+                            "replacements": 0,
+                            "created": false,
+                            "overwritten": false,
+                            "deleted": true,
+                        }),
+                    )
+                }
+            };
+            changes.push(change);
+        }
+
+        Ok(changes)
     }
 
     fn display_path(&self, path: &Path) -> String {
@@ -459,6 +686,49 @@ fn built_in_definitions() -> Vec<ToolDefinition> {
             }),
         ),
         ToolDefinition::function(
+            "edit_file",
+            "Edit a UTF-8 text file by replacing text that matches exactly once.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "old_text": {"type": "string", "minLength": 1},
+                    "new_text": {"type": "string"}
+                },
+                "required": ["path", "old_text", "new_text"],
+                "additionalProperties": false
+            }),
+        ),
+        ToolDefinition::function(
+            "write_file",
+            "Create or overwrite a UTF-8 text file.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                    "overwrite": {"type": "boolean"}
+                },
+                "required": ["path", "content"],
+                "additionalProperties": false
+            }),
+        ),
+        ToolDefinition::function(
+            "apply_patch",
+            "Apply a patch to add, update, or delete files.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "patch": {
+                        "type": "string",
+                        "description": "Patch text to apply."
+                    }
+                },
+                "required": ["patch"],
+                "additionalProperties": false
+            }),
+        ),
+        ToolDefinition::function(
             "shell_command",
             "Run a shell command in the workspace root with a timeout.",
             json!({
@@ -499,6 +769,489 @@ fn complete_tool_result(result: Result<Value, String>) -> ToolExecution {
         Ok(data) => ToolExecution::Completed(tool_ok(data)),
         Err(error) => ToolExecution::Completed(tool_error(error)),
     }
+}
+
+fn write_atomic(
+    path: &Path,
+    content: &str,
+    permissions: Option<fs::Permissions>,
+    tools: &ToolRegistry,
+) -> Result<(), String> {
+    let _parent = path
+        .parent()
+        .ok_or_else(|| format!("{} must have a parent directory", tools.display_path(path)))?;
+    let temp_path = temp_path_for(path);
+
+    write_temp_file(path, &temp_path, content, permissions, tools)?;
+
+    fs::rename(&temp_path, path).map_err(|err| {
+        let _ = fs::remove_file(&temp_path);
+        format!("failed to replace {}: {err}", tools.display_path(path))
+    })?;
+
+    Ok(())
+}
+
+fn temp_path_for(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "morrow-write".into());
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    path.with_file_name(format!(".{file_name}.tmp-{}-{stamp}", std::process::id()))
+}
+
+fn backup_path_for(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "morrow-backup".into());
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    path.with_file_name(format!(".{file_name}.bak-{}-{stamp}", std::process::id()))
+}
+
+fn write_temp_file(
+    display_path: &Path,
+    temp_path: &Path,
+    content: &str,
+    permissions: Option<fs::Permissions>,
+    tools: &ToolRegistry,
+) -> Result<(), String> {
+    fs::write(temp_path, content).map_err(|err| {
+        format!(
+            "failed to write temporary file for {}: {err}",
+            tools.display_path(display_path)
+        )
+    })?;
+    if let Some(permissions) = permissions {
+        fs::set_permissions(temp_path, permissions).map_err(|err| {
+            let _ = fs::remove_file(temp_path);
+            format!(
+                "failed to set permissions on temporary file for {}: {err}",
+                tools.display_path(display_path)
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
+fn commit_patch_changes(
+    mut changes: Vec<StagedPatchChange>,
+    tools: &ToolRegistry,
+) -> Result<(), String> {
+    for index in 0..changes.len() {
+        let Some(content) = changes[index].content.as_deref() else {
+            continue;
+        };
+        let temp_path = temp_path_for(&changes[index].path);
+        if let Err(error) = write_temp_file(
+            &changes[index].path,
+            &temp_path,
+            content,
+            changes[index].permissions.clone(),
+            tools,
+        ) {
+            cleanup_patch_temps(&changes);
+            return Err(error);
+        }
+        changes[index].temp_path = Some(temp_path);
+    }
+
+    let mut applied = Vec::new();
+    for change in &mut changes {
+        match change.kind {
+            PatchOperationKind::Add => {
+                if change.path.exists() {
+                    return fail_patch_commit(
+                        format!(
+                            "{} already exists; add file cannot overwrite it",
+                            tools.display_path(&change.path)
+                        ),
+                        &changes,
+                        applied,
+                        tools,
+                    );
+                }
+                let temp_path = change
+                    .temp_path
+                    .take()
+                    .ok_or_else(|| "staged add file is missing temporary content".to_string())?;
+                if let Err(err) = fs::rename(&temp_path, &change.path) {
+                    let _ = fs::remove_file(&temp_path);
+                    return fail_patch_commit(
+                        format!(
+                            "failed to create {}: {err}",
+                            tools.display_path(&change.path)
+                        ),
+                        &changes,
+                        applied,
+                        tools,
+                    );
+                }
+                applied.push(AppliedPatchChange {
+                    path: change.path.clone(),
+                    kind: PatchOperationKind::Add,
+                    backup_path: None,
+                });
+            }
+            PatchOperationKind::Update => {
+                let temp_path = change
+                    .temp_path
+                    .take()
+                    .ok_or_else(|| "staged update file is missing temporary content".to_string())?;
+                let backup_path = backup_path_for(&change.path);
+                if let Err(err) = fs::rename(&change.path, &backup_path) {
+                    let _ = fs::remove_file(&temp_path);
+                    return fail_patch_commit(
+                        format!(
+                            "failed to back up {}: {err}",
+                            tools.display_path(&change.path)
+                        ),
+                        &changes,
+                        applied,
+                        tools,
+                    );
+                }
+                if let Err(err) = fs::rename(&temp_path, &change.path) {
+                    let _ = fs::rename(&backup_path, &change.path);
+                    let _ = fs::remove_file(&temp_path);
+                    return fail_patch_commit(
+                        format!(
+                            "failed to replace {}: {err}",
+                            tools.display_path(&change.path)
+                        ),
+                        &changes,
+                        applied,
+                        tools,
+                    );
+                }
+                applied.push(AppliedPatchChange {
+                    path: change.path.clone(),
+                    kind: PatchOperationKind::Update,
+                    backup_path: Some(backup_path),
+                });
+            }
+            PatchOperationKind::Delete => {
+                let backup_path = backup_path_for(&change.path);
+                if let Err(err) = fs::rename(&change.path, &backup_path) {
+                    return fail_patch_commit(
+                        format!(
+                            "failed to delete {}: {err}",
+                            tools.display_path(&change.path)
+                        ),
+                        &changes,
+                        applied,
+                        tools,
+                    );
+                }
+                applied.push(AppliedPatchChange {
+                    path: change.path.clone(),
+                    kind: PatchOperationKind::Delete,
+                    backup_path: Some(backup_path),
+                });
+            }
+        }
+    }
+
+    for change in applied {
+        if let Some(backup_path) = change.backup_path {
+            let _ = fs::remove_file(backup_path);
+        }
+    }
+
+    Ok(())
+}
+
+fn cleanup_patch_temps(changes: &[StagedPatchChange]) {
+    for change in changes {
+        if let Some(temp_path) = change.temp_path.as_ref() {
+            let _ = fs::remove_file(temp_path);
+        }
+    }
+}
+
+fn fail_patch_commit(
+    error: String,
+    changes: &[StagedPatchChange],
+    applied: Vec<AppliedPatchChange>,
+    tools: &ToolRegistry,
+) -> Result<(), String> {
+    cleanup_patch_temps(changes);
+    let rollback_errors = rollback_patch_changes(applied, tools);
+    if rollback_errors.is_empty() {
+        Err(error)
+    } else {
+        Err(format!(
+            "{error}; rollback errors: {}",
+            rollback_errors.join("; ")
+        ))
+    }
+}
+
+fn rollback_patch_changes(
+    mut applied: Vec<AppliedPatchChange>,
+    tools: &ToolRegistry,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    while let Some(change) = applied.pop() {
+        match change.kind {
+            PatchOperationKind::Add => {
+                if let Err(err) = fs::remove_file(&change.path) {
+                    errors.push(format!(
+                        "failed to remove created {}: {err}",
+                        tools.display_path(&change.path)
+                    ));
+                }
+            }
+            PatchOperationKind::Update => {
+                if let Err(err) = fs::remove_file(&change.path) {
+                    errors.push(format!(
+                        "failed to remove updated {}: {err}",
+                        tools.display_path(&change.path)
+                    ));
+                }
+                if let Some(backup_path) = change.backup_path
+                    && let Err(err) = fs::rename(&backup_path, &change.path)
+                {
+                    errors.push(format!(
+                        "failed to restore {}: {err}",
+                        tools.display_path(&change.path)
+                    ));
+                }
+            }
+            PatchOperationKind::Delete => {
+                if let Some(backup_path) = change.backup_path
+                    && let Err(err) = fs::rename(&backup_path, &change.path)
+                {
+                    errors.push(format!(
+                        "failed to restore deleted {}: {err}",
+                        tools.display_path(&change.path)
+                    ));
+                }
+            }
+        }
+    }
+    errors
+}
+
+fn parse_patch(patch: &str) -> Result<Vec<ParsedPatchOperation>, String> {
+    let normalized = patch.replace("\r\n", "\n");
+    let mut lines = normalized.split('\n').collect::<Vec<_>>();
+    while matches!(lines.last(), Some(line) if line.is_empty()) {
+        lines.pop();
+    }
+
+    if lines.first().copied() != Some("*** Begin Patch") {
+        return Err("patch must start with *** Begin Patch".to_string());
+    }
+    if lines.last().copied() != Some("*** End Patch") {
+        return Err("patch must end with *** End Patch".to_string());
+    }
+    if lines.len() <= 2 {
+        return Err("patch must contain at least one operation".to_string());
+    }
+
+    let end = lines.len() - 1;
+    let mut index = 1;
+    let mut operations = Vec::new();
+    while index < end {
+        let line = lines[index];
+        if line.starts_with("*** Move to:") {
+            return Err("apply_patch does not support move operations".to_string());
+        }
+        if let Some(path) = line.strip_prefix("*** Add File: ") {
+            let path = parse_patch_path(path)?;
+            index += 1;
+            let mut content = String::new();
+            let mut line_count = 0;
+            while index < end && !is_patch_directive(lines[index]) {
+                let line = lines[index];
+                let Some(payload) = line.strip_prefix('+') else {
+                    return Err(format!(
+                        "invalid add file line for {path}; expected + prefix"
+                    ));
+                };
+                push_patch_line(&mut content, payload);
+                line_count += 1;
+                index += 1;
+            }
+            if line_count == 0 {
+                return Err(format!("add file {path} must contain at least one line"));
+            }
+            operations.push(ParsedPatchOperation::Add { path, content });
+            continue;
+        }
+
+        if let Some(path) = line.strip_prefix("*** Update File: ") {
+            let path = parse_patch_path(path)?;
+            index += 1;
+            let mut hunks = Vec::new();
+            while index < end && !is_patch_directive(lines[index]) {
+                if !lines[index].starts_with("@@") {
+                    return Err(format!("expected @@ hunk header for update file {path}"));
+                }
+                index += 1;
+                let mut old_text = String::new();
+                let mut new_text = String::new();
+                let mut line_count = 0;
+                while index < end
+                    && !lines[index].starts_with("@@")
+                    && !is_patch_directive(lines[index])
+                {
+                    let line = lines[index];
+                    let Some(prefix) = line.chars().next() else {
+                        return Err(format!("invalid empty hunk line for update file {path}"));
+                    };
+                    let payload = &line[prefix.len_utf8()..];
+                    match prefix {
+                        ' ' => {
+                            push_patch_line(&mut old_text, payload);
+                            push_patch_line(&mut new_text, payload);
+                        }
+                        '-' => push_patch_line(&mut old_text, payload),
+                        '+' => push_patch_line(&mut new_text, payload),
+                        _ => {
+                            return Err(format!(
+                                "invalid hunk line prefix {prefix:?} for update file {path}"
+                            ));
+                        }
+                    }
+                    line_count += 1;
+                    index += 1;
+                }
+                if line_count == 0 {
+                    return Err(format!("empty hunk for update file {path}"));
+                }
+                if old_text.is_empty() {
+                    return Err(format!(
+                        "hunk for update file {path} must include context or removed lines"
+                    ));
+                }
+                if old_text == new_text {
+                    return Err(format!("hunk for update file {path} has no changes"));
+                }
+                hunks.push(PatchHunk { old_text, new_text });
+            }
+            if hunks.is_empty() {
+                return Err(format!("update file {path} must contain at least one hunk"));
+            }
+            operations.push(ParsedPatchOperation::Update { path, hunks });
+            continue;
+        }
+
+        if let Some(path) = line.strip_prefix("*** Delete File: ") {
+            let path = parse_patch_path(path)?;
+            index += 1;
+            operations.push(ParsedPatchOperation::Delete { path });
+            continue;
+        }
+
+        if line.starts_with("*** ") {
+            return Err(format!("unknown patch operation {line:?}"));
+        }
+        return Err(format!("expected patch operation, found {line:?}"));
+    }
+
+    Ok(operations)
+}
+
+fn parse_patch_path(path: &str) -> Result<String, String> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Err("patch operation path must not be empty".to_string());
+    }
+    Ok(path.to_string())
+}
+
+fn is_patch_directive(line: &str) -> bool {
+    line.starts_with("*** ")
+}
+
+fn push_patch_line(content: &mut String, line: &str) {
+    content.push_str(line);
+    content.push('\n');
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ParsedPatchOperation {
+    Add { path: String, content: String },
+    Update { path: String, hunks: Vec<PatchHunk> },
+    Delete { path: String },
+}
+
+impl ParsedPatchOperation {
+    fn path(&self) -> &str {
+        match self {
+            Self::Add { path, .. } | Self::Update { path, .. } | Self::Delete { path } => path,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PatchHunk {
+    old_text: String,
+    new_text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PatchOperationKind {
+    Add,
+    Update,
+    Delete,
+}
+
+#[derive(Debug)]
+struct StagedPatchChange {
+    path: PathBuf,
+    kind: PatchOperationKind,
+    content: Option<String>,
+    permissions: Option<fs::Permissions>,
+    result: Value,
+    temp_path: Option<PathBuf>,
+}
+
+impl StagedPatchChange {
+    fn write(
+        path: PathBuf,
+        kind: PatchOperationKind,
+        content: String,
+        permissions: Option<fs::Permissions>,
+        result: Value,
+    ) -> Self {
+        Self {
+            path,
+            kind,
+            content: Some(content),
+            permissions,
+            result,
+            temp_path: None,
+        }
+    }
+
+    fn delete(path: PathBuf, result: Value) -> Self {
+        Self {
+            path,
+            kind: PatchOperationKind::Delete,
+            content: None,
+            permissions: None,
+            result,
+            temp_path: None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct AppliedPatchChange {
+    path: PathBuf,
+    kind: PatchOperationKind,
+    backup_path: Option<PathBuf>,
 }
 
 fn tool_ok(data: Value) -> ToolResult {
@@ -651,6 +1404,25 @@ struct SearchOptions<'a> {
 }
 
 #[derive(Debug, Deserialize)]
+struct EditFileArgs {
+    path: String,
+    old_text: String,
+    new_text: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WriteFileArgs {
+    path: String,
+    content: String,
+    overwrite: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApplyPatchArgs {
+    patch: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct ShellCommandArgs {
     command: String,
     timeout_secs: Option<u64>,
@@ -672,6 +1444,13 @@ mod tests {
         path
     }
 
+    fn outside_path(root: &Path, name: &str) -> PathBuf {
+        let root_name = root.file_name().expect("root file name").to_string_lossy();
+        root.parent()
+            .expect("root parent")
+            .join(format!("{root_name}-{name}"))
+    }
+
     fn registry(root: &Path) -> ToolRegistry {
         ToolRegistry::built_in(
             root,
@@ -686,6 +1465,10 @@ mod tests {
 
     fn call(name: &str, arguments: Value) -> ToolCall {
         ToolCall::function("call_1", name, arguments.to_string())
+    }
+
+    fn patch_call(patch: &str) -> ToolCall {
+        call("apply_patch", json!({"patch": patch}))
     }
 
     fn content(execution: ToolExecution) -> Value {
@@ -777,6 +1560,667 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0]["path"], "a.txt");
         assert_eq!(results[0]["line"], 1);
+    }
+
+    #[test]
+    fn edit_file_replaces_unique_match() {
+        let root = unique_dir("edit-root");
+        fs::write(root.join("note.txt"), "before old after\n").expect("write file");
+        let tools = registry(&root);
+
+        let value = content(tools.execute(&call(
+            "edit_file",
+            json!({"path": "note.txt", "old_text": "old", "new_text": "new"}),
+        )));
+
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["data"]["path"], "note.txt");
+        assert_eq!(value["data"]["replacements"], 1);
+        assert_eq!(value["data"]["created"], false);
+        assert_eq!(value["data"]["overwritten"], true);
+        assert_eq!(
+            fs::read_to_string(root.join("note.txt")).expect("read file"),
+            "before new after\n"
+        );
+    }
+
+    #[test]
+    fn edit_file_rejects_invalid_matches_and_targets() {
+        let root = unique_dir("edit-invalid-root");
+        fs::write(root.join("no-match.txt"), "alpha\n").expect("write no match");
+        fs::write(root.join("many.txt"), "alpha alpha\n").expect("write many");
+        fs::create_dir(root.join("dir")).expect("create dir");
+        let tools = registry(&root);
+
+        let no_match = content(tools.execute(&call(
+            "edit_file",
+            json!({"path": "no-match.txt", "old_text": "beta", "new_text": "gamma"}),
+        )));
+        assert_eq!(no_match["ok"], false);
+        assert!(
+            no_match["error"]
+                .as_str()
+                .expect("error")
+                .contains("found 0")
+        );
+
+        let many = content(tools.execute(&call(
+            "edit_file",
+            json!({"path": "many.txt", "old_text": "alpha", "new_text": "beta"}),
+        )));
+        assert_eq!(many["ok"], false);
+        assert!(many["error"].as_str().expect("error").contains("found 2"));
+
+        let empty = content(tools.execute(&call(
+            "edit_file",
+            json!({"path": "no-match.txt", "old_text": "", "new_text": "gamma"}),
+        )));
+        assert_eq!(empty["ok"], false);
+        assert!(
+            empty["error"]
+                .as_str()
+                .expect("error")
+                .contains("old_text must not be empty")
+        );
+
+        let missing = content(tools.execute(&call(
+            "edit_file",
+            json!({"path": "missing.txt", "old_text": "a", "new_text": "b"}),
+        )));
+        assert_eq!(missing["ok"], false);
+        assert!(
+            missing["error"]
+                .as_str()
+                .expect("error")
+                .contains("failed to inspect")
+        );
+
+        let directory = content(tools.execute(&call(
+            "edit_file",
+            json!({"path": "dir", "old_text": "a", "new_text": "b"}),
+        )));
+        assert_eq!(directory["ok"], false);
+        assert!(
+            directory["error"]
+                .as_str()
+                .expect("error")
+                .contains("is not a file")
+        );
+
+        assert_eq!(
+            fs::read_to_string(root.join("no-match.txt")).expect("read no match"),
+            "alpha\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("many.txt")).expect("read many"),
+            "alpha alpha\n"
+        );
+    }
+
+    #[test]
+    fn write_file_creates_new_file() {
+        let root = unique_dir("write-create-root");
+        let tools = registry(&root);
+
+        let value = content(tools.execute(&call(
+            "write_file",
+            json!({"path": "note.txt", "content": "created\n"}),
+        )));
+
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["data"]["path"], "note.txt");
+        assert_eq!(value["data"]["replacements"], 0);
+        assert_eq!(value["data"]["created"], true);
+        assert_eq!(value["data"]["overwritten"], false);
+        assert_eq!(
+            fs::read_to_string(root.join("note.txt")).expect("read file"),
+            "created\n"
+        );
+    }
+
+    #[test]
+    fn write_file_rejects_default_overwrite_and_preserves_file() {
+        let root = unique_dir("write-default-overwrite-root");
+        fs::write(root.join("note.txt"), "old\n").expect("write file");
+        let tools = registry(&root);
+
+        let value = content(tools.execute(&call(
+            "write_file",
+            json!({"path": "note.txt", "content": "new\n"}),
+        )));
+
+        assert_eq!(value["ok"], false);
+        assert!(
+            value["error"]
+                .as_str()
+                .expect("error")
+                .contains("already exists")
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("note.txt")).expect("read file"),
+            "old\n"
+        );
+    }
+
+    #[test]
+    fn write_file_overwrites_existing_file_when_requested() {
+        let root = unique_dir("write-overwrite-root");
+        fs::write(root.join("note.txt"), "old\n").expect("write file");
+        let tools = registry(&root);
+
+        let value = content(tools.execute(&call(
+            "write_file",
+            json!({"path": "note.txt", "content": "new\n", "overwrite": true}),
+        )));
+
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["data"]["created"], false);
+        assert_eq!(value["data"]["overwritten"], true);
+        assert_eq!(
+            fs::read_to_string(root.join("note.txt")).expect("read file"),
+            "new\n"
+        );
+    }
+
+    #[test]
+    fn write_file_rejects_missing_parent_directory() {
+        let root = unique_dir("write-missing-parent-root");
+        let tools = registry(&root);
+
+        let value = content(tools.execute(&call(
+            "write_file",
+            json!({"path": "missing/note.txt", "content": "new\n"}),
+        )));
+
+        assert_eq!(value["ok"], false);
+        assert!(
+            value["error"]
+                .as_str()
+                .expect("error")
+                .contains("failed to resolve parent directory")
+        );
+        assert!(!root.join("missing").exists());
+    }
+
+    #[test]
+    fn read_only_rejects_file_write_tools() {
+        let root = unique_dir("read-only-tools-root");
+        fs::write(root.join("note.txt"), "old\n").expect("write file");
+        let tools =
+            registry_with_permissions(&root, PermissionProfile::for_mode(PermissionMode::ReadOnly));
+
+        let edit = content(tools.execute(&call(
+            "edit_file",
+            json!({"path": "note.txt", "old_text": "old", "new_text": "new"}),
+        )));
+        let write = content(tools.execute(&call(
+            "write_file",
+            json!({"path": "created.txt", "content": "created\n"}),
+        )));
+
+        assert_eq!(edit["ok"], false);
+        assert!(
+            edit["error"]
+                .as_str()
+                .expect("error")
+                .contains("file writes are denied")
+        );
+        assert_eq!(write["ok"], false);
+        assert!(
+            write["error"]
+                .as_str()
+                .expect("error")
+                .contains("file writes are denied")
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("note.txt")).expect("read file"),
+            "old\n"
+        );
+        assert!(!root.join("created.txt").exists());
+    }
+
+    #[test]
+    fn workspace_write_rejects_file_write_tools_outside_workspace() {
+        let root = unique_dir("workspace-write-tools-root");
+        let outside = outside_path(&root, "outside.txt");
+        fs::write(&outside, "old\n").expect("write outside");
+        let tools = registry(&root);
+
+        let edit = content(tools.execute(&call(
+            "edit_file",
+            json!({"path": outside.display().to_string(), "old_text": "old", "new_text": "new"}),
+        )));
+        let write = content(tools.execute(&call(
+            "write_file",
+            json!({"path": outside.display().to_string(), "content": "new\n", "overwrite": true}),
+        )));
+
+        assert_eq!(edit["ok"], false);
+        assert!(
+            edit["error"]
+                .as_str()
+                .expect("error")
+                .contains("outside the workspace root")
+        );
+        assert_eq!(write["ok"], false);
+        assert!(
+            write["error"]
+                .as_str()
+                .expect("error")
+                .contains("outside the workspace root")
+        );
+        assert_eq!(fs::read_to_string(outside).expect("read outside"), "old\n");
+    }
+
+    #[test]
+    fn danger_full_access_can_write_absolute_paths_outside_workspace() {
+        let root = unique_dir("danger-write-root");
+        let outside = outside_path(&root, "outside-danger.txt");
+        let tools = registry_with_permissions(
+            &root,
+            PermissionProfile::for_mode(PermissionMode::DangerFullAccess),
+        );
+
+        let value = content(tools.execute(&call(
+            "write_file",
+            json!({"path": outside.display().to_string(), "content": "outside\n"}),
+        )));
+
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["data"]["created"], true);
+        assert_eq!(value["data"]["overwritten"], false);
+        assert_eq!(
+            fs::read_to_string(outside).expect("read outside"),
+            "outside\n"
+        );
+    }
+
+    #[test]
+    fn apply_patch_adds_updates_and_deletes_files() {
+        let root = unique_dir("patch-basic-root");
+        fs::write(root.join("update.txt"), "alpha\nbeta\ngamma\n").expect("write update");
+        fs::write(root.join("delete.txt"), "delete me\n").expect("write delete");
+        let tools = registry(&root);
+
+        let value = content(tools.execute(&patch_call(
+            r#"*** Begin Patch
+*** Add File: added.txt
++hello
++world
+*** Update File: update.txt
+@@
+ alpha
+-beta
++BETA
+ gamma
+*** Delete File: delete.txt
+*** End Patch"#,
+        )));
+
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["data"]["changed_files"], 3);
+        assert_eq!(
+            fs::read_to_string(root.join("added.txt")).expect("read added"),
+            "hello\nworld\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("update.txt")).expect("read update"),
+            "alpha\nBETA\ngamma\n"
+        );
+        assert!(!root.join("delete.txt").exists());
+        let files = value["data"]["files"].as_array().expect("files");
+        assert_eq!(files[0]["operation"], "add");
+        assert_eq!(files[1]["operation"], "update");
+        assert_eq!(files[1]["replacements"], 1);
+        assert_eq!(files[2]["operation"], "delete");
+    }
+
+    #[test]
+    fn apply_patch_updates_multiple_files_and_hunks() {
+        let root = unique_dir("patch-multi-root");
+        fs::write(root.join("a.txt"), "one\ntwo\nthree\nfour\n").expect("write a");
+        fs::write(root.join("b.txt"), "red\nblue\n").expect("write b");
+        let tools = registry(&root);
+
+        let value = content(tools.execute(&patch_call(
+            r#"*** Begin Patch
+*** Update File: a.txt
+@@
+ one
+-two
++TWO
+ three
+@@
+ three
+-four
++FOUR
+*** Update File: b.txt
+@@
+-red
++RED
+ blue
+*** End Patch"#,
+        )));
+
+        assert_eq!(value["ok"], true);
+        assert_eq!(
+            fs::read_to_string(root.join("a.txt")).expect("read a"),
+            "one\nTWO\nthree\nFOUR\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("b.txt")).expect("read b"),
+            "RED\nblue\n"
+        );
+        let files = value["data"]["files"].as_array().expect("files");
+        assert_eq!(files[0]["replacements"], 2);
+        assert_eq!(files[1]["replacements"], 1);
+    }
+
+    #[test]
+    fn apply_patch_rejects_invalid_targets() {
+        let root = unique_dir("patch-invalid-targets-root");
+        fs::write(root.join("existing.txt"), "old\n").expect("write existing");
+        fs::create_dir(root.join("dir")).expect("create dir");
+        fs::write(root.join("binary.bin"), [0xff, 0xfe]).expect("write binary");
+        let tools = registry(&root);
+
+        let add_existing = content(tools.execute(&patch_call(
+            r#"*** Begin Patch
+*** Add File: existing.txt
++new
+*** End Patch"#,
+        )));
+        assert_eq!(add_existing["ok"], false);
+        assert!(
+            add_existing["error"]
+                .as_str()
+                .expect("error")
+                .contains("already exists")
+        );
+
+        let update_missing = content(tools.execute(&patch_call(
+            r#"*** Begin Patch
+*** Update File: missing.txt
+@@
+-old
++new
+*** End Patch"#,
+        )));
+        assert_eq!(update_missing["ok"], false);
+        assert!(
+            update_missing["error"]
+                .as_str()
+                .expect("error")
+                .contains("failed to inspect")
+        );
+
+        let delete_missing = content(tools.execute(&patch_call(
+            r#"*** Begin Patch
+*** Delete File: missing.txt
+*** End Patch"#,
+        )));
+        assert_eq!(delete_missing["ok"], false);
+        assert!(
+            delete_missing["error"]
+                .as_str()
+                .expect("error")
+                .contains("failed to inspect")
+        );
+
+        let update_dir = content(tools.execute(&patch_call(
+            r#"*** Begin Patch
+*** Update File: dir
+@@
+-old
++new
+*** End Patch"#,
+        )));
+        assert_eq!(update_dir["ok"], false);
+        assert!(
+            update_dir["error"]
+                .as_str()
+                .expect("error")
+                .contains("is not a file")
+        );
+
+        let update_binary = content(tools.execute(&patch_call(
+            r#"*** Begin Patch
+*** Update File: binary.bin
+@@
+-old
++new
+*** End Patch"#,
+        )));
+        assert_eq!(update_binary["ok"], false);
+        assert!(
+            update_binary["error"]
+                .as_str()
+                .expect("error")
+                .contains("UTF-8")
+        );
+    }
+
+    #[test]
+    fn apply_patch_rejects_invalid_update_hunks() {
+        let root = unique_dir("patch-invalid-hunks-root");
+        fs::write(root.join("no-match.txt"), "alpha\n").expect("write no match");
+        fs::write(root.join("many.txt"), "alpha\nalpha\n").expect("write many");
+        fs::write(root.join("same.txt"), "alpha\n").expect("write same");
+        let tools = registry(&root);
+
+        let no_match = content(tools.execute(&patch_call(
+            r#"*** Begin Patch
+*** Update File: no-match.txt
+@@
+-beta
++gamma
+*** End Patch"#,
+        )));
+        assert_eq!(no_match["ok"], false);
+        assert!(
+            no_match["error"]
+                .as_str()
+                .expect("error")
+                .contains("found 0")
+        );
+
+        let many = content(tools.execute(&patch_call(
+            r#"*** Begin Patch
+*** Update File: many.txt
+@@
+-alpha
++beta
+*** End Patch"#,
+        )));
+        assert_eq!(many["ok"], false);
+        assert!(many["error"].as_str().expect("error").contains("found 2"));
+
+        let empty = content(tools.execute(&patch_call(
+            r#"*** Begin Patch
+*** Update File: same.txt
+@@
+*** End Patch"#,
+        )));
+        assert_eq!(empty["ok"], false);
+        assert!(
+            empty["error"]
+                .as_str()
+                .expect("error")
+                .contains("empty hunk")
+        );
+
+        let no_old_text = content(tools.execute(&patch_call(
+            r#"*** Begin Patch
+*** Update File: same.txt
+@@
++insert
+*** End Patch"#,
+        )));
+        assert_eq!(no_old_text["ok"], false);
+        assert!(
+            no_old_text["error"]
+                .as_str()
+                .expect("error")
+                .contains("must include context or removed lines")
+        );
+
+        let no_change = content(tools.execute(&patch_call(
+            r#"*** Begin Patch
+*** Update File: same.txt
+@@
+ alpha
+*** End Patch"#,
+        )));
+        assert_eq!(no_change["ok"], false);
+        assert!(
+            no_change["error"]
+                .as_str()
+                .expect("error")
+                .contains("has no changes")
+        );
+    }
+
+    #[test]
+    fn apply_patch_rejects_invalid_patch_syntax() {
+        let root = unique_dir("patch-invalid-syntax-root");
+        let tools = registry(&root);
+
+        for patch in [
+            "*** Add File: a.txt\n+x\n*** End Patch",
+            "*** Begin Patch\n*** Add File: a.txt\n+x",
+            "*** Begin Patch\n*** Move to: b.txt\n*** End Patch",
+            "*** Begin Patch\n*** Rename File: a.txt\n*** End Patch",
+            "*** Begin Patch\n*** Add File: a.txt\nx\n*** End Patch",
+            "*** Begin Patch\n*** Update File: a.txt\n@@\n?bad\n*** End Patch",
+        ] {
+            let value = content(tools.execute(&patch_call(patch)));
+            assert_eq!(value["ok"], false, "patch should fail: {patch}");
+        }
+    }
+
+    #[test]
+    fn apply_patch_rejects_duplicate_paths_and_preserves_files() {
+        let root = unique_dir("patch-duplicate-root");
+        fs::write(root.join("same.txt"), "old\n").expect("write same");
+        let tools = registry(&root);
+
+        let value = content(tools.execute(&patch_call(
+            r#"*** Begin Patch
+*** Update File: same.txt
+@@
+-old
++new
+*** Delete File: ./same.txt
+*** End Patch"#,
+        )));
+
+        assert_eq!(value["ok"], false);
+        assert!(
+            value["error"]
+                .as_str()
+                .expect("error")
+                .contains("more than once")
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("same.txt")).expect("read same"),
+            "old\n"
+        );
+    }
+
+    #[test]
+    fn apply_patch_validation_failure_preserves_all_files() {
+        let root = unique_dir("patch-atomic-validation-root");
+        fs::write(root.join("first.txt"), "old\n").expect("write first");
+        fs::write(root.join("second.txt"), "keep\n").expect("write second");
+        let tools = registry(&root);
+
+        let value = content(tools.execute(&patch_call(
+            r#"*** Begin Patch
+*** Update File: first.txt
+@@
+-old
++new
+*** Update File: second.txt
+@@
+-missing
++changed
+*** End Patch"#,
+        )));
+
+        assert_eq!(value["ok"], false);
+        assert_eq!(
+            fs::read_to_string(root.join("first.txt")).expect("read first"),
+            "old\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("second.txt")).expect("read second"),
+            "keep\n"
+        );
+    }
+
+    #[test]
+    fn read_only_rejects_apply_patch() {
+        let root = unique_dir("patch-read-only-root");
+        let tools =
+            registry_with_permissions(&root, PermissionProfile::for_mode(PermissionMode::ReadOnly));
+
+        let value = content(tools.execute(&patch_call(
+            r#"*** Begin Patch
+*** Add File: created.txt
++content
+*** End Patch"#,
+        )));
+
+        assert_eq!(value["ok"], false);
+        assert!(
+            value["error"]
+                .as_str()
+                .expect("error")
+                .contains("file writes are denied")
+        );
+        assert!(!root.join("created.txt").exists());
+    }
+
+    #[test]
+    fn workspace_write_rejects_apply_patch_outside_workspace() {
+        let root = unique_dir("patch-workspace-write-root");
+        let outside = outside_path(&root, "outside-patch.txt");
+        let tools = registry(&root);
+
+        let value = content(tools.execute(&patch_call(&format!(
+            "*** Begin Patch\n*** Add File: {}\n+outside\n*** End Patch",
+            outside.display()
+        ))));
+
+        assert_eq!(value["ok"], false);
+        assert!(
+            value["error"]
+                .as_str()
+                .expect("error")
+                .contains("outside the workspace root")
+        );
+        assert!(!outside.exists());
+    }
+
+    #[test]
+    fn danger_full_access_can_apply_patch_outside_workspace() {
+        let root = unique_dir("patch-danger-root");
+        let outside = outside_path(&root, "outside-patch-danger.txt");
+        let tools = registry_with_permissions(
+            &root,
+            PermissionProfile::for_mode(PermissionMode::DangerFullAccess),
+        );
+
+        let value = content(tools.execute(&patch_call(&format!(
+            "*** Begin Patch\n*** Add File: {}\n+outside\n*** End Patch",
+            outside.display()
+        ))));
+
+        assert_eq!(value["ok"], true);
+        assert_eq!(
+            fs::read_to_string(outside).expect("read outside"),
+            "outside\n"
+        );
     }
 
     #[test]
