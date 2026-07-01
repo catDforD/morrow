@@ -1,4 +1,7 @@
-use agent_protocol::{ToolCall, ToolDefinition};
+use agent_protocol::{
+    ApprovalDecision, ApprovalRequest, PermissionProfile, ToolCall, ToolDefinition,
+};
+use agent_sandbox::{PermissionDecision, PermissionEvaluator, PermissionEvaluatorError};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -22,28 +25,36 @@ const MAX_SHELL_OUTPUT_BYTES: usize = 20_000;
 
 #[derive(Debug, Error)]
 pub enum ToolRegistryError {
-    #[error("failed to canonicalize workspace root {path}: {source}")]
-    Root {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
+    #[error(transparent)]
+    PermissionEvaluator(#[from] PermissionEvaluatorError),
 }
 
 #[derive(Debug, Clone)]
 pub struct ToolRegistry {
-    root: PathBuf,
+    evaluator: Option<PermissionEvaluator>,
     definitions: Vec<ToolDefinition>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolExecution {
+pub enum ToolExecution {
+    Completed(ToolResult),
+    ApprovalRequired(ApprovalRequest),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolResult {
     pub ok: bool,
     pub content: String,
     pub error: Option<String>,
 }
 
 impl ToolExecution {
+    pub fn error(error: impl Into<String>) -> Self {
+        Self::Completed(tool_error(error.into()))
+    }
+}
+
+impl ToolResult {
     pub fn error(error: impl Into<String>) -> Self {
         tool_error(error.into())
     }
@@ -52,19 +63,19 @@ impl ToolExecution {
 impl ToolRegistry {
     pub fn empty() -> Self {
         Self {
-            root: PathBuf::new(),
+            evaluator: None,
             definitions: Vec::new(),
         }
     }
 
-    pub fn built_in(root: impl Into<PathBuf>) -> Result<Self, ToolRegistryError> {
-        let root = root.into();
-        let root = root
-            .canonicalize()
-            .map_err(|source| ToolRegistryError::Root { path: root, source })?;
+    pub fn built_in(
+        root: impl Into<PathBuf>,
+        permissions: PermissionProfile,
+    ) -> Result<Self, ToolRegistryError> {
+        let evaluator = PermissionEvaluator::new(root, permissions)?;
 
         Ok(Self {
-            root,
+            evaluator: Some(evaluator),
             definitions: built_in_definitions(),
         })
     }
@@ -74,17 +85,25 @@ impl ToolRegistry {
     }
 
     pub fn execute(&self, call: &ToolCall) -> ToolExecution {
+        self.execute_inner(call, None)
+    }
+
+    pub fn execute_approved(&self, call: &ToolCall, decision: &ApprovalDecision) -> ToolExecution {
+        self.execute_inner(call, Some(decision))
+    }
+
+    fn execute_inner(&self, call: &ToolCall, approval: Option<&ApprovalDecision>) -> ToolExecution {
         let result = match call.function.name.as_str() {
-            "read_file" => self.read_file(call),
-            "list_files" => self.list_files(call),
-            "search_text" => self.search_text(call),
-            "shell_command" => self.shell_command(call),
+            "read_file" => self.read_file(call).map(tool_ok),
+            "list_files" => self.list_files(call).map(tool_ok),
+            "search_text" => self.search_text(call).map(tool_ok),
+            "shell_command" => return self.shell_command(call, approval),
             name => Err(format!("unknown tool {name:?}")),
         };
 
         match result {
-            Ok(data) => tool_ok(data),
-            Err(error) => tool_error(error),
+            Ok(result) => ToolExecution::Completed(result),
+            Err(error) => ToolExecution::Completed(tool_error(error)),
         }
     }
 
@@ -193,51 +212,73 @@ impl ToolRegistry {
         }))
     }
 
-    fn shell_command(&self, call: &ToolCall) -> Result<Value, String> {
-        let args = parse_args::<ShellCommandArgs>(call)?;
+    fn shell_command(&self, call: &ToolCall, approval: Option<&ApprovalDecision>) -> ToolExecution {
+        let args = match parse_args::<ShellCommandArgs>(call) {
+            Ok(args) => args,
+            Err(error) => return ToolExecution::error(error),
+        };
         if args.command.trim().is_empty() {
-            return Err("command must not be empty".to_string());
+            return ToolExecution::error("command must not be empty");
         }
         let timeout_secs = args
             .timeout_secs
             .unwrap_or(DEFAULT_SHELL_TIMEOUT_SECS)
             .min(MAX_SHELL_TIMEOUT_SECS);
         if timeout_secs == 0 {
-            return Err("timeout_secs must be at least 1".to_string());
+            return ToolExecution::error("timeout_secs must be at least 1");
         }
 
-        run_shell_command(&self.root, &args.command, Duration::from_secs(timeout_secs))
+        let evaluator = match self.evaluator() {
+            Ok(evaluator) => evaluator,
+            Err(error) => return ToolExecution::error(error),
+        };
+
+        match evaluator.shell_command_decision(&call.id, &args.command, timeout_secs) {
+            PermissionDecision::Allow => complete_tool_result(run_shell_command(
+                evaluator.root(),
+                &args.command,
+                Duration::from_secs(timeout_secs),
+            )),
+            PermissionDecision::Deny(error) => ToolExecution::error(error),
+            PermissionDecision::Prompt(request) => match approval {
+                None => ToolExecution::ApprovalRequired(request),
+                Some(decision) if decision.request_id != request.id => {
+                    ToolExecution::error(format!(
+                        "approval decision {} does not match required approval {}",
+                        decision.request_id, request.id
+                    ))
+                }
+                Some(decision) if !decision.approved => {
+                    ToolExecution::error("shell command approval denied")
+                }
+                Some(_) => complete_tool_result(run_shell_command(
+                    evaluator.root(),
+                    &args.command,
+                    Duration::from_secs(timeout_secs),
+                )),
+            },
+        }
     }
 
     fn resolve_existing_path(&self, input: &str) -> Result<PathBuf, String> {
-        let input = input.trim();
-        if input.is_empty() {
-            return Err("path must not be empty".to_string());
-        }
-        let candidate = Path::new(input);
-        let path = if candidate.is_absolute() {
-            candidate.to_path_buf()
-        } else {
-            self.root.join(candidate)
-        };
-        let path = path
-            .canonicalize()
-            .map_err(|err| format!("failed to resolve path {input:?}: {err}"))?;
-
-        if !path.starts_with(&self.root) {
-            return Err(format!("path {input:?} is outside the workspace root"));
-        }
-
-        Ok(path)
+        self.evaluator()?.resolve_existing_path(input)
     }
 
     fn display_path(&self, path: &Path) -> String {
-        let relative = path.strip_prefix(&self.root).unwrap_or(path);
-        if relative.as_os_str().is_empty() {
-            ".".to_string()
-        } else {
-            relative.display().to_string()
-        }
+        self.evaluator()
+            .map(|evaluator| evaluator.display_path(path))
+            .unwrap_or_else(|_| path.display().to_string())
+    }
+
+    fn evaluator(&self) -> Result<&PermissionEvaluator, String> {
+        self.evaluator
+            .as_ref()
+            .ok_or_else(|| "built-in tools are not available".to_string())
+    }
+
+    fn path_allowed(&self, path: &Path) -> Result<bool, String> {
+        let evaluator = self.evaluator()?;
+        Ok(evaluator.allows_paths_outside_workspace() || path.starts_with(evaluator.root()))
     }
 
     fn collect_entries(
@@ -267,7 +308,7 @@ impl ToolRegistry {
                 .path()
                 .canonicalize()
                 .map_err(|err| format!("failed to resolve listed path: {err}"))?;
-            if !path.starts_with(&self.root) {
+            if !self.path_allowed(&path)? {
                 continue;
             }
             let file_type = entry
@@ -311,7 +352,7 @@ impl ToolRegistry {
                 .path()
                 .canonicalize()
                 .map_err(|err| format!("failed to resolve search path: {err}"))?;
-            if !path.starts_with(&self.root) {
+            if !self.path_allowed(&path)? {
                 continue;
             }
             let file_type = entry
@@ -453,26 +494,33 @@ fn should_skip_entry(path: &Path) -> bool {
     )
 }
 
-fn tool_ok(data: Value) -> ToolExecution {
+fn complete_tool_result(result: Result<Value, String>) -> ToolExecution {
+    match result {
+        Ok(data) => ToolExecution::Completed(tool_ok(data)),
+        Err(error) => ToolExecution::Completed(tool_error(error)),
+    }
+}
+
+fn tool_ok(data: Value) -> ToolResult {
     let content = serde_json::to_string(&json!({
         "ok": true,
         "data": data,
     }))
     .expect("tool result JSON must serialize");
-    ToolExecution {
+    ToolResult {
         ok: true,
         content,
         error: None,
     }
 }
 
-fn tool_error(error: String) -> ToolExecution {
+fn tool_error(error: String) -> ToolResult {
     let content = serde_json::to_string(&json!({
         "ok": false,
         "error": error,
     }))
     .expect("tool error JSON must serialize");
-    ToolExecution {
+    ToolResult {
         ok: false,
         error: Some(error),
         content,
@@ -611,6 +659,7 @@ struct ShellCommandArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_protocol::{PermissionMode, ShellPolicy};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn unique_dir(name: &str) -> PathBuf {
@@ -624,7 +673,15 @@ mod tests {
     }
 
     fn registry(root: &Path) -> ToolRegistry {
-        ToolRegistry::built_in(root).expect("tool registry")
+        ToolRegistry::built_in(
+            root,
+            PermissionProfile::for_mode(PermissionMode::WorkspaceWrite),
+        )
+        .expect("tool registry")
+    }
+
+    fn registry_with_permissions(root: &Path, permissions: PermissionProfile) -> ToolRegistry {
+        ToolRegistry::built_in(root, permissions).expect("tool registry")
     }
 
     fn call(name: &str, arguments: Value) -> ToolCall {
@@ -632,7 +689,17 @@ mod tests {
     }
 
     fn content(execution: ToolExecution) -> Value {
-        serde_json::from_str(&execution.content).expect("tool JSON")
+        let ToolExecution::Completed(result) = execution else {
+            panic!("expected completed tool execution");
+        };
+        serde_json::from_str(&result.content).expect("tool JSON")
+    }
+
+    fn approval_request(execution: ToolExecution) -> ApprovalRequest {
+        let ToolExecution::ApprovalRequired(request) = execution else {
+            panic!("expected approval request");
+        };
+        request
     }
 
     #[test]
@@ -715,7 +782,10 @@ mod tests {
     #[test]
     fn shell_command_runs_in_workspace_and_reports_exit_code() {
         let root = unique_dir("shell-root");
-        let tools = registry(&root);
+        let tools = registry_with_permissions(
+            &root,
+            PermissionProfile::for_mode(PermissionMode::DangerFullAccess),
+        );
 
         let value = content(tools.execute(&call(
             "shell_command",
@@ -737,7 +807,10 @@ mod tests {
     #[test]
     fn shell_command_times_out() {
         let root = unique_dir("timeout-root");
-        let tools = registry(&root);
+        let tools = registry_with_permissions(
+            &root,
+            PermissionProfile::for_mode(PermissionMode::DangerFullAccess),
+        );
 
         let value = content(tools.execute(&call(
             "shell_command",
@@ -746,5 +819,97 @@ mod tests {
 
         assert_eq!(value["ok"], true);
         assert_eq!(value["data"]["timed_out"], true);
+    }
+
+    #[test]
+    fn shell_command_requires_approval_in_workspace_write() {
+        let root = unique_dir("shell-approval-root");
+        let tools = registry(&root);
+
+        let request = approval_request(tools.execute(&call(
+            "shell_command",
+            json!({"command": "pwd", "timeout_secs": 5}),
+        )));
+
+        assert_eq!(request.id, "approval-call_1");
+    }
+
+    #[test]
+    fn shell_command_runs_after_matching_approval() {
+        let root = unique_dir("shell-approved-root");
+        let tools = registry(&root);
+        let call = call(
+            "shell_command",
+            json!({"command": "pwd && exit 3", "timeout_secs": 5}),
+        );
+        let request = approval_request(tools.execute(&call));
+
+        let value = content(tools.execute_approved(&call, &ApprovalDecision::approve(request.id)));
+
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["data"]["exit_code"], 3);
+    }
+
+    #[test]
+    fn shell_command_rejects_denied_approval() {
+        let root = unique_dir("shell-denied-root");
+        let tools = registry(&root);
+        let call = call(
+            "shell_command",
+            json!({"command": "pwd", "timeout_secs": 5}),
+        );
+        let request = approval_request(tools.execute(&call));
+
+        let value = content(tools.execute_approved(&call, &ApprovalDecision::deny(request.id)));
+
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["error"], "shell command approval denied");
+    }
+
+    #[test]
+    fn shell_command_can_be_denied_by_policy() {
+        let root = unique_dir("shell-policy-denied-root");
+        let tools = registry_with_permissions(
+            &root,
+            PermissionProfile {
+                mode: PermissionMode::WorkspaceWrite,
+                shell: ShellPolicy::Deny,
+            },
+        );
+
+        let value = content(tools.execute(&call(
+            "shell_command",
+            json!({"command": "pwd", "timeout_secs": 5}),
+        )));
+
+        assert_eq!(value["ok"], false);
+        assert!(
+            value["error"]
+                .as_str()
+                .expect("error")
+                .contains("shell commands are denied")
+        );
+    }
+
+    #[test]
+    fn danger_full_access_can_read_absolute_paths_outside_workspace() {
+        let root = unique_dir("danger-read-root");
+        let outside = root
+            .parent()
+            .expect("parent")
+            .join("outside-morrow-tools-danger.txt");
+        fs::write(&outside, "secret").expect("write outside");
+        let tools = registry_with_permissions(
+            &root,
+            PermissionProfile::for_mode(PermissionMode::DangerFullAccess),
+        );
+
+        let value = content(tools.execute(&call(
+            "read_file",
+            json!({"path": outside.display().to_string()}),
+        )));
+
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["data"]["content"], "secret");
     }
 }
