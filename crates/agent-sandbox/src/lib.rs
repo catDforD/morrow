@@ -73,6 +73,53 @@ impl PermissionEvaluator {
         Ok(path)
     }
 
+    pub fn resolve_write_path(&self, input: &str) -> Result<PathBuf, String> {
+        let input = input.trim();
+        if input.is_empty() {
+            return Err("path must not be empty".to_string());
+        }
+        if self.profile.mode == PermissionMode::ReadOnly {
+            return Err(format!(
+                "file writes are denied by the active {} permission profile",
+                self.profile.mode.as_str()
+            ));
+        }
+
+        let candidate = Path::new(input);
+        let path = if candidate.is_absolute() {
+            candidate.to_path_buf()
+        } else {
+            self.root.join(candidate)
+        };
+        let parent = path
+            .parent()
+            .ok_or_else(|| format!("path {input:?} must have a parent directory"))?;
+        let parent = parent.canonicalize().map_err(|err| {
+            format!("failed to resolve parent directory for path {input:?}: {err}")
+        })?;
+        if !parent.is_dir() {
+            return Err(format!(
+                "parent path {} is not a directory",
+                self.display_path(&parent)
+            ));
+        }
+
+        let file_name = path
+            .file_name()
+            .ok_or_else(|| format!("path {input:?} must name a file"))?;
+        let resolved = match path.canonicalize() {
+            Ok(existing) => existing,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => parent.join(file_name),
+            Err(err) => return Err(format!("failed to resolve path {input:?}: {err}")),
+        };
+
+        if !self.allows_paths_outside_workspace() && !resolved.starts_with(&self.root) {
+            return Err(format!("path {input:?} is outside the workspace root"));
+        }
+
+        Ok(resolved)
+    }
+
     pub fn shell_command_decision(
         &self,
         tool_call_id: &str,
@@ -205,6 +252,57 @@ mod tests {
     }
 
     #[test]
+    fn read_only_rejects_write_paths() {
+        let root = unique_dir("read-only-write-root");
+        let evaluator =
+            PermissionEvaluator::new(&root, PermissionProfile::for_mode(PermissionMode::ReadOnly))
+                .expect("eval");
+
+        let err = evaluator
+            .resolve_write_path("new.txt")
+            .expect_err("read-only write must fail");
+
+        assert!(err.contains("file writes are denied"));
+    }
+
+    #[test]
+    fn workspace_write_resolves_new_paths_inside_workspace() {
+        let root = unique_dir("workspace-write-root");
+        let evaluator = PermissionEvaluator::new(
+            &root,
+            PermissionProfile::for_mode(PermissionMode::WorkspaceWrite),
+        )
+        .expect("eval");
+
+        let path = evaluator.resolve_write_path("new.txt").expect("write path");
+
+        assert_eq!(
+            path,
+            root.canonicalize().expect("canonical root").join("new.txt")
+        );
+    }
+
+    #[test]
+    fn workspace_write_rejects_write_paths_outside_workspace() {
+        let root = unique_dir("workspace-write-restricted-root");
+        let outside = root
+            .parent()
+            .expect("parent")
+            .join("outside-morrow-sandbox-write.txt");
+        let evaluator = PermissionEvaluator::new(
+            &root,
+            PermissionProfile::for_mode(PermissionMode::WorkspaceWrite),
+        )
+        .expect("eval");
+
+        let err = evaluator
+            .resolve_write_path(&outside.display().to_string())
+            .expect_err("outside write path must fail");
+
+        assert!(err.contains("outside the workspace root"));
+    }
+
+    #[test]
     fn danger_full_access_allows_paths_outside_workspace() {
         let root = unique_dir("danger-root");
         let outside = root
@@ -223,5 +321,25 @@ mod tests {
             .expect("outside path");
 
         assert_eq!(path, outside.canonicalize().expect("canonical outside"));
+    }
+
+    #[test]
+    fn danger_full_access_allows_write_paths_outside_workspace() {
+        let root = unique_dir("danger-write-root");
+        let outside = root
+            .parent()
+            .expect("parent")
+            .join("outside-morrow-sandbox-write-danger.txt");
+        let evaluator = PermissionEvaluator::new(
+            &root,
+            PermissionProfile::for_mode(PermissionMode::DangerFullAccess),
+        )
+        .expect("eval");
+
+        let path = evaluator
+            .resolve_write_path(&outside.display().to_string())
+            .expect("outside write path");
+
+        assert_eq!(path, outside);
     }
 }
