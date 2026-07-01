@@ -147,7 +147,11 @@ impl AgentTurnStream<'_> {
             .push_back(AgentEvent::ApprovalResolved(decision.clone()));
 
         if decision.approved {
-            self.start_approved_tool_call(pending_approval.tool_call, decision);
+            self.start_approved_tool_call(
+                pending_approval.tool_call,
+                decision,
+                pending_approval.request,
+            );
         } else {
             let result = ToolResult::error("approval denied");
             self.finish_tool_call(pending_approval.tool_call, result);
@@ -238,14 +242,19 @@ impl AgentTurnStream<'_> {
         );
     }
 
-    fn start_approved_tool_call(&mut self, tool_call: ToolCall, decision: ApprovalDecision) {
+    fn start_approved_tool_call(
+        &mut self,
+        tool_call: ToolCall,
+        decision: ApprovalDecision,
+        request: ApprovalRequest,
+    ) {
         let tools = self.tools.clone();
         let call_for_result = tool_call.clone();
         self.tool_future = Some(
             async move {
                 let call_for_execution = call_for_result.clone();
                 let execution = tokio::task::spawn_blocking(move || {
-                    tools.execute_approved(&call_for_execution, &decision)
+                    tools.execute_approved(&call_for_execution, &decision, &request)
                 })
                 .await
                 .unwrap_or_else(|err| {
@@ -276,6 +285,7 @@ impl AgentTurnStream<'_> {
         let name = tool_call.function.name.clone();
         let ok = result.ok;
         let error = result.error.clone();
+        let summary = result.summary.clone();
         let tool_message = Message::tool_result(id.clone(), result.content);
         self.conversation.push(tool_message.clone());
         self.turn_messages.push(tool_message);
@@ -288,8 +298,12 @@ impl AgentTurnStream<'_> {
             }
         }
 
-        self.pending
-            .push_back(AgentEvent::ToolCallFinished { id, name, ok });
+        self.pending.push_back(AgentEvent::ToolCallFinished {
+            id,
+            name,
+            ok,
+            summary,
+        });
         self.start_next_tool_call();
     }
 
@@ -399,7 +413,8 @@ mod tests {
     use super::*;
     use agent_model::OpenAiCompatConfig;
     use agent_protocol::{
-        ApprovalDecision, PermissionMode, PermissionProfile, ToolCallKind, TurnStatus, TurnStepKind,
+        ApprovalAction, ApprovalDecision, PermissionMode, PermissionProfile, ToolCallKind,
+        TurnStatus, TurnStepKind,
     };
     use agent_tools::ToolRegistry;
     use futures_util::StreamExt;
@@ -676,7 +691,8 @@ mod tests {
                 AgentEvent::ToolCallFinished {
                     id: "call_1".to_string(),
                     name: "read_file".to_string(),
-                    ok: true
+                    ok: true,
+                    summary: None
                 },
                 AgentEvent::TextDelta("Read it".to_string()),
                 AgentEvent::AgentMessage("Read it".to_string()),
@@ -792,6 +808,9 @@ mod tests {
                 id: "call_1".to_string(),
                 name: "shell_command".to_string(),
                 ok: false,
+                summary: Some(agent_protocol::ToolExecutionSummary::error(
+                    "approval denied"
+                )),
             }
         );
         assert_eq!(
@@ -810,6 +829,147 @@ mod tests {
         assert_eq!(turn.steps[1].status, TurnStatus::Failed);
         assert_eq!(thread.messages.len(), 4);
 
+        let requests = requests.lock().expect("requests lock poisoned");
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].contains("approval denied"));
+    }
+
+    #[tokio::test]
+    async fn file_change_approval_success_writes_file_and_emits_summary() {
+        let root = unique_dir("file-approval-approved");
+        let first_body = tool_call_body(
+            "call_1",
+            "write_file",
+            json!({"path": "note.txt", "content": "created\n"}),
+        );
+        let second_body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Wrote it\"},\"finish_reason\":null}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (base_url, requests) = spawn_recording_sse_server(vec![first_body, second_body]).await;
+        let agent = Agent::with_tools(client(base_url), "You are helpful.", tools(&root));
+        let mut thread = Thread::new();
+
+        let mut stream = agent
+            .run_turn(&mut thread, "Write note.txt")
+            .await
+            .expect("run turn");
+
+        assert_eq!(next_event(&mut stream).await, AgentEvent::TurnStarted);
+        assert_eq!(
+            next_event(&mut stream).await,
+            AgentEvent::ToolCallStarted {
+                id: "call_1".to_string(),
+                name: "write_file".to_string()
+            }
+        );
+        let AgentEvent::ApprovalRequested(request) = next_event(&mut stream).await else {
+            panic!("expected approval request");
+        };
+        let ApprovalAction::FileChanges { files, diff } = &request.action else {
+            panic!("expected file changes approval");
+        };
+        assert_eq!(files.len(), 1);
+        assert!(diff.contains("+created"));
+
+        stream
+            .resolve_approval(ApprovalDecision::approve(request.id.clone()))
+            .expect("resolve approval");
+
+        assert_eq!(
+            next_event(&mut stream).await,
+            AgentEvent::ApprovalResolved(ApprovalDecision::approve(request.id))
+        );
+        let AgentEvent::ToolCallFinished {
+            name,
+            ok,
+            summary: Some(summary),
+            ..
+        } = next_event(&mut stream).await
+        else {
+            panic!("expected summarized tool finish");
+        };
+        assert_eq!(name, "write_file");
+        assert!(ok);
+        assert_eq!(summary.files.len(), 1);
+        assert!(summary.diff.as_deref().expect("diff").contains("+created"));
+        assert_eq!(
+            next_event(&mut stream).await,
+            AgentEvent::TextDelta("Wrote it".to_string())
+        );
+        assert_eq!(
+            next_event(&mut stream).await,
+            AgentEvent::AgentMessage("Wrote it".to_string())
+        );
+        assert_eq!(next_event(&mut stream).await, AgentEvent::TurnCompleted);
+        assert_eq!(stream.next().await, None);
+
+        assert_eq!(
+            fs::read_to_string(root.join("note.txt")).expect("read created"),
+            "created\n"
+        );
+        let requests = requests.lock().expect("requests lock poisoned");
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].contains(r#""role":"tool""#));
+    }
+
+    #[tokio::test]
+    async fn file_change_approval_denial_is_returned_to_model_without_writing() {
+        let root = unique_dir("file-approval-denied");
+        let first_body = tool_call_body(
+            "call_1",
+            "write_file",
+            json!({"path": "note.txt", "content": "created\n"}),
+        );
+        let second_body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Denied\"},\"finish_reason\":null}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (base_url, requests) = spawn_recording_sse_server(vec![first_body, second_body]).await;
+        let agent = Agent::with_tools(client(base_url), "You are helpful.", tools(&root));
+        let mut thread = Thread::new();
+
+        let mut stream = agent
+            .run_turn(&mut thread, "Write note.txt")
+            .await
+            .expect("run turn");
+
+        assert_eq!(next_event(&mut stream).await, AgentEvent::TurnStarted);
+        assert!(matches!(
+            next_event(&mut stream).await,
+            AgentEvent::ToolCallStarted { .. }
+        ));
+        let AgentEvent::ApprovalRequested(request) = next_event(&mut stream).await else {
+            panic!("expected approval request");
+        };
+        stream
+            .resolve_approval(ApprovalDecision::deny(request.id.clone()))
+            .expect("resolve approval");
+
+        assert_eq!(
+            next_event(&mut stream).await,
+            AgentEvent::ApprovalResolved(ApprovalDecision::deny(request.id))
+        );
+        assert!(matches!(
+            next_event(&mut stream).await,
+            AgentEvent::ToolCallFinished {
+                name,
+                ok: false,
+                ..
+            } if name == "write_file"
+        ));
+        assert_eq!(
+            next_event(&mut stream).await,
+            AgentEvent::TextDelta("Denied".to_string())
+        );
+        assert_eq!(
+            next_event(&mut stream).await,
+            AgentEvent::AgentMessage("Denied".to_string())
+        );
+        assert_eq!(next_event(&mut stream).await, AgentEvent::TurnCompleted);
+        assert_eq!(stream.next().await, None);
+
+        assert!(!root.join("note.txt").exists());
         let requests = requests.lock().expect("requests lock poisoned");
         assert_eq!(requests.len(), 2);
         assert!(requests[1].contains("approval denied"));

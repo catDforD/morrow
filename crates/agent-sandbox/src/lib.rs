@@ -1,4 +1,6 @@
-use agent_protocol::{ApprovalRequest, PermissionMode, PermissionProfile, ShellPolicy};
+use agent_protocol::{
+    ApprovalRequest, FileChangeSummary, PermissionMode, PermissionProfile, ShellPolicy,
+};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -142,6 +144,29 @@ impl PermissionEvaluator {
         }
     }
 
+    pub fn file_changes_decision(
+        &self,
+        tool_call_id: &str,
+        files: Vec<FileChangeSummary>,
+        diff: String,
+    ) -> PermissionDecision {
+        match self.profile.mode {
+            PermissionMode::DangerFullAccess => PermissionDecision::Allow,
+            PermissionMode::WorkspaceWrite => {
+                PermissionDecision::Prompt(ApprovalRequest::file_changes(
+                    approval_id_for_tool_call(tool_call_id),
+                    files,
+                    diff,
+                    "file changes require approval",
+                ))
+            }
+            PermissionMode::ReadOnly => PermissionDecision::Deny(format!(
+                "file writes are denied by the active {} permission profile",
+                self.profile.mode.as_str()
+            )),
+        }
+    }
+
     pub fn display_path(&self, path: &Path) -> String {
         let relative = path.strip_prefix(&self.root).unwrap_or(path);
         if relative.as_os_str().is_empty() {
@@ -159,7 +184,7 @@ pub fn approval_id_for_tool_call(tool_call_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_protocol::{ApprovalAction, PermissionMode};
+    use agent_protocol::{ApprovalAction, FileChangeOperation, FileChangeSummary, PermissionMode};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -228,6 +253,51 @@ mod tests {
             evaluator.shell_command_decision("call_1", "cargo test", 30),
             PermissionDecision::Deny(_)
         ));
+    }
+
+    #[test]
+    fn workspace_write_prompts_for_file_changes_and_danger_allows() {
+        let root = unique_dir("file-change-approval");
+        let file = FileChangeSummary {
+            path: "note.txt".to_string(),
+            operation: FileChangeOperation::Add,
+            replacements: 0,
+            created: true,
+            overwritten: false,
+            deleted: false,
+        };
+        let workspace = PermissionEvaluator::new(
+            &root,
+            PermissionProfile::for_mode(PermissionMode::WorkspaceWrite),
+        )
+        .expect("workspace eval");
+        let danger = PermissionEvaluator::new(
+            &root,
+            PermissionProfile::for_mode(PermissionMode::DangerFullAccess),
+        )
+        .expect("danger eval");
+
+        let decision = workspace.file_changes_decision(
+            "call_1",
+            vec![file.clone()],
+            "--- /dev/null\n+++ note.txt\n".to_string(),
+        );
+
+        let PermissionDecision::Prompt(request) = decision else {
+            panic!("expected prompt");
+        };
+        assert_eq!(request.id, "approval-call_1");
+        assert_eq!(
+            request.action,
+            ApprovalAction::FileChanges {
+                files: vec![file.clone()],
+                diff: "--- /dev/null\n+++ note.txt\n".to_string(),
+            }
+        );
+        assert_eq!(
+            danger.file_changes_decision("call_1", vec![file], String::new()),
+            PermissionDecision::Allow
+        );
     }
 
     #[test]

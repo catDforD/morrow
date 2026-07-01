@@ -263,6 +263,10 @@ pub enum ApprovalAction {
         cwd: PathBuf,
         timeout_secs: u64,
     },
+    FileChanges {
+        files: Vec<FileChangeSummary>,
+        diff: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -290,6 +294,22 @@ impl ApprovalRequest {
             reason: reason.into(),
         }
     }
+
+    pub fn file_changes(
+        id: impl Into<String>,
+        files: Vec<FileChangeSummary>,
+        diff: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            action: ApprovalAction::FileChanges {
+                files,
+                diff: diff.into(),
+            },
+            reason: reason.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -310,6 +330,84 @@ impl ApprovalDecision {
         Self {
             request_id: request_id.into(),
             approved: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileChangeOperation {
+    Add,
+    Update,
+    Delete,
+}
+
+impl FileChangeOperation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Add => "add",
+            Self::Update => "update",
+            Self::Delete => "delete",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct FileChangeSummary {
+    pub path: String,
+    pub operation: FileChangeOperation,
+    pub replacements: usize,
+    pub created: bool,
+    pub overwritten: bool,
+    pub deleted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ShellCommandSummary {
+    pub command: String,
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ToolExecutionSummary {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<FileChangeSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shell: Option<ShellCommandSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl ToolExecutionSummary {
+    pub fn file_changes(files: Vec<FileChangeSummary>, diff: impl Into<String>) -> Self {
+        Self {
+            files,
+            diff: Some(diff.into()),
+            shell: None,
+            error: None,
+        }
+    }
+
+    pub fn shell(shell: ShellCommandSummary) -> Self {
+        Self {
+            files: Vec::new(),
+            diff: None,
+            shell: Some(shell),
+            error: None,
+        }
+    }
+
+    pub fn error(error: impl Into<String>) -> Self {
+        Self {
+            files: Vec::new(),
+            diff: None,
+            shell: None,
+            error: Some(error.into()),
         }
     }
 }
@@ -421,8 +519,17 @@ pub enum AgentEvent {
     TurnStarted,
     TextDelta(String),
     AgentMessage(String),
-    ToolCallStarted { id: String, name: String },
-    ToolCallFinished { id: String, name: String, ok: bool },
+    ToolCallStarted {
+        id: String,
+        name: String,
+    },
+    ToolCallFinished {
+        id: String,
+        name: String,
+        ok: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        summary: Option<ToolExecutionSummary>,
+    },
     ApprovalRequested(ApprovalRequest),
     ApprovalResolved(ApprovalDecision),
     TurnCompleted,
@@ -560,6 +667,104 @@ mod tests {
                     }
                 }
             ])
+        );
+    }
+
+    #[test]
+    fn serializes_file_change_approval_and_tool_summary() {
+        let file = FileChangeSummary {
+            path: "src/lib.rs".to_string(),
+            operation: FileChangeOperation::Update,
+            replacements: 2,
+            created: false,
+            overwritten: true,
+            deleted: false,
+        };
+        let request = ApprovalRequest::file_changes(
+            "approval-call_1",
+            vec![file.clone()],
+            "--- src/lib.rs\n+++ src/lib.rs\n@@\n-old\n+new\n",
+            "file changes require approval",
+        );
+        let event = AgentEvent::ToolCallFinished {
+            id: "call_1".to_string(),
+            name: "apply_patch".to_string(),
+            ok: true,
+            summary: Some(ToolExecutionSummary::file_changes(
+                vec![file],
+                "--- src/lib.rs\n+++ src/lib.rs\n@@\n-old\n+new\n",
+            )),
+        };
+
+        let value = serde_json::to_value(json!({
+            "request": request,
+            "event": event,
+        }))
+        .expect("serialize file approval");
+
+        assert_eq!(
+            value,
+            json!({
+                "request": {
+                    "id": "approval-call_1",
+                    "action": {
+                        "kind": "file_changes",
+                        "files": [{
+                            "path": "src/lib.rs",
+                            "operation": "update",
+                            "replacements": 2,
+                            "created": false,
+                            "overwritten": true,
+                            "deleted": false
+                        }],
+                        "diff": "--- src/lib.rs\n+++ src/lib.rs\n@@\n-old\n+new\n"
+                    },
+                    "reason": "file changes require approval"
+                },
+                "event": {
+                    "type": "tool_call_finished",
+                    "data": {
+                        "id": "call_1",
+                        "name": "apply_patch",
+                        "ok": true,
+                        "summary": {
+                            "files": [{
+                                "path": "src/lib.rs",
+                                "operation": "update",
+                                "replacements": 2,
+                                "created": false,
+                                "overwritten": true,
+                                "deleted": false
+                            }],
+                            "diff": "--- src/lib.rs\n+++ src/lib.rs\n@@\n-old\n+new\n"
+                        }
+                    }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn omits_empty_tool_execution_summary() {
+        let event = AgentEvent::ToolCallFinished {
+            id: "call_1".to_string(),
+            name: "read_file".to_string(),
+            ok: true,
+            summary: None,
+        };
+
+        let value = serde_json::to_value(&event).expect("serialize event");
+
+        assert_eq!(
+            value,
+            json!({
+                "type": "tool_call_finished",
+                "data": {
+                    "id": "call_1",
+                    "name": "read_file",
+                    "ok": true
+                }
+            })
         );
     }
 

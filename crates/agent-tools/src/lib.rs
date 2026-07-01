@@ -1,5 +1,6 @@
 use agent_protocol::{
-    ApprovalDecision, ApprovalRequest, PermissionProfile, ToolCall, ToolDefinition,
+    ApprovalDecision, ApprovalRequest, FileChangeOperation, FileChangeSummary, PermissionProfile,
+    ShellCommandSummary, ToolCall, ToolDefinition, ToolExecutionSummary,
 };
 use agent_sandbox::{PermissionDecision, PermissionEvaluator, PermissionEvaluatorError};
 use serde::Deserialize;
@@ -23,6 +24,8 @@ const MAX_SEARCH_RESULTS: usize = 200;
 const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 30;
 const MAX_SHELL_TIMEOUT_SECS: u64 = 120;
 const MAX_SHELL_OUTPUT_BYTES: usize = 20_000;
+const MAX_FILE_DIFF_LINES: usize = 240;
+const MAX_FILE_DIFF_BYTES: usize = 20_000;
 
 #[derive(Debug, Error)]
 pub enum ToolRegistryError {
@@ -47,6 +50,7 @@ pub struct ToolResult {
     pub ok: bool,
     pub content: String,
     pub error: Option<String>,
+    pub summary: Option<ToolExecutionSummary>,
 }
 
 impl ToolExecution {
@@ -89,18 +93,27 @@ impl ToolRegistry {
         self.execute_inner(call, None)
     }
 
-    pub fn execute_approved(&self, call: &ToolCall, decision: &ApprovalDecision) -> ToolExecution {
-        self.execute_inner(call, Some(decision))
+    pub fn execute_approved(
+        &self,
+        call: &ToolCall,
+        decision: &ApprovalDecision,
+        request: &ApprovalRequest,
+    ) -> ToolExecution {
+        self.execute_inner(call, Some((decision, request)))
     }
 
-    fn execute_inner(&self, call: &ToolCall, approval: Option<&ApprovalDecision>) -> ToolExecution {
+    fn execute_inner(
+        &self,
+        call: &ToolCall,
+        approval: Option<(&ApprovalDecision, &ApprovalRequest)>,
+    ) -> ToolExecution {
         let result = match call.function.name.as_str() {
             "read_file" => self.read_file(call).map(tool_ok),
             "list_files" => self.list_files(call).map(tool_ok),
             "search_text" => self.search_text(call).map(tool_ok),
-            "edit_file" => self.edit_file(call).map(tool_ok),
-            "write_file" => self.write_file(call).map(tool_ok),
-            "apply_patch" => self.apply_patch(call).map(tool_ok),
+            "edit_file" => return self.edit_file(call, approval),
+            "write_file" => return self.write_file(call, approval),
+            "apply_patch" => return self.apply_patch(call, approval),
             "shell_command" => return self.shell_command(call, approval),
             name => Err(format!("unknown tool {name:?}")),
         };
@@ -216,7 +229,15 @@ impl ToolRegistry {
         }))
     }
 
-    fn edit_file(&self, call: &ToolCall) -> Result<Value, String> {
+    fn edit_file(
+        &self,
+        call: &ToolCall,
+        approval: Option<(&ApprovalDecision, &ApprovalRequest)>,
+    ) -> ToolExecution {
+        self.execute_file_change_plan(call, self.plan_edit_file(call), approval)
+    }
+
+    fn plan_edit_file(&self, call: &ToolCall) -> Result<FileChangePlan, String> {
         let args = parse_args::<EditFileArgs>(call)?;
         if args.old_text.is_empty() {
             return Err("old_text must not be empty".to_string());
@@ -244,17 +265,43 @@ impl ToolRegistry {
         }
 
         let updated = content.replacen(&args.old_text, &args.new_text, 1);
-        write_atomic(&path, &updated, Some(metadata.permissions()), self)?;
-
-        Ok(json!({
-            "path": self.display_path(&path),
+        let display_path = self.display_path(&path);
+        let summary = FileChangeSummary {
+            path: display_path.clone(),
+            operation: FileChangeOperation::Update,
+            replacements: 1,
+            created: false,
+            overwritten: true,
+            deleted: false,
+        };
+        let change = StagedPatchChange::write(
+            path,
+            PatchOperationKind::Update,
+            updated.clone(),
+            Some(metadata.permissions()),
+            summary,
+            Some(content),
+            Some(updated),
+        );
+        let data = json!({
+            "path": display_path,
             "replacements": 1,
             "created": false,
             "overwritten": true,
-        }))
+        });
+
+        self.file_change_plan(vec![change], data)
     }
 
-    fn write_file(&self, call: &ToolCall) -> Result<Value, String> {
+    fn write_file(
+        &self,
+        call: &ToolCall,
+        approval: Option<(&ApprovalDecision, &ApprovalRequest)>,
+    ) -> ToolExecution {
+        self.execute_file_change_plan(call, self.plan_write_file(call), approval)
+    }
+
+    fn plan_write_file(&self, call: &ToolCall) -> Result<FileChangePlan, String> {
         let args = parse_args::<WriteFileArgs>(call)?;
         let overwrite = args.overwrite.unwrap_or(false);
         let path = self.resolve_write_path(&args.path)?;
@@ -283,35 +330,158 @@ impl ToolRegistry {
 
         let created = existing.is_none();
         let overwritten = existing.is_some();
+        let original = if overwritten {
+            Some(fs::read_to_string(&path).map_err(|err| {
+                format!(
+                    "failed to read {} as UTF-8 text: {err}",
+                    self.display_path(&path)
+                )
+            })?)
+        } else {
+            None
+        };
         let permissions = existing.map(|metadata| metadata.permissions());
+        let display_path = self.display_path(&path);
+        let summary = FileChangeSummary {
+            path: display_path.clone(),
+            operation: if created {
+                FileChangeOperation::Add
+            } else {
+                FileChangeOperation::Update
+            },
+            replacements: 0,
+            created,
+            overwritten,
+            deleted: false,
+        };
+        let change = StagedPatchChange::write(
+            path,
+            if created {
+                PatchOperationKind::Add
+            } else {
+                PatchOperationKind::Update
+            },
+            args.content.clone(),
+            permissions,
+            summary,
+            original,
+            Some(args.content),
+        );
 
-        write_atomic(&path, &args.content, permissions, self)?;
-
-        Ok(json!({
-            "path": self.display_path(&path),
+        let data = json!({
+            "path": display_path,
             "replacements": 0,
             "created": created,
             "overwritten": overwritten,
-        }))
+        });
+
+        self.file_change_plan(vec![change], data)
     }
 
-    fn apply_patch(&self, call: &ToolCall) -> Result<Value, String> {
+    fn apply_patch(
+        &self,
+        call: &ToolCall,
+        approval: Option<(&ApprovalDecision, &ApprovalRequest)>,
+    ) -> ToolExecution {
+        self.execute_file_change_plan(call, self.plan_apply_patch(call), approval)
+    }
+
+    fn plan_apply_patch(&self, call: &ToolCall) -> Result<FileChangePlan, String> {
         let args = parse_args::<ApplyPatchArgs>(call)?;
         let operations = parse_patch(&args.patch)?;
         let changes = self.plan_patch_changes(operations)?;
         let files = changes
             .iter()
-            .map(|change| change.result.clone())
+            .map(|change| file_change_summary_json(&change.summary))
             .collect::<Vec<_>>();
-        commit_patch_changes(changes, self)?;
-
-        Ok(json!({
+        let data = json!({
             "changed_files": files.len(),
             "files": files,
-        }))
+        });
+
+        self.file_change_plan(changes, data)
     }
 
-    fn shell_command(&self, call: &ToolCall, approval: Option<&ApprovalDecision>) -> ToolExecution {
+    fn execute_file_change_plan(
+        &self,
+        call: &ToolCall,
+        plan: Result<FileChangePlan, String>,
+        approval: Option<(&ApprovalDecision, &ApprovalRequest)>,
+    ) -> ToolExecution {
+        let plan = match plan {
+            Ok(plan) => plan,
+            Err(error) => return ToolExecution::error(error),
+        };
+        let evaluator = match self.evaluator() {
+            Ok(evaluator) => evaluator,
+            Err(error) => return ToolExecution::error(error),
+        };
+
+        match evaluator.file_changes_decision(&call.id, plan.files.clone(), plan.diff.clone()) {
+            PermissionDecision::Allow => self.commit_file_change_plan(plan),
+            PermissionDecision::Deny(error) => ToolExecution::error(error),
+            PermissionDecision::Prompt(request) => match approval {
+                None => ToolExecution::ApprovalRequired(request),
+                Some((decision, original_request)) => {
+                    if decision.request_id != original_request.id {
+                        return ToolExecution::error(format!(
+                            "approval decision {} does not match pending approval {}",
+                            decision.request_id, original_request.id
+                        ));
+                    }
+                    if original_request.id != request.id {
+                        return ToolExecution::error(format!(
+                            "approval request {} does not match required approval {}",
+                            original_request.id, request.id
+                        ));
+                    }
+                    if original_request.action != request.action {
+                        return ToolExecution::error(
+                            "file changes changed since approval request; approval no longer matches planned changes",
+                        );
+                    }
+                    if !decision.approved {
+                        return ToolExecution::error("file changes approval denied");
+                    }
+                    self.commit_file_change_plan(plan)
+                }
+            },
+        }
+    }
+
+    fn commit_file_change_plan(&self, plan: FileChangePlan) -> ToolExecution {
+        match commit_patch_changes(plan.changes, self) {
+            Ok(()) => ToolExecution::Completed(tool_ok_with_summary(plan.data, plan.summary)),
+            Err(error) => ToolExecution::error(error),
+        }
+    }
+
+    fn file_change_plan(
+        &self,
+        changes: Vec<StagedPatchChange>,
+        data: Value,
+    ) -> Result<FileChangePlan, String> {
+        let files = changes
+            .iter()
+            .map(|change| change.summary.clone())
+            .collect::<Vec<_>>();
+        let diff = render_file_diff(&changes, self);
+        let summary = ToolExecutionSummary::file_changes(files.clone(), diff.clone());
+
+        Ok(FileChangePlan {
+            changes,
+            data,
+            files,
+            diff,
+            summary,
+        })
+    }
+
+    fn shell_command(
+        &self,
+        call: &ToolCall,
+        approval: Option<(&ApprovalDecision, &ApprovalRequest)>,
+    ) -> ToolExecution {
         let args = match parse_args::<ShellCommandArgs>(call) {
             Ok(args) => args,
             Err(error) => return ToolExecution::error(error),
@@ -333,7 +503,7 @@ impl ToolRegistry {
         };
 
         match evaluator.shell_command_decision(&call.id, &args.command, timeout_secs) {
-            PermissionDecision::Allow => complete_tool_result(run_shell_command(
+            PermissionDecision::Allow => complete_shell_result(run_shell_command(
                 evaluator.root(),
                 &args.command,
                 Duration::from_secs(timeout_secs),
@@ -341,16 +511,16 @@ impl ToolRegistry {
             PermissionDecision::Deny(error) => ToolExecution::error(error),
             PermissionDecision::Prompt(request) => match approval {
                 None => ToolExecution::ApprovalRequired(request),
-                Some(decision) if decision.request_id != request.id => {
+                Some((decision, _)) if decision.request_id != request.id => {
                     ToolExecution::error(format!(
                         "approval decision {} does not match required approval {}",
                         decision.request_id, request.id
                     ))
                 }
-                Some(decision) if !decision.approved => {
+                Some((decision, _)) if !decision.approved => {
                     ToolExecution::error("shell command approval denied")
                 }
-                Some(_) => complete_tool_result(run_shell_command(
+                Some(_) => complete_shell_result(run_shell_command(
                     evaluator.root(),
                     &args.command,
                     Duration::from_secs(timeout_secs),
@@ -400,19 +570,22 @@ impl ToolRegistry {
                             ));
                         }
                     }
+                    let summary = FileChangeSummary {
+                        path: self.display_path(&path),
+                        operation: FileChangeOperation::Add,
+                        replacements: 0,
+                        created: true,
+                        overwritten: false,
+                        deleted: false,
+                    };
                     StagedPatchChange::write(
                         path.clone(),
                         PatchOperationKind::Add,
-                        content,
+                        content.clone(),
                         None,
-                        json!({
-                            "path": self.display_path(&path),
-                            "operation": "add",
-                            "replacements": 0,
-                            "created": true,
-                            "overwritten": false,
-                            "deleted": false,
-                        }),
+                        summary,
+                        None,
+                        Some(content),
                     )
                 }
                 ParsedPatchOperation::Update { path: _, hunks } => {
@@ -452,16 +625,18 @@ impl ToolRegistry {
                     StagedPatchChange::write(
                         path.clone(),
                         PatchOperationKind::Update,
-                        updated,
+                        updated.clone(),
                         Some(metadata.permissions()),
-                        json!({
-                            "path": self.display_path(&path),
-                            "operation": "update",
-                            "replacements": replacements,
-                            "created": false,
-                            "overwritten": true,
-                            "deleted": false,
-                        }),
+                        FileChangeSummary {
+                            path: self.display_path(&path),
+                            operation: FileChangeOperation::Update,
+                            replacements,
+                            created: false,
+                            overwritten: true,
+                            deleted: false,
+                        },
+                        Some(original),
+                        Some(updated),
                     )
                 }
                 ParsedPatchOperation::Delete { path: _ } => {
@@ -471,17 +646,25 @@ impl ToolRegistry {
                     if !metadata.is_file() {
                         return Err(format!("{} is not a file", self.display_path(&path)));
                     }
+                    let original = fs::read_to_string(&path).map_err(|err| {
+                        format!(
+                            "failed to read {} as UTF-8 text: {err}",
+                            self.display_path(&path)
+                        )
+                    })?;
 
                     StagedPatchChange::delete(
                         path.clone(),
-                        json!({
-                            "path": self.display_path(&path),
-                            "operation": "delete",
-                            "replacements": 0,
-                            "created": false,
-                            "overwritten": false,
-                            "deleted": true,
-                        }),
+                        FileChangeSummary {
+                            path: self.display_path(&path),
+                            operation: FileChangeOperation::Delete,
+                            replacements: 0,
+                            created: false,
+                            overwritten: false,
+                            deleted: true,
+                        },
+                        Some(original),
+                        None,
                     )
                 }
             };
@@ -764,32 +947,85 @@ fn should_skip_entry(path: &Path) -> bool {
     )
 }
 
-fn complete_tool_result(result: Result<Value, String>) -> ToolExecution {
-    match result {
-        Ok(data) => ToolExecution::Completed(tool_ok(data)),
-        Err(error) => ToolExecution::Completed(tool_error(error)),
-    }
+fn file_change_summary_json(summary: &FileChangeSummary) -> Value {
+    json!({
+        "path": summary.path,
+        "operation": summary.operation.as_str(),
+        "replacements": summary.replacements,
+        "created": summary.created,
+        "overwritten": summary.overwritten,
+        "deleted": summary.deleted,
+    })
 }
 
-fn write_atomic(
-    path: &Path,
-    content: &str,
-    permissions: Option<fs::Permissions>,
-    tools: &ToolRegistry,
-) -> Result<(), String> {
-    let _parent = path
-        .parent()
-        .ok_or_else(|| format!("{} must have a parent directory", tools.display_path(path)))?;
-    let temp_path = temp_path_for(path);
+fn render_file_diff(changes: &[StagedPatchChange], tools: &ToolRegistry) -> String {
+    let mut builder = DiffBuilder::default();
 
-    write_temp_file(path, &temp_path, content, permissions, tools)?;
+    for change in changes {
+        let path = tools.display_path(&change.path);
+        let old_path = if matches!(change.kind, PatchOperationKind::Add) {
+            "/dev/null"
+        } else {
+            path.as_str()
+        };
+        let new_path = if matches!(change.kind, PatchOperationKind::Delete) {
+            "/dev/null"
+        } else {
+            path.as_str()
+        };
+        builder.push_line(&format!("--- {old_path}"));
+        builder.push_line(&format!("+++ {new_path}"));
+        builder.push_line("@@");
+        if let Some(before) = change.before.as_deref() {
+            for line in before.lines() {
+                builder.push_line(&format!("-{line}"));
+            }
+        }
+        if let Some(after) = change.after.as_deref() {
+            for line in after.lines() {
+                builder.push_line(&format!("+{line}"));
+            }
+        }
+        builder.push_line("");
+    }
 
-    fs::rename(&temp_path, path).map_err(|err| {
-        let _ = fs::remove_file(&temp_path);
-        format!("failed to replace {}: {err}", tools.display_path(path))
-    })?;
+    builder.finish()
+}
 
-    Ok(())
+#[derive(Default)]
+struct DiffBuilder {
+    output: String,
+    lines: usize,
+    truncated: bool,
+}
+
+impl DiffBuilder {
+    fn push_line(&mut self, line: &str) {
+        if self.truncated {
+            return;
+        }
+        if self.lines >= MAX_FILE_DIFF_LINES
+            || self
+                .output
+                .len()
+                .saturating_add(line.len())
+                .saturating_add(1)
+                > MAX_FILE_DIFF_BYTES
+        {
+            self.truncated = true;
+            return;
+        }
+        self.output.push_str(line);
+        self.output.push('\n');
+        self.lines += 1;
+    }
+
+    fn finish(mut self) -> String {
+        if self.truncated {
+            self.output.push_str("... diff truncated ...\n");
+        }
+        self.output
+    }
 }
 
 fn temp_path_for(path: &Path) -> PathBuf {
@@ -1213,7 +1449,9 @@ struct StagedPatchChange {
     kind: PatchOperationKind,
     content: Option<String>,
     permissions: Option<fs::Permissions>,
-    result: Value,
+    summary: FileChangeSummary,
+    before: Option<String>,
+    after: Option<String>,
     temp_path: Option<PathBuf>,
 }
 
@@ -1223,28 +1461,48 @@ impl StagedPatchChange {
         kind: PatchOperationKind,
         content: String,
         permissions: Option<fs::Permissions>,
-        result: Value,
+        summary: FileChangeSummary,
+        before: Option<String>,
+        after: Option<String>,
     ) -> Self {
         Self {
             path,
             kind,
             content: Some(content),
             permissions,
-            result,
+            summary,
+            before,
+            after,
             temp_path: None,
         }
     }
 
-    fn delete(path: PathBuf, result: Value) -> Self {
+    fn delete(
+        path: PathBuf,
+        summary: FileChangeSummary,
+        before: Option<String>,
+        after: Option<String>,
+    ) -> Self {
         Self {
             path,
             kind: PatchOperationKind::Delete,
             content: None,
             permissions: None,
-            result,
+            summary,
+            before,
+            after,
             temp_path: None,
         }
     }
+}
+
+#[derive(Debug)]
+struct FileChangePlan {
+    changes: Vec<StagedPatchChange>,
+    data: Value,
+    files: Vec<FileChangeSummary>,
+    diff: String,
+    summary: ToolExecutionSummary,
 }
 
 #[derive(Debug)]
@@ -1255,6 +1513,14 @@ struct AppliedPatchChange {
 }
 
 fn tool_ok(data: Value) -> ToolResult {
+    tool_ok_inner(data, None)
+}
+
+fn tool_ok_with_summary(data: Value, summary: ToolExecutionSummary) -> ToolResult {
+    tool_ok_inner(data, Some(summary))
+}
+
+fn tool_ok_inner(data: Value, summary: Option<ToolExecutionSummary>) -> ToolResult {
     let content = serde_json::to_string(&json!({
         "ok": true,
         "data": data,
@@ -1264,6 +1530,7 @@ fn tool_ok(data: Value) -> ToolResult {
         ok: true,
         content,
         error: None,
+        summary,
     }
 }
 
@@ -1275,12 +1542,27 @@ fn tool_error(error: String) -> ToolResult {
     .expect("tool error JSON must serialize");
     ToolResult {
         ok: false,
-        error: Some(error),
+        error: Some(error.clone()),
         content,
+        summary: Some(ToolExecutionSummary::error(error)),
     }
 }
 
-fn run_shell_command(root: &Path, command: &str, timeout: Duration) -> Result<Value, String> {
+fn complete_shell_result(result: Result<(Value, ShellCommandSummary), String>) -> ToolExecution {
+    match result {
+        Ok((data, summary)) => ToolExecution::Completed(tool_ok_with_summary(
+            data,
+            ToolExecutionSummary::shell(summary),
+        )),
+        Err(error) => ToolExecution::error(error),
+    }
+}
+
+fn run_shell_command(
+    root: &Path,
+    command: &str,
+    timeout: Duration,
+) -> Result<(Value, ShellCommandSummary), String> {
     let mut child = shell_command(command)
         .current_dir(root)
         .stdout(Stdio::piped())
@@ -1325,15 +1607,25 @@ fn run_shell_command(root: &Path, command: &str, timeout: Duration) -> Result<Va
         .join()
         .map_err(|_| "failed to join stderr reader".to_string())??;
 
-    Ok(json!({
+    let exit_code = status.code();
+    let data = json!({
         "command": command,
-        "exit_code": status.code(),
+        "exit_code": exit_code,
         "timed_out": timed_out,
         "stdout": stdout,
         "stderr": stderr,
         "stdout_truncated": stdout_truncated,
         "stderr_truncated": stderr_truncated,
-    }))
+    });
+    let summary = ShellCommandSummary {
+        command: command.to_string(),
+        exit_code,
+        timed_out,
+        stdout_truncated,
+        stderr_truncated,
+    };
+
+    Ok((data, summary))
 }
 
 #[cfg(windows)]
@@ -1431,7 +1723,7 @@ struct ShellCommandArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_protocol::{PermissionMode, ShellPolicy};
+    use agent_protocol::{ApprovalAction, PermissionMode, ShellPolicy};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn unique_dir(name: &str) -> PathBuf {
@@ -1472,10 +1764,15 @@ mod tests {
     }
 
     fn content(execution: ToolExecution) -> Value {
+        let result = completed_result(execution);
+        serde_json::from_str(&result.content).expect("tool JSON")
+    }
+
+    fn completed_result(execution: ToolExecution) -> ToolResult {
         let ToolExecution::Completed(result) = execution else {
             panic!("expected completed tool execution");
         };
-        serde_json::from_str(&result.content).expect("tool JSON")
+        result
     }
 
     fn approval_request(execution: ToolExecution) -> ApprovalRequest {
@@ -1483,6 +1780,16 @@ mod tests {
             panic!("expected approval request");
         };
         request
+    }
+
+    fn approved_content(tools: &ToolRegistry, call: &ToolCall) -> Value {
+        let request = approval_request(tools.execute(call));
+        assert!(matches!(request.action, ApprovalAction::FileChanges { .. }));
+        content(tools.execute_approved(
+            call,
+            &ApprovalDecision::approve(request.id.clone()),
+            &request,
+        ))
     }
 
     #[test]
@@ -1567,11 +1874,22 @@ mod tests {
         let root = unique_dir("edit-root");
         fs::write(root.join("note.txt"), "before old after\n").expect("write file");
         let tools = registry(&root);
-
-        let value = content(tools.execute(&call(
+        let call = call(
             "edit_file",
             json!({"path": "note.txt", "old_text": "old", "new_text": "new"}),
-        )));
+        );
+
+        let request = approval_request(tools.execute(&call));
+        assert!(matches!(request.action, ApprovalAction::FileChanges { .. }));
+        assert_eq!(
+            fs::read_to_string(root.join("note.txt")).expect("read before approval"),
+            "before old after\n"
+        );
+        let value = content(tools.execute_approved(
+            &call,
+            &ApprovalDecision::approve(request.id.clone()),
+            &request,
+        ));
 
         assert_eq!(value["ok"], true);
         assert_eq!(value["data"]["path"], "note.txt");
@@ -1661,11 +1979,19 @@ mod tests {
     fn write_file_creates_new_file() {
         let root = unique_dir("write-create-root");
         let tools = registry(&root);
-
-        let value = content(tools.execute(&call(
+        let call = call(
             "write_file",
             json!({"path": "note.txt", "content": "created\n"}),
-        )));
+        );
+
+        let request = approval_request(tools.execute(&call));
+        assert!(matches!(request.action, ApprovalAction::FileChanges { .. }));
+        assert!(!root.join("note.txt").exists());
+        let value = content(tools.execute_approved(
+            &call,
+            &ApprovalDecision::approve(request.id.clone()),
+            &request,
+        ));
 
         assert_eq!(value["ok"], true);
         assert_eq!(value["data"]["path"], "note.txt");
@@ -1676,6 +2002,36 @@ mod tests {
             fs::read_to_string(root.join("note.txt")).expect("read file"),
             "created\n"
         );
+    }
+
+    #[test]
+    fn file_change_approval_returns_diff_summary() {
+        let root = unique_dir("write-summary-root");
+        let tools = registry(&root);
+        let call = call(
+            "write_file",
+            json!({"path": "note.txt", "content": "created\n"}),
+        );
+
+        let request = approval_request(tools.execute(&call));
+        let ApprovalAction::FileChanges { files, diff } = &request.action else {
+            panic!("expected file changes approval");
+        };
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].operation, FileChangeOperation::Add);
+        assert!(diff.contains("+++ note.txt"));
+        assert!(diff.contains("+created"));
+
+        let result = completed_result(tools.execute_approved(
+            &call,
+            &ApprovalDecision::approve(request.id.clone()),
+            &request,
+        ));
+        let summary = result.summary.as_ref().expect("summary");
+
+        assert_eq!(summary.files.len(), 1);
+        assert_eq!(summary.files[0].path, "note.txt");
+        assert!(summary.diff.as_deref().expect("diff").contains("+created"));
     }
 
     #[test]
@@ -1707,11 +2063,22 @@ mod tests {
         let root = unique_dir("write-overwrite-root");
         fs::write(root.join("note.txt"), "old\n").expect("write file");
         let tools = registry(&root);
-
-        let value = content(tools.execute(&call(
+        let call = call(
             "write_file",
             json!({"path": "note.txt", "content": "new\n", "overwrite": true}),
-        )));
+        );
+
+        let request = approval_request(tools.execute(&call));
+        assert!(matches!(request.action, ApprovalAction::FileChanges { .. }));
+        assert_eq!(
+            fs::read_to_string(root.join("note.txt")).expect("read before approval"),
+            "old\n"
+        );
+        let value = content(tools.execute_approved(
+            &call,
+            &ApprovalDecision::approve(request.id.clone()),
+            &request,
+        ));
 
         assert_eq!(value["ok"], true);
         assert_eq!(value["data"]["created"], false);
@@ -1719,6 +2086,37 @@ mod tests {
         assert_eq!(
             fs::read_to_string(root.join("note.txt")).expect("read file"),
             "new\n"
+        );
+    }
+
+    #[test]
+    fn file_change_approval_rejects_drift_before_commit() {
+        let root = unique_dir("approval-drift-root");
+        fs::write(root.join("note.txt"), "old\n").expect("write file");
+        let tools = registry(&root);
+        let call = call(
+            "edit_file",
+            json!({"path": "note.txt", "old_text": "old", "new_text": "new"}),
+        );
+        let request = approval_request(tools.execute(&call));
+        fs::write(root.join("note.txt"), "old\nextra\n").expect("change after approval");
+
+        let value = content(tools.execute_approved(
+            &call,
+            &ApprovalDecision::approve(request.id.clone()),
+            &request,
+        ));
+
+        assert_eq!(value["ok"], false);
+        assert!(
+            value["error"]
+                .as_str()
+                .expect("error")
+                .contains("approval no longer matches")
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("note.txt")).expect("read drifted file"),
+            "old\nextra\n"
         );
     }
 
@@ -1842,7 +2240,7 @@ mod tests {
         fs::write(root.join("delete.txt"), "delete me\n").expect("write delete");
         let tools = registry(&root);
 
-        let value = content(tools.execute(&patch_call(
+        let call = patch_call(
             r#"*** Begin Patch
 *** Add File: added.txt
 +hello
@@ -1855,7 +2253,20 @@ mod tests {
  gamma
 *** Delete File: delete.txt
 *** End Patch"#,
-        )));
+        );
+        let request = approval_request(tools.execute(&call));
+        assert!(matches!(request.action, ApprovalAction::FileChanges { .. }));
+        assert!(!root.join("added.txt").exists());
+        assert_eq!(
+            fs::read_to_string(root.join("update.txt")).expect("read before approval"),
+            "alpha\nbeta\ngamma\n"
+        );
+        assert!(root.join("delete.txt").exists());
+        let value = content(tools.execute_approved(
+            &call,
+            &ApprovalDecision::approve(request.id.clone()),
+            &request,
+        ));
 
         assert_eq!(value["ok"], true);
         assert_eq!(value["data"]["changed_files"], 3);
@@ -1882,7 +2293,7 @@ mod tests {
         fs::write(root.join("b.txt"), "red\nblue\n").expect("write b");
         let tools = registry(&root);
 
-        let value = content(tools.execute(&patch_call(
+        let call = patch_call(
             r#"*** Begin Patch
 *** Update File: a.txt
 @@
@@ -1900,7 +2311,8 @@ mod tests {
 +RED
  blue
 *** End Patch"#,
-        )));
+        );
+        let value = approved_content(&tools, &call);
 
         assert_eq!(value["ok"], true);
         assert_eq!(
@@ -2231,14 +2643,24 @@ mod tests {
             PermissionProfile::for_mode(PermissionMode::DangerFullAccess),
         );
 
-        let value = content(tools.execute(&call(
+        let result = completed_result(tools.execute(&call(
             "shell_command",
             json!({"command": "pwd && exit 7", "timeout_secs": 5}),
         )));
+        let value: Value = serde_json::from_str(&result.content).expect("tool JSON");
+        let shell = result
+            .summary
+            .as_ref()
+            .and_then(|summary| summary.shell.as_ref())
+            .expect("shell summary");
 
         assert_eq!(value["ok"], true);
         assert_eq!(value["data"]["exit_code"], 7);
         assert_eq!(value["data"]["timed_out"], false);
+        assert_eq!(shell.exit_code, Some(7));
+        assert!(!shell.timed_out);
+        assert!(!shell.stdout_truncated);
+        assert!(!shell.stderr_truncated);
         assert_eq!(
             value["data"]["stdout"].as_str().expect("stdout").trim(),
             root.canonicalize()
@@ -2288,7 +2710,11 @@ mod tests {
         );
         let request = approval_request(tools.execute(&call));
 
-        let value = content(tools.execute_approved(&call, &ApprovalDecision::approve(request.id)));
+        let value = content(tools.execute_approved(
+            &call,
+            &ApprovalDecision::approve(request.id.clone()),
+            &request,
+        ));
 
         assert_eq!(value["ok"], true);
         assert_eq!(value["data"]["exit_code"], 3);
@@ -2304,7 +2730,11 @@ mod tests {
         );
         let request = approval_request(tools.execute(&call));
 
-        let value = content(tools.execute_approved(&call, &ApprovalDecision::deny(request.id)));
+        let value = content(tools.execute_approved(
+            &call,
+            &ApprovalDecision::deny(request.id.clone()),
+            &request,
+        ));
 
         assert_eq!(value["ok"], false);
         assert_eq!(value["error"], "shell command approval denied");

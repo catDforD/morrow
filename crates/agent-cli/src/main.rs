@@ -2,12 +2,14 @@ use agent_config::load_config;
 use agent_core::{Agent, AgentError};
 use agent_model::{ModelError, OpenAiCompatClient, OpenAiCompatConfig};
 use agent_protocol::{
-    AgentEvent, ApprovalAction, ApprovalDecision, ApprovalRequest, PermissionMode,
-    PermissionProfile, ShellPolicy, Thread,
+    AgentEvent, ApprovalAction, ApprovalDecision, ApprovalRequest, FileChangeSummary,
+    PermissionMode, PermissionProfile, ShellCommandSummary, ShellPolicy, Thread,
+    ToolExecutionSummary,
 };
 use agent_tools::{ToolRegistry, ToolRegistryError};
 use clap::Parser;
 use futures_util::StreamExt;
+use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -135,6 +137,13 @@ struct ReplContext<'a> {
     config_path: &'a Path,
 }
 
+#[derive(Debug, Clone)]
+struct ExecutionRecord {
+    name: String,
+    ok: bool,
+    summary: Option<ToolExecutionSummary>,
+}
+
 async fn run_repl(
     context: ReplContext<'_>,
     thread: &mut Thread,
@@ -255,6 +264,7 @@ async fn run_agent_turn(
     let mut output_ends_with_newline = false;
     let mut agent_error = None;
     let mut turn_completed = false;
+    let mut execution_records = Vec::new();
 
     {
         let mut stream = agent.run_turn(thread, prompt.to_string()).await?;
@@ -274,9 +284,12 @@ async fn run_agent_turn(
                 AgentEvent::ToolCallStarted { name, .. } => {
                     eprintln!("tool {name} started");
                 }
-                AgentEvent::ToolCallFinished { name, ok, .. } => {
+                AgentEvent::ToolCallFinished {
+                    name, ok, summary, ..
+                } => {
                     let status = if ok { "ok" } else { "error" };
                     eprintln!("tool {name} {status}");
+                    execution_records.push(ExecutionRecord { name, ok, summary });
                 }
                 AgentEvent::ApprovalRequested(request) => {
                     let decision = approval_decision(&request, permissions, interactive_approvals)?;
@@ -295,6 +308,7 @@ async fn run_agent_turn(
                         stdout.write_all(b"\n").map_err(CliError::Stdout)?;
                         stdout.flush().map_err(CliError::Stdout)?;
                     }
+                    print_execution_summary(&execution_records);
                     turn_completed = true;
                 }
                 AgentEvent::Error(message) => {
@@ -338,21 +352,108 @@ fn approval_decision(
 }
 
 fn print_approval_request(request: &ApprovalRequest, permissions: PermissionProfile) {
-    eprintln!("approval required: {}", request.reason);
+    eprint!("{}", format_approval_request(request, permissions));
+}
+
+fn format_approval_request(request: &ApprovalRequest, permissions: PermissionProfile) -> String {
+    let mut output = String::new();
+    let _ = writeln!(output, "approval required: {}", request.reason);
     match &request.action {
         ApprovalAction::ShellCommand {
             command,
             cwd,
             timeout_secs,
         } => {
-            eprintln!("action: shell command");
-            eprintln!("command: {command}");
-            eprintln!("cwd: {}", cwd.display());
-            eprintln!("timeout: {timeout_secs}s");
-            eprintln!("permissions: {}", permission_summary(permissions));
-            eprintln!("warning: approving this command may modify files or access the network.");
+            let _ = writeln!(output, "action: shell command");
+            let _ = writeln!(output, "command: {command}");
+            let _ = writeln!(output, "cwd: {}", cwd.display());
+            let _ = writeln!(output, "timeout: {timeout_secs}s");
+            let _ = writeln!(output, "permissions: {}", permission_summary(permissions));
+            let _ = writeln!(
+                output,
+                "warning: approving this command may modify files or access the network."
+            );
+        }
+        ApprovalAction::FileChanges { files, diff } => {
+            let _ = writeln!(output, "action: file changes");
+            append_file_list(&mut output, files);
+            let _ = writeln!(output, "diff:");
+            output.push_str(diff);
+            if !diff.ends_with('\n') {
+                output.push('\n');
+            }
+            let _ = writeln!(output, "permissions: {}", permission_summary(permissions));
+            let _ = writeln!(output, "warning: approving this action will modify files.");
         }
     }
+    output
+}
+
+fn print_execution_summary(records: &[ExecutionRecord]) {
+    if let Some(summary) = format_execution_summary(records) {
+        eprint!("{summary}");
+    }
+}
+
+fn format_execution_summary(records: &[ExecutionRecord]) -> Option<String> {
+    if records.is_empty() {
+        return None;
+    }
+
+    let mut output = String::from("execution summary:\n");
+    for record in records {
+        let status = if record.ok { "ok" } else { "error" };
+        let _ = writeln!(output, "- {}: {status}", record.name);
+        if let Some(summary) = record.summary.as_ref() {
+            if !summary.files.is_empty() {
+                append_file_list(&mut output, &summary.files);
+                if summary.diff.as_deref().is_some_and(|diff| !diff.is_empty()) {
+                    let _ = writeln!(output, "  diff: available");
+                }
+            }
+            if let Some(shell) = summary.shell.as_ref() {
+                append_shell_summary(&mut output, shell);
+            }
+            if let Some(error) = summary.error.as_ref() {
+                let _ = writeln!(output, "  error: {error}");
+            }
+        }
+    }
+
+    Some(output)
+}
+
+fn append_file_list(output: &mut String, files: &[FileChangeSummary]) {
+    if files.is_empty() {
+        let _ = writeln!(output, "files: none");
+        return;
+    }
+
+    let _ = writeln!(output, "files:");
+    for file in files {
+        let _ = writeln!(
+            output,
+            "- {} ({}, replacements={}, created={}, overwritten={}, deleted={})",
+            file.path,
+            file.operation.as_str(),
+            file.replacements,
+            file.created,
+            file.overwritten,
+            file.deleted
+        );
+    }
+}
+
+fn append_shell_summary(output: &mut String, shell: &ShellCommandSummary) {
+    let exit_code = shell
+        .exit_code
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let _ = writeln!(
+        output,
+        "  shell: exit_code={exit_code}, timed_out={}, stdout_truncated={}, stderr_truncated={}",
+        shell.timed_out, shell.stdout_truncated, shell.stderr_truncated
+    );
 }
 
 fn effective_permissions(
@@ -414,6 +515,18 @@ fn manifest_has_workspace_header(path: &std::path::Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_protocol::FileChangeOperation;
+
+    fn file_summary() -> FileChangeSummary {
+        FileChangeSummary {
+            path: "note.txt".to_string(),
+            operation: FileChangeOperation::Add,
+            replacements: 0,
+            created: true,
+            overwritten: false,
+            deleted: false,
+        }
+    }
 
     #[test]
     fn parses_permission_modes_for_cli_and_repl() {
@@ -451,5 +564,65 @@ mod tests {
                 shell: ShellPolicy::Allow,
             }
         );
+    }
+
+    #[test]
+    fn formats_file_change_approval_request_with_diff() {
+        let request = ApprovalRequest::file_changes(
+            "approval-call_1",
+            vec![file_summary()],
+            "--- /dev/null\n+++ note.txt\n@@\n+created\n",
+            "file changes require approval",
+        );
+
+        let text = format_approval_request(
+            &request,
+            PermissionProfile::for_mode(PermissionMode::WorkspaceWrite),
+        );
+
+        assert!(text.contains("approval required: file changes require approval"));
+        assert!(text.contains("action: file changes"));
+        assert!(text.contains("- note.txt (add"));
+        assert!(text.contains("+++ note.txt"));
+        assert!(text.contains("permissions: mode=workspace_write, shell=prompt"));
+    }
+
+    #[test]
+    fn formats_execution_summary_for_file_shell_and_error_results() {
+        let records = vec![
+            ExecutionRecord {
+                name: "write_file".to_string(),
+                ok: true,
+                summary: Some(ToolExecutionSummary::file_changes(
+                    vec![file_summary()],
+                    "--- /dev/null\n+++ note.txt\n@@\n+created\n",
+                )),
+            },
+            ExecutionRecord {
+                name: "shell_command".to_string(),
+                ok: true,
+                summary: Some(ToolExecutionSummary::shell(ShellCommandSummary {
+                    command: "cargo test".to_string(),
+                    exit_code: Some(0),
+                    timed_out: false,
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                })),
+            },
+            ExecutionRecord {
+                name: "edit_file".to_string(),
+                ok: false,
+                summary: Some(ToolExecutionSummary::error("approval denied")),
+            },
+        ];
+
+        let text = format_execution_summary(&records).expect("summary");
+
+        assert!(text.contains("execution summary:"));
+        assert!(text.contains("- write_file: ok"));
+        assert!(text.contains("diff: available"));
+        assert!(text.contains("shell: exit_code=0"));
+        assert!(text.contains("- edit_file: error"));
+        assert!(text.contains("error: approval denied"));
     }
 }
