@@ -7,14 +7,15 @@ use agent_protocol::{
     ToolExecutionSummary, TurnRecord, TurnStatus,
 };
 use agent_tools::{ToolRegistry, ToolRegistryError};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
+use serde_json::json;
 use session_store::SessionStore;
 use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 mod session_store;
@@ -44,8 +45,42 @@ struct Args {
     #[arg(long)]
     allow_shell: bool,
 
+    #[arg(long)]
+    jsonl: bool,
+
+    #[command(subcommand)]
+    command: Option<CliCommand>,
+
     #[arg(value_name = "PROMPT", num_args = 0..)]
     prompt: Vec<String>,
+}
+
+#[derive(Debug, Subcommand)]
+enum CliCommand {
+    Session {
+        #[command(subcommand)]
+        command: SessionCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SessionCommand {
+    List,
+    Show {
+        name: Option<String>,
+    },
+    Delete {
+        name: String,
+    },
+    Rename {
+        old: String,
+        new: String,
+    },
+    Export {
+        name: Option<String>,
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -64,6 +99,20 @@ enum CliError {
     AgentRun(String),
     #[error("--session and --thread cannot be used together")]
     ConflictingSessionArgs,
+    #[error("--jsonl requires a prompt and cannot be used in interactive mode")]
+    JsonlRequiresPrompt,
+    #[error("--jsonl cannot be used with session commands")]
+    JsonlUnsupportedForSessionCommand,
+    #[error("output file already exists: {path}")]
+    OutputExists { path: PathBuf },
+    #[error("failed to write output file {path}: {source}")]
+    OutputWrite {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to serialize JSONL event: {0}")]
+    JsonlSerialize(#[source] serde_json::Error),
     #[error("failed to read stdin: {0}")]
     Stdin(#[source] io::Error),
     #[error("failed to write stderr: {0}")]
@@ -83,6 +132,18 @@ async fn main() {
 async fn run() -> Result<(), CliError> {
     let args = Args::parse();
     let session_name = resolve_session_name(&args)?;
+
+    if let Some(command) = args.command.as_ref() {
+        if args.jsonl {
+            return Err(CliError::JsonlUnsupportedForSessionCommand);
+        }
+        let mut stdout = io::stdout().lock();
+        return handle_cli_command(command, &session_name, &mut stdout);
+    }
+
+    let prompt = args.prompt.join(" ");
+    validate_jsonl_prompt(&args, &prompt)?;
+
     let reset_session = args.reset_session || args.reset_thread;
     let loaded = load_config(args.config.as_deref())?;
     let permissions =
@@ -100,7 +161,6 @@ async fn run() -> Result<(), CliError> {
         session_store.load()?
     };
     let workspace_root = detect_workspace_root()?;
-    let prompt = args.prompt.join(" ");
 
     if prompt.trim().is_empty() {
         let mut permissions = permissions;
@@ -121,6 +181,7 @@ async fn run() -> Result<(), CliError> {
         return Ok(());
     }
 
+    let mut stdout = io::stdout().lock();
     let outcome = run_agent_turn(
         RunAgentTurnContext {
             client: &client,
@@ -129,9 +190,18 @@ async fn run() -> Result<(), CliError> {
             workspace_root: &workspace_root,
             permissions,
             interactive_approvals: io::stdin().is_terminal(),
+            output: if args.jsonl {
+                OutputMode::Jsonl {
+                    session_name: &session_name,
+                    turn_index: session.turns.len(),
+                }
+            } else {
+                OutputMode::Human
+            },
         },
         &mut session,
         &prompt,
+        &mut stdout,
     )
     .await?;
 
@@ -163,6 +233,16 @@ struct RunAgentTurnContext<'a> {
     workspace_root: &'a Path,
     permissions: PermissionProfile,
     interactive_approvals: bool,
+    output: OutputMode<'a>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputMode<'a> {
+    Human,
+    Jsonl {
+        session_name: &'a str,
+        turn_index: usize,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -213,6 +293,7 @@ async fn run_repl(
             continue;
         }
 
+        let mut stdout = io::stdout().lock();
         let outcome = run_agent_turn(
             RunAgentTurnContext {
                 client: context.client,
@@ -221,9 +302,11 @@ async fn run_repl(
                 workspace_root: context.workspace_root,
                 permissions: *permissions,
                 interactive_approvals: io::stdin().is_terminal(),
+                output: OutputMode::Human,
             },
             session,
             input,
+            &mut stdout,
         )
         .await?;
 
@@ -317,6 +400,7 @@ async fn run_agent_turn(
     context: RunAgentTurnContext<'_>,
     session: &mut Session,
     prompt: &str,
+    stdout: &mut dyn Write,
 ) -> Result<RunAgentTurnOutcome, CliError> {
     if let Err(error) = maybe_auto_compact(
         context.client,
@@ -343,12 +427,12 @@ async fn run_agent_turn(
         context.system_prompt.to_string(),
         tools,
     );
-    let mut stdout = io::stdout().lock();
     let mut wrote_text = false;
     let mut output_ends_with_newline = false;
     let mut agent_error = None;
     let mut turn_completed = false;
     let mut execution_records = Vec::new();
+    let mut event_index = 0;
 
     {
         let mut stream = agent
@@ -356,25 +440,47 @@ async fn run_agent_turn(
             .await?;
 
         while let Some(event) = stream.next().await {
+            if let OutputMode::Jsonl {
+                session_name,
+                turn_index,
+            } = context.output
+            {
+                write_jsonl_event(
+                    stdout,
+                    session_name,
+                    context.workspace_root,
+                    turn_index,
+                    event_index,
+                    &event,
+                )?;
+                event_index += 1;
+            }
+
             match event {
                 AgentEvent::TurnStarted => {}
                 AgentEvent::TextDelta(text) => {
-                    wrote_text = true;
-                    output_ends_with_newline = text.ends_with('\n');
-                    stdout
-                        .write_all(text.as_bytes())
-                        .map_err(CliError::Stdout)?;
-                    stdout.flush().map_err(CliError::Stdout)?;
+                    if context.output == OutputMode::Human {
+                        wrote_text = true;
+                        output_ends_with_newline = text.ends_with('\n');
+                        stdout
+                            .write_all(text.as_bytes())
+                            .map_err(CliError::Stdout)?;
+                        stdout.flush().map_err(CliError::Stdout)?;
+                    }
                 }
                 AgentEvent::AgentMessage(_) => {}
                 AgentEvent::ToolCallStarted { name, .. } => {
-                    eprintln!("tool {name} started");
+                    if context.output == OutputMode::Human {
+                        eprintln!("tool {name} started");
+                    }
                 }
                 AgentEvent::ToolCallFinished {
                     name, ok, summary, ..
                 } => {
-                    let status = if ok { "ok" } else { "error" };
-                    eprintln!("tool {name} {status}");
+                    if context.output == OutputMode::Human {
+                        let status = if ok { "ok" } else { "error" };
+                        eprintln!("tool {name} {status}");
+                    }
                     execution_records.push(ExecutionRecord { name, ok, summary });
                 }
                 AgentEvent::ApprovalRequested(request) => {
@@ -386,19 +492,26 @@ async fn run_agent_turn(
                     stream.resolve_approval(decision)?;
                 }
                 AgentEvent::ApprovalResolved(decision) => {
-                    let status = if decision.approved {
-                        "approved"
-                    } else {
-                        "denied"
-                    };
-                    eprintln!("approval {} {status}", decision.request_id);
+                    if context.output == OutputMode::Human {
+                        let status = if decision.approved {
+                            "approved"
+                        } else {
+                            "denied"
+                        };
+                        eprintln!("approval {} {status}", decision.request_id);
+                    }
                 }
                 AgentEvent::TurnCompleted => {
-                    if wrote_text && !output_ends_with_newline {
+                    if context.output == OutputMode::Human
+                        && wrote_text
+                        && !output_ends_with_newline
+                    {
                         stdout.write_all(b"\n").map_err(CliError::Stdout)?;
                         stdout.flush().map_err(CliError::Stdout)?;
                     }
-                    print_execution_summary(&execution_records);
+                    if context.output == OutputMode::Human {
+                        print_execution_summary(&execution_records);
+                    }
                     turn_completed = true;
                 }
                 AgentEvent::Error(message) => {
@@ -423,6 +536,152 @@ fn resolve_session_name(args: &Args) -> Result<String, CliError> {
         (None, Some(thread)) => Ok(thread.clone()),
         (None, None) => Ok("default".to_string()),
     }
+}
+
+fn validate_jsonl_prompt(args: &Args, prompt: &str) -> Result<(), CliError> {
+    if args.jsonl && prompt.trim().is_empty() {
+        return Err(CliError::JsonlRequiresPrompt);
+    }
+    Ok(())
+}
+
+fn handle_cli_command(
+    command: &CliCommand,
+    default_session_name: &str,
+    stdout: &mut dyn Write,
+) -> Result<(), CliError> {
+    match command {
+        CliCommand::Session { command } => {
+            handle_session_command(command, default_session_name, stdout)
+        }
+    }
+}
+
+fn handle_session_command(
+    command: &SessionCommand,
+    default_session_name: &str,
+    stdout: &mut dyn Write,
+) -> Result<(), CliError> {
+    match command {
+        SessionCommand::List => {
+            let store = SessionStore::for_current_dir(default_session_name)?;
+            let entries = store.list_current_scope()?;
+            if entries.is_empty() {
+                writeln!(stdout, "no sessions").map_err(CliError::Stdout)?;
+            } else {
+                writeln!(stdout, "NAME\tTURNS\tACTIVE_MESSAGES\tSUMMARY\tPATH")
+                    .map_err(CliError::Stdout)?;
+                for entry in entries {
+                    writeln!(
+                        stdout,
+                        "{}\t{}\t{}\t{}\t{}",
+                        entry.name,
+                        entry.turns,
+                        entry.active_messages,
+                        if entry.has_summary { "yes" } else { "no" },
+                        entry.path.display()
+                    )
+                    .map_err(CliError::Stdout)?;
+                }
+            }
+        }
+        SessionCommand::Show { name } => {
+            let name = name.as_deref().unwrap_or(default_session_name);
+            let store = SessionStore::for_current_dir(name)?;
+            let session = store.load_existing()?;
+            writeln!(stdout, "name: {name}").map_err(CliError::Stdout)?;
+            writeln!(stdout, "path: {}", store.path().display()).map_err(CliError::Stdout)?;
+            writeln!(stdout, "turns: {}", session.turns.len()).map_err(CliError::Stdout)?;
+            writeln!(
+                stdout,
+                "active_messages: {}",
+                session.active_thread.messages.len()
+            )
+            .map_err(CliError::Stdout)?;
+            writeln!(
+                stdout,
+                "summarized_turns: {}",
+                session.context.summarized_turns
+            )
+            .map_err(CliError::Stdout)?;
+            writeln!(
+                stdout,
+                "summary: {}",
+                if session.context.summary.is_some() {
+                    "yes"
+                } else {
+                    "no"
+                }
+            )
+            .map_err(CliError::Stdout)?;
+        }
+        SessionCommand::Delete { name } => {
+            let store = SessionStore::for_current_dir(name)?;
+            store.delete()?;
+            writeln!(stdout, "deleted session: {name}").map_err(CliError::Stdout)?;
+        }
+        SessionCommand::Rename { old, new } => {
+            let store = SessionStore::for_current_dir(old)?;
+            let target = store.rename(new)?;
+            writeln!(
+                stdout,
+                "renamed session: {old} -> {new} ({})",
+                target.path().display()
+            )
+            .map_err(CliError::Stdout)?;
+        }
+        SessionCommand::Export { name, output } => {
+            let name = name.as_deref().unwrap_or(default_session_name);
+            let store = SessionStore::for_current_dir(name)?;
+            let bytes = store.export_document_bytes()?;
+            if let Some(path) = output {
+                if path.exists() {
+                    return Err(CliError::OutputExists { path: path.clone() });
+                }
+                fs::write(path, &bytes).map_err(|source| CliError::OutputWrite {
+                    path: path.clone(),
+                    source,
+                })?;
+                eprintln!("exported session: {name} -> {}", path.display());
+            } else {
+                stdout.write_all(&bytes).map_err(CliError::Stdout)?;
+                stdout.write_all(b"\n").map_err(CliError::Stdout)?;
+            }
+        }
+    }
+
+    stdout.flush().map_err(CliError::Stdout)
+}
+
+fn write_jsonl_event(
+    stdout: &mut dyn Write,
+    session_name: &str,
+    workspace_root: &Path,
+    turn_index: usize,
+    event_index: usize,
+    event: &AgentEvent,
+) -> Result<(), CliError> {
+    let envelope = json!({
+        "schema_version": 1,
+        "timestamp_ms": timestamp_ms(),
+        "session": session_name,
+        "workspace_root": workspace_root.display().to_string(),
+        "turn_index": turn_index,
+        "event_index": event_index,
+        "event": event,
+    });
+    serde_json::to_writer(&mut *stdout, &envelope).map_err(CliError::JsonlSerialize)?;
+    stdout.write_all(b"\n").map_err(CliError::Stdout)?;
+    stdout.flush().map_err(CliError::Stdout)?;
+    Ok(())
+}
+
+fn timestamp_ms() -> u64 {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    millis.min(u128::from(u64::MAX)) as u64
 }
 
 async fn maybe_auto_compact(
@@ -911,6 +1170,45 @@ mod tests {
         Box::leak(body.into_boxed_str())
     }
 
+    fn tool_call_body(id: &str, name: &str, arguments: serde_json::Value) -> &'static str {
+        let body = format!(
+            "data: {}\n\ndata: {}\n\n",
+            json!({
+                "choices": [{
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": id,
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": arguments.to_string()
+                            }
+                        }]
+                    },
+                    "finish_reason": null
+                }]
+            }),
+            json!({
+                "choices": [{
+                    "delta": {},
+                    "finish_reason": "tool_calls"
+                }]
+            })
+        );
+        Box::leak(body.into_boxed_str())
+    }
+
+    fn unique_cli_dir(name: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("morrow-cli-{name}-{stamp}"));
+        fs::create_dir_all(&path).expect("create root");
+        path
+    }
+
     fn context_config(max_context_chars: usize, retain_recent_turns: usize) -> ContextConfig {
         ContextConfig {
             auto_compact: true,
@@ -1002,6 +1300,47 @@ mod tests {
             resolve_session_name(&conflicting),
             Err(CliError::ConflictingSessionArgs)
         ));
+    }
+
+    #[test]
+    fn parses_session_subcommands() {
+        let list_args =
+            Args::try_parse_from(["morrow", "session", "list"]).expect("parse session list");
+        assert!(matches!(
+            list_args.command,
+            Some(CliCommand::Session {
+                command: SessionCommand::List
+            })
+        ));
+
+        let export_args = Args::try_parse_from([
+            "morrow",
+            "--session",
+            "work",
+            "session",
+            "export",
+            "--output",
+            "session.json",
+        ])
+        .expect("parse session export");
+        assert!(matches!(
+            export_args.command,
+            Some(CliCommand::Session {
+                command: SessionCommand::Export { .. }
+            })
+        ));
+        assert_eq!(resolve_session_name(&export_args).expect("session"), "work");
+    }
+
+    #[test]
+    fn jsonl_requires_prompt() {
+        let args = Args::try_parse_from(["morrow", "--jsonl"]).expect("parse jsonl");
+
+        assert!(matches!(
+            validate_jsonl_prompt(&args, ""),
+            Err(CliError::JsonlRequiresPrompt)
+        ));
+        assert!(validate_jsonl_prompt(&args, "hello").is_ok());
     }
 
     #[test]
@@ -1122,12 +1461,11 @@ mod tests {
 
     #[tokio::test]
     async fn run_agent_turn_records_completed_turn_in_history_and_active_context() {
-        let root =
-            std::env::temp_dir().join(format!("morrow-cli-run-success-{}", std::process::id()));
-        fs::create_dir_all(&root).expect("create root");
+        let root = unique_cli_dir("run-success");
         let (base_url, requests) = spawn_recording_sse_server(vec![sse_text_body("ok")]).await;
         let client = client(base_url);
         let mut session = Session::new();
+        let mut output = Vec::new();
 
         let outcome = run_agent_turn(
             RunAgentTurnContext {
@@ -1137,9 +1475,11 @@ mod tests {
                 workspace_root: &root,
                 permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
                 interactive_approvals: false,
+                output: OutputMode::Human,
             },
             &mut session,
             "hello",
+            &mut output,
         )
         .await
         .expect("run turn");
@@ -1162,12 +1502,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_agent_turn_jsonl_outputs_event_envelopes() {
+        let root = unique_cli_dir("jsonl-text");
+        let (base_url, _) = spawn_recording_sse_server(vec![sse_text_body("ok")]).await;
+        let client = client(base_url);
+        let mut session = Session::new();
+        let mut output = Vec::new();
+
+        let outcome = run_agent_turn(
+            RunAgentTurnContext {
+                client: &client,
+                system_prompt: "system",
+                context_config: context_config(10_000, 2),
+                workspace_root: &root,
+                permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
+                interactive_approvals: false,
+                output: OutputMode::Jsonl {
+                    session_name: "default",
+                    turn_index: 0,
+                },
+            },
+            &mut session,
+            "hello",
+            &mut output,
+        )
+        .await
+        .expect("run turn");
+
+        assert_eq!(outcome.error, None);
+        let text = String::from_utf8(output).expect("utf8 output");
+        let lines = text
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json line"))
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[0]["schema_version"], json!(1));
+        assert!(lines[0]["timestamp_ms"].as_u64().is_some());
+        assert_eq!(lines[0]["session"], "default");
+        assert_eq!(lines[0]["workspace_root"], root.display().to_string());
+        assert_eq!(lines[0]["turn_index"], json!(0));
+        assert_eq!(lines[0]["event_index"], json!(0));
+        assert_eq!(lines[0]["event"], json!({"type": "turn_started"}));
+        assert_eq!(
+            lines[1]["event"],
+            json!({"type": "text_delta", "data": "ok"})
+        );
+        assert_eq!(
+            lines[2]["event"],
+            json!({"type": "agent_message", "data": "ok"})
+        );
+        assert_eq!(lines[3]["event"], json!({"type": "turn_completed"}));
+    }
+
+    #[tokio::test]
+    async fn run_agent_turn_jsonl_suppresses_human_execution_summary() {
+        let root = unique_cli_dir("jsonl-tool");
+        fs::write(root.join("note.txt"), "tool result\n").expect("write note");
+        let first_body = tool_call_body(
+            "call_1",
+            "read_file",
+            json!({"path": "note.txt", "max_lines": 5}),
+        );
+        let second_body = sse_text_body("done");
+        let (base_url, _) = spawn_recording_sse_server(vec![first_body, second_body]).await;
+        let client = client(base_url);
+        let mut session = Session::new();
+        let mut output = Vec::new();
+
+        let outcome = run_agent_turn(
+            RunAgentTurnContext {
+                client: &client,
+                system_prompt: "system",
+                context_config: context_config(10_000, 2),
+                workspace_root: &root,
+                permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
+                interactive_approvals: false,
+                output: OutputMode::Jsonl {
+                    session_name: "default",
+                    turn_index: 0,
+                },
+            },
+            &mut session,
+            "read note",
+            &mut output,
+        )
+        .await
+        .expect("run turn");
+
+        assert_eq!(outcome.error, None);
+        let text = String::from_utf8(output).expect("utf8 output");
+        assert!(!text.contains("execution summary:"));
+        let lines = text
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json line"))
+            .collect::<Vec<_>>();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line["event"]["type"] == "tool_call_finished")
+        );
+    }
+
+    #[tokio::test]
     async fn auto_compaction_failure_records_failed_turn_without_main_model_call() {
-        let root = std::env::temp_dir().join(format!(
-            "morrow-cli-run-compact-fail-{}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&root).expect("create root");
+        let root = unique_cli_dir("run-compact-fail");
         let (base_url, requests) = spawn_recording_sse_server(vec!["data: {not-json}\n\n"]).await;
         let client = client(base_url);
         let mut session = compactable_session();
@@ -1175,6 +1613,7 @@ mod tests {
             "large active context that exceeds the tiny budget",
         ));
         let original_active_thread = session.active_thread.clone();
+        let mut output = Vec::new();
 
         let outcome = run_agent_turn(
             RunAgentTurnContext {
@@ -1184,9 +1623,11 @@ mod tests {
                 workspace_root: &root,
                 permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
                 interactive_approvals: false,
+                output: OutputMode::Human,
             },
             &mut session,
             "hello",
+            &mut output,
         )
         .await
         .expect("run turn");

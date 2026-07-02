@@ -81,7 +81,6 @@ impl Agent {
             turn: Turn::running(user_message.clone()),
             turn_messages: vec![user_message.clone()],
             assistant_text: String::new(),
-            assistant_deltas: VecDeque::new(),
             pending: VecDeque::from([AgentEvent::TurnStarted]),
             finished: false,
             tool_rounds: 0,
@@ -112,7 +111,6 @@ pub struct AgentTurnStream<'a> {
     turn: Turn,
     turn_messages: Vec<Message>,
     assistant_text: String,
-    assistant_deltas: VecDeque<String>,
     pending: VecDeque<AgentEvent>,
     finished: bool,
     tool_rounds: usize,
@@ -170,9 +168,6 @@ impl AgentTurnStream<'_> {
         self.turn_messages.push(assistant_message.clone());
         self.thread.messages.extend(self.turn_messages.clone());
         self.turn.complete(assistant_message);
-        for text in self.assistant_deltas.drain(..) {
-            self.pending.push_back(AgentEvent::TextDelta(text));
-        }
         self.pending
             .push_back(AgentEvent::AgentMessage(assistant_text));
         self.pending.push_back(AgentEvent::TurnCompleted);
@@ -204,7 +199,6 @@ impl AgentTurnStream<'_> {
         }
         self.tool_rounds += 1;
         self.assistant_text.clear();
-        self.assistant_deltas.clear();
 
         let assistant_message = Message::assistant_tool_calls(tool_calls.clone());
         self.conversation.push(assistant_message.clone());
@@ -376,8 +370,7 @@ impl Stream for AgentTurnStream<'_> {
                 match Pin::new(model_stream).poll_next(cx) {
                     Poll::Ready(Some(Ok(ModelEvent::TextDelta(text)))) => {
                         this.assistant_text.push_str(&text);
-                        this.assistant_deltas.push_back(text);
-                        continue;
+                        return Poll::Ready(Some(AgentEvent::TextDelta(text)));
                     }
                     Poll::Ready(Some(Ok(ModelEvent::ToolCalls(tool_calls)))) => {
                         this.model_stream = None;
@@ -447,6 +440,35 @@ mod tests {
                 .expect("write response");
         });
         format!("http://{addr}/v1")
+    }
+
+    async fn spawn_gated_sse_server(
+        first_chunk: &'static str,
+        rest: &'static str,
+    ) -> (String, tokio::sync::oneshot::Sender<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind server");
+        let addr = listener.local_addr().expect("server addr");
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept request");
+            let mut request = vec![0_u8; 4096];
+            let _ = socket.read(&mut request).await.expect("read request");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                first_chunk.len() + rest.len()
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response headers");
+            socket
+                .write_all(first_chunk.as_bytes())
+                .await
+                .expect("write first chunk");
+            let _ = release_rx.await;
+            socket.write_all(rest.as_bytes()).await.expect("write rest");
+        });
+        (format!("http://{addr}/v1"), release_tx)
     }
 
     async fn spawn_recording_sse_server(
@@ -586,6 +608,36 @@ mod tests {
             thread.messages,
             vec![Message::user("Say hi"), Message::assistant("Hello world"),]
         );
+    }
+
+    #[tokio::test]
+    async fn run_turn_emits_text_delta_before_stream_done() {
+        let first_chunk =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n";
+        let rest = "data: [DONE]\n\n";
+        let (base_url, release) = spawn_gated_sse_server(first_chunk, rest).await;
+        let agent = Agent::new(client(base_url), "You are helpful.");
+        let mut thread = Thread::new();
+        let mut stream = agent
+            .run_turn(&mut thread, "Say hi")
+            .await
+            .expect("run turn");
+
+        assert_eq!(next_event(&mut stream).await, AgentEvent::TurnStarted);
+        let delta = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("text delta before done")
+            .expect("text delta event");
+        assert_eq!(delta, AgentEvent::TextDelta("Hello".to_string()));
+
+        release.send(()).expect("release stream");
+
+        assert_eq!(
+            next_event(&mut stream).await,
+            AgentEvent::AgentMessage("Hello".to_string())
+        );
+        assert_eq!(next_event(&mut stream).await, AgentEvent::TurnCompleted);
+        assert_eq!(stream.next().await, None);
     }
 
     #[tokio::test]
