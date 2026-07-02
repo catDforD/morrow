@@ -1,0 +1,94 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+            bin: morrow
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            archive: tar.gz
+            bin: morrow
+          - target: x86_64-apple-darwin
+            os: macos-13
+            archive: tar.gz
+            bin: morrow
+          - target: aarch64-apple-darwin
+            os: macos-14
+            archive: tar.gz
+            bin: morrow
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+            bin: morrow.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --bin morrow --target ${{ matrix.target }}
+
+      - name: Package Unix
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          mkdir -p dist/pkg
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" dist/pkg/morrow
+          chmod +x dist/pkg/morrow
+          tar -C dist/pkg -czf "dist/morrow-${{ matrix.target }}.tar.gz" morrow
+
+      - name: Package Windows
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/pkg | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/pkg/morrow.exe"
+          Compress-Archive -Path "dist/pkg/morrow.exe" -DestinationPath "dist/morrow-${{ matrix.target }}.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: morrow-${{ matrix.target }}
+          path: dist/morrow-*
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum morrow-* > SHA256SUMS
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/morrow-*
+            dist/SHA256SUMS

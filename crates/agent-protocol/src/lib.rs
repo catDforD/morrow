@@ -57,6 +57,18 @@ impl Message {
         }
     }
 
+    pub fn assistant_tool_calls_with_content(
+        content: impl Into<String>,
+        tool_calls: Vec<ToolCall>,
+    ) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: Some(content.into()),
+            tool_calls: Some(tool_calls),
+            tool_call_id: None,
+        }
+    }
+
     pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
             role: Role::Tool,
@@ -909,6 +921,31 @@ mod tests {
                     "tool_call_id": "call_1"
                 }
             ])
+        );
+    }
+
+    #[test]
+    fn serializes_assistant_tool_call_message_with_content() {
+        let tool_call = ToolCall::function("call_1", "read_file", r#"{"path":"Cargo.toml"}"#);
+        let message =
+            Message::assistant_tool_calls_with_content("I will read it.", vec![tool_call]);
+
+        let value = serde_json::to_value(&message).expect("serialize message");
+
+        assert_eq!(
+            value,
+            json!({
+                "role": "assistant",
+                "content": "I will read it.",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"Cargo.toml\"}"
+                    }
+                }]
+            })
         );
     }
 

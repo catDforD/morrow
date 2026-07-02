@@ -20,6 +20,11 @@ use thiserror::Error;
 
 mod session_store;
 
+const INIT_CONFIG_MODEL: &str = "gpt-4.1";
+const INIT_CONFIG_BASE_URL: &str = "https://api.openai.com/v1";
+const INIT_CONFIG_API_KEY_PLACEHOLDER: &str = "replace-with-your-openai-api-key";
+const INIT_CONFIG_TIMEOUT_SECS: u64 = 120;
+
 #[derive(Debug, Parser)]
 #[command(name = "morrow")]
 #[command(about = "Minimal OpenAI-compatible agent loop CLI")]
@@ -57,6 +62,12 @@ struct Args {
 
 #[derive(Debug, Subcommand)]
 enum CliCommand {
+    Init {
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        template: bool,
+    },
     Session {
         #[command(subcommand)]
         command: SessionCommand,
@@ -103,6 +114,24 @@ enum CliError {
     JsonlRequiresPrompt,
     #[error("--jsonl cannot be used with session commands")]
     JsonlUnsupportedForSessionCommand,
+    #[error("home directory was not found")]
+    HomeDirNotFound,
+    #[error("config file already exists: {path}; use --force to overwrite it")]
+    ConfigExists { path: PathBuf },
+    #[error("API key must not be empty")]
+    EmptyApiKey,
+    #[error("failed to create config directory {path}: {source}")]
+    ConfigCreateDir {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to write config file {path}: {source}")]
+    ConfigWrite {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
     #[error("output file already exists: {path}")]
     OutputExists { path: PathBuf },
     #[error("failed to write output file {path}: {source}")]
@@ -551,10 +580,92 @@ fn handle_cli_command(
     stdout: &mut dyn Write,
 ) -> Result<(), CliError> {
     match command {
+        CliCommand::Init { force, template } => handle_init_command(*force, *template, stdout),
         CliCommand::Session { command } => {
             handle_session_command(command, default_session_name, stdout)
         }
     }
+}
+
+fn handle_init_command(
+    force: bool,
+    template: bool,
+    stdout: &mut dyn Write,
+) -> Result<(), CliError> {
+    let path = default_config_path()?;
+    let api_key = if template {
+        INIT_CONFIG_API_KEY_PLACEHOLDER.to_string()
+    } else {
+        read_init_api_key()?
+    };
+
+    write_init_config(&path, &api_key, force)?;
+    writeln!(stdout, "wrote config: {}", path.display()).map_err(CliError::Stdout)?;
+    if template {
+        writeln!(stdout, "edit [model].OPENAI_API_KEY before running morrow")
+            .map_err(CliError::Stdout)?;
+    } else {
+        writeln!(stdout, "try: morrow \"hello\"").map_err(CliError::Stdout)?;
+    }
+    Ok(())
+}
+
+fn default_config_path() -> Result<PathBuf, CliError> {
+    let home = dirs::home_dir().ok_or(CliError::HomeDirNotFound)?;
+    Ok(default_config_path_for_home(&home))
+}
+
+fn default_config_path_for_home(home: &Path) -> PathBuf {
+    home.join(".morrow").join("config.toml")
+}
+
+fn read_init_api_key() -> Result<String, CliError> {
+    eprint!("OpenAI API key: ");
+    io::stderr().flush().map_err(CliError::Stderr)?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).map_err(CliError::Stdin)?;
+    let api_key = input.trim().to_string();
+    if api_key.is_empty() {
+        return Err(CliError::EmptyApiKey);
+    }
+    Ok(api_key)
+}
+
+fn write_init_config(path: &Path, api_key: &str, force: bool) -> Result<(), CliError> {
+    if path.exists() && !force {
+        return Err(CliError::ConfigExists {
+            path: path.to_path_buf(),
+        });
+    }
+    if api_key.trim().is_empty() {
+        return Err(CliError::EmptyApiKey);
+    }
+
+    let parent = path.parent().expect("config path must have parent");
+    fs::create_dir_all(parent).map_err(|source| CliError::ConfigCreateDir {
+        path: parent.to_path_buf(),
+        source,
+    })?;
+    fs::write(path, render_init_config(api_key)).map_err(|source| CliError::ConfigWrite {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(())
+}
+
+fn render_init_config(api_key: &str) -> String {
+    format!(
+        r#"[model]
+base_url = "{INIT_CONFIG_BASE_URL}"
+model = "{INIT_CONFIG_MODEL}"
+OPENAI_API_KEY = "{api_key}"
+timeout_secs = {INIT_CONFIG_TIMEOUT_SECS}
+
+[permissions]
+mode = "read_only"
+shell = "deny"
+"#
+    )
 }
 
 fn handle_session_command(
@@ -1304,6 +1415,26 @@ mod tests {
 
     #[test]
     fn parses_session_subcommands() {
+        let init_args =
+            Args::try_parse_from(["morrow", "init", "--template"]).expect("parse init template");
+        assert!(matches!(
+            init_args.command,
+            Some(CliCommand::Init {
+                force: false,
+                template: true
+            })
+        ));
+
+        let force_init_args =
+            Args::try_parse_from(["morrow", "init", "--force"]).expect("parse init force");
+        assert!(matches!(
+            force_init_args.command,
+            Some(CliCommand::Init {
+                force: true,
+                template: false
+            })
+        ));
+
         let list_args =
             Args::try_parse_from(["morrow", "session", "list"]).expect("parse session list");
         assert!(matches!(
@@ -1330,6 +1461,45 @@ mod tests {
             })
         ));
         assert_eq!(resolve_session_name(&export_args).expect("session"), "work");
+    }
+
+    #[test]
+    fn init_config_writes_global_config_template() {
+        let home = unique_cli_dir("init-home");
+        let path = default_config_path_for_home(&home);
+
+        write_init_config(&path, INIT_CONFIG_API_KEY_PLACEHOLDER, false)
+            .expect("write init config");
+
+        let content = fs::read_to_string(path).expect("read init config");
+        assert!(content.contains(r#"base_url = "https://api.openai.com/v1""#));
+        assert!(content.contains(r#"model = "gpt-4.1""#));
+        assert!(content.contains(r#"OPENAI_API_KEY = "replace-with-your-openai-api-key""#));
+        assert!(content.contains(r#"mode = "read_only""#));
+        assert!(content.contains(r#"shell = "deny""#));
+    }
+
+    #[test]
+    fn init_config_refuses_existing_file_unless_forced() {
+        let home = unique_cli_dir("init-force-home");
+        let path = default_config_path_for_home(&home);
+        write_init_config(&path, "first-key", false).expect("write first config");
+
+        let err = write_init_config(&path, "second-key", false).expect_err("must not overwrite");
+
+        assert!(matches!(err, CliError::ConfigExists { .. }));
+        assert!(
+            fs::read_to_string(&path)
+                .expect("read preserved config")
+                .contains("first-key")
+        );
+
+        write_init_config(&path, "second-key", true).expect("force overwrite");
+        assert!(
+            fs::read_to_string(path)
+                .expect("read overwritten config")
+                .contains("second-key")
+        );
     }
 
     #[test]
