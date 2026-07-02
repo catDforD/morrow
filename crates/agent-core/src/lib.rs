@@ -1,7 +1,7 @@
 use agent_model::{ChatCompletionStream, ModelError, ModelEvent, OpenAiCompatClient};
 use agent_protocol::{
     AgentEvent, ApprovalDecision, ApprovalRequest, Conversation, Message, Thread, ToolCall, Turn,
-    TurnStep,
+    TurnRecord, TurnStep,
 };
 use agent_tools::{ToolExecution, ToolRegistry, ToolResult};
 use futures_util::Stream;
@@ -61,19 +61,19 @@ impl Agent {
         let mut conversation = Conversation::with_system_prompt(self.system_prompt.clone());
         conversation.messages.extend(thread.messages.clone());
         conversation.push(user_message.clone());
-
-        let model_stream = self
-            .client
-            .stream_chat(&conversation, self.tools.definitions())
-            .await?;
+        let client = self.client.clone();
+        let conversation_for_model = conversation.clone();
+        let tools = self.tools.definitions().to_vec();
 
         Ok(AgentTurnStream {
             client: self.client.clone(),
             tools: self.tools.clone(),
             max_tool_rounds: self.max_tool_rounds,
             conversation,
-            model_stream: Some(model_stream),
-            model_start: None,
+            model_stream: None,
+            model_start: Some(
+                async move { client.stream_chat(&conversation_for_model, &tools).await }.boxed(),
+            ),
             pending_tool_calls: VecDeque::new(),
             tool_future: None,
             pending_approval: None,
@@ -125,6 +125,10 @@ impl AgentTurnStream<'_> {
 
     pub fn into_turn(self) -> Turn {
         self.turn
+    }
+
+    pub fn into_turn_record(self) -> TurnRecord {
+        TurnRecord::new(self.turn, self.turn_messages)
     }
 
     pub fn resolve_approval(&mut self, decision: ApprovalDecision) -> Result<(), AgentError> {

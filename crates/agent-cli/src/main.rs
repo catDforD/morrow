@@ -1,23 +1,23 @@
-use agent_config::load_config;
+use agent_config::{ContextConfig, load_config};
 use agent_core::{Agent, AgentError};
-use agent_model::{ModelError, OpenAiCompatClient, OpenAiCompatConfig};
+use agent_model::{ModelError, ModelEvent, OpenAiCompatClient, OpenAiCompatConfig};
 use agent_protocol::{
-    AgentEvent, ApprovalAction, ApprovalDecision, ApprovalRequest, FileChangeSummary,
-    PermissionMode, PermissionProfile, ShellCommandSummary, ShellPolicy, Thread,
-    ToolExecutionSummary,
+    AgentEvent, ApprovalAction, ApprovalDecision, ApprovalRequest, Conversation, FileChangeSummary,
+    Message, PermissionMode, PermissionProfile, Session, ShellCommandSummary, ShellPolicy,
+    ToolExecutionSummary, TurnRecord, TurnStatus,
 };
 use agent_tools::{ToolRegistry, ToolRegistryError};
 use clap::Parser;
 use futures_util::StreamExt;
+use session_store::SessionStore;
 use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
-use thread_store::ThreadStore;
 
-mod thread_store;
+mod session_store;
 
 #[derive(Debug, Parser)]
 #[command(name = "morrow")]
@@ -26,10 +26,16 @@ struct Args {
     #[arg(long)]
     config: Option<PathBuf>,
 
-    #[arg(long, default_value = "default")]
-    thread: String,
+    #[arg(long)]
+    session: Option<String>,
+
+    #[arg(long, help = "Deprecated alias for --session")]
+    thread: Option<String>,
 
     #[arg(long)]
+    reset_session: bool,
+
+    #[arg(long, help = "Deprecated alias for --reset-session")]
     reset_thread: bool,
 
     #[arg(long, value_parser = parse_permission_mode)]
@@ -51,11 +57,13 @@ enum CliError {
     #[error(transparent)]
     Agent(#[from] AgentError),
     #[error(transparent)]
-    ThreadStore(#[from] thread_store::ThreadStoreError),
+    SessionStore(#[from] session_store::SessionStoreError),
     #[error(transparent)]
     Tools(#[from] ToolRegistryError),
     #[error("agent run failed: {0}")]
     AgentRun(String),
+    #[error("--session and --thread cannot be used together")]
+    ConflictingSessionArgs,
     #[error("failed to read stdin: {0}")]
     Stdin(#[source] io::Error),
     #[error("failed to write stderr: {0}")]
@@ -74,6 +82,8 @@ async fn main() {
 
 async fn run() -> Result<(), CliError> {
     let args = Args::parse();
+    let session_name = resolve_session_name(&args)?;
+    let reset_session = args.reset_session || args.reset_thread;
     let loaded = load_config(args.config.as_deref())?;
     let permissions =
         effective_permissions(loaded.config.permissions, args.permission, args.allow_shell);
@@ -83,11 +93,11 @@ async fn run() -> Result<(), CliError> {
         api_key: loaded.api_key,
         timeout: Duration::from_secs(loaded.config.model.timeout_secs),
     })?;
-    let thread_store = ThreadStore::for_current_dir(&args.thread)?;
-    let mut thread = if args.reset_thread {
-        Thread::new()
+    let session_store = SessionStore::for_current_dir(&session_name)?;
+    let mut session = if reset_session {
+        Session::new()
     } else {
-        thread_store.load()?
+        session_store.load()?
     };
     let workspace_root = detect_workspace_root()?;
     let prompt = args.prompt.join(" ");
@@ -98,31 +108,38 @@ async fn run() -> Result<(), CliError> {
             ReplContext {
                 client: &client,
                 system_prompt: &loaded.config.agent.system_prompt,
-                thread_store: &thread_store,
-                thread_name: &args.thread,
+                context_config: loaded.config.context,
+                session_store: &session_store,
+                session_name: &session_name,
                 workspace_root: &workspace_root,
                 config_path: &loaded.path,
             },
-            &mut thread,
+            &mut session,
             &mut permissions,
         )
         .await?;
         return Ok(());
     }
 
-    let turn_completed = run_agent_turn(
-        &client,
-        &loaded.config.agent.system_prompt,
-        &mut thread,
-        &workspace_root,
-        permissions,
+    let outcome = run_agent_turn(
+        RunAgentTurnContext {
+            client: &client,
+            system_prompt: &loaded.config.agent.system_prompt,
+            context_config: loaded.config.context,
+            workspace_root: &workspace_root,
+            permissions,
+            interactive_approvals: io::stdin().is_terminal(),
+        },
+        &mut session,
         &prompt,
-        io::stdin().is_terminal(),
     )
     .await?;
 
-    if turn_completed {
-        thread_store.save(&thread)?;
+    if outcome.session_changed {
+        session_store.save(&session)?;
+    }
+    if let Some(error) = outcome.error {
+        return Err(CliError::AgentRun(error));
     }
 
     Ok(())
@@ -131,10 +148,21 @@ async fn run() -> Result<(), CliError> {
 struct ReplContext<'a> {
     client: &'a OpenAiCompatClient,
     system_prompt: &'a str,
-    thread_store: &'a ThreadStore,
-    thread_name: &'a str,
+    context_config: ContextConfig,
+    session_store: &'a SessionStore,
+    session_name: &'a str,
     workspace_root: &'a Path,
     config_path: &'a Path,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RunAgentTurnContext<'a> {
+    client: &'a OpenAiCompatClient,
+    system_prompt: &'a str,
+    context_config: ContextConfig,
+    workspace_root: &'a Path,
+    permissions: PermissionProfile,
+    interactive_approvals: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -144,9 +172,21 @@ struct ExecutionRecord {
     summary: Option<ToolExecutionSummary>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RunAgentTurnOutcome {
+    session_changed: bool,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompactionOutcome {
+    Changed,
+    Noop,
+}
+
 async fn run_repl(
     context: ReplContext<'_>,
-    thread: &mut Thread,
+    session: &mut Session,
     permissions: &mut PermissionProfile,
 ) -> Result<(), CliError> {
     eprintln!("morrow interactive mode. Type /exit to quit.");
@@ -167,46 +207,41 @@ async fn run_repl(
         }
 
         if input.starts_with('/') {
-            if handle_repl_command(
-                input,
-                context.thread_store,
-                context.thread_name,
-                thread,
-                context.workspace_root,
-                context.config_path,
-                permissions,
-            )? {
+            if handle_repl_command(input, &context, session, permissions).await? {
                 break;
             }
             continue;
         }
 
-        let turn_completed = run_agent_turn(
-            context.client,
-            context.system_prompt,
-            thread,
-            context.workspace_root,
-            *permissions,
+        let outcome = run_agent_turn(
+            RunAgentTurnContext {
+                client: context.client,
+                system_prompt: context.system_prompt,
+                context_config: context.context_config,
+                workspace_root: context.workspace_root,
+                permissions: *permissions,
+                interactive_approvals: io::stdin().is_terminal(),
+            },
+            session,
             input,
-            io::stdin().is_terminal(),
         )
         .await?;
 
-        if turn_completed {
-            context.thread_store.save(thread)?;
+        if outcome.session_changed {
+            context.session_store.save(session)?;
+        }
+        if let Some(error) = outcome.error {
+            return Err(CliError::AgentRun(error));
         }
     }
 
     Ok(())
 }
 
-fn handle_repl_command(
+async fn handle_repl_command(
     input: &str,
-    thread_store: &ThreadStore,
-    thread_name: &str,
-    thread: &mut Thread,
-    workspace_root: &Path,
-    config_path: &Path,
+    context: &ReplContext<'_>,
+    session: &mut Session,
     permissions: &mut PermissionProfile,
 ) -> Result<bool, CliError> {
     let mut parts = input.split_whitespace();
@@ -215,16 +250,46 @@ fn handle_repl_command(
     match command {
         "/exit" | "/quit" => Ok(true),
         "/status" => {
-            eprintln!("thread: {thread_name}");
-            eprintln!("workspace: {}", workspace_root.display());
-            eprintln!("config: {}", config_path.display());
+            eprintln!("session: {}", context.session_name);
+            eprintln!("turns: {}", session.turns.len());
+            eprintln!("active messages: {}", session.active_thread.messages.len());
+            eprintln!(
+                "summary: {}",
+                if session.context.summary.is_some() {
+                    "yes"
+                } else {
+                    "no"
+                }
+            );
+            eprintln!("workspace: {}", context.workspace_root.display());
+            eprintln!("config: {}", context.config_path.display());
+            eprintln!("context: {}", context_summary(context.context_config));
             eprintln!("permissions: {}", permission_summary(*permissions));
             Ok(false)
         }
         "/reset" => {
-            *thread = Thread::new();
-            thread_store.save(thread)?;
-            eprintln!("thread reset");
+            *session = Session::new();
+            context.session_store.save(session)?;
+            eprintln!("session reset");
+            Ok(false)
+        }
+        "/compact" => {
+            match compact_session(
+                context.client,
+                context.system_prompt,
+                session,
+                context.context_config,
+            )
+            .await?
+            {
+                CompactionOutcome::Changed => {
+                    context.session_store.save(session)?;
+                    eprintln!("session compacted");
+                }
+                CompactionOutcome::Noop => {
+                    eprintln!("no compactable session history");
+                }
+            }
             Ok(false)
         }
         "/permissions" => {
@@ -249,16 +314,35 @@ fn handle_repl_command(
 }
 
 async fn run_agent_turn(
-    client: &OpenAiCompatClient,
-    system_prompt: &str,
-    thread: &mut Thread,
-    workspace_root: &Path,
-    permissions: PermissionProfile,
+    context: RunAgentTurnContext<'_>,
+    session: &mut Session,
     prompt: &str,
-    interactive_approvals: bool,
-) -> Result<bool, CliError> {
-    let tools = ToolRegistry::built_in(workspace_root, permissions)?;
-    let agent = Agent::with_tools(client.clone(), system_prompt.to_string(), tools);
+) -> Result<RunAgentTurnOutcome, CliError> {
+    if let Err(error) = maybe_auto_compact(
+        context.client,
+        context.system_prompt,
+        session,
+        context.context_config,
+        prompt,
+    )
+    .await
+    {
+        let message = format!("context compaction failed: {error}");
+        session
+            .turns
+            .push(TurnRecord::failed_user_prompt(prompt, message.clone()));
+        return Ok(RunAgentTurnOutcome {
+            session_changed: true,
+            error: Some(message),
+        });
+    }
+
+    let tools = ToolRegistry::built_in(context.workspace_root, context.permissions)?;
+    let agent = Agent::with_tools(
+        context.client.clone(),
+        context.system_prompt.to_string(),
+        tools,
+    );
     let mut stdout = io::stdout().lock();
     let mut wrote_text = false;
     let mut output_ends_with_newline = false;
@@ -267,7 +351,9 @@ async fn run_agent_turn(
     let mut execution_records = Vec::new();
 
     {
-        let mut stream = agent.run_turn(thread, prompt.to_string()).await?;
+        let mut stream = agent
+            .run_turn(&mut session.active_thread, prompt.to_string())
+            .await?;
 
         while let Some(event) = stream.next().await {
             match event {
@@ -292,7 +378,11 @@ async fn run_agent_turn(
                     execution_records.push(ExecutionRecord { name, ok, summary });
                 }
                 AgentEvent::ApprovalRequested(request) => {
-                    let decision = approval_decision(&request, permissions, interactive_approvals)?;
+                    let decision = approval_decision(
+                        &request,
+                        context.permissions,
+                        context.interactive_approvals,
+                    )?;
                     stream.resolve_approval(decision)?;
                 }
                 AgentEvent::ApprovalResolved(decision) => {
@@ -316,13 +406,251 @@ async fn run_agent_turn(
                 }
             }
         }
+
+        session.turns.push(stream.into_turn_record());
     }
 
-    if let Some(message) = agent_error {
-        return Err(CliError::AgentRun(message));
+    Ok(RunAgentTurnOutcome {
+        session_changed: true,
+        error: agent_error.filter(|_| !turn_completed),
+    })
+}
+
+fn resolve_session_name(args: &Args) -> Result<String, CliError> {
+    match (&args.session, &args.thread) {
+        (Some(_), Some(_)) => Err(CliError::ConflictingSessionArgs),
+        (Some(session), None) => Ok(session.clone()),
+        (None, Some(thread)) => Ok(thread.clone()),
+        (None, None) => Ok("default".to_string()),
+    }
+}
+
+async fn maybe_auto_compact(
+    client: &OpenAiCompatClient,
+    system_prompt: &str,
+    session: &mut Session,
+    context_config: ContextConfig,
+    prompt: &str,
+) -> Result<(), String> {
+    if !context_config.auto_compact {
+        return Ok(());
     }
 
-    Ok(turn_completed)
+    let estimate = estimate_context_chars(system_prompt, session, prompt);
+    if estimate <= context_config.max_context_chars {
+        return Ok(());
+    }
+
+    compact_session(client, system_prompt, session, context_config)
+        .await
+        .map_err(|err| err.to_string())?;
+
+    let compacted_estimate = estimate_context_chars(system_prompt, session, prompt);
+    if compacted_estimate > context_config.max_context_chars {
+        return Err(format!(
+            "context is still over budget after compaction ({compacted_estimate} > {})",
+            context_config.max_context_chars
+        ));
+    }
+
+    Ok(())
+}
+
+async fn compact_session(
+    client: &OpenAiCompatClient,
+    _system_prompt: &str,
+    session: &mut Session,
+    context_config: ContextConfig,
+) -> Result<CompactionOutcome, CliError> {
+    let prefix_len = compactable_prefix_len(session, context_config.retain_recent_turns);
+    if prefix_len <= session.context.summarized_turns {
+        return Ok(CompactionOutcome::Noop);
+    }
+
+    let records = session.turns[session.context.summarized_turns..prefix_len].to_vec();
+    let summary = request_session_summary(
+        client,
+        session.context.summary.as_deref(),
+        context_config.summary_target_chars,
+        &records,
+        session.context.summarized_turns,
+    )
+    .await?;
+
+    session.context.summary = Some(summary);
+    session.context.summarized_turns = prefix_len;
+    rebuild_active_thread(session);
+
+    Ok(CompactionOutcome::Changed)
+}
+
+fn compactable_prefix_len(session: &Session, retain_recent_turns: usize) -> usize {
+    let completed_indices = session
+        .turns
+        .iter()
+        .enumerate()
+        .filter_map(|(index, record)| {
+            (record.turn.status == TurnStatus::Completed).then_some(index)
+        })
+        .collect::<Vec<_>>();
+
+    if completed_indices.len() <= retain_recent_turns {
+        return session.context.summarized_turns;
+    }
+
+    completed_indices[completed_indices.len() - retain_recent_turns]
+        .max(session.context.summarized_turns)
+}
+
+fn rebuild_active_thread(session: &mut Session) {
+    let mut messages = Vec::new();
+    if let Some(summary) = session.context.summary.as_ref() {
+        messages.push(Message::system(format!("Session summary:\n{summary}")));
+    }
+
+    for record in session.turns.iter().skip(session.context.summarized_turns) {
+        if record.turn.status == TurnStatus::Completed {
+            messages.extend(record.messages.clone());
+        }
+    }
+
+    session.active_thread.messages = messages;
+}
+
+async fn request_session_summary(
+    client: &OpenAiCompatClient,
+    existing_summary: Option<&str>,
+    target_chars: usize,
+    records: &[TurnRecord],
+    first_turn_index: usize,
+) -> Result<String, CliError> {
+    let mut conversation = Conversation::with_system_prompt(
+        "You compact long-running coding agent session history. Produce a concise, factual summary that preserves user goals, constraints, decisions, file and command results, failure reasons, pending tasks, and open questions. Do not include fluff.",
+    );
+    conversation.push(Message::user(build_summary_prompt(
+        existing_summary,
+        target_chars,
+        records,
+        first_turn_index,
+    )));
+
+    let mut stream = client.stream_chat(&conversation, &[]).await?;
+    let mut summary = String::new();
+    while let Some(event) = stream.next().await {
+        match event? {
+            ModelEvent::TextDelta(text) => summary.push_str(&text),
+            ModelEvent::Completed => {
+                let summary = summary.trim().to_string();
+                if summary.is_empty() {
+                    return Err(CliError::AgentRun(
+                        "summary model returned an empty summary".to_string(),
+                    ));
+                }
+                return Ok(summary);
+            }
+            ModelEvent::ToolCalls(_) => {
+                return Err(CliError::AgentRun(
+                    "summary model requested tool calls".to_string(),
+                ));
+            }
+        }
+    }
+
+    Err(CliError::AgentRun(
+        "summary model stream ended before completion".to_string(),
+    ))
+}
+
+fn build_summary_prompt(
+    existing_summary: Option<&str>,
+    target_chars: usize,
+    records: &[TurnRecord],
+    first_turn_index: usize,
+) -> String {
+    let mut prompt = String::new();
+    let _ = writeln!(
+        prompt,
+        "Update the session summary. Target length: at most {target_chars} characters."
+    );
+    let _ = writeln!(prompt);
+    let _ = writeln!(prompt, "Existing summary:");
+    let _ = writeln!(prompt, "{}", existing_summary.unwrap_or("(none)"));
+    let _ = writeln!(prompt);
+    let _ = writeln!(prompt, "Turns to incorporate:");
+
+    for (offset, record) in records.iter().enumerate() {
+        append_turn_record_transcript(&mut prompt, first_turn_index + offset, record);
+    }
+
+    prompt
+}
+
+fn append_turn_record_transcript(output: &mut String, index: usize, record: &TurnRecord) {
+    let _ = writeln!(
+        output,
+        "\nTurn {index}: status={}",
+        turn_status_label(record.turn.status)
+    );
+    if let Some(error) = record.turn.error.as_ref() {
+        let _ = writeln!(output, "turn_error: {error}");
+    }
+    for message in &record.messages {
+        let _ = writeln!(output, "{}:", message_role_label(message));
+        if let Some(content) = message.content.as_ref() {
+            let _ = writeln!(output, "{content}");
+        }
+        if let Some(tool_calls) = message.tool_calls.as_ref() {
+            let tool_calls = serde_json::to_string(tool_calls).unwrap_or_else(|_| "[]".to_string());
+            let _ = writeln!(output, "tool_calls: {tool_calls}");
+        }
+        if let Some(tool_call_id) = message.tool_call_id.as_ref() {
+            let _ = writeln!(output, "tool_call_id: {tool_call_id}");
+        }
+    }
+}
+
+fn estimate_context_chars(system_prompt: &str, session: &Session, prompt: &str) -> usize {
+    system_prompt.chars().count()
+        + prompt.chars().count()
+        + session
+            .active_thread
+            .messages
+            .iter()
+            .map(message_context_chars)
+            .sum::<usize>()
+}
+
+fn message_context_chars(message: &Message) -> usize {
+    let mut total = message_role_label(message).len();
+    if let Some(content) = message.content.as_ref() {
+        total += content.chars().count();
+    }
+    if let Some(tool_call_id) = message.tool_call_id.as_ref() {
+        total += tool_call_id.chars().count();
+    }
+    if let Some(tool_calls) = message.tool_calls.as_ref() {
+        total += serde_json::to_string(tool_calls)
+            .map(|value| value.chars().count())
+            .unwrap_or_default();
+    }
+    total
+}
+
+fn message_role_label(message: &Message) -> &'static str {
+    match message.role {
+        agent_protocol::Role::System => "system",
+        agent_protocol::Role::User => "user",
+        agent_protocol::Role::Assistant => "assistant",
+        agent_protocol::Role::Tool => "tool",
+    }
+}
+
+fn turn_status_label(status: TurnStatus) -> &'static str {
+    match status {
+        TurnStatus::Running => "running",
+        TurnStatus::Completed => "completed",
+        TurnStatus::Failed => "failed",
+    }
 }
 
 fn approval_decision(
@@ -478,6 +806,16 @@ fn permission_summary(permissions: PermissionProfile) -> String {
     )
 }
 
+fn context_summary(context: ContextConfig) -> String {
+    format!(
+        "auto_compact={}, max_context_chars={}, retain_recent_turns={}, summary_target_chars={}",
+        context.auto_compact,
+        context.max_context_chars,
+        context.retain_recent_turns,
+        context.summary_target_chars
+    )
+}
+
 fn parse_permission_mode(value: &str) -> Result<PermissionMode, String> {
     match value {
         "read-only" | "read_only" => Ok(PermissionMode::ReadOnly),
@@ -490,7 +828,7 @@ fn parse_permission_mode(value: &str) -> Result<PermissionMode, String> {
 }
 
 fn detect_workspace_root() -> Result<PathBuf, CliError> {
-    let cwd = std::env::current_dir().map_err(thread_store::ThreadStoreError::CurrentDir)?;
+    let cwd = std::env::current_dir().map_err(session_store::SessionStoreError::CurrentDir)?;
     let mut candidate = cwd.as_path();
 
     loop {
@@ -515,7 +853,97 @@ fn manifest_has_workspace_header(path: &std::path::Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_protocol::FileChangeOperation;
+    use agent_protocol::{FileChangeOperation, Thread, Turn};
+    use serde_json::json;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    async fn spawn_recording_sse_server(
+        bodies: Vec<&'static str>,
+    ) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind server");
+        let addr = listener.local_addr().expect("server addr");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured_requests = Arc::clone(&requests);
+        tokio::spawn(async move {
+            for body in bodies {
+                let (mut socket, _) = listener.accept().await.expect("accept request");
+                let mut request = vec![0_u8; 8192];
+                let read = socket.read(&mut request).await.expect("read request");
+                captured_requests
+                    .lock()
+                    .expect("requests lock poisoned")
+                    .push(String::from_utf8_lossy(&request[..read]).to_string());
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write response");
+            }
+        });
+        (format!("http://{addr}/v1"), requests)
+    }
+
+    fn client(base_url: String) -> OpenAiCompatClient {
+        OpenAiCompatClient::new_without_proxy(OpenAiCompatConfig {
+            base_url,
+            model: "test-model".to_string(),
+            api_key: "test-key".to_string(),
+            timeout: Duration::from_secs(5),
+        })
+        .expect("client")
+    }
+
+    fn sse_text_body(text: &str) -> &'static str {
+        let body = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({
+                "choices": [{
+                    "delta": {"content": text},
+                    "finish_reason": null
+                }]
+            })
+        );
+        Box::leak(body.into_boxed_str())
+    }
+
+    fn context_config(max_context_chars: usize, retain_recent_turns: usize) -> ContextConfig {
+        ContextConfig {
+            auto_compact: true,
+            max_context_chars,
+            retain_recent_turns,
+            summary_target_chars: 256,
+        }
+    }
+
+    fn completed_record(user: &str, assistant: &str) -> TurnRecord {
+        let user_message = Message::user(user);
+        let assistant_message = Message::assistant(assistant);
+        let mut turn = Turn::running(user_message.clone());
+        turn.complete(assistant_message.clone());
+        TurnRecord::new(turn, vec![user_message, assistant_message])
+    }
+
+    fn compactable_session() -> Session {
+        let turns = vec![
+            completed_record("u0", "a0"),
+            completed_record("u1", "a1"),
+            TurnRecord::failed_user_prompt("broken", "failure reason"),
+            completed_record("u3", "a3"),
+            completed_record("u4", "a4"),
+        ];
+        let mut session = Session {
+            active_thread: Thread::new(),
+            turns,
+            context: agent_protocol::SessionContext::new(),
+        };
+        rebuild_active_thread(&mut session);
+        session
+    }
 
     fn file_summary() -> FileChangeSummary {
         FileChangeSummary {
@@ -543,6 +971,37 @@ mod tests {
             PermissionMode::DangerFullAccess
         );
         assert!(parse_permission_mode("full").is_err());
+    }
+
+    #[test]
+    fn resolves_session_cli_args_and_thread_alias() {
+        let default_args = Args::try_parse_from(["morrow"]).expect("default args");
+        assert_eq!(
+            resolve_session_name(&default_args).expect("session"),
+            "default"
+        );
+
+        let session_args =
+            Args::try_parse_from(["morrow", "--session", "work"]).expect("session args");
+        assert_eq!(
+            resolve_session_name(&session_args).expect("session"),
+            "work"
+        );
+
+        let thread_args =
+            Args::try_parse_from(["morrow", "--thread", "legacy"]).expect("thread args");
+        assert_eq!(
+            resolve_session_name(&thread_args).expect("session"),
+            "legacy"
+        );
+
+        let conflicting =
+            Args::try_parse_from(["morrow", "--session", "work", "--thread", "legacy"])
+                .expect("parse conflicting aliases");
+        assert!(matches!(
+            resolve_session_name(&conflicting),
+            Err(CliError::ConflictingSessionArgs)
+        ));
     }
 
     #[test]
@@ -624,5 +1083,138 @@ mod tests {
         assert!(text.contains("shell: exit_code=0"));
         assert!(text.contains("- edit_file: error"));
         assert!(text.contains("error: approval denied"));
+    }
+
+    #[tokio::test]
+    async fn manual_compaction_summarizes_old_turns_and_rebuilds_active_context() {
+        let (base_url, requests) =
+            spawn_recording_sse_server(vec![sse_text_body("new summary")]).await;
+        let mut session = compactable_session();
+
+        let outcome = compact_session(
+            &client(base_url),
+            "system",
+            &mut session,
+            context_config(10_000, 2),
+        )
+        .await
+        .expect("compact session");
+
+        assert_eq!(outcome, CompactionOutcome::Changed);
+        assert_eq!(session.context.summary.as_deref(), Some("new summary"));
+        assert_eq!(session.context.summarized_turns, 3);
+        assert_eq!(
+            session.active_thread.messages,
+            vec![
+                Message::system("Session summary:\nnew summary"),
+                Message::user("u3"),
+                Message::assistant("a3"),
+                Message::user("u4"),
+                Message::assistant("a4"),
+            ]
+        );
+
+        let requests = requests.lock().expect("requests lock poisoned");
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("failure reason"));
+        assert!(requests[0].contains("Target length: at most 256 characters"));
+    }
+
+    #[tokio::test]
+    async fn run_agent_turn_records_completed_turn_in_history_and_active_context() {
+        let root =
+            std::env::temp_dir().join(format!("morrow-cli-run-success-{}", std::process::id()));
+        fs::create_dir_all(&root).expect("create root");
+        let (base_url, requests) = spawn_recording_sse_server(vec![sse_text_body("ok")]).await;
+        let client = client(base_url);
+        let mut session = Session::new();
+
+        let outcome = run_agent_turn(
+            RunAgentTurnContext {
+                client: &client,
+                system_prompt: "system",
+                context_config: context_config(10_000, 2),
+                workspace_root: &root,
+                permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
+                interactive_approvals: false,
+            },
+            &mut session,
+            "hello",
+        )
+        .await
+        .expect("run turn");
+
+        assert_eq!(
+            outcome,
+            RunAgentTurnOutcome {
+                session_changed: true,
+                error: None,
+            }
+        );
+        assert_eq!(
+            session.active_thread.messages,
+            vec![Message::user("hello"), Message::assistant("ok")]
+        );
+        assert_eq!(session.turns.len(), 1);
+        assert_eq!(session.turns[0].turn.status, TurnStatus::Completed);
+        assert_eq!(session.turns[0].messages, session.active_thread.messages);
+        assert_eq!(requests.lock().expect("requests lock poisoned").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn auto_compaction_failure_records_failed_turn_without_main_model_call() {
+        let root = std::env::temp_dir().join(format!(
+            "morrow-cli-run-compact-fail-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("create root");
+        let (base_url, requests) = spawn_recording_sse_server(vec!["data: {not-json}\n\n"]).await;
+        let client = client(base_url);
+        let mut session = compactable_session();
+        session.active_thread.push(Message::user(
+            "large active context that exceeds the tiny budget",
+        ));
+        let original_active_thread = session.active_thread.clone();
+
+        let outcome = run_agent_turn(
+            RunAgentTurnContext {
+                client: &client,
+                system_prompt: "system",
+                context_config: context_config(1, 2),
+                workspace_root: &root,
+                permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
+                interactive_approvals: false,
+            },
+            &mut session,
+            "hello",
+        )
+        .await
+        .expect("run turn");
+
+        assert!(matches!(
+            outcome,
+            RunAgentTurnOutcome {
+                session_changed: true,
+                error: Some(_),
+            }
+        ));
+        assert_eq!(session.active_thread, original_active_thread);
+        assert_eq!(session.turns.len(), 6);
+        assert_eq!(
+            session.turns.last().expect("failed turn").turn.status,
+            TurnStatus::Failed
+        );
+        assert!(
+            session
+                .turns
+                .last()
+                .expect("failed turn")
+                .turn
+                .error
+                .as_deref()
+                .expect("error")
+                .contains("context compaction failed")
+        );
+        assert_eq!(requests.lock().expect("requests lock poisoned").len(), 1);
     }
 }

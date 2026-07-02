@@ -9,11 +9,16 @@ const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_API_KEY_ENV: &str = "OPENAI_API_KEY";
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful assistant.";
+const DEFAULT_AUTO_COMPACT: bool = true;
+const DEFAULT_MAX_CONTEXT_CHARS: usize = 64_000;
+const DEFAULT_RETAIN_RECENT_TURNS: usize = 6;
+const DEFAULT_SUMMARY_TARGET_CHARS: usize = 8_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppConfig {
     pub model: ModelConfig,
     pub agent: AgentConfig,
+    pub context: ContextConfig,
     pub permissions: PermissionProfile,
 }
 
@@ -28,6 +33,14 @@ pub struct ModelConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentConfig {
     pub system_prompt: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextConfig {
+    pub auto_compact: bool,
+    pub max_context_chars: usize,
+    pub retain_recent_turns: usize,
+    pub summary_target_chars: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,6 +72,8 @@ pub enum ConfigError {
     MissingModel,
     #[error("configured API key environment variable {env_var} is not set")]
     MissingApiKey { env_var: String },
+    #[error("invalid context config value: [context].{field} must be greater than 0")]
+    InvalidContextValue { field: &'static str },
 }
 
 #[derive(Debug, Deserialize)]
@@ -66,6 +81,7 @@ pub enum ConfigError {
 struct RawAppConfig {
     model: Option<RawModelConfig>,
     agent: Option<RawAgentConfig>,
+    context: Option<RawContextConfig>,
     permissions: Option<RawPermissionsConfig>,
 }
 
@@ -84,6 +100,15 @@ struct RawModelConfig {
 #[serde(deny_unknown_fields)]
 struct RawAgentConfig {
     system_prompt: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawContextConfig {
+    auto_compact: Option<bool>,
+    max_context_chars: Option<usize>,
+    retain_recent_turns: Option<usize>,
+    summary_target_chars: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -182,6 +207,7 @@ impl TryFrom<RawAppConfig> for AppConfig {
             .ok_or(ConfigError::MissingModel)?;
 
         let agent = value.agent.unwrap_or_default();
+        let context = ContextConfig::try_from(value.context.unwrap_or_default())?;
         let permissions = value.permissions.unwrap_or_default();
         let mode = permissions.mode.unwrap_or_default();
         let mut permissions_profile = PermissionProfile::for_mode(mode);
@@ -205,9 +231,47 @@ impl TryFrom<RawAppConfig> for AppConfig {
                     .system_prompt
                     .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string()),
             },
+            context,
             permissions: permissions_profile,
         })
     }
+}
+
+impl TryFrom<RawContextConfig> for ContextConfig {
+    type Error = ConfigError;
+
+    fn try_from(value: RawContextConfig) -> Result<Self, Self::Error> {
+        let max_context_chars = non_zero_context_value(
+            "max_context_chars",
+            value.max_context_chars.unwrap_or(DEFAULT_MAX_CONTEXT_CHARS),
+        )?;
+        let retain_recent_turns = non_zero_context_value(
+            "retain_recent_turns",
+            value
+                .retain_recent_turns
+                .unwrap_or(DEFAULT_RETAIN_RECENT_TURNS),
+        )?;
+        let summary_target_chars = non_zero_context_value(
+            "summary_target_chars",
+            value
+                .summary_target_chars
+                .unwrap_or(DEFAULT_SUMMARY_TARGET_CHARS),
+        )?;
+
+        Ok(Self {
+            auto_compact: value.auto_compact.unwrap_or(DEFAULT_AUTO_COMPACT),
+            max_context_chars,
+            retain_recent_turns,
+            summary_target_chars,
+        })
+    }
+}
+
+fn non_zero_context_value(field: &'static str, value: usize) -> Result<usize, ConfigError> {
+    if value == 0 {
+        return Err(ConfigError::InvalidContextValue { field });
+    }
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -274,6 +338,29 @@ api_key_env = "MORROW_PERMISSIONS_KEY"
 [permissions]
 mode = "workspace_write"
 shell = "deny"
+"#
+            ),
+        )
+        .expect("write config");
+    }
+
+    fn write_context_config(path: &Path, model: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create config parent");
+        }
+        fs::write(
+            path,
+            format!(
+                r#"
+[model]
+model = "{model}"
+api_key_env = "MORROW_CONTEXT_KEY"
+
+[context]
+auto_compact = false
+max_context_chars = 1024
+retain_recent_turns = 2
+summary_target_chars = 256
 "#
             ),
         )
@@ -390,6 +477,15 @@ shell = "deny"
         assert_eq!(loaded.config.model.timeout_secs, DEFAULT_TIMEOUT_SECS);
         assert_eq!(loaded.config.agent.system_prompt, DEFAULT_SYSTEM_PROMPT);
         assert_eq!(
+            loaded.config.context,
+            ContextConfig {
+                auto_compact: DEFAULT_AUTO_COMPACT,
+                max_context_chars: DEFAULT_MAX_CONTEXT_CHARS,
+                retain_recent_turns: DEFAULT_RETAIN_RECENT_TURNS,
+                summary_target_chars: DEFAULT_SUMMARY_TARGET_CHARS,
+            }
+        );
+        assert_eq!(
             loaded.config.permissions,
             PermissionProfile::for_mode(PermissionMode::ReadOnly)
         );
@@ -411,5 +507,53 @@ shell = "deny"
                 shell: ShellPolicy::Deny,
             }
         );
+    }
+
+    #[test]
+    fn loads_context_config() {
+        let root = unique_dir("context");
+        let config = root.join("morrow.toml");
+        write_context_config(&config, "test-model");
+        set_env("MORROW_CONTEXT_KEY", "secret");
+
+        let loaded = load_config_from_locations(Some(&config), &root, None).expect("load config");
+
+        assert_eq!(
+            loaded.config.context,
+            ContextConfig {
+                auto_compact: false,
+                max_context_chars: 1024,
+                retain_recent_turns: 2,
+                summary_target_chars: 256,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_zero_context_values() {
+        let root = unique_dir("context-zero");
+        let config = root.join("morrow.toml");
+        fs::write(
+            &config,
+            r#"
+[model]
+model = "test-model"
+api_key_env = "MORROW_CONTEXT_ZERO_KEY"
+
+[context]
+max_context_chars = 0
+"#,
+        )
+        .expect("write config");
+        set_env("MORROW_CONTEXT_ZERO_KEY", "secret");
+
+        let err = load_config_from_locations(Some(&config), &root, None).expect_err("must fail");
+
+        assert!(matches!(
+            err,
+            ConfigError::InvalidContextValue {
+                field: "max_context_chars"
+            }
+        ));
     }
 }
