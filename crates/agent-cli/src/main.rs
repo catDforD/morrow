@@ -13,7 +13,7 @@ use serde_json::json;
 use session_store::SessionStore;
 use std::fmt::Write as FmtWrite;
 use std::fs;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -293,6 +293,12 @@ enum CompactionOutcome {
     Noop,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InputLine {
+    text: String,
+    had_invalid_utf8: bool,
+}
+
 async fn run_repl(
     context: ReplContext<'_>,
     session: &mut Session,
@@ -304,13 +310,12 @@ async fn run_repl(
         eprint!("morrow> ");
         io::stderr().flush().map_err(CliError::Stderr)?;
 
-        let mut input = String::new();
-        let read = io::stdin().read_line(&mut input).map_err(CliError::Stdin)?;
-        if read == 0 {
+        let Some(input) = read_stdin_line()? else {
             break;
-        }
+        };
+        warn_if_lossy_input(&input);
 
-        let input = input.trim();
+        let input = input.text.trim();
         if input.is_empty() {
             continue;
         }
@@ -622,9 +627,9 @@ fn default_config_path_for_home(home: &Path) -> PathBuf {
 fn read_init_api_key() -> Result<String, CliError> {
     eprint!("OpenAI API key: ");
     io::stderr().flush().map_err(CliError::Stderr)?;
-    let mut input = String::new();
-    io::stdin().read_line(&mut input).map_err(CliError::Stdin)?;
-    let api_key = input.trim().to_string();
+    let input = read_stdin_line()?.ok_or_else(|| CliError::EmptyApiKey)?;
+    warn_if_lossy_input(&input);
+    let api_key = input.text.trim().to_string();
     if api_key.is_empty() {
         return Err(CliError::EmptyApiKey);
     }
@@ -1038,9 +1043,12 @@ fn approval_decision(
     eprint!("approve this action? [y/N] ");
     io::stderr().flush().map_err(CliError::Stderr)?;
 
-    let mut input = String::new();
-    io::stdin().read_line(&mut input).map_err(CliError::Stdin)?;
-    let approved = matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes");
+    let input = read_stdin_line()?.unwrap_or_else(|| InputLine {
+        text: String::new(),
+        had_invalid_utf8: false,
+    });
+    warn_if_lossy_input(&input);
+    let approved = matches!(input.text.trim().to_ascii_lowercase().as_str(), "y" | "yes");
 
     Ok(if approved {
         ApprovalDecision::approve(request.id.clone())
@@ -1051,6 +1059,37 @@ fn approval_decision(
 
 fn print_approval_request(request: &ApprovalRequest, permissions: PermissionProfile) {
     eprint!("{}", format_approval_request(request, permissions));
+}
+
+fn read_stdin_line() -> Result<Option<InputLine>, CliError> {
+    let stdin = io::stdin();
+    let mut stdin = stdin.lock();
+    read_input_line(&mut stdin).map_err(CliError::Stdin)
+}
+
+fn read_input_line(reader: &mut impl BufRead) -> io::Result<Option<InputLine>> {
+    let mut bytes = Vec::new();
+    let read = reader.read_until(b'\n', &mut bytes)?;
+    if read == 0 {
+        return Ok(None);
+    }
+
+    Ok(Some(match String::from_utf8(bytes) {
+        Ok(text) => InputLine {
+            text,
+            had_invalid_utf8: false,
+        },
+        Err(error) => InputLine {
+            text: String::from_utf8_lossy(&error.into_bytes()).into_owned(),
+            had_invalid_utf8: true,
+        },
+    }))
+}
+
+fn warn_if_lossy_input(input: &InputLine) {
+    if input.had_invalid_utf8 {
+        eprintln!("warning: stdin contained invalid UTF-8; replaced invalid bytes");
+    }
 }
 
 fn format_approval_request(request: &ApprovalRequest, permissions: PermissionProfile) -> String {
@@ -1363,6 +1402,39 @@ mod tests {
             overwritten: false,
             deleted: false,
         }
+    }
+
+    #[test]
+    fn read_input_line_accepts_valid_utf8() {
+        let mut input = std::io::Cursor::new(vec![0xe4, 0xbd, 0xa0, b'\n']);
+
+        let line = read_input_line(&mut input)
+            .expect("read line")
+            .expect("line");
+
+        assert_eq!(line.text, "\u{4f60}\n");
+        assert!(!line.had_invalid_utf8);
+    }
+
+    #[test]
+    fn read_input_line_replaces_invalid_utf8() {
+        let mut input = std::io::Cursor::new(vec![b'h', 0xff, b'i', b'\n']);
+
+        let line = read_input_line(&mut input)
+            .expect("read line")
+            .expect("line");
+
+        assert_eq!(line.text, "h\u{fffd}i\n");
+        assert!(line.had_invalid_utf8);
+    }
+
+    #[test]
+    fn read_input_line_returns_none_on_eof() {
+        let mut input = std::io::Cursor::new(Vec::new());
+
+        let line = read_input_line(&mut input).expect("read eof");
+
+        assert_eq!(line, None);
     }
 
     #[test]
