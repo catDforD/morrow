@@ -10,6 +10,10 @@ members = [
 ]
 resolver = "3"
 
+[workspace.package]
+version = "0.1.2"
+edition = "2024"
+
 [workspace.dependencies]
 agent-config = { path = "crates/agent-config" }
 agent-core = { path = "crates/agent-core" }
