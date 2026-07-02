@@ -198,9 +198,15 @@ impl AgentTurnStream<'_> {
             step.complete();
         }
         self.tool_rounds += 1;
+        let assistant_message = if self.assistant_text.is_empty() {
+            Message::assistant_tool_calls(tool_calls.clone())
+        } else {
+            Message::assistant_tool_calls_with_content(
+                self.assistant_text.clone(),
+                tool_calls.clone(),
+            )
+        };
         self.assistant_text.clear();
-
-        let assistant_message = Message::assistant_tool_calls(tool_calls.clone());
         self.conversation.push(assistant_message.clone());
         self.turn_messages.push(assistant_message);
         self.pending_tool_calls = VecDeque::from(tool_calls);
@@ -549,6 +555,42 @@ mod tests {
         Box::leak(body.into_boxed_str())
     }
 
+    fn tool_calls_body(calls: Vec<(&str, &str, serde_json::Value)>) -> &'static str {
+        let tool_calls = calls
+            .into_iter()
+            .enumerate()
+            .map(|(index, (id, name, arguments))| {
+                json!({
+                    "index": index,
+                    "id": id,
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": arguments.to_string()
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let body = format!(
+            "data: {}\n\ndata: {}\n\n",
+            json!({
+                "choices": [{
+                    "delta": {
+                        "tool_calls": tool_calls
+                    },
+                    "finish_reason": null
+                }]
+            }),
+            json!({
+                "choices": [{
+                    "delta": {},
+                    "finish_reason": "tool_calls"
+                }]
+            })
+        );
+        Box::leak(body.into_boxed_str())
+    }
+
     fn tools(root: &Path) -> ToolRegistry {
         ToolRegistry::built_in(
             root,
@@ -818,6 +860,155 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_turn_executes_multiple_tool_calls_in_order() {
+        let root = unique_dir("multi-tool-success");
+        fs::write(root.join("a.txt"), "alpha\n").expect("write a");
+        fs::write(root.join("b.txt"), "bravo\n").expect("write b");
+        let first_body = tool_calls_body(vec![
+            (
+                "call_1",
+                "read_file",
+                json!({"path": "a.txt", "max_lines": 5}),
+            ),
+            (
+                "call_2",
+                "read_file",
+                json!({"path": "b.txt", "max_lines": 5}),
+            ),
+        ]);
+        let second_body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Read both\"},\"finish_reason\":null}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (base_url, requests) = spawn_recording_sse_server(vec![first_body, second_body]).await;
+        let agent = Agent::with_tools(client(base_url), "You are helpful.", tools(&root));
+        let mut thread = Thread::new();
+
+        let stream = agent
+            .run_turn(&mut thread, "Read a.txt and b.txt")
+            .await
+            .expect("run turn");
+        let (events, turn) = collect_events(stream).await;
+
+        assert_eq!(turn.status, TurnStatus::Completed);
+        assert_eq!(turn.steps.len(), 4);
+        assert_eq!(turn.steps[1].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(turn.steps[2].tool_call_id.as_deref(), Some("call_2"));
+        assert_eq!(thread.messages.len(), 5);
+        assert_eq!(
+            thread.messages[1]
+                .tool_calls
+                .as_ref()
+                .expect("tool calls")
+                .len(),
+            2
+        );
+        assert_eq!(thread.messages[2].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(thread.messages[3].tool_call_id.as_deref(), Some("call_2"));
+        assert!(matches!(
+            events.as_slice(),
+            [
+                AgentEvent::TurnStarted,
+                AgentEvent::ToolCallStarted { id: first_id, .. },
+                AgentEvent::ToolCallFinished {
+                    id: first_finish,
+                    ok: true,
+                    ..
+                },
+                AgentEvent::ToolCallStarted { id: second_id, .. },
+                AgentEvent::ToolCallFinished {
+                    id: second_finish,
+                    ok: true,
+                    ..
+                },
+                AgentEvent::TextDelta(_),
+                AgentEvent::AgentMessage(_),
+                AgentEvent::TurnCompleted,
+            ] if first_id == "call_1"
+                && first_finish == "call_1"
+                && second_id == "call_2"
+                && second_finish == "call_2"
+        ));
+
+        let requests = requests.lock().expect("requests lock poisoned");
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].contains(r#""tool_call_id":"call_1""#));
+        assert!(requests[1].contains(r#""tool_call_id":"call_2""#));
+        assert!(requests[1].contains("alpha"));
+        assert!(requests[1].contains("bravo"));
+    }
+
+    #[tokio::test]
+    async fn tool_call_after_text_delta_preserves_assistant_tool_message_content() {
+        let root = unique_dir("tool-after-text");
+        fs::write(root.join("note.txt"), "tool result\n").expect("write note");
+        let tool_body = tool_call_body(
+            "call_1",
+            "read_file",
+            json!({"path": "note.txt", "max_lines": 5}),
+        );
+        let first_body = Box::leak(
+            format!(
+                "data: {}\n\n{}",
+                json!({
+                    "choices": [{
+                        "delta": {
+                            "content": "I will inspect it."
+                        },
+                        "finish_reason": null
+                    }]
+                }),
+                tool_body
+            )
+            .into_boxed_str(),
+        );
+        let second_body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Done\"},\"finish_reason\":null}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (base_url, requests) = spawn_recording_sse_server(vec![first_body, second_body]).await;
+        let agent = Agent::with_tools(client(base_url), "You are helpful.", tools(&root));
+        let mut thread = Thread::new();
+
+        let stream = agent
+            .run_turn(&mut thread, "Read note.txt")
+            .await
+            .expect("run turn");
+        let (events, turn) = collect_events(stream).await;
+
+        assert_eq!(turn.status, TurnStatus::Completed);
+        assert!(matches!(
+            events.as_slice(),
+            [
+                AgentEvent::TurnStarted,
+                AgentEvent::TextDelta(prefix),
+                AgentEvent::ToolCallStarted { .. },
+                AgentEvent::ToolCallFinished { ok: true, .. },
+                AgentEvent::TextDelta(done),
+                AgentEvent::AgentMessage(_),
+                AgentEvent::TurnCompleted,
+            ] if prefix == "I will inspect it." && done == "Done"
+        ));
+        assert_eq!(
+            thread.messages[1].content.as_deref(),
+            Some("I will inspect it.")
+        );
+        assert_eq!(
+            thread.messages[1]
+                .tool_calls
+                .as_ref()
+                .expect("tool calls")
+                .len(),
+            1
+        );
+        assert_eq!(thread.messages[3], Message::assistant("Done"));
+
+        let requests = requests.lock().expect("requests lock poisoned");
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].contains(r#""content":"I will inspect it.""#));
+    }
+
+    #[tokio::test]
     async fn shell_tool_approval_denial_is_returned_to_model() {
         let root = unique_dir("shell-approval-denied");
         let first_body = tool_call_body(
@@ -888,6 +1079,65 @@ mod tests {
         let requests = requests.lock().expect("requests lock poisoned");
         assert_eq!(requests.len(), 2);
         assert!(requests[1].contains("approval denied"));
+    }
+
+    #[tokio::test]
+    async fn approval_mismatch_keeps_pending_approval_until_correct_decision() {
+        let root = unique_dir("approval-mismatch");
+        let first_body = tool_call_body(
+            "call_1",
+            "write_file",
+            json!({"path": "note.txt", "content": "created\n"}),
+        );
+        let second_body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Denied\"},\"finish_reason\":null}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (base_url, requests) = spawn_recording_sse_server(vec![first_body, second_body]).await;
+        let agent = Agent::with_tools(client(base_url), "You are helpful.", tools(&root));
+        let mut thread = Thread::new();
+        let mut stream = agent
+            .run_turn(&mut thread, "Write note.txt")
+            .await
+            .expect("run turn");
+
+        assert_eq!(next_event(&mut stream).await, AgentEvent::TurnStarted);
+        assert!(matches!(
+            next_event(&mut stream).await,
+            AgentEvent::ToolCallStarted { .. }
+        ));
+        let AgentEvent::ApprovalRequested(request) = next_event(&mut stream).await else {
+            panic!("expected approval request");
+        };
+
+        let err = stream
+            .resolve_approval(ApprovalDecision::approve("approval-wrong"))
+            .expect_err("mismatched approval must fail");
+
+        assert!(matches!(err, AgentError::Approval(_)));
+        stream
+            .resolve_approval(ApprovalDecision::deny(request.id.clone()))
+            .expect("correct approval decision");
+        assert_eq!(
+            next_event(&mut stream).await,
+            AgentEvent::ApprovalResolved(ApprovalDecision::deny(request.id))
+        );
+        assert!(matches!(
+            next_event(&mut stream).await,
+            AgentEvent::ToolCallFinished { ok: false, .. }
+        ));
+        assert_eq!(
+            next_event(&mut stream).await,
+            AgentEvent::TextDelta("Denied".to_string())
+        );
+        assert_eq!(
+            next_event(&mut stream).await,
+            AgentEvent::AgentMessage("Denied".to_string())
+        );
+        assert_eq!(next_event(&mut stream).await, AgentEvent::TurnCompleted);
+        assert_eq!(stream.next().await, None);
+        assert!(!root.join("note.txt").exists());
+        assert_eq!(requests.lock().expect("requests lock poisoned").len(), 2);
     }
 
     #[tokio::test]

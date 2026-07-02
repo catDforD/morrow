@@ -166,7 +166,7 @@ impl OpenAiCompatClient {
 
 pub struct ChatCompletionStream {
     inner: BoxStream<'static, Result<Bytes, reqwest::Error>>,
-    buffer: String,
+    buffer: Vec<u8>,
     pending: VecDeque<Result<ModelEvent, ModelError>>,
     tool_calls: BTreeMap<usize, ToolCallAccumulator>,
     done: bool,
@@ -177,7 +177,7 @@ impl ChatCompletionStream {
     fn new(inner: BoxStream<'static, Result<Bytes, reqwest::Error>>) -> Self {
         Self {
             inner,
-            buffer: String::new(),
+            buffer: Vec::new(),
             pending: VecDeque::new(),
             tool_calls: BTreeMap::new(),
             done: false,
@@ -186,20 +186,18 @@ impl ChatCompletionStream {
     }
 
     fn push_chunk(&mut self, bytes: Bytes) {
-        let chunk = match std::str::from_utf8(&bytes) {
-            Ok(chunk) => chunk,
-            Err(err) => {
-                self.finish_with_error(ModelError::Utf8(err.to_string()));
-                return;
-            }
-        };
+        self.buffer.extend_from_slice(&bytes);
 
-        self.buffer.push_str(chunk);
-        self.buffer = self.buffer.replace("\r\n", "\n");
-
-        while let Some(frame_end) = self.buffer.find("\n\n") {
-            let frame = self.buffer[..frame_end].to_string();
-            self.buffer.drain(..frame_end + 2);
+        while let Some((frame_end, delimiter_len)) = find_sse_frame_end(&self.buffer) {
+            let frame = self.buffer[..frame_end].to_vec();
+            self.buffer.drain(..frame_end + delimiter_len);
+            let frame = match String::from_utf8(frame) {
+                Ok(frame) => frame.replace("\r\n", "\n"),
+                Err(err) => {
+                    self.finish_with_error(ModelError::Utf8(err.to_string()));
+                    return;
+                }
+            };
             self.handle_frame(&frame);
             if self.done {
                 break;
@@ -335,6 +333,18 @@ impl ChatCompletionStream {
     }
 }
 
+fn find_sse_frame_end(buffer: &[u8]) -> Option<(usize, usize)> {
+    for index in 0..buffer.len() {
+        if buffer[index..].starts_with(b"\r\n\r\n") {
+            return Some((index, 4));
+        }
+        if buffer[index..].starts_with(b"\n\n") {
+            return Some((index, 2));
+        }
+    }
+    None
+}
+
 #[derive(Debug, Default)]
 struct ToolCallAccumulator {
     id: Option<String>,
@@ -387,7 +397,7 @@ impl Stream for ChatCompletionStream {
 mod tests {
     use super::*;
     use agent_protocol::{Message, ToolCall, ToolDefinition};
-    use futures_util::StreamExt;
+    use futures_util::{StreamExt, stream};
     use serde_json::json;
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -490,6 +500,58 @@ mod tests {
             &ModelEvent::TextDelta("lo".to_string())
         );
         assert_eq!(events[2].as_ref().expect("event"), &ModelEvent::Completed);
+    }
+
+    #[tokio::test]
+    async fn parses_unicode_split_across_byte_chunks() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"你\"},\"finish_reason\":null}]}\n\n",
+            "data: [DONE]\n\n"
+        )
+        .as_bytes()
+        .to_vec();
+        let split_at = body
+            .iter()
+            .position(|byte| *byte == 0xe4)
+            .expect("unicode byte")
+            + 1;
+        let chunks = vec![
+            Bytes::copy_from_slice(&body[..split_at]),
+            Bytes::copy_from_slice(&body[split_at..]),
+        ];
+        let inner = stream::iter(chunks.into_iter().map(Ok::<Bytes, reqwest::Error>)).boxed();
+        let stream = ChatCompletionStream::new(inner);
+
+        let events = collect_events(stream).await;
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0].as_ref().expect("text"),
+            &ModelEvent::TextDelta("你".to_string())
+        );
+        assert_eq!(events[1].as_ref().expect("done"), &ModelEvent::Completed);
+    }
+
+    #[tokio::test]
+    async fn parses_crlf_sse_frames() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\r\n\r\n",
+            "data: [DONE]\r\n\r\n"
+        );
+        let client = client_for(body).await;
+        let stream = client
+            .stream_chat(&conversation(), &[])
+            .await
+            .expect("stream chat");
+
+        let events = collect_events(stream).await;
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0].as_ref().expect("text"),
+            &ModelEvent::TextDelta("ok".to_string())
+        );
+        assert_eq!(events[1].as_ref().expect("done"), &ModelEvent::Completed);
     }
 
     #[tokio::test]
