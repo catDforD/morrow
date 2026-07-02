@@ -178,6 +178,7 @@ impl Thread {
 }
 
 pub const THREAD_DOCUMENT_SCHEMA_VERSION: u32 = 2;
+pub const SESSION_DOCUMENT_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ThreadDocument {
@@ -190,6 +191,55 @@ impl ThreadDocument {
         Self {
             schema_version: THREAD_DOCUMENT_SCHEMA_VERSION,
             thread,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct SessionContext {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    pub summarized_turns: usize,
+}
+
+impl SessionContext {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct Session {
+    pub active_thread: Thread,
+    pub turns: Vec<TurnRecord>,
+    pub context: SessionContext,
+}
+
+impl Session {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn from_thread(active_thread: Thread) -> Self {
+        Self {
+            active_thread,
+            turns: Vec::new(),
+            context: SessionContext::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct SessionDocument {
+    pub schema_version: u32,
+    pub session: Session,
+}
+
+impl SessionDocument {
+    pub fn new(session: Session) -> Self {
+        Self {
+            schema_version: SESSION_DOCUMENT_SCHEMA_VERSION,
+            session,
         }
     }
 }
@@ -514,6 +564,28 @@ impl Turn {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct TurnRecord {
+    pub turn: Turn,
+    pub messages: Vec<Message>,
+}
+
+impl TurnRecord {
+    pub fn new(turn: Turn, messages: Vec<Message>) -> Self {
+        Self { turn, messages }
+    }
+
+    pub fn failed_user_prompt(prompt: impl Into<String>, error: impl Into<String>) -> Self {
+        let user_message = Message::user(prompt.into());
+        let mut turn = Turn::running(user_message.clone());
+        turn.fail(error);
+        Self {
+            turn,
+            messages: vec![user_message],
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum AgentEvent {
     TurnStarted,
@@ -605,6 +677,44 @@ mod tests {
 
         assert_eq!(decoded.schema_version, THREAD_DOCUMENT_SCHEMA_VERSION);
         assert_eq!(decoded.thread, thread);
+    }
+
+    #[test]
+    fn session_document_serializes_versioned_session() {
+        let mut active_thread = Thread::new();
+        active_thread.push(Message::system("Session summary:\nKnown facts"));
+        active_thread.push(Message::user("Continue"));
+        let mut turn = Turn::running(Message::user("Hello"));
+        turn.complete(Message::assistant("Hi"));
+        let session = Session {
+            active_thread: active_thread.clone(),
+            turns: vec![TurnRecord::new(
+                turn.clone(),
+                vec![Message::user("Hello"), Message::assistant("Hi")],
+            )],
+            context: SessionContext {
+                summary: Some("Known facts".to_string()),
+                summarized_turns: 1,
+            },
+        };
+
+        let document = SessionDocument::new(session.clone());
+        let value = serde_json::to_value(&document).expect("serialize session document");
+
+        assert_eq!(value["schema_version"], json!(3));
+        assert_eq!(
+            value["session"]["context"],
+            json!({"summary": "Known facts", "summarized_turns": 1})
+        );
+        assert_eq!(
+            value["session"]["active_thread"],
+            serde_json::to_value(active_thread).expect("active thread")
+        );
+
+        let decoded =
+            serde_json::from_value::<SessionDocument>(value).expect("deserialize session document");
+        assert_eq!(decoded.schema_version, SESSION_DOCUMENT_SCHEMA_VERSION);
+        assert_eq!(decoded.session, session);
     }
 
     #[test]
@@ -842,5 +952,24 @@ mod tests {
         assert_eq!(failed.steps[0].status, TurnStatus::Failed);
         assert_eq!(failed.steps[0].error, Some("model error".to_string()));
         assert_eq!(failed.error, Some("model error".to_string()));
+    }
+
+    #[test]
+    fn turn_record_preserves_messages_for_completed_and_failed_turns() {
+        let mut completed = Turn::running(Message::user("Hello"));
+        completed.complete(Message::assistant("Hi"));
+        let record = TurnRecord::new(
+            completed.clone(),
+            vec![Message::user("Hello"), Message::assistant("Hi")],
+        );
+
+        assert_eq!(record.turn, completed);
+        assert_eq!(record.messages.len(), 2);
+
+        let failed = TurnRecord::failed_user_prompt("Broken", "model error");
+
+        assert_eq!(failed.turn.status, TurnStatus::Failed);
+        assert_eq!(failed.messages, vec![Message::user("Broken")]);
+        assert_eq!(failed.turn.error.as_deref(), Some("model error"));
     }
 }
