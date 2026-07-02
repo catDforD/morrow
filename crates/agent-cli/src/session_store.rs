@@ -33,6 +33,8 @@ pub enum SessionStoreError {
         #[source]
         source: serde_json::Error,
     },
+    #[error("session {name:?} was not found")]
+    SessionNotFound { name: String },
     #[error("unsupported session document schema version {version} in {path}; expected {expected}")]
     UnsupportedSchemaVersion {
         path: PathBuf,
@@ -63,12 +65,46 @@ pub enum SessionStoreError {
         #[source]
         source: std::io::Error,
     },
+    #[error("failed to list session directory {path}: {source}")]
+    List {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to read session metadata {path}: {source}")]
+    Metadata {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to remove session file {path}: {source}")]
+    Remove {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("target session already exists at {path}")]
+    TargetExists { path: PathBuf },
 }
 
 #[derive(Debug, Clone)]
 pub struct SessionStore {
+    root: PathBuf,
+    legacy_root: PathBuf,
+    scope: String,
+    session_name: String,
     path: PathBuf,
     legacy_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionEntry {
+    pub name: String,
+    pub path: PathBuf,
+    pub turns: usize,
+    pub active_messages: usize,
+    pub summarized_turns: usize,
+    pub has_summary: bool,
 }
 
 impl SessionStore {
@@ -91,6 +127,18 @@ impl SessionStore {
             return self.load_path(&self.legacy_path);
         }
         Ok(Session::new())
+    }
+
+    pub fn load_existing(&self) -> Result<Session, SessionStoreError> {
+        if self.path.is_file() {
+            return self.load_path(&self.path);
+        }
+        if self.legacy_path.is_file() {
+            return self.load_path(&self.legacy_path);
+        }
+        Err(SessionStoreError::SessionNotFound {
+            name: self.session_name.clone(),
+        })
     }
 
     pub fn save(&self, session: &Session) -> Result<(), SessionStoreError> {
@@ -121,14 +169,103 @@ impl SessionStore {
         Ok(())
     }
 
-    #[cfg(test)]
-    fn path(&self) -> &Path {
+    pub fn path(&self) -> &Path {
         &self.path
     }
 
     #[cfg(test)]
     fn legacy_path(&self) -> &Path {
         &self.legacy_path
+    }
+
+    pub fn list_current_scope(&self) -> Result<Vec<SessionEntry>, SessionStoreError> {
+        let scope_dir = self.scope_dir();
+        if !scope_dir.is_dir() {
+            return Ok(Vec::new());
+        }
+
+        let mut entries = Vec::new();
+        let read_dir = fs::read_dir(&scope_dir).map_err(|source| SessionStoreError::List {
+            path: scope_dir.clone(),
+            source,
+        })?;
+
+        for entry in read_dir {
+            let entry = entry.map_err(|source| SessionStoreError::List {
+                path: scope_dir.clone(),
+                source,
+            })?;
+            let path = entry.path();
+            let metadata = entry
+                .metadata()
+                .map_err(|source| SessionStoreError::Metadata {
+                    path: path.clone(),
+                    source,
+                })?;
+            if !metadata.is_file()
+                || path.extension().and_then(|value| value.to_str()) != Some("json")
+            {
+                continue;
+            }
+            let Some(name) = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            let session = self.load_path(&path)?;
+            entries.push(SessionEntry {
+                name,
+                path,
+                turns: session.turns.len(),
+                active_messages: session.active_thread.messages.len(),
+                summarized_turns: session.context.summarized_turns,
+                has_summary: session.context.summary.is_some(),
+            });
+        }
+
+        entries.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(entries)
+    }
+
+    pub fn delete(&self) -> Result<(), SessionStoreError> {
+        let removed_primary = remove_if_exists(&self.path)?;
+        let removed_legacy = remove_if_exists(&self.legacy_path)?;
+        if !removed_primary && !removed_legacy {
+            return Err(SessionStoreError::SessionNotFound {
+                name: self.session_name.clone(),
+            });
+        }
+
+        Ok(())
+    }
+
+    pub fn rename(&self, target_name: &str) -> Result<SessionStore, SessionStoreError> {
+        let target = self.store_for_name(target_name)?;
+        if target.path.is_file() {
+            return Err(SessionStoreError::TargetExists { path: target.path });
+        }
+        if target.legacy_path.is_file() {
+            return Err(SessionStoreError::TargetExists {
+                path: target.legacy_path,
+            });
+        }
+
+        let session = self.load_existing()?;
+        target.save(&session)?;
+        let _ = remove_if_exists(&self.path)?;
+        let _ = remove_if_exists(&self.legacy_path)?;
+
+        Ok(target)
+    }
+
+    pub fn export_document_bytes(&self) -> Result<Vec<u8>, SessionStoreError> {
+        let document = SessionDocument::new(self.load_existing()?);
+        serde_json::to_vec_pretty(&document).map_err(|source| SessionStoreError::Serialize {
+            path: self.path.clone(),
+            source,
+        })
     }
 
     fn new(
@@ -138,6 +275,8 @@ impl SessionStore {
         session_name: &str,
     ) -> Result<Self, SessionStoreError> {
         validate_session_name(session_name)?;
+        let root = root.into();
+        let legacy_root = legacy_root.into();
         let canonical_cwd =
             cwd.canonicalize()
                 .map_err(|source| SessionStoreError::CanonicalizeCwd {
@@ -146,10 +285,17 @@ impl SessionStore {
                 })?;
         let scope = hex_encode(canonical_cwd.as_os_str().as_encoded_bytes());
         let file_name = format!("{session_name}.json");
-        let path = root.into().join(&scope).join(&file_name);
-        let legacy_path = legacy_root.into().join(scope).join(file_name);
+        let path = root.join(&scope).join(&file_name);
+        let legacy_path = legacy_root.join(&scope).join(file_name);
 
-        Ok(Self { path, legacy_path })
+        Ok(Self {
+            root,
+            legacy_root,
+            scope,
+            session_name: session_name.to_string(),
+            path,
+            legacy_path,
+        })
     }
 
     fn load_path(&self, path: &Path) -> Result<Session, SessionStoreError> {
@@ -168,6 +314,34 @@ impl SessionStore {
             .to_string_lossy();
         self.path
             .with_file_name(format!("{file_name}.tmp-{}", std::process::id()))
+    }
+
+    fn scope_dir(&self) -> PathBuf {
+        self.root.join(&self.scope)
+    }
+
+    fn store_for_name(&self, session_name: &str) -> Result<Self, SessionStoreError> {
+        validate_session_name(session_name)?;
+        let file_name = format!("{session_name}.json");
+        Ok(Self {
+            root: self.root.clone(),
+            legacy_root: self.legacy_root.clone(),
+            scope: self.scope.clone(),
+            session_name: session_name.to_string(),
+            path: self.root.join(&self.scope).join(&file_name),
+            legacy_path: self.legacy_root.join(&self.scope).join(file_name),
+        })
+    }
+}
+
+fn remove_if_exists(path: &Path) -> Result<bool, SessionStoreError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(SessionStoreError::Remove {
+            path: path.to_path_buf(),
+            source,
+        }),
     }
 }
 
@@ -424,5 +598,117 @@ mod tests {
         assert!(store.legacy_path().is_file());
         let saved = fs::read_to_string(store.path()).expect("read saved session");
         assert!(saved.contains(r#""schema_version": 3"#));
+    }
+
+    #[test]
+    fn lists_primary_sessions_for_current_scope() {
+        let root = unique_dir("list-root");
+        let legacy_root = unique_dir("list-legacy-root");
+        let cwd = unique_dir("list-cwd");
+        make_store(&root, &legacy_root, &cwd, "work")
+            .save(&Session::from_thread(sample_thread()))
+            .expect("save work");
+        make_store(&root, &legacy_root, &cwd, "default")
+            .save(&Session::new())
+            .expect("save default");
+        let other_cwd = unique_dir("list-other-cwd");
+        make_store(&root, &legacy_root, &other_cwd, "other")
+            .save(&Session::new())
+            .expect("save other scope");
+        let store = make_store(&root, &legacy_root, &cwd, "default");
+
+        let entries = store.list_current_scope().expect("list sessions");
+
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["default", "work"]
+        );
+        let work = entries
+            .iter()
+            .find(|entry| entry.name == "work")
+            .expect("work entry");
+        assert_eq!(work.active_messages, 2);
+        assert_eq!(work.turns, 0);
+    }
+
+    #[test]
+    fn delete_removes_primary_and_legacy_session_files() {
+        let root = unique_dir("delete-root");
+        let legacy_root = unique_dir("delete-legacy-root");
+        let cwd = unique_dir("delete-cwd");
+        let store = make_store(&root, &legacy_root, &cwd, "default");
+        store
+            .save(&Session::from_thread(sample_thread()))
+            .expect("save primary");
+        fs::create_dir_all(store.legacy_path().parent().expect("legacy parent"))
+            .expect("create legacy parent");
+        fs::write(
+            store.legacy_path(),
+            json!({"schema_version": 2, "thread": {"messages": []}}).to_string(),
+        )
+        .expect("write legacy");
+
+        store.delete().expect("delete session");
+
+        assert!(!store.path().exists());
+        assert!(!store.legacy_path().exists());
+        assert!(matches!(
+            store.delete(),
+            Err(SessionStoreError::SessionNotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn rename_saves_target_and_removes_source_files() {
+        let root = unique_dir("rename-root");
+        let legacy_root = unique_dir("rename-legacy-root");
+        let cwd = unique_dir("rename-cwd");
+        let source = make_store(&root, &legacy_root, &cwd, "old");
+        let session = Session::from_thread(sample_thread());
+        source.save(&session).expect("save source");
+
+        let target = source.rename("new").expect("rename session");
+
+        assert!(!source.path().exists());
+        assert_eq!(target.load().expect("load target"), session);
+    }
+
+    #[test]
+    fn rename_fails_when_target_exists_and_preserves_source() {
+        let root = unique_dir("rename-target-root");
+        let legacy_root = unique_dir("rename-target-legacy-root");
+        let cwd = unique_dir("rename-target-cwd");
+        let source = make_store(&root, &legacy_root, &cwd, "old");
+        let target = make_store(&root, &legacy_root, &cwd, "new");
+        source
+            .save(&Session::from_thread(sample_thread()))
+            .expect("save source");
+        target.save(&Session::new()).expect("save target");
+
+        let err = source.rename("new").expect_err("rename must fail");
+
+        assert!(matches!(err, SessionStoreError::TargetExists { .. }));
+        assert!(source.path().exists());
+        assert!(target.path().exists());
+    }
+
+    #[test]
+    fn export_document_bytes_outputs_schema_v3_document() {
+        let root = unique_dir("export-root");
+        let legacy_root = unique_dir("export-legacy-root");
+        let cwd = unique_dir("export-cwd");
+        let store = make_store(&root, &legacy_root, &cwd, "default");
+        let session = Session::from_thread(sample_thread());
+        store.save(&session).expect("save session");
+
+        let bytes = store.export_document_bytes().expect("export document");
+        let document =
+            serde_json::from_slice::<SessionDocument>(&bytes).expect("parse exported document");
+
+        assert_eq!(document.schema_version, SESSION_DOCUMENT_SCHEMA_VERSION);
+        assert_eq!(document.session, session);
     }
 }
