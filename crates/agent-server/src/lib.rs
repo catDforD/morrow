@@ -441,6 +441,10 @@ async fn start_turn(
         });
     }
 
+    if let Ok(snapshot) = snapshot_message(&state, &session_name).await {
+        broadcast_message(&tx, snapshot);
+    }
+
     let state_for_task = state.clone();
     let session_for_task = session_name.clone();
     let turn_for_task = turn_id.clone();
