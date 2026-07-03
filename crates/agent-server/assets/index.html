@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Morrow</title>
+    <link rel="stylesheet" href="/assets/style.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">M</div>
+          <div>
+            <h1>Morrow</h1>
+            <p id="workspace"></p>
+          </div>
+        </div>
+        <div class="section-title">Sessions</div>
+        <div id="sessions" class="session-list"></div>
+      </aside>
+
+      <section class="workspace">
+        <header class="topbar">
+          <div>
+            <h2 id="session-title">default</h2>
+            <p id="status-line"></p>
+          </div>
+          <div class="top-actions">
+            <button id="refresh" type="button" title="Refresh">Refresh</button>
+            <button id="reset" type="button" title="Reset session">Reset</button>
+          </div>
+        </header>
+
+        <div id="messages" class="messages"></div>
+        <div id="tools" class="tools"></div>
+
+        <form id="composer" class="composer">
+          <textarea id="prompt" rows="3" autocomplete="off"></textarea>
+          <button id="send" type="submit">Send</button>
+        </form>
+      </section>
+    </main>
+
+    <div id="approval" class="approval hidden" role="dialog" aria-modal="true">
+      <div class="approval-panel">
+        <header>
+          <h3>Approval</h3>
+          <button id="approval-close" type="button" title="Deny">Deny</button>
+        </header>
+        <pre id="approval-body"></pre>
+        <div class="approval-actions">
+          <button id="approval-deny" type="button">Deny</button>
+          <button id="approval-approve" type="button">Approve</button>
+        </div>
+      </div>
+    </div>
+
+    <script src="/assets/app.js"></script>
+  </body>
+</html>
