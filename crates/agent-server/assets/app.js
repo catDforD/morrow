@@ -200,7 +200,7 @@ function handleAgentEvent(event) {
 }
 
 function renderMessage(role, content) {
-  if (!content) return null;
+  if (content == null) return null;
   const row = document.createElement("div");
   row.className = `message ${role}`;
   const label = document.createElement("div");
