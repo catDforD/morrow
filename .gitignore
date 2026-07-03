@@ -1,3 +1,4 @@
 /target
 morrow.toml
 .codegraph/
+crates/agent-server/web/node_modules/
