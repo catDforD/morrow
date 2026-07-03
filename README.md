@@ -81,6 +81,19 @@ Start interactive mode:
 morrow
 ```
 
+Start the local web dashboard:
+
+```bash
+morrow server
+```
+
+By default the dashboard listens on `127.0.0.1:3000` and uses the current
+workspace, config, session store, and permission profile. It is local-first and
+unauthenticated; do not bind it to a public interface unless you add your own
+network protections. The browser UI can approve or deny prompted shell/file
+actions, but it cannot raise permissions beyond the mode used when the server
+started.
+
 Useful REPL commands:
 
 ```text

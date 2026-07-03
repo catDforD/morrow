@@ -1,21 +1,19 @@
 [package]
-name = "agent-cli"
+name = "agent-runtime"
 version.workspace = true
 edition.workspace = true
 
-[[bin]]
-name = "morrow"
-path = "src/main.rs"
-
 [dependencies]
 agent-config = { workspace = true }
-agent-runtime = { workspace = true }
-agent-server = { workspace = true }
+agent-core = { workspace = true }
 agent-model = { workspace = true }
 agent-protocol = { workspace = true }
-clap = { workspace = true }
+agent-tools = { workspace = true }
 dirs = { workspace = true }
 futures-util = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
 tokio = { workspace = true }

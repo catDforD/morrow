@@ -1,24 +1,22 @@
 use agent_config::{ContextConfig, load_config};
-use agent_core::{Agent, AgentError};
-use agent_model::{ModelError, ModelEvent, OpenAiCompatClient, OpenAiCompatConfig};
+use agent_model::{ModelError, OpenAiCompatClient, OpenAiCompatConfig};
 use agent_protocol::{
-    AgentEvent, ApprovalAction, ApprovalDecision, ApprovalRequest, Conversation, FileChangeSummary,
-    Message, PermissionMode, PermissionProfile, Session, ShellCommandSummary, ShellPolicy,
-    ToolExecutionSummary, TurnRecord, TurnStatus,
+    AgentEvent, ApprovalAction, ApprovalDecision, ApprovalRequest, FileChangeSummary,
+    PermissionMode, PermissionProfile, Session, ShellCommandSummary, ShellPolicy,
+    ToolExecutionSummary,
 };
-use agent_tools::{ToolRegistry, ToolRegistryError};
+use agent_runtime::{
+    AgentEventEnvelope, CompactionOutcome, RunAgentTurnOutcome, SessionStore, TurnEventHandler,
+};
 use clap::{Parser, Subcommand};
-use futures_util::StreamExt;
-use serde_json::json;
-use session_store::SessionStore;
+use futures_util::future::{BoxFuture, FutureExt};
 use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Write};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use thiserror::Error;
-
-mod session_store;
 
 const INIT_CONFIG_MODEL: &str = "gpt-4.1";
 const INIT_CONFIG_BASE_URL: &str = "https://api.openai.com/v1";
@@ -68,6 +66,12 @@ enum CliCommand {
         #[arg(long)]
         template: bool,
     },
+    Server {
+        #[arg(long, default_value = "127.0.0.1")]
+        host: IpAddr,
+        #[arg(long, default_value_t = 3000)]
+        port: u16,
+    },
     Session {
         #[command(subcommand)]
         command: SessionCommand,
@@ -101,11 +105,11 @@ enum CliError {
     #[error(transparent)]
     Model(#[from] ModelError),
     #[error(transparent)]
-    Agent(#[from] AgentError),
+    Runtime(#[from] agent_runtime::RuntimeError),
     #[error(transparent)]
-    SessionStore(#[from] session_store::SessionStoreError),
+    SessionStore(#[from] agent_runtime::SessionStoreError),
     #[error(transparent)]
-    Tools(#[from] ToolRegistryError),
+    Server(#[from] agent_server::ServerError),
     #[error("agent run failed: {0}")]
     AgentRun(String),
     #[error("--session and --thread cannot be used together")]
@@ -166,8 +170,10 @@ async fn run() -> Result<(), CliError> {
         if args.jsonl {
             return Err(CliError::JsonlUnsupportedForSessionCommand);
         }
-        let mut stdout = io::stdout().lock();
-        return handle_cli_command(command, &session_name, &mut stdout);
+        if !matches!(command, CliCommand::Server { .. }) {
+            let mut stdout = io::stdout().lock();
+            return handle_cli_command(command, &session_name, &mut stdout);
+        }
     }
 
     let prompt = args.prompt.join(" ");
@@ -183,13 +189,31 @@ async fn run() -> Result<(), CliError> {
         api_key: loaded.api_key,
         timeout: Duration::from_secs(loaded.config.model.timeout_secs),
     })?;
+    let workspace_root = agent_runtime::detect_workspace_root()?;
+
+    if let Some(CliCommand::Server { host, port }) = args.command.as_ref() {
+        eprintln!("morrow server listening on http://{host}:{port}");
+        agent_server::serve(agent_server::ServerOptions {
+            host: *host,
+            port: *port,
+            client,
+            system_prompt: loaded.config.agent.system_prompt,
+            context_config: loaded.config.context,
+            workspace_root,
+            config_path: loaded.path,
+            permissions,
+            default_session_name: session_name,
+        })
+        .await?;
+        return Ok(());
+    }
+
     let session_store = SessionStore::for_current_dir(&session_name)?;
     let mut session = if reset_session {
         Session::new()
     } else {
         session_store.load()?
     };
-    let workspace_root = detect_workspace_root()?;
 
     if prompt.trim().is_empty() {
         let mut permissions = permissions;
@@ -279,18 +303,6 @@ struct ExecutionRecord {
     name: String,
     ok: bool,
     summary: Option<ToolExecutionSummary>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RunAgentTurnOutcome {
-    session_changed: bool,
-    error: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CompactionOutcome {
-    Changed,
-    Noop,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -391,13 +403,8 @@ async fn handle_repl_command(
             Ok(false)
         }
         "/compact" => {
-            match compact_session(
-                context.client,
-                context.system_prompt,
-                session,
-                context.context_config,
-            )
-            .await?
+            match agent_runtime::compact_session(context.client, session, context.context_config)
+                .await?
             {
                 CompactionOutcome::Changed => {
                     context.session_store.save(session)?;
@@ -436,131 +443,146 @@ async fn run_agent_turn(
     prompt: &str,
     stdout: &mut dyn Write,
 ) -> Result<RunAgentTurnOutcome, CliError> {
-    if let Err(error) = maybe_auto_compact(
-        context.client,
-        context.system_prompt,
+    let turn_index = match context.output {
+        OutputMode::Human => session.turns.len(),
+        OutputMode::Jsonl { turn_index, .. } => turn_index,
+    };
+    let session_name = match context.output {
+        OutputMode::Human => "default",
+        OutputMode::Jsonl { session_name, .. } => session_name,
+    };
+    let mut handler = CliTurnHandler::new(context, stdout);
+
+    agent_runtime::run_agent_turn(
+        agent_runtime::RunAgentTurnContext {
+            client: context.client,
+            system_prompt: context.system_prompt,
+            context_config: context.context_config,
+            workspace_root: context.workspace_root,
+            permissions: context.permissions,
+            session_name,
+            turn_index,
+        },
         session,
-        context.context_config,
         prompt,
+        &mut handler,
     )
     .await
-    {
-        let message = format!("context compaction failed: {error}");
-        session
-            .turns
-            .push(TurnRecord::failed_user_prompt(prompt, message.clone()));
-        return Ok(RunAgentTurnOutcome {
-            session_changed: true,
-            error: Some(message),
-        });
+    .map_err(CliError::from)
+}
+
+struct CliTurnHandler<'a, 'b> {
+    context: RunAgentTurnContext<'a>,
+    stdout: &'b mut dyn Write,
+    wrote_text: bool,
+    output_ends_with_newline: bool,
+    execution_records: Vec<ExecutionRecord>,
+}
+
+impl<'a, 'b> CliTurnHandler<'a, 'b> {
+    fn new(context: RunAgentTurnContext<'a>, stdout: &'b mut dyn Write) -> Self {
+        Self {
+            context,
+            stdout,
+            wrote_text: false,
+            output_ends_with_newline: false,
+            execution_records: Vec::new(),
+        }
     }
+}
 
-    let tools = ToolRegistry::built_in(context.workspace_root, context.permissions)?;
-    let agent = Agent::with_tools(
-        context.client.clone(),
-        context.system_prompt.to_string(),
-        tools,
-    );
-    let mut wrote_text = false;
-    let mut output_ends_with_newline = false;
-    let mut agent_error = None;
-    let mut turn_completed = false;
-    let mut execution_records = Vec::new();
-    let mut event_index = 0;
-
-    {
-        let mut stream = agent
-            .run_turn(&mut session.active_thread, prompt.to_string())
-            .await?;
-
-        while let Some(event) = stream.next().await {
-            if let OutputMode::Jsonl {
-                session_name,
-                turn_index,
-            } = context.output
-            {
-                write_jsonl_event(
-                    stdout,
-                    session_name,
-                    context.workspace_root,
-                    turn_index,
-                    event_index,
-                    &event,
-                )?;
-                event_index += 1;
-            }
-
-            match event {
-                AgentEvent::TurnStarted => {}
-                AgentEvent::TextDelta(text) => {
-                    if context.output == OutputMode::Human {
-                        wrote_text = true;
-                        output_ends_with_newline = text.ends_with('\n');
-                        stdout
-                            .write_all(text.as_bytes())
-                            .map_err(CliError::Stdout)?;
-                        stdout.flush().map_err(CliError::Stdout)?;
-                    }
-                }
-                AgentEvent::AgentMessage(_) => {}
-                AgentEvent::ToolCallStarted { name, .. } => {
-                    if context.output == OutputMode::Human {
-                        eprintln!("tool {name} started");
-                    }
-                }
-                AgentEvent::ToolCallFinished {
-                    name, ok, summary, ..
-                } => {
-                    if context.output == OutputMode::Human {
-                        let status = if ok { "ok" } else { "error" };
-                        eprintln!("tool {name} {status}");
-                    }
-                    execution_records.push(ExecutionRecord { name, ok, summary });
-                }
-                AgentEvent::ApprovalRequested(request) => {
-                    let decision = approval_decision(
-                        &request,
-                        context.permissions,
-                        context.interactive_approvals,
-                    )?;
-                    stream.resolve_approval(decision)?;
-                }
-                AgentEvent::ApprovalResolved(decision) => {
-                    if context.output == OutputMode::Human {
-                        let status = if decision.approved {
-                            "approved"
-                        } else {
-                            "denied"
-                        };
-                        eprintln!("approval {} {status}", decision.request_id);
-                    }
-                }
-                AgentEvent::TurnCompleted => {
-                    if context.output == OutputMode::Human
-                        && wrote_text
-                        && !output_ends_with_newline
-                    {
-                        stdout.write_all(b"\n").map_err(CliError::Stdout)?;
-                        stdout.flush().map_err(CliError::Stdout)?;
-                    }
-                    if context.output == OutputMode::Human {
-                        print_execution_summary(&execution_records);
-                    }
-                    turn_completed = true;
-                }
-                AgentEvent::Error(message) => {
-                    agent_error = Some(message);
-                }
-            }
+impl TurnEventHandler for CliTurnHandler<'_, '_> {
+    fn on_event(
+        &mut self,
+        envelope: &AgentEventEnvelope,
+    ) -> Result<(), agent_runtime::RuntimeError> {
+        if matches!(self.context.output, OutputMode::Jsonl { .. }) {
+            write_jsonl_event(self.stdout, envelope)
+                .map_err(agent_runtime::RuntimeError::event_handler)?;
         }
 
-        session.turns.push(stream.into_turn_record());
+        match &envelope.event {
+            AgentEvent::TurnStarted => {}
+            AgentEvent::TextDelta(text) => {
+                if self.context.output == OutputMode::Human {
+                    self.wrote_text = true;
+                    self.output_ends_with_newline = text.ends_with('\n');
+                    self.stdout
+                        .write_all(text.as_bytes())
+                        .map_err(CliError::Stdout)
+                        .map_err(agent_runtime::RuntimeError::event_handler)?;
+                    self.stdout
+                        .flush()
+                        .map_err(CliError::Stdout)
+                        .map_err(agent_runtime::RuntimeError::event_handler)?;
+                }
+            }
+            AgentEvent::AgentMessage(_) => {}
+            AgentEvent::ToolCallStarted { name, .. } => {
+                if self.context.output == OutputMode::Human {
+                    eprintln!("tool {name} started");
+                }
+            }
+            AgentEvent::ToolCallFinished {
+                name, ok, summary, ..
+            } => {
+                if self.context.output == OutputMode::Human {
+                    let status = if *ok { "ok" } else { "error" };
+                    eprintln!("tool {name} {status}");
+                }
+                self.execution_records.push(ExecutionRecord {
+                    name: name.clone(),
+                    ok: *ok,
+                    summary: summary.clone(),
+                });
+            }
+            AgentEvent::ApprovalRequested(_) => {}
+            AgentEvent::ApprovalResolved(decision) => {
+                if self.context.output == OutputMode::Human {
+                    let status = if decision.approved {
+                        "approved"
+                    } else {
+                        "denied"
+                    };
+                    eprintln!("approval {} {status}", decision.request_id);
+                }
+            }
+            AgentEvent::TurnCompleted => {
+                if self.context.output == OutputMode::Human
+                    && self.wrote_text
+                    && !self.output_ends_with_newline
+                {
+                    self.stdout
+                        .write_all(b"\n")
+                        .map_err(CliError::Stdout)
+                        .map_err(agent_runtime::RuntimeError::event_handler)?;
+                    self.stdout
+                        .flush()
+                        .map_err(CliError::Stdout)
+                        .map_err(agent_runtime::RuntimeError::event_handler)?;
+                }
+                if self.context.output == OutputMode::Human {
+                    print_execution_summary(&self.execution_records);
+                }
+            }
+            AgentEvent::Error(_) => {}
+        }
+
+        Ok(())
     }
 
-    Ok(RunAgentTurnOutcome {
-        session_changed: true,
-        error: agent_error.filter(|_| !turn_completed),
-    })
+    fn resolve_approval<'a>(
+        &'a mut self,
+        request: &'a ApprovalRequest,
+    ) -> BoxFuture<'a, Result<ApprovalDecision, agent_runtime::RuntimeError>> {
+        let result = approval_decision(
+            request,
+            self.context.permissions,
+            self.context.interactive_approvals,
+        )
+        .map_err(agent_runtime::RuntimeError::event_handler);
+        futures_util::future::ready(result).boxed()
+    }
 }
 
 fn resolve_session_name(args: &Args) -> Result<String, CliError> {
@@ -586,6 +608,7 @@ fn handle_cli_command(
 ) -> Result<(), CliError> {
     match command {
         CliCommand::Init { force, template } => handle_init_command(*force, *template, stdout),
+        CliCommand::Server { .. } => Ok(()),
         CliCommand::Session { command } => {
             handle_session_command(command, default_session_name, stdout)
         }
@@ -771,261 +794,12 @@ fn handle_session_command(
 
 fn write_jsonl_event(
     stdout: &mut dyn Write,
-    session_name: &str,
-    workspace_root: &Path,
-    turn_index: usize,
-    event_index: usize,
-    event: &AgentEvent,
+    envelope: &AgentEventEnvelope,
 ) -> Result<(), CliError> {
-    let envelope = json!({
-        "schema_version": 1,
-        "timestamp_ms": timestamp_ms(),
-        "session": session_name,
-        "workspace_root": workspace_root.display().to_string(),
-        "turn_index": turn_index,
-        "event_index": event_index,
-        "event": event,
-    });
-    serde_json::to_writer(&mut *stdout, &envelope).map_err(CliError::JsonlSerialize)?;
+    serde_json::to_writer(&mut *stdout, envelope).map_err(CliError::JsonlSerialize)?;
     stdout.write_all(b"\n").map_err(CliError::Stdout)?;
     stdout.flush().map_err(CliError::Stdout)?;
     Ok(())
-}
-
-fn timestamp_ms() -> u64 {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    millis.min(u128::from(u64::MAX)) as u64
-}
-
-async fn maybe_auto_compact(
-    client: &OpenAiCompatClient,
-    system_prompt: &str,
-    session: &mut Session,
-    context_config: ContextConfig,
-    prompt: &str,
-) -> Result<(), String> {
-    if !context_config.auto_compact {
-        return Ok(());
-    }
-
-    let estimate = estimate_context_chars(system_prompt, session, prompt);
-    if estimate <= context_config.max_context_chars {
-        return Ok(());
-    }
-
-    compact_session(client, system_prompt, session, context_config)
-        .await
-        .map_err(|err| err.to_string())?;
-
-    let compacted_estimate = estimate_context_chars(system_prompt, session, prompt);
-    if compacted_estimate > context_config.max_context_chars {
-        return Err(format!(
-            "context is still over budget after compaction ({compacted_estimate} > {})",
-            context_config.max_context_chars
-        ));
-    }
-
-    Ok(())
-}
-
-async fn compact_session(
-    client: &OpenAiCompatClient,
-    _system_prompt: &str,
-    session: &mut Session,
-    context_config: ContextConfig,
-) -> Result<CompactionOutcome, CliError> {
-    let prefix_len = compactable_prefix_len(session, context_config.retain_recent_turns);
-    if prefix_len <= session.context.summarized_turns {
-        return Ok(CompactionOutcome::Noop);
-    }
-
-    let records = session.turns[session.context.summarized_turns..prefix_len].to_vec();
-    let summary = request_session_summary(
-        client,
-        session.context.summary.as_deref(),
-        context_config.summary_target_chars,
-        &records,
-        session.context.summarized_turns,
-    )
-    .await?;
-
-    session.context.summary = Some(summary);
-    session.context.summarized_turns = prefix_len;
-    rebuild_active_thread(session);
-
-    Ok(CompactionOutcome::Changed)
-}
-
-fn compactable_prefix_len(session: &Session, retain_recent_turns: usize) -> usize {
-    let completed_indices = session
-        .turns
-        .iter()
-        .enumerate()
-        .filter_map(|(index, record)| {
-            (record.turn.status == TurnStatus::Completed).then_some(index)
-        })
-        .collect::<Vec<_>>();
-
-    if completed_indices.len() <= retain_recent_turns {
-        return session.context.summarized_turns;
-    }
-
-    completed_indices[completed_indices.len() - retain_recent_turns]
-        .max(session.context.summarized_turns)
-}
-
-fn rebuild_active_thread(session: &mut Session) {
-    let mut messages = Vec::new();
-    if let Some(summary) = session.context.summary.as_ref() {
-        messages.push(Message::system(format!("Session summary:\n{summary}")));
-    }
-
-    for record in session.turns.iter().skip(session.context.summarized_turns) {
-        if record.turn.status == TurnStatus::Completed {
-            messages.extend(record.messages.clone());
-        }
-    }
-
-    session.active_thread.messages = messages;
-}
-
-async fn request_session_summary(
-    client: &OpenAiCompatClient,
-    existing_summary: Option<&str>,
-    target_chars: usize,
-    records: &[TurnRecord],
-    first_turn_index: usize,
-) -> Result<String, CliError> {
-    let mut conversation = Conversation::with_system_prompt(
-        "You compact long-running coding agent session history. Produce a concise, factual summary that preserves user goals, constraints, decisions, file and command results, failure reasons, pending tasks, and open questions. Do not include fluff.",
-    );
-    conversation.push(Message::user(build_summary_prompt(
-        existing_summary,
-        target_chars,
-        records,
-        first_turn_index,
-    )));
-
-    let mut stream = client.stream_chat(&conversation, &[]).await?;
-    let mut summary = String::new();
-    while let Some(event) = stream.next().await {
-        match event? {
-            ModelEvent::TextDelta(text) => summary.push_str(&text),
-            ModelEvent::Completed => {
-                let summary = summary.trim().to_string();
-                if summary.is_empty() {
-                    return Err(CliError::AgentRun(
-                        "summary model returned an empty summary".to_string(),
-                    ));
-                }
-                return Ok(summary);
-            }
-            ModelEvent::ToolCalls(_) => {
-                return Err(CliError::AgentRun(
-                    "summary model requested tool calls".to_string(),
-                ));
-            }
-        }
-    }
-
-    Err(CliError::AgentRun(
-        "summary model stream ended before completion".to_string(),
-    ))
-}
-
-fn build_summary_prompt(
-    existing_summary: Option<&str>,
-    target_chars: usize,
-    records: &[TurnRecord],
-    first_turn_index: usize,
-) -> String {
-    let mut prompt = String::new();
-    let _ = writeln!(
-        prompt,
-        "Update the session summary. Target length: at most {target_chars} characters."
-    );
-    let _ = writeln!(prompt);
-    let _ = writeln!(prompt, "Existing summary:");
-    let _ = writeln!(prompt, "{}", existing_summary.unwrap_or("(none)"));
-    let _ = writeln!(prompt);
-    let _ = writeln!(prompt, "Turns to incorporate:");
-
-    for (offset, record) in records.iter().enumerate() {
-        append_turn_record_transcript(&mut prompt, first_turn_index + offset, record);
-    }
-
-    prompt
-}
-
-fn append_turn_record_transcript(output: &mut String, index: usize, record: &TurnRecord) {
-    let _ = writeln!(
-        output,
-        "\nTurn {index}: status={}",
-        turn_status_label(record.turn.status)
-    );
-    if let Some(error) = record.turn.error.as_ref() {
-        let _ = writeln!(output, "turn_error: {error}");
-    }
-    for message in &record.messages {
-        let _ = writeln!(output, "{}:", message_role_label(message));
-        if let Some(content) = message.content.as_ref() {
-            let _ = writeln!(output, "{content}");
-        }
-        if let Some(tool_calls) = message.tool_calls.as_ref() {
-            let tool_calls = serde_json::to_string(tool_calls).unwrap_or_else(|_| "[]".to_string());
-            let _ = writeln!(output, "tool_calls: {tool_calls}");
-        }
-        if let Some(tool_call_id) = message.tool_call_id.as_ref() {
-            let _ = writeln!(output, "tool_call_id: {tool_call_id}");
-        }
-    }
-}
-
-fn estimate_context_chars(system_prompt: &str, session: &Session, prompt: &str) -> usize {
-    system_prompt.chars().count()
-        + prompt.chars().count()
-        + session
-            .active_thread
-            .messages
-            .iter()
-            .map(message_context_chars)
-            .sum::<usize>()
-}
-
-fn message_context_chars(message: &Message) -> usize {
-    let mut total = message_role_label(message).len();
-    if let Some(content) = message.content.as_ref() {
-        total += content.chars().count();
-    }
-    if let Some(tool_call_id) = message.tool_call_id.as_ref() {
-        total += tool_call_id.chars().count();
-    }
-    if let Some(tool_calls) = message.tool_calls.as_ref() {
-        total += serde_json::to_string(tool_calls)
-            .map(|value| value.chars().count())
-            .unwrap_or_default();
-    }
-    total
-}
-
-fn message_role_label(message: &Message) -> &'static str {
-    match message.role {
-        agent_protocol::Role::System => "system",
-        agent_protocol::Role::User => "user",
-        agent_protocol::Role::Assistant => "assistant",
-        agent_protocol::Role::Tool => "tool",
-    }
-}
-
-fn turn_status_label(status: TurnStatus) -> &'static str {
-    match status {
-        TurnStatus::Running => "running",
-        TurnStatus::Completed => "completed",
-        TurnStatus::Failed => "failed",
-    }
 }
 
 fn approval_decision(
@@ -1236,35 +1010,14 @@ fn parse_permission_mode(value: &str) -> Result<PermissionMode, String> {
     }
 }
 
-fn detect_workspace_root() -> Result<PathBuf, CliError> {
-    let cwd = std::env::current_dir().map_err(session_store::SessionStoreError::CurrentDir)?;
-    let mut candidate = cwd.as_path();
-
-    loop {
-        let manifest = candidate.join("Cargo.toml");
-        if manifest.is_file() && manifest_has_workspace_header(&manifest) {
-            return Ok(candidate.to_path_buf());
-        }
-        let Some(parent) = candidate.parent() else {
-            return Ok(cwd);
-        };
-        candidate = parent;
-    }
-}
-
-fn manifest_has_workspace_header(path: &std::path::Path) -> bool {
-    let Ok(content) = fs::read_to_string(path) else {
-        return false;
-    };
-    content.lines().any(|line| line.trim() == "[workspace]")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_protocol::{FileChangeOperation, Thread, Turn};
+    use agent_protocol::{FileChangeOperation, Message, Thread, Turn, TurnRecord, TurnStatus};
+    use agent_runtime::{compact_session, rebuild_active_thread};
     use serde_json::json;
     use std::sync::{Arc, Mutex};
+    use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -1672,14 +1425,9 @@ mod tests {
             spawn_recording_sse_server(vec![sse_text_body("new summary")]).await;
         let mut session = compactable_session();
 
-        let outcome = compact_session(
-            &client(base_url),
-            "system",
-            &mut session,
-            context_config(10_000, 2),
-        )
-        .await
-        .expect("compact session");
+        let outcome = compact_session(&client(base_url), &mut session, context_config(10_000, 2))
+            .await
+            .expect("compact session");
 
         assert_eq!(outcome, CompactionOutcome::Changed);
         assert_eq!(session.context.summary.as_deref(), Some("new summary"));
