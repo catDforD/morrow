@@ -195,12 +195,6 @@ export type ClientMessage =
     }
   | { type: 'cancel_turn'; data: { turn_id: string } }
 
-export interface UiMessage {
-  id: string
-  role: Exclude<Role, 'system'>
-  content: string
-}
-
 export interface ToolRun {
   id: string
   name: string
@@ -215,3 +209,54 @@ export interface ActivityItem {
   tone: 'neutral' | 'running' | 'ok' | 'error' | 'approval'
   time: string
 }
+
+export type TimelineMessageRole = 'user' | 'assistant'
+
+export interface TimelineMessageItem {
+  kind: 'message'
+  id: string
+  role: TimelineMessageRole
+  content: string
+}
+
+export interface TimelineNoticeItem {
+  kind: 'notice'
+  id: string
+  tone: ActivityItem['tone']
+  title: string
+  detail?: string
+}
+
+export type RunTraceStatus = 'running' | 'completed' | 'failed' | 'approval'
+export type RunStepKind = 'model' | 'tool' | 'approval' | 'error' | 'final'
+export type RunStepStatus = 'running' | 'ok' | 'error' | 'approval'
+
+export interface RunStep {
+  id: string
+  kind: RunStepKind
+  status: RunStepStatus
+  title: string
+  detail?: string
+  summary?: ToolExecutionSummary
+}
+
+export interface RunTrace {
+  id: string
+  status: RunTraceStatus
+  collapsed: boolean
+  startedAt: string
+  completedAt?: string
+  steps: RunStep[]
+  toolCount: number
+}
+
+export interface TimelineRunItem {
+  kind: 'run'
+  id: string
+  trace: RunTrace
+}
+
+export type TimelineItem =
+  | TimelineMessageItem
+  | TimelineNoticeItem
+  | TimelineRunItem
