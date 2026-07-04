@@ -72,7 +72,10 @@ pub fn router(options: ServerOptions) -> Router {
         .route("/assets/{*path}", get(asset))
         .route("/api/status", get(status))
         .route("/api/sessions", get(list_sessions))
-        .route("/api/sessions/{name}", get(get_session))
+        .route(
+            "/api/sessions/{name}",
+            get(get_session).post(create_session),
+        )
         .route("/api/sessions/{name}/reset", post(reset_session))
         .route("/api/sessions/{name}/ws", get(session_ws))
         .with_state(state)
@@ -262,6 +265,32 @@ async fn get_session(
             .load()
             .map_err(|error| ApiError::internal(error.to_string()))?,
     )))
+}
+
+async fn create_session(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<SessionDocument>, ApiError> {
+    if running_snapshot(&state, &name).await.is_some() {
+        return Err(ApiError::conflict("session has a running turn"));
+    }
+
+    let store = session_store(&name)?;
+    match store.load_existing() {
+        Ok(_) => {
+            return Err(ApiError::conflict(format!(
+                "session {name:?} already exists"
+            )));
+        }
+        Err(agent_runtime::SessionStoreError::SessionNotFound { .. }) => {}
+        Err(error) => return Err(ApiError::internal(error.to_string())),
+    }
+
+    let session = Session::new();
+    store
+        .save(&session)
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    Ok(Json(SessionDocument::new(session)))
 }
 
 async fn reset_session(
@@ -757,7 +786,13 @@ mod tests {
     use super::*;
     use agent_model::OpenAiCompatConfig;
     use agent_protocol::{PermissionMode, ShellPolicy};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::OnceLock;
     use std::time::Duration;
+    use tokio::sync::Mutex as AsyncMutex;
+
+    static ENV_LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
 
     fn test_options() -> ServerOptions {
         let root = std::env::temp_dir();
@@ -797,6 +832,16 @@ mod tests {
         }
     }
 
+    fn unique_test_dir(name: &str) -> PathBuf {
+        let stamp = agent_runtime::timestamp_ms();
+        let path = std::env::temp_dir().join(format!(
+            "morrow-server-{name}-{stamp}-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&path).expect("create temp dir");
+        path
+    }
+
     #[tokio::test]
     async fn status_response_omits_api_key() {
         let response = status(State(test_state())).await;
@@ -830,6 +875,77 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn create_session_saves_empty_session() {
+        let lock = ENV_LOCK.get_or_init(|| AsyncMutex::new(())).lock().await;
+        let home = unique_test_dir("create-home");
+        let cwd = unique_test_dir("create-cwd");
+        let previous_cwd = std::env::current_dir().expect("current dir");
+        let previous_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        std::env::set_current_dir(&cwd).expect("set cwd");
+
+        let response = create_session(State(test_state()), Path("fresh".to_string()))
+            .await
+            .expect("create session");
+        let store = SessionStore::for_current_dir("fresh").expect("store");
+        let session = store.load_existing().expect("load created session");
+
+        assert_eq!(response.0.session, Session::new());
+        assert_eq!(session, Session::new());
+        assert!(store.path().is_file());
+
+        std::env::set_current_dir(previous_cwd).expect("restore cwd");
+        match previous_home {
+            Some(value) => unsafe {
+                std::env::set_var("HOME", value);
+            },
+            None => unsafe {
+                std::env::remove_var("HOME");
+            },
+        }
+        drop(lock);
+    }
+
+    #[tokio::test]
+    async fn create_session_rejects_existing_session() {
+        let lock = ENV_LOCK.get_or_init(|| AsyncMutex::new(())).lock().await;
+        let home = unique_test_dir("create-existing-home");
+        let cwd = unique_test_dir("create-existing-cwd");
+        let previous_cwd = std::env::current_dir().expect("current dir");
+        let previous_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        std::env::set_current_dir(&cwd).expect("set cwd");
+
+        let store = SessionStore::for_current_dir("existing").expect("store");
+        store.save(&Session::new()).expect("save existing session");
+
+        let result = create_session(State(test_state()), Path("existing".to_string())).await;
+
+        assert!(matches!(
+            result,
+            Err(ApiError {
+                status: StatusCode::CONFLICT,
+                ..
+            })
+        ));
+
+        std::env::set_current_dir(previous_cwd).expect("restore cwd");
+        match previous_home {
+            Some(value) => unsafe {
+                std::env::set_var("HOME", value);
+            },
+            None => unsafe {
+                std::env::remove_var("HOME");
+            },
+        }
+        drop(lock);
     }
 
     #[tokio::test]

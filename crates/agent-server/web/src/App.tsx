@@ -3,12 +3,17 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Activity,
   Bot,
+  Check,
+  ChevronDown,
+  ChevronRight,
   CheckCircle2,
   CircleAlert,
   Clock3,
+  FileText,
   Files,
   ListTree,
   Moon,
+  Plus,
   RefreshCw,
   RotateCcw,
   Send,
@@ -19,6 +24,8 @@ import {
   Wrench,
   X,
 } from 'lucide-react'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 import { fetchJson, sessionSocketUrl } from './api'
 import type {
   ActivityItem,
@@ -32,9 +39,13 @@ import type {
   SessionDocument,
   SessionEntryResponse,
   StatusResponse,
+  TimelineItem,
+  TimelineMessageItem,
+  TimelineNoticeItem,
+  RunStep,
+  RunTrace,
   ToolExecutionSummary,
   ToolRun,
-  UiMessage,
 } from './types'
 
 type Tab = 'chat' | 'activity' | 'tools' | 'sessions'
@@ -46,6 +57,8 @@ const tabs: { id: Tab; label: string; icon: ReactNode }[] = [
   { id: 'tools', label: 'Tools', icon: <Wrench size={18} /> },
   { id: 'sessions', label: 'Sessions', icon: <ListTree size={18} /> },
 ]
+
+const markdownPlugins = [remarkGfm]
 
 const emptySessionEntry = (name: string): SessionEntryResponse => ({
   name,
@@ -61,9 +74,14 @@ export default function App() {
   const [status, setStatus] = useState<StatusResponse | null>(null)
   const [sessions, setSessions] = useState<SessionEntryResponse[]>([])
   const [selected, setSelected] = useState('default')
-  const [messages, setMessages] = useState<UiMessage[]>([])
+  const [timeline, setTimeline] = useState<TimelineItem[]>([])
   const [tools, setTools] = useState<ToolRun[]>([])
   const [activity, setActivity] = useState<ActivityItem[]>([])
+  const [isCreatingSession, setIsCreatingSession] = useState(false)
+  const [newSessionName, setNewSessionName] = useState('')
+  const [createSessionError, setCreateSessionError] = useState<string | null>(
+    null,
+  )
   const [runningTurn, setRunningTurn] = useState<RunningTurnSnapshot | null>(
     null,
   )
@@ -79,6 +97,7 @@ export default function App() {
   const socketRef = useRef<WebSocket | null>(null)
   const selectedRef = useRef(selected)
   const assistantMessageIdRef = useRef<string | null>(null)
+  const runTraceIdRef = useRef<string | null>(null)
   const idRef = useRef(0)
   const selectionRef = useRef(0)
   const messagesEndRef = useRef<HTMLDivElement | null>(null)
@@ -110,22 +129,242 @@ export default function App() {
     [nextId],
   )
 
-  const addMessage = useCallback(
-    (role: UiMessage['role'], content: string) => {
+  const addTimelineMessage = useCallback(
+    (role: TimelineMessageItem['role'], content: string) => {
       const id = nextId(role)
-      setMessages((items) => [...items, { id, role, content }])
+      setTimeline((items) => [...items, { kind: 'message', id, role, content }])
       return id
     },
     [nextId],
   )
 
+  const addNotice = useCallback(
+    (
+      tone: TimelineNoticeItem['tone'],
+      title: string,
+      detail?: string,
+    ) => {
+      const id = nextId('notice')
+      setTimeline((items) => [...items, { kind: 'notice', id, tone, title, detail }])
+      return id
+    },
+    [nextId],
+  )
+
+  const updateRunTrace = useCallback(
+    (id: string, update: (trace: RunTrace) => RunTrace) => {
+      setTimeline((items) =>
+        items.map((item) =>
+          item.kind === 'run' && item.id === id
+            ? { ...item, trace: update(item.trace) }
+            : item,
+        ),
+      )
+    },
+    [],
+  )
+
+  const createRunTrace = useCallback(
+    (title: string, detail?: string) => {
+      const id = nextId('run')
+      const step: RunStep = {
+        id: nextId('step'),
+        kind: 'model',
+        status: 'running',
+        title,
+        detail,
+      }
+      const trace: RunTrace = {
+        id,
+        status: 'running',
+        collapsed: false,
+        startedAt: currentTime(),
+        steps: [step],
+        toolCount: 0,
+      }
+      runTraceIdRef.current = id
+      setTimeline((items) => [...items, { kind: 'run', id, trace }])
+      return id
+    },
+    [nextId],
+  )
+
+  const ensureRunTrace = useCallback(
+    (title = 'Model call started', detail?: string) => {
+      if (runTraceIdRef.current) return runTraceIdRef.current
+      return createRunTrace(title, detail)
+    },
+    [createRunTrace],
+  )
+
+  const refreshCurrentModelStep = useCallback(
+    (title: string, detail?: string) => {
+      const id = ensureRunTrace(title, detail)
+      updateRunTrace(id, (trace) => {
+        const firstRunningModel = trace.steps.findIndex(
+          (step) => step.kind === 'model' && step.status === 'running',
+        )
+        if (firstRunningModel === -1) return trace
+        const steps = [...trace.steps]
+        steps[firstRunningModel] = { ...steps[firstRunningModel], title, detail }
+        return { ...trace, status: 'running', collapsed: false, steps }
+      })
+    },
+    [ensureRunTrace, updateRunTrace],
+  )
+
+  const upsertRunStep = useCallback(
+    (runId: string, nextStep: RunStep) => {
+      updateRunTrace(runId, (trace) => {
+        const existing = trace.steps.findIndex((step) => step.id === nextStep.id)
+        const steps =
+          existing === -1
+            ? [...trace.steps, nextStep]
+            : trace.steps.map((step) =>
+                step.id === nextStep.id ? { ...step, ...nextStep } : step,
+              )
+        return {
+          ...trace,
+          collapsed: false,
+          steps,
+          toolCount: steps.filter((step) => step.kind === 'tool').length,
+        }
+      })
+    },
+    [updateRunTrace],
+  )
+
+  const startToolStep = useCallback(
+    (id: string, name: string) => {
+      const runId = ensureRunTrace('Model requested a tool', name)
+      updateRunTrace(runId, (trace) => ({
+        ...trace,
+        steps: trace.steps.map((step) =>
+          step.kind === 'model' && step.status === 'running'
+            ? { ...step, status: 'ok' }
+            : step,
+        ),
+      }))
+      upsertRunStep(runId, {
+        id,
+        kind: 'tool',
+        status: 'running',
+        title: name,
+        detail: 'Tool call started',
+      })
+    },
+    [ensureRunTrace, updateRunTrace, upsertRunStep],
+  )
+
+  const finishToolStep = useCallback(
+    (
+      id: string,
+      name: string,
+      ok: boolean,
+      summary?: ToolExecutionSummary,
+    ) => {
+      const runId = ensureRunTrace('Tool result received', name)
+      upsertRunStep(runId, {
+        id,
+        kind: 'tool',
+        status: ok ? 'ok' : 'error',
+        title: name,
+        detail: formatToolSummary(summary),
+        summary,
+      })
+    },
+    [ensureRunTrace, upsertRunStep],
+  )
+
+  const setApprovalStep = useCallback(
+    (requestId: string, title: string, detail: string, approved?: boolean) => {
+      const runId = ensureRunTrace('Approval requested', detail)
+      upsertRunStep(runId, {
+        id: `approval-${requestId}`,
+        kind: 'approval',
+        status: approved == null ? 'approval' : approved ? 'ok' : 'error',
+        title,
+        detail,
+      })
+      updateRunTrace(runId, (trace) => ({
+        ...trace,
+        status: approved == null ? 'approval' : approved ? 'running' : 'failed',
+      }))
+    },
+    [ensureRunTrace, updateRunTrace, upsertRunStep],
+  )
+
+  const completeCurrentRun = useCallback(() => {
+    const id = runTraceIdRef.current
+    if (!id) return
+    updateRunTrace(id, (trace) => {
+      const hasFinalStep = trace.steps.some((step) => step.kind === 'final')
+      const completedSteps = trace.steps.map((step) =>
+        step.status === 'running' || step.status === 'approval'
+          ? { ...step, status: 'ok' as const }
+          : step,
+      )
+      const steps = hasFinalStep
+        ? completedSteps
+        : [
+            ...completedSteps,
+            {
+              id: nextId('step'),
+              kind: 'final' as const,
+              status: 'ok' as const,
+              title: 'Final response ready',
+            },
+          ]
+      return {
+        ...trace,
+        status: 'completed',
+        collapsed: true,
+        completedAt: currentTime(),
+        steps,
+      }
+    })
+    runTraceIdRef.current = null
+  }, [nextId, updateRunTrace])
+
+  const failCurrentRun = useCallback(
+    (message: string) => {
+      const id = runTraceIdRef.current
+      if (!id) {
+        addNotice('error', 'Error', message)
+        return
+      }
+      updateRunTrace(id, (trace) => ({
+        ...trace,
+        status: 'failed',
+        collapsed: false,
+        completedAt: currentTime(),
+        steps: [
+          ...trace.steps.map((step) =>
+            step.status === 'running' || step.status === 'approval'
+              ? { ...step, status: 'error' as const }
+              : step,
+          ),
+          {
+            id: nextId('step'),
+            kind: 'error',
+            status: 'error',
+            title: 'Error',
+            detail: message,
+          },
+        ],
+      }))
+      runTraceIdRef.current = null
+    },
+    [addNotice, nextId, updateRunTrace],
+  )
+
   const showError = useCallback(
     (error: unknown) => {
       const message = error instanceof Error ? error.message : String(error)
-      addMessage('tool', message)
+      failCurrentRun(message)
       recordActivity('Error', message, 'error')
     },
-    [addMessage, recordActivity],
+    [failCurrentRun, recordActivity],
   )
 
   const appendAssistantDelta = useCallback(
@@ -133,14 +372,19 @@ export default function App() {
       if (!assistantMessageIdRef.current) {
         const id = nextId('assistant')
         assistantMessageIdRef.current = id
-        setMessages((items) => [...items, { id, role: 'assistant', content: text }])
+        setTimeline((items) => [
+          ...items,
+          { kind: 'message', id, role: 'assistant', content: text },
+        ])
         return
       }
 
       const id = assistantMessageIdRef.current
-      setMessages((items) =>
+      setTimeline((items) =>
         items.map((item) =>
-          item.id === id ? { ...item, content: item.content + text } : item,
+          item.kind === 'message' && item.id === id
+            ? { ...item, content: item.content + text }
+            : item,
         ),
       )
     },
@@ -193,6 +437,7 @@ export default function App() {
         case 'turn_started':
           assistantMessageIdRef.current = null
           setTools([])
+          refreshCurrentModelStep('Model call started', selectedRef.current)
           recordActivity('Turn started', selectedRef.current, 'running')
           break
         case 'text_delta':
@@ -200,12 +445,13 @@ export default function App() {
           break
         case 'agent_message':
           if (!assistantMessageIdRef.current && event.data.trim()) {
-            addMessage('assistant', event.data)
+            addTimelineMessage('assistant', event.data)
           }
           assistantMessageIdRef.current = null
           break
         case 'tool_call_started':
           upsertTool(event.data.id, event.data.name, 'running')
+          startToolStep(event.data.id, event.data.name)
           recordActivity('Tool started', event.data.name, 'running')
           break
         case 'tool_call_finished':
@@ -213,6 +459,12 @@ export default function App() {
             event.data.id,
             event.data.name,
             event.data.ok ? 'ok' : 'error',
+            event.data.summary,
+          )
+          finishToolStep(
+            event.data.id,
+            event.data.name,
+            event.data.ok,
             event.data.summary,
           )
           recordActivity(
@@ -223,10 +475,17 @@ export default function App() {
           break
         case 'approval_requested':
           setPendingApproval(event.data)
+          setApprovalStep(event.data.id, 'Approval requested', event.data.reason)
           recordActivity('Approval requested', event.data.reason, 'approval')
           break
         case 'approval_resolved':
           setPendingApproval(null)
+          setApprovalStep(
+            event.data.request_id,
+            event.data.approved ? 'Approval granted' : 'Approval denied',
+            event.data.request_id,
+            event.data.approved,
+          )
           recordActivity(
             event.data.approved ? 'Approval granted' : 'Approval denied',
             event.data.request_id,
@@ -236,6 +495,7 @@ export default function App() {
         case 'turn_completed':
           setRunningTurn(null)
           assistantMessageIdRef.current = null
+          completeCurrentRun()
           recordActivity('Turn completed', selectedRef.current, 'ok')
           break
         case 'error':
@@ -244,7 +504,18 @@ export default function App() {
           break
       }
     },
-    [addMessage, appendAssistantDelta, recordActivity, showError, upsertTool],
+    [
+      addTimelineMessage,
+      appendAssistantDelta,
+      completeCurrentRun,
+      finishToolStep,
+      recordActivity,
+      refreshCurrentModelStep,
+      setApprovalStep,
+      showError,
+      startToolStep,
+      upsertTool,
+    ],
   )
 
   const handleServerMessage = useCallback(
@@ -323,7 +594,8 @@ export default function App() {
       setTools([])
       setActivity([])
       assistantMessageIdRef.current = null
-      setMessages([])
+      runTraceIdRef.current = null
+      setTimeline([])
       closeSocket()
       history.replaceState(null, '', `?session=${encodeURIComponent(name)}`)
 
@@ -332,7 +604,7 @@ export default function App() {
           `/api/sessions/${encodeURIComponent(name)}`,
         )
         if (selectionRef.current !== selectionId) return
-        setMessages(sessionMessages(document.session))
+        setTimeline(sessionTimeline(document.session))
         recordActivity(
           'Session loaded',
           `${document.session.turns.length} turns`,
@@ -360,7 +632,7 @@ export default function App() {
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ block: 'end' })
-  }, [messages])
+  }, [timeline])
 
   useEffect(() => {
     let mounted = true
@@ -399,7 +671,8 @@ export default function App() {
     const trimmed = prompt.trim()
     if (!trimmed || !canSend) return
     try {
-      addMessage('user', trimmed)
+      addTimelineMessage('user', trimmed)
+      createRunTrace('Request queued', compactText(trimmed, 90))
       sendSocketMessage({
         type: 'start_turn',
         data: {
@@ -419,6 +692,38 @@ export default function App() {
     if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
       event.preventDefault()
       event.currentTarget.form?.requestSubmit()
+    }
+  }
+
+  const startCreateSession = () => {
+    setIsCreatingSession(true)
+    setCreateSessionError(null)
+  }
+
+  const cancelCreateSession = () => {
+    setIsCreatingSession(false)
+    setNewSessionName('')
+    setCreateSessionError(null)
+  }
+
+  const createSession = async () => {
+    const name = newSessionName.trim()
+    if (!name) return
+
+    try {
+      setCreateSessionError(null)
+      await fetchJson<SessionDocument>(
+        `/api/sessions/${encodeURIComponent(name)}`,
+        { method: 'POST' },
+      )
+      setIsCreatingSession(false)
+      setNewSessionName('')
+      await loadSessions()
+      await selectSession(name)
+      setActiveTab('chat')
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      setCreateSessionError(message)
     }
   }
 
@@ -494,9 +799,12 @@ export default function App() {
               connection={connection}
               selected={selected}
               selectedEntry={selectedEntry}
-              messages={messages}
+              timeline={timeline}
               tools={tools}
               activity={activity}
+              isCreatingSession={isCreatingSession}
+              newSessionName={newSessionName}
+              createSessionError={createSessionError}
               runningTurn={runningTurn}
               pendingApproval={pendingApproval}
               prompt={prompt}
@@ -509,6 +817,25 @@ export default function App() {
               onCancel={cancelTurn}
               onReset={() => void resetSession()}
               onSelectSession={(name) => void selectSession(name)}
+              onStartCreateSession={startCreateSession}
+              onCancelCreateSession={cancelCreateSession}
+              onNewSessionNameChange={setNewSessionName}
+              onCreateSession={() => void createSession()}
+              onToggleRun={(id) => {
+                setTimeline((items) =>
+                  items.map((item) =>
+                    item.kind === 'run' && item.id === id
+                      ? {
+                          ...item,
+                          trace: {
+                            ...item.trace,
+                            collapsed: !item.trace.collapsed,
+                          },
+                        }
+                      : item,
+                  ),
+                )
+              }}
               messagesEndRef={messagesEndRef}
             />
           ) : activeTab === 'activity' ? (
@@ -519,10 +846,17 @@ export default function App() {
             <SessionsView
               sessions={sessions}
               selected={selected}
+              isCreatingSession={isCreatingSession}
+              newSessionName={newSessionName}
+              createSessionError={createSessionError}
               onSelect={(name) => {
                 setActiveTab('chat')
                 void selectSession(name)
               }}
+              onStartCreateSession={startCreateSession}
+              onCancelCreateSession={cancelCreateSession}
+              onNewSessionNameChange={setNewSessionName}
+              onCreateSession={() => void createSession()}
               onRefresh={() => void refresh()}
             />
           )}
@@ -594,9 +928,12 @@ function ChatView({
   connection,
   selected,
   selectedEntry,
-  messages,
+  timeline,
   tools,
   activity,
+  isCreatingSession,
+  newSessionName,
+  createSessionError,
   runningTurn,
   pendingApproval,
   prompt,
@@ -609,6 +946,11 @@ function ChatView({
   onCancel,
   onReset,
   onSelectSession,
+  onStartCreateSession,
+  onCancelCreateSession,
+  onNewSessionNameChange,
+  onCreateSession,
+  onToggleRun,
   messagesEndRef,
 }: {
   sessions: SessionEntryResponse[]
@@ -616,9 +958,12 @@ function ChatView({
   connection: ConnectionStatus
   selected: string
   selectedEntry?: SessionEntryResponse
-  messages: UiMessage[]
+  timeline: TimelineItem[]
   tools: ToolRun[]
   activity: ActivityItem[]
+  isCreatingSession: boolean
+  newSessionName: string
+  createSessionError: string | null
   runningTurn: RunningTurnSnapshot | null
   pendingApproval: ApprovalRequest | null
   prompt: string
@@ -631,6 +976,11 @@ function ChatView({
   onCancel: () => void
   onReset: () => void
   onSelectSession: (name: string) => void
+  onStartCreateSession: () => void
+  onCancelCreateSession: () => void
+  onNewSessionNameChange: (value: string) => void
+  onCreateSession: () => void
+  onToggleRun: (id: string) => void
   messagesEndRef: React.RefObject<HTMLDivElement | null>
 }) {
   return (
@@ -641,20 +991,22 @@ function ChatView({
         connection={connection}
         runningTurn={runningTurn}
         selected={selected}
+        isCreating={isCreatingSession}
+        newSessionName={newSessionName}
+        createError={createSessionError}
         onSelect={onSelectSession}
+        onStartCreate={onStartCreateSession}
+        onCancelCreate={onCancelCreateSession}
+        onNameChange={onNewSessionNameChange}
+        onCreate={onCreateSession}
       />
       <section className="conversation-panel">
         <ConversationHeader selected={selected} selectedEntry={selectedEntry} />
-        <div className="message-scroll main-scroll">
-          {messages.length === 0 ? (
-            <EmptyState />
-          ) : (
-            messages.map((message) => (
-              <MessageBubble key={message.id} message={message} />
-            ))
-          )}
-          <div ref={messagesEndRef} />
-        </div>
+        <ConversationTimeline
+          items={timeline}
+          messagesEndRef={messagesEndRef}
+          onToggleRun={onToggleRun}
+        />
         <Composer
           prompt={prompt}
           canSend={canSend}
@@ -683,22 +1035,50 @@ function SessionRail({
   connection,
   runningTurn,
   selected,
+  isCreating,
+  newSessionName,
+  createError,
   onSelect,
+  onStartCreate,
+  onCancelCreate,
+  onNameChange,
+  onCreate,
 }: {
   sessions: SessionEntryResponse[]
   status: StatusResponse | null
   connection: ConnectionStatus
   runningTurn: RunningTurnSnapshot | null
   selected: string
+  isCreating: boolean
+  newSessionName: string
+  createError: string | null
   onSelect: (name: string) => void
+  onStartCreate: () => void
+  onCancelCreate: () => void
+  onNameChange: (value: string) => void
+  onCreate: () => void
 }) {
   return (
     <aside className="session-rail">
-      <div className="panel-title">
-        <Files size={18} />
-        <span>Sessions</span>
+      <div className="panel-title split-title">
+        <div className="panel-title-label">
+          <Files size={18} />
+          <span>Sessions</span>
+        </div>
+        <MiniIconButton title="New session" onClick={onStartCreate}>
+          <Plus size={17} />
+        </MiniIconButton>
       </div>
       <div className="session-list main-scroll">
+        {isCreating ? (
+          <CreateSessionRow
+            value={newSessionName}
+            error={createError}
+            onChange={onNameChange}
+            onCancel={onCancelCreate}
+            onSubmit={onCreate}
+          />
+        ) : null}
         {sessions.map((session) => (
           <button
             key={session.name}
@@ -779,12 +1159,185 @@ function ConversationHeader({
   )
 }
 
-function MessageBubble({ message }: { message: UiMessage }) {
+function ConversationTimeline({
+  items,
+  messagesEndRef,
+  onToggleRun,
+}: {
+  items: TimelineItem[]
+  messagesEndRef: React.RefObject<HTMLDivElement | null>
+  onToggleRun: (id: string) => void
+}) {
+  return (
+    <div className="message-scroll main-scroll">
+      {items.length === 0 ? (
+        <EmptyState />
+      ) : (
+        items.map((item) => {
+          if (item.kind === 'message') {
+            return <TimelineMessage key={item.id} message={item} />
+          }
+          if (item.kind === 'run') {
+            return (
+              <RunTraceCard
+                key={item.id}
+                trace={item.trace}
+                onToggle={() => onToggleRun(item.id)}
+              />
+            )
+          }
+          return <TimelineNotice key={item.id} notice={item} />
+        })
+      )}
+      <div ref={messagesEndRef} />
+    </div>
+  )
+}
+
+function TimelineMessage({ message }: { message: TimelineMessageItem }) {
   return (
     <article className={`message-row ${message.role}`}>
       <div className="message-role">{message.role}</div>
-      <pre className="message-bubble">{message.content}</pre>
+      {message.role === 'assistant' ? (
+        <MarkdownMessage content={message.content} />
+      ) : (
+        <pre className="message-bubble">{message.content}</pre>
+      )}
     </article>
+  )
+}
+
+function MarkdownMessage({ content }: { content: string }) {
+  return (
+    <div className="message-bubble markdown-message">
+      <ReactMarkdown
+        remarkPlugins={markdownPlugins}
+        skipHtml
+        components={{
+          a: ({ node: _node, ...props }) => (
+            <a {...props} target="_blank" rel="noreferrer" />
+          ),
+          table: ({ node: _node, ...props }) => (
+            <div className="markdown-table-scroll">
+              <table {...props} />
+            </div>
+          ),
+        }}
+      >
+        {content}
+      </ReactMarkdown>
+    </div>
+  )
+}
+
+function TimelineNotice({ notice }: { notice: TimelineNoticeItem }) {
+  return (
+    <article className={`timeline-notice ${notice.tone}`}>
+      {noticeIcon(notice.tone)}
+      <div>
+        <strong>{notice.title}</strong>
+        {notice.detail ? <p>{notice.detail}</p> : null}
+      </div>
+    </article>
+  )
+}
+
+function RunTraceCard({
+  trace,
+  onToggle,
+}: {
+  trace: RunTrace
+  onToggle: () => void
+}) {
+  const summary = runTraceSummary(trace)
+  return (
+    <article
+      className={`run-card ${trace.status}${trace.collapsed ? ' collapsed' : ' expanded'}`}
+    >
+      <header className="run-card-head">
+        <button
+          type="button"
+          className="run-toggle"
+          title={trace.collapsed ? 'Expand run' : 'Collapse run'}
+          aria-expanded={!trace.collapsed}
+          onClick={onToggle}
+        >
+          {trace.collapsed ? (
+            <ChevronRight size={18} />
+          ) : (
+            <ChevronDown size={18} />
+          )}
+        </button>
+        <div className="run-heading">
+          <p className="eyebrow">Run</p>
+          <h2>{runTraceTitle(trace)}</h2>
+          {summary ? <p>{summary}</p> : null}
+        </div>
+        <div className="run-meta">
+          <span>{trace.steps.length} steps</span>
+          <span>{trace.toolCount} tools</span>
+          <span>{trace.status}</span>
+        </div>
+      </header>
+      {!trace.collapsed ? (
+        <div className="run-step-list">
+          {trace.steps.map((step) => (
+            <RunStepRow key={step.id} step={step} />
+          ))}
+        </div>
+      ) : null}
+    </article>
+  )
+}
+
+function RunStepRow({ step }: { step: RunStep }) {
+  return (
+    <article className={`run-step ${step.kind} ${step.status}`}>
+      <div className="run-step-icon">{runStepIcon(step)}</div>
+      <div className="run-step-main">
+        <div className="run-step-head">
+          <strong>{step.title}</strong>
+          <span>{step.status}</span>
+        </div>
+        {step.detail ? <p>{step.detail}</p> : null}
+        <RunStepDetails step={step} />
+      </div>
+    </article>
+  )
+}
+
+function RunStepDetails({ step }: { step: RunStep }) {
+  const summary = step.summary
+  if (!summary) return null
+
+  return (
+    <details className="run-step-details">
+      <summary>Details</summary>
+      {summary.shell ? (
+        <pre>
+          {[
+            `command: ${summary.shell.command}`,
+            summary.shell.exit_code == null
+              ? 'exit: unavailable'
+              : `exit: ${summary.shell.exit_code}`,
+            `timed out: ${summary.shell.timed_out ? 'yes' : 'no'}`,
+            `stdout truncated: ${summary.shell.stdout_truncated ? 'yes' : 'no'}`,
+            `stderr truncated: ${summary.shell.stderr_truncated ? 'yes' : 'no'}`,
+          ].join('\n')}
+        </pre>
+      ) : null}
+      {summary.files?.length ? (
+        <div className="run-file-list">
+          {summary.files.map((file) => (
+            <span key={`${file.operation}-${file.path}`}>
+              {file.operation}: {file.path}
+            </span>
+          ))}
+        </div>
+      ) : null}
+      {summary.diff ? <pre>{summary.diff}</pre> : null}
+      {summary.error ? <pre>{summary.error}</pre> : null}
+    </details>
   )
 }
 
@@ -909,12 +1462,26 @@ function ToolsView({ tools }: { tools: ToolRun[] }) {
 function SessionsView({
   sessions,
   selected,
+  isCreatingSession,
+  newSessionName,
+  createSessionError,
   onSelect,
+  onStartCreateSession,
+  onCancelCreateSession,
+  onNewSessionNameChange,
+  onCreateSession,
   onRefresh,
 }: {
   sessions: SessionEntryResponse[]
   selected: string
+  isCreatingSession: boolean
+  newSessionName: string
+  createSessionError: string | null
   onSelect: (name: string) => void
+  onStartCreateSession: () => void
+  onCancelCreateSession: () => void
+  onNewSessionNameChange: (value: string) => void
+  onCreateSession: () => void
   onRefresh: () => void
 }) {
   return (
@@ -924,11 +1491,25 @@ function SessionsView({
           <Files size={22} />
           <h1>Sessions</h1>
         </div>
-        <IconButton title="Refresh sessions" onClick={onRefresh}>
-          <RefreshCw size={18} />
-        </IconButton>
+        <div className="single-header-actions">
+          <MiniIconButton title="New session" onClick={onStartCreateSession}>
+            <Plus size={17} />
+          </MiniIconButton>
+          <IconButton title="Refresh sessions" onClick={onRefresh}>
+            <RefreshCw size={18} />
+          </IconButton>
+        </div>
       </div>
       <div className="session-table">
+        {isCreatingSession ? (
+          <CreateSessionRow
+            value={newSessionName}
+            error={createSessionError}
+            onChange={onNewSessionNameChange}
+            onCancel={onCancelCreateSession}
+            onSubmit={onCreateSession}
+          />
+        ) : null}
         {sessions.map((session) => (
           <button
             key={session.name}
@@ -998,6 +1579,56 @@ function ActivityList({
         </article>
       ))}
     </div>
+  )
+}
+
+function CreateSessionRow({
+  value,
+  error,
+  onChange,
+  onCancel,
+  onSubmit,
+}: {
+  value: string
+  error: string | null
+  onChange: (value: string) => void
+  onCancel: () => void
+  onSubmit: () => void
+}) {
+  const canSubmit = value.trim().length > 0
+
+  const handleSubmit = (event: FormEvent) => {
+    event.preventDefault()
+    if (canSubmit) onSubmit()
+  }
+
+  const handleKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
+    if (event.key === 'Escape') {
+      event.preventDefault()
+      onCancel()
+    }
+  }
+
+  return (
+    <form className="session-create-row" onSubmit={handleSubmit}>
+      <input
+        aria-label="New session name"
+        autoFocus
+        value={value}
+        placeholder="session name"
+        onChange={(event) => onChange(event.target.value)}
+        onKeyDown={handleKeyDown}
+      />
+      <div className="session-create-actions">
+        <MiniIconButton title="Create session" type="submit" disabled={!canSubmit}>
+          <Check size={17} />
+        </MiniIconButton>
+        <MiniIconButton title="Cancel" onClick={onCancel}>
+          <X size={17} />
+        </MiniIconButton>
+      </div>
+      {error ? <p>{error}</p> : null}
+    </form>
   )
 }
 
@@ -1092,6 +1723,33 @@ function IconButton({
   )
 }
 
+function MiniIconButton({
+  title,
+  type = 'button',
+  disabled = false,
+  onClick,
+  children,
+}: {
+  title: string
+  type?: 'button' | 'submit'
+  disabled?: boolean
+  onClick?: () => void
+  children: ReactNode
+}) {
+  return (
+    <button
+      className="mini-icon-button"
+      type={type}
+      title={title}
+      disabled={disabled}
+      onClick={onClick}
+    >
+      <span className="sr-only">{title}</span>
+      {children}
+    </button>
+  )
+}
+
 function StatusPill({
   status,
   running,
@@ -1112,26 +1770,156 @@ function Metric({ label, value }: { label: string; value: string }) {
   )
 }
 
-function sessionMessages(session: Session): UiMessage[] {
-  const source =
-    session.turns.length > 0
-      ? session.turns.flatMap((record) => record.messages)
-      : session.active_thread.messages
+function sessionTimeline(session: Session): TimelineItem[] {
+  if (session.turns.length > 0) {
+    return session.turns.flatMap((record, index) =>
+      turnRecordTimeline(record, index),
+    )
+  }
 
-  return source
-    .map((message, index) => messageToUi(message, index))
-    .filter((message): message is UiMessage => Boolean(message))
+  return session.active_thread.messages.flatMap((message, index) =>
+    fallbackMessageTimeline(message, index),
+  )
 }
 
-function messageToUi(message: Message, index: number): UiMessage | null {
-  if (message.role === 'system') return null
-  const content = message.content ?? formatToolCalls(message)
-  if (!content) return null
-  return {
-    id: `history-${index}-${message.role}`,
-    role: message.role,
-    content,
+function turnRecordTimeline(
+  record: Session['turns'][number],
+  turnIndex: number,
+): TimelineItem[] {
+  const items: TimelineItem[] = []
+  const userContent = record.turn.user_message.content
+  if (userContent) {
+    items.push({
+      kind: 'message',
+      id: `history-${turnIndex}-user`,
+      role: 'user',
+      content: userContent,
+    })
   }
+
+  if (record.turn.steps.length > 0 || record.turn.error) {
+    const trace = historyRunTrace(record.turn, turnIndex)
+    items.push({
+      kind: 'run',
+      id: trace.id,
+      trace,
+    })
+  }
+
+  const assistantContent = finalAssistantContent(record)
+  if (assistantContent) {
+    items.push({
+      kind: 'message',
+      id: `history-${turnIndex}-assistant`,
+      role: 'assistant',
+      content: assistantContent,
+    })
+  }
+
+  return items
+}
+
+function historyRunTrace(
+  turn: Session['turns'][number]['turn'],
+  turnIndex: number,
+): RunTrace {
+  const steps: RunStep[] = turn.steps.map((step, stepIndex) => ({
+    id: `history-${turnIndex}-step-${stepIndex}`,
+    kind: step.kind === 'tool_call' ? 'tool' : 'model',
+    status:
+      step.status === 'completed'
+        ? 'ok'
+        : step.status === 'failed'
+          ? 'error'
+          : 'running',
+    title:
+      step.kind === 'tool_call'
+        ? step.tool_name || 'Tool call'
+        : 'Model call',
+    detail: step.error || step.tool_call_id || undefined,
+  }))
+
+  if (turn.error && !steps.some((step) => step.status === 'error')) {
+    steps.push({
+      id: `history-${turnIndex}-error`,
+      kind: 'error',
+      status: 'error',
+      title: 'Error',
+      detail: turn.error,
+    })
+  }
+
+  return {
+    id: `history-${turnIndex}-run`,
+    status:
+      turn.status === 'completed'
+        ? 'completed'
+        : turn.status === 'failed'
+          ? 'failed'
+          : 'running',
+    collapsed: true,
+    startedAt: `turn ${turnIndex + 1}`,
+    steps,
+    toolCount: steps.filter((step) => step.kind === 'tool').length,
+  }
+}
+
+function finalAssistantContent(record: Session['turns'][number]): string {
+  const direct = record.turn.assistant_message?.content
+  if (direct?.trim()) return direct
+
+  const fallback = [...record.messages]
+    .reverse()
+    .find(
+      (message) =>
+        message.role === 'assistant' &&
+        Boolean(message.content?.trim()) &&
+        !message.tool_calls?.length,
+    )
+  return fallback?.content || ''
+}
+
+function fallbackMessageTimeline(
+  message: Message,
+  index: number,
+): TimelineItem[] {
+  if (message.role === 'system') return []
+
+  const content = message.content ?? formatToolCalls(message)
+  if (!content) return []
+
+  if (message.role === 'tool') {
+    return [
+      {
+        kind: 'notice',
+        id: `history-${index}-tool`,
+        tone: 'neutral',
+        title: 'Tool result',
+        detail: compactText(content, 180),
+      },
+    ]
+  }
+
+  if (message.role === 'assistant' && message.tool_calls?.length && !message.content) {
+    return [
+      {
+        kind: 'notice',
+        id: `history-${index}-tool-calls`,
+        tone: 'neutral',
+        title: 'Tool calls',
+        detail: compactText(content, 180),
+      },
+    ]
+  }
+
+  return [
+    {
+      kind: 'message',
+      id: `history-${index}-${message.role}`,
+      role: message.role,
+      content,
+    },
+  ]
 }
 
 function formatToolCalls(message: Message): string {
@@ -1163,6 +1951,71 @@ function formatToolSummary(summary?: ToolExecutionSummary): string {
     parts.push('diff available')
   }
   return parts.join(' / ') || 'finished'
+}
+
+function runTraceTitle(trace: RunTrace): string {
+  switch (trace.status) {
+    case 'approval':
+      return 'Waiting for approval'
+    case 'completed':
+      return 'Execution complete'
+    case 'failed':
+      return 'Execution failed'
+    case 'running':
+      return 'Executing task'
+  }
+}
+
+function runTraceSummary(trace: RunTrace): string {
+  const lastStep = trace.steps.at(-1)
+  if (!lastStep) return trace.completedAt || trace.startedAt
+  const detail = lastStep.detail ? ` - ${compactText(lastStep.detail, 90)}` : ''
+  return `${lastStep.title}${detail}`
+}
+
+function noticeIcon(tone: TimelineNoticeItem['tone']): ReactNode {
+  switch (tone) {
+    case 'running':
+      return <Clock3 size={18} />
+    case 'ok':
+      return <CheckCircle2 size={18} />
+    case 'error':
+      return <CircleAlert size={18} />
+    case 'approval':
+      return <Shield size={18} />
+    case 'neutral':
+      return <Activity size={18} />
+  }
+}
+
+function runStepIcon(step: RunStep): ReactNode {
+  if (step.status === 'running') return <Clock3 size={18} />
+  if (step.status === 'error') return <CircleAlert size={18} />
+
+  switch (step.kind) {
+    case 'approval':
+      return <Shield size={18} />
+    case 'error':
+      return <CircleAlert size={18} />
+    case 'final':
+      return <CheckCircle2 size={18} />
+    case 'model':
+      return <Bot size={18} />
+    case 'tool':
+      return step.summary?.files?.length ? (
+        <FileText size={18} />
+      ) : (
+        <Terminal size={18} />
+      )
+  }
+}
+
+function currentTime(): string {
+  return new Date().toLocaleTimeString([], {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  })
 }
 
 function approvalTitle(request: ApprovalRequest): string {
