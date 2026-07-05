@@ -1,6 +1,18 @@
 # Morrow
 
-Morrow is a local coding agent CLI backed by an OpenAI-compatible chat completions API. It can stream model output, keep project-scoped sessions, read and edit files, apply patches, run shell commands with approval, and emit JSONL events for automation.
+Morrow is a local coding agent CLI and web dashboard backed by an OpenAI-compatible Chat Completions API. It streams model output, persists project-scoped sessions, reads and edits files, applies patches, runs shell commands behind explicit permissions, and can emit JSONL events for automation.
+
+![Morrow web dashboard screenshot](Img/dashboard.png)
+
+## Highlights
+
+- CLI, interactive REPL, and local browser dashboard.
+- OpenAI-compatible model configuration through `--config`, local `morrow.toml`, or `~/.morrow/config.toml`.
+- Persistent named sessions scoped to the current project.
+- Built-in tools for file reads, file edits, patch application, text search, directory listing, and shell commands.
+- Read-only, workspace-write, and full-access permission profiles, with shell execution controlled separately.
+- Automatic context compaction for long sessions.
+- JSONL event output for scripts and integrations.
 
 ## Install
 
@@ -25,7 +37,7 @@ MORROW_INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/c
 
 Windows users can download `morrow-x86_64-pc-windows-msvc.zip` from GitHub Releases, extract `morrow.exe`, and put it on `PATH`.
 
-From source:
+Install from source:
 
 ```bash
 cargo install --git https://github.com/catDforD/morrow --locked -p agent-cli
@@ -33,41 +45,58 @@ cargo install --git https://github.com/catDforD/morrow --locked -p agent-cli
 
 ## Configure
 
-Run:
+Create a user config:
 
 ```bash
 morrow init
 ```
 
-This writes `~/.morrow/config.toml`. By default it stores `[model].OPENAI_API_KEY` inline for the local machine. Treat this file as private and do not commit it.
+This writes `~/.morrow/config.toml` and prompts for an API key. The generated file stores the key inline as `[model].OPENAI_API_KEY`, so treat it as private and do not commit it.
 
-To generate an editable template without entering a real key:
+Generate an editable template without entering a real key:
 
 ```bash
 morrow init --template
 ```
 
-To overwrite an existing config:
+Overwrite an existing generated config:
 
 ```bash
 morrow init --force
 ```
 
-Example config:
+Config lookup order:
+
+1. Path passed with `--config`.
+2. `morrow.toml` in the current working directory.
+3. `~/.morrow/config.toml`.
+
+Example config using an environment variable instead of an inline key:
 
 ```toml
 [model]
 base_url = "https://api.openai.com/v1"
 model = "gpt-4.1"
-OPENAI_API_KEY = "replace-with-your-openai-api-key"
+api_key_env = "OPENAI_API_KEY"
 timeout_secs = 120
+
+[agent]
+system_prompt = "You are a helpful assistant."
+
+[context]
+auto_compact = true
+max_context_chars = 64000
+retain_recent_turns = 6
+summary_target_chars = 8000
 
 [permissions]
 mode = "read_only"
 shell = "deny"
 ```
 
-## Use
+The inline `[model].OPENAI_API_KEY` value takes priority when present. Otherwise Morrow reads the environment variable named by `api_key_env`, which defaults to `OPENAI_API_KEY`.
+
+## Run
 
 Run one prompt in the current project:
 
@@ -87,28 +116,51 @@ Start the local web dashboard:
 morrow server
 ```
 
-By default the dashboard listens on `127.0.0.1:3000` and uses the current
-workspace, config, session store, and permission profile. It is local-first and
-unauthenticated; do not bind it to a public interface unless you add your own
-network protections. The browser UI can approve or deny prompted shell/file
-actions, but it cannot raise permissions beyond the mode used when the server
-started.
+The dashboard listens on `127.0.0.1:3000` by default. It uses the current workspace, config, session store, and permission profile. It is local-first and unauthenticated; do not bind it to a public interface unless you add your own network protections.
 
-Useful REPL commands:
+Customize the dashboard bind address:
 
-```text
-/status
-/permissions read-only
-/permissions workspace-write
-/compact
-/reset
-/exit
+```bash
+morrow server --host 127.0.0.1 --port 3000
 ```
 
-Use a named session:
+The browser UI can approve or deny prompted shell and file actions, but it cannot raise permissions beyond the mode used when the server started.
+
+## Permissions
+
+File access is controlled by `permissions.mode`:
+
+- `read_only`: write tools are denied.
+- `workspace_write`: file changes require approval and are limited to the workspace.
+- `danger_full_access`: file reads and writes may access paths outside the workspace.
+
+Shell execution is controlled separately by `permissions.shell`:
+
+- `deny`: shell commands are denied.
+- `prompt`: shell commands require approval.
+- `allow`: shell commands run without an approval prompt.
+
+The default `morrow init` config uses `read_only` and `shell = "deny"`.
+
+Override permissions for a single run:
+
+```bash
+morrow --permission workspace-write "update the README"
+morrow --allow-shell "run the test suite and explain failures"
+```
+
+## Sessions
+
+Morrow stores project-scoped sessions under `~/.morrow/sessions/`. Use a named session to continue work across invocations:
 
 ```bash
 morrow --session work "continue the refactor"
+morrow --session work
+```
+
+Manage sessions:
+
+```bash
 morrow session list
 morrow session show work
 morrow session export work --output work-session.json
@@ -116,28 +168,77 @@ morrow session rename work backend-refactor
 morrow session delete backend-refactor
 ```
 
-Emit machine-readable JSONL events:
+Compatibility aliases `--thread` and `--reset-thread` are still accepted, but new usage should prefer `--session` and `--reset-session`.
+
+Useful REPL commands:
+
+```text
+/status
+/permissions read-only
+/permissions workspace-write
+/permissions danger-full-access
+/compact
+/reset
+/exit
+```
+
+## Automation
+
+For automation, emit one JSON object per event:
 
 ```bash
 morrow --jsonl "inspect this crate" > events.jsonl
 ```
 
-## Permissions
-
-Morrow has three file permission modes:
-
-- `read_only`: file-write tools are denied.
-- `workspace_write`: file changes require approval and are limited to the workspace.
-- `danger_full_access`: file reads and writes may access paths outside the workspace.
-
-Shell execution is controlled separately with `shell = "deny"`, `shell = "prompt"`, or `shell = "allow"`. The default `morrow init` config uses `read_only` and `shell = "deny"`.
+JSONL mode requires a prompt and is not available for interactive mode or session subcommands.
 
 ## Development
 
+Morrow is a Rust workspace:
+
+- `crates/agent-cli`: CLI entry point, REPL, JSONL output, server command, and config wiring.
+- `crates/agent-config`: `morrow.toml` and `~/.morrow/config.toml` loading.
+- `crates/agent-core`: agent turn execution and event stream orchestration.
+- `crates/agent-model`: OpenAI-compatible HTTP client and streaming response parsing.
+- `crates/agent-protocol`: shared protocol, session, permission, and event types.
+- `crates/agent-runtime`: reusable runtime helpers for sessions, compaction, workspace detection, and turn execution.
+- `crates/agent-server`: Axum HTTP/WebSocket server and embedded dashboard assets.
+- `crates/agent-sandbox`: permission evaluation.
+- `crates/agent-tools`: built-in file and shell tools.
+
+Common Rust checks:
+
 ```bash
+cargo build --workspace
 cargo test --workspace
 cargo fmt --check
 cargo clippy --workspace --all-targets
+```
+
+Run from source:
+
+```bash
+cargo run -p agent-cli -- "hello"
+cargo run -p agent-cli -- --session work "continue"
+cargo run -p agent-cli -- server
+```
+
+Develop the web dashboard:
+
+```bash
+cd crates/agent-server/web
+pnpm install
+pnpm dev
+```
+
+The Vite dev server listens on `127.0.0.1:5173` and proxies `/api` to `http://127.0.0.1:3000`, so run `cargo run -p agent-cli -- server` in another terminal.
+
+Build dashboard assets for embedding in `agent-server`:
+
+```bash
+cd crates/agent-server/web
+pnpm build
+pnpm typecheck
 ```
 
 Release builds are created by tagging `v*` and letting GitHub Actions publish the platform archives plus `SHA256SUMS`.
