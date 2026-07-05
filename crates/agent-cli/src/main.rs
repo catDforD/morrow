@@ -1,4 +1,4 @@
-use agent_config::{ContextConfig, load_config};
+use agent_config::{ContextConfig, LarkConfig, load_config};
 use agent_model::{ModelError, OpenAiCompatClient, OpenAiCompatConfig};
 use agent_protocol::{
     AgentEvent, ApprovalAction, ApprovalDecision, ApprovalRequest, FileChangeSummary,
@@ -6,7 +6,8 @@ use agent_protocol::{
     ToolExecutionSummary,
 };
 use agent_runtime::{
-    AgentEventEnvelope, CompactionOutcome, RunAgentTurnOutcome, SessionStore, TurnEventHandler,
+    AgentEventEnvelope, CompactionOutcome, LarkToolConfig, RunAgentTurnOutcome, SessionStore,
+    TurnEventHandler,
 };
 use clap::{Parser, Subcommand};
 use futures_util::future::{BoxFuture, FutureExt};
@@ -71,11 +72,22 @@ enum CliCommand {
         host: IpAddr,
         #[arg(long, default_value_t = 3000)]
         port: u16,
+        #[arg(long)]
+        robot: bool,
+    },
+    Robot {
+        #[command(subcommand)]
+        command: RobotCommand,
     },
     Session {
         #[command(subcommand)]
         command: SessionCommand,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum RobotCommand {
+    Doctor,
 }
 
 #[derive(Debug, Subcommand)]
@@ -170,7 +182,10 @@ async fn run() -> Result<(), CliError> {
         if args.jsonl {
             return Err(CliError::JsonlUnsupportedForSessionCommand);
         }
-        if !matches!(command, CliCommand::Server { .. }) {
+        if !matches!(
+            command,
+            CliCommand::Server { .. } | CliCommand::Robot { .. }
+        ) {
             let mut stdout = io::stdout().lock();
             return handle_cli_command(command, &session_name, &mut stdout);
         }
@@ -181,6 +196,12 @@ async fn run() -> Result<(), CliError> {
 
     let reset_session = args.reset_session || args.reset_thread;
     let loaded = load_config(args.config.as_deref())?;
+
+    if let Some(CliCommand::Robot { command }) = args.command.as_ref() {
+        let mut stdout = io::stdout().lock();
+        return handle_robot_command(command, &loaded.config, &mut stdout).await;
+    }
+
     let permissions =
         effective_permissions(loaded.config.permissions, args.permission, args.allow_shell);
     let client = OpenAiCompatClient::new(OpenAiCompatConfig {
@@ -191,18 +212,37 @@ async fn run() -> Result<(), CliError> {
     })?;
     let workspace_root = agent_runtime::detect_workspace_root()?;
 
-    if let Some(CliCommand::Server { host, port }) = args.command.as_ref() {
+    if let Some(CliCommand::Server { host, port, robot }) = args.command.as_ref() {
         eprintln!("morrow server listening on http://{host}:{port}");
+        let lark_tools = robot.then(|| lark_tool_config(&loaded.config.lark));
+        let robot_config = if *robot {
+            let mut config = loaded.config.robot.clone();
+            config.enabled = true;
+            Some(config)
+        } else {
+            None
+        };
         agent_server::serve(agent_server::ServerOptions {
             host: *host,
             port: *port,
             client,
-            system_prompt: loaded.config.agent.system_prompt,
+            system_prompt: if *robot {
+                robot_system_prompt(&loaded.config.agent.system_prompt)
+            } else {
+                loaded.config.agent.system_prompt
+            },
             context_config: loaded.config.context,
             workspace_root,
             config_path: loaded.path,
             permissions,
             default_session_name: session_name,
+            robot: robot.then(|| agent_server::RobotServerOptions {
+                robot: robot_config.expect("robot config"),
+                lark: loaded.config.lark,
+                qweather: loaded.config.qweather,
+                amap: loaded.config.amap,
+                lark_tools: lark_tools.expect("robot lark tools"),
+            }),
         })
         .await?;
         return Ok(());
@@ -226,6 +266,7 @@ async fn run() -> Result<(), CliError> {
                 session_name: &session_name,
                 workspace_root: &workspace_root,
                 config_path: &loaded.path,
+                lark: None,
             },
             &mut session,
             &mut permissions,
@@ -242,6 +283,7 @@ async fn run() -> Result<(), CliError> {
             context_config: loaded.config.context,
             workspace_root: &workspace_root,
             permissions,
+            lark: None,
             interactive_approvals: io::stdin().is_terminal(),
             output: if args.jsonl {
                 OutputMode::Jsonl {
@@ -276,6 +318,7 @@ struct ReplContext<'a> {
     session_name: &'a str,
     workspace_root: &'a Path,
     config_path: &'a Path,
+    lark: Option<&'a LarkToolConfig>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -285,6 +328,7 @@ struct RunAgentTurnContext<'a> {
     context_config: ContextConfig,
     workspace_root: &'a Path,
     permissions: PermissionProfile,
+    lark: Option<&'a LarkToolConfig>,
     interactive_approvals: bool,
     output: OutputMode<'a>,
 }
@@ -347,6 +391,7 @@ async fn run_repl(
                 context_config: context.context_config,
                 workspace_root: context.workspace_root,
                 permissions: *permissions,
+                lark: context.lark,
                 interactive_approvals: io::stdin().is_terminal(),
                 output: OutputMode::Human,
             },
@@ -460,6 +505,7 @@ async fn run_agent_turn(
             context_config: context.context_config,
             workspace_root: context.workspace_root,
             permissions: context.permissions,
+            lark: context.lark,
             session_name,
             turn_index,
         },
@@ -609,10 +655,70 @@ fn handle_cli_command(
     match command {
         CliCommand::Init { force, template } => handle_init_command(*force, *template, stdout),
         CliCommand::Server { .. } => Ok(()),
+        CliCommand::Robot { .. } => Ok(()),
         CliCommand::Session { command } => {
             handle_session_command(command, default_session_name, stdout)
         }
     }
+}
+
+async fn handle_robot_command(
+    command: &RobotCommand,
+    config: &agent_config::AppConfig,
+    stdout: &mut dyn Write,
+) -> Result<(), CliError> {
+    match command {
+        RobotCommand::Doctor => {
+            let report = agent_server::robot_doctor(agent_server::RobotServerOptions {
+                robot: config.robot.clone(),
+                lark: config.lark.clone(),
+                qweather: config.qweather.clone(),
+                amap: config.amap.clone(),
+                lark_tools: lark_tool_config(&config.lark),
+            })
+            .await;
+            write_robot_doctor_report(stdout, &report)?;
+        }
+    }
+    Ok(())
+}
+
+fn write_robot_doctor_report(
+    stdout: &mut dyn Write,
+    report: &agent_server::RobotDoctorReport,
+) -> Result<(), CliError> {
+    writeln!(
+        stdout,
+        "robot doctor: {}",
+        if report.ok { "ok" } else { "failed" }
+    )
+    .map_err(CliError::Stdout)?;
+    for check in &report.checks {
+        writeln!(
+            stdout,
+            "{}: {} - {}",
+            check.name,
+            if check.ok { "ok" } else { "failed" },
+            check.message
+        )
+        .map_err(CliError::Stdout)?;
+    }
+    stdout.flush().map_err(CliError::Stdout)
+}
+
+fn lark_tool_config(config: &LarkConfig) -> LarkToolConfig {
+    LarkToolConfig {
+        cli_path: config.cli_path.clone(),
+        calendar_identity: config.calendar_identity.clone(),
+        message_identity: config.message_identity.clone(),
+        calendar_id: config.calendar_id.clone(),
+    }
+}
+
+fn robot_system_prompt(base: &str) -> String {
+    format!(
+        "{base}\n\n机器人特别版规则：你负责飞书日程、会议提醒、外勤出行和出差提醒。面向用户的最终回复必须是适合直接转语音的纯文字。不要输出 Markdown 表格、代码块、项目符号、编号列表、emoji、图标或调试信息。复盘上周工作时，先读取上周一零点到上周日二十三点五十九分的飞书日程，再说明这是基于日程的进度复盘。创建日程前必须解析清楚时间、标题和参会人；参会人姓名需要先解析为飞书 open_id。用户要求代通知迟到时，先查最近一小时内即将开始的会议，读取参会人，只有找到会议群 chat_id 时才发送飞书纯文本通知。"
+    )
 }
 
 fn handle_init_command(
@@ -692,6 +798,30 @@ timeout_secs = {INIT_CONFIG_TIMEOUT_SECS}
 [permissions]
 mode = "read_only"
 shell = "deny"
+
+[robot]
+enabled = false
+timezone = "Asia/Shanghai"
+default_origin = "深圳福田区"
+meeting_reminder_minutes = [15, 5]
+fieldwork_reminder_minutes = 60
+workday_end_time = "18:00"
+
+[lark]
+cli_path = "lark-cli"
+calendar_identity = "user"
+message_identity = "user"
+calendar_id = "primary"
+
+[qweather]
+# token = "replace-with-your-qweather-token"
+token_env = "QWEATHER_TOKEN"
+base_url = "https://devapi.qweather.com"
+
+[amap]
+# key = "replace-with-your-amap-key"
+key_env = "AMAP_API_KEY"
+base_url = "https://restapi.amap.com"
 "#
     )
 }
@@ -1286,6 +1416,22 @@ mod tests {
             })
         ));
         assert_eq!(resolve_session_name(&export_args).expect("session"), "work");
+
+        let server_args =
+            Args::try_parse_from(["morrow", "server", "--robot"]).expect("parse robot server");
+        assert!(matches!(
+            server_args.command,
+            Some(CliCommand::Server { robot: true, .. })
+        ));
+
+        let doctor_args =
+            Args::try_parse_from(["morrow", "robot", "doctor"]).expect("parse robot doctor");
+        assert!(matches!(
+            doctor_args.command,
+            Some(CliCommand::Robot {
+                command: RobotCommand::Doctor
+            })
+        ));
     }
 
     #[test]
@@ -1302,6 +1448,14 @@ mod tests {
         assert!(content.contains(r#"OPENAI_API_KEY = "replace-with-your-openai-api-key""#));
         assert!(content.contains(r#"mode = "read_only""#));
         assert!(content.contains(r#"shell = "deny""#));
+        assert!(content.contains("[robot]"));
+        assert!(content.contains(r#"default_origin = "深圳福田区""#));
+        assert!(content.contains("[lark]"));
+        assert!(content.contains(r#"message_identity = "user""#));
+        assert!(content.contains("[qweather]"));
+        assert!(content.contains(r#"# token = "replace-with-your-qweather-token""#));
+        assert!(content.contains("[amap]"));
+        assert!(content.contains(r#"# key = "replace-with-your-amap-key""#));
     }
 
     #[test]
@@ -1464,6 +1618,7 @@ mod tests {
                 context_config: context_config(10_000, 2),
                 workspace_root: &root,
                 permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
+                lark: None,
                 interactive_approvals: false,
                 output: OutputMode::Human,
             },
@@ -1506,6 +1661,7 @@ mod tests {
                 context_config: context_config(10_000, 2),
                 workspace_root: &root,
                 permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
+                lark: None,
                 interactive_approvals: false,
                 output: OutputMode::Jsonl {
                     session_name: "default",
@@ -1566,6 +1722,7 @@ mod tests {
                 context_config: context_config(10_000, 2),
                 workspace_root: &root,
                 permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
+                lark: None,
                 interactive_approvals: false,
                 output: OutputMode::Jsonl {
                     session_name: "default",
@@ -1612,6 +1769,7 @@ mod tests {
                 context_config: context_config(1, 2),
                 workspace_root: &root,
                 permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
+                lark: None,
                 interactive_approvals: false,
                 output: OutputMode::Human,
             },

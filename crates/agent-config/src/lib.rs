@@ -13,6 +13,20 @@ const DEFAULT_AUTO_COMPACT: bool = true;
 const DEFAULT_MAX_CONTEXT_CHARS: usize = 64_000;
 const DEFAULT_RETAIN_RECENT_TURNS: usize = 6;
 const DEFAULT_SUMMARY_TARGET_CHARS: usize = 8_000;
+const DEFAULT_ROBOT_ENABLED: bool = false;
+const DEFAULT_ROBOT_TIMEZONE: &str = "Asia/Shanghai";
+const DEFAULT_ROBOT_ORIGIN: &str = "深圳福田区";
+const DEFAULT_MEETING_REMINDER_MINUTES: &[u32] = &[15, 5];
+const DEFAULT_FIELDWORK_REMINDER_MINUTES: u32 = 60;
+const DEFAULT_WORKDAY_END_TIME: &str = "18:00";
+const DEFAULT_LARK_CLI_PATH: &str = "lark-cli";
+const DEFAULT_LARK_CALENDAR_ID: &str = "primary";
+const DEFAULT_LARK_CALENDAR_IDENTITY: &str = "user";
+const DEFAULT_LARK_MESSAGE_IDENTITY: &str = "user";
+const DEFAULT_QWEATHER_TOKEN_ENV: &str = "QWEATHER_TOKEN";
+const DEFAULT_QWEATHER_BASE_URL: &str = "https://devapi.qweather.com";
+const DEFAULT_AMAP_KEY_ENV: &str = "AMAP_API_KEY";
+const DEFAULT_AMAP_BASE_URL: &str = "https://restapi.amap.com";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppConfig {
@@ -20,6 +34,10 @@ pub struct AppConfig {
     pub agent: AgentConfig,
     pub context: ContextConfig,
     pub permissions: PermissionProfile,
+    pub robot: RobotConfig,
+    pub lark: LarkConfig,
+    pub qweather: QWeatherConfig,
+    pub amap: AmapConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +59,38 @@ pub struct ContextConfig {
     pub max_context_chars: usize,
     pub retain_recent_turns: usize,
     pub summary_target_chars: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RobotConfig {
+    pub enabled: bool,
+    pub timezone: String,
+    pub default_origin: String,
+    pub meeting_reminder_minutes: Vec<u32>,
+    pub fieldwork_reminder_minutes: u32,
+    pub workday_end_time: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LarkConfig {
+    pub cli_path: String,
+    pub calendar_identity: String,
+    pub message_identity: String,
+    pub calendar_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QWeatherConfig {
+    pub token: Option<String>,
+    pub token_env: String,
+    pub base_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmapConfig {
+    pub key: Option<String>,
+    pub key_env: String,
+    pub base_url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,7 +122,7 @@ pub enum ConfigError {
     MissingModel,
     #[error("configured API key environment variable {env_var} is not set")]
     MissingApiKey { env_var: String },
-    #[error("invalid context config value: [context].{field} must be greater than 0")]
+    #[error("invalid config value: {field} must be greater than 0")]
     InvalidContextValue { field: &'static str },
 }
 
@@ -83,6 +133,10 @@ struct RawAppConfig {
     agent: Option<RawAgentConfig>,
     context: Option<RawContextConfig>,
     permissions: Option<RawPermissionsConfig>,
+    robot: Option<RawRobotConfig>,
+    lark: Option<RawLarkConfig>,
+    qweather: Option<RawQWeatherConfig>,
+    amap: Option<RawAmapConfig>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -116,6 +170,42 @@ struct RawContextConfig {
 struct RawPermissionsConfig {
     mode: Option<PermissionMode>,
     shell: Option<ShellPolicy>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRobotConfig {
+    enabled: Option<bool>,
+    timezone: Option<String>,
+    default_origin: Option<String>,
+    meeting_reminder_minutes: Option<Vec<u32>>,
+    fieldwork_reminder_minutes: Option<u32>,
+    workday_end_time: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLarkConfig {
+    cli_path: Option<String>,
+    calendar_identity: Option<String>,
+    message_identity: Option<String>,
+    calendar_id: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawQWeatherConfig {
+    token: Option<String>,
+    token_env: Option<String>,
+    base_url: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAmapConfig {
+    key: Option<String>,
+    key_env: Option<String>,
+    base_url: Option<String>,
 }
 
 pub fn load_config(explicit_path: Option<&Path>) -> Result<LoadedConfig, ConfigError> {
@@ -208,6 +298,10 @@ impl TryFrom<RawAppConfig> for AppConfig {
 
         let agent = value.agent.unwrap_or_default();
         let context = ContextConfig::try_from(value.context.unwrap_or_default())?;
+        let robot = RobotConfig::try_from(value.robot.unwrap_or_default())?;
+        let lark = LarkConfig::try_from(value.lark.unwrap_or_default())?;
+        let qweather = QWeatherConfig::from(value.qweather.unwrap_or_default());
+        let amap = AmapConfig::from(value.amap.unwrap_or_default());
         let permissions = value.permissions.unwrap_or_default();
         let mode = permissions.mode.unwrap_or_default();
         let mut permissions_profile = PermissionProfile::for_mode(mode);
@@ -233,6 +327,10 @@ impl TryFrom<RawAppConfig> for AppConfig {
             },
             context,
             permissions: permissions_profile,
+            robot,
+            lark,
+            qweather,
+            amap,
         })
     }
 }
@@ -265,6 +363,96 @@ impl TryFrom<RawContextConfig> for ContextConfig {
             summary_target_chars,
         })
     }
+}
+
+impl TryFrom<RawRobotConfig> for RobotConfig {
+    type Error = ConfigError;
+
+    fn try_from(value: RawRobotConfig) -> Result<Self, Self::Error> {
+        let meeting_reminder_minutes = value
+            .meeting_reminder_minutes
+            .unwrap_or_else(|| DEFAULT_MEETING_REMINDER_MINUTES.to_vec());
+        if meeting_reminder_minutes.contains(&0) {
+            return Err(ConfigError::InvalidContextValue {
+                field: "meeting_reminder_minutes",
+            });
+        }
+        let fieldwork_reminder_minutes = value
+            .fieldwork_reminder_minutes
+            .unwrap_or(DEFAULT_FIELDWORK_REMINDER_MINUTES);
+        if fieldwork_reminder_minutes == 0 {
+            return Err(ConfigError::InvalidContextValue {
+                field: "fieldwork_reminder_minutes",
+            });
+        }
+
+        Ok(Self {
+            enabled: value.enabled.unwrap_or(DEFAULT_ROBOT_ENABLED),
+            timezone: value
+                .timezone
+                .unwrap_or_else(|| DEFAULT_ROBOT_TIMEZONE.to_string()),
+            default_origin: value
+                .default_origin
+                .unwrap_or_else(|| DEFAULT_ROBOT_ORIGIN.to_string()),
+            meeting_reminder_minutes,
+            fieldwork_reminder_minutes,
+            workday_end_time: value
+                .workday_end_time
+                .unwrap_or_else(|| DEFAULT_WORKDAY_END_TIME.to_string()),
+        })
+    }
+}
+
+impl TryFrom<RawLarkConfig> for LarkConfig {
+    type Error = ConfigError;
+
+    fn try_from(value: RawLarkConfig) -> Result<Self, Self::Error> {
+        Ok(Self {
+            cli_path: non_empty_string(value.cli_path, DEFAULT_LARK_CLI_PATH),
+            calendar_identity: non_empty_string(
+                value.calendar_identity,
+                DEFAULT_LARK_CALENDAR_IDENTITY,
+            ),
+            message_identity: non_empty_string(
+                value.message_identity,
+                DEFAULT_LARK_MESSAGE_IDENTITY,
+            ),
+            calendar_id: non_empty_string(value.calendar_id, DEFAULT_LARK_CALENDAR_ID),
+        })
+    }
+}
+
+impl From<RawQWeatherConfig> for QWeatherConfig {
+    fn from(value: RawQWeatherConfig) -> Self {
+        Self {
+            token: optional_non_empty_string(value.token),
+            token_env: non_empty_string(value.token_env, DEFAULT_QWEATHER_TOKEN_ENV),
+            base_url: non_empty_string(value.base_url, DEFAULT_QWEATHER_BASE_URL),
+        }
+    }
+}
+
+impl From<RawAmapConfig> for AmapConfig {
+    fn from(value: RawAmapConfig) -> Self {
+        Self {
+            key: optional_non_empty_string(value.key),
+            key_env: non_empty_string(value.key_env, DEFAULT_AMAP_KEY_ENV),
+            base_url: non_empty_string(value.base_url, DEFAULT_AMAP_BASE_URL),
+        }
+    }
+}
+
+fn non_empty_string(value: Option<String>, default: &str) -> String {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| default.to_string())
+}
+
+fn optional_non_empty_string(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn non_zero_context_value(field: &'static str, value: usize) -> Result<usize, ConfigError> {
@@ -489,6 +677,42 @@ summary_target_chars = 256
             loaded.config.permissions,
             PermissionProfile::for_mode(PermissionMode::ReadOnly)
         );
+        assert_eq!(
+            loaded.config.robot,
+            RobotConfig {
+                enabled: DEFAULT_ROBOT_ENABLED,
+                timezone: DEFAULT_ROBOT_TIMEZONE.to_string(),
+                default_origin: DEFAULT_ROBOT_ORIGIN.to_string(),
+                meeting_reminder_minutes: DEFAULT_MEETING_REMINDER_MINUTES.to_vec(),
+                fieldwork_reminder_minutes: DEFAULT_FIELDWORK_REMINDER_MINUTES,
+                workday_end_time: DEFAULT_WORKDAY_END_TIME.to_string(),
+            }
+        );
+        assert_eq!(
+            loaded.config.lark,
+            LarkConfig {
+                cli_path: DEFAULT_LARK_CLI_PATH.to_string(),
+                calendar_identity: DEFAULT_LARK_CALENDAR_IDENTITY.to_string(),
+                message_identity: DEFAULT_LARK_MESSAGE_IDENTITY.to_string(),
+                calendar_id: DEFAULT_LARK_CALENDAR_ID.to_string(),
+            }
+        );
+        assert_eq!(
+            loaded.config.qweather,
+            QWeatherConfig {
+                token: None,
+                token_env: DEFAULT_QWEATHER_TOKEN_ENV.to_string(),
+                base_url: DEFAULT_QWEATHER_BASE_URL.to_string(),
+            }
+        );
+        assert_eq!(
+            loaded.config.amap,
+            AmapConfig {
+                key: None,
+                key_env: DEFAULT_AMAP_KEY_ENV.to_string(),
+                base_url: DEFAULT_AMAP_BASE_URL.to_string(),
+            }
+        );
     }
 
     #[test]
@@ -527,6 +751,61 @@ summary_target_chars = 256
                 summary_target_chars: 256,
             }
         );
+    }
+
+    #[test]
+    fn loads_robot_integrations_config() {
+        let root = unique_dir("robot");
+        let config = root.join("morrow.toml");
+        fs::write(
+            &config,
+            r#"
+[model]
+model = "test-model"
+api_key_env = "MORROW_ROBOT_KEY"
+
+[robot]
+enabled = true
+timezone = "Asia/Shanghai"
+default_origin = "深圳市福田区"
+meeting_reminder_minutes = [30, 10]
+fieldwork_reminder_minutes = 45
+workday_end_time = "17:30"
+
+[lark]
+cli_path = "/usr/local/bin/lark-cli"
+calendar_identity = "user"
+message_identity = "user"
+calendar_id = "primary"
+
+[qweather]
+token = "direct-weather"
+token_env = "CUSTOM_QWEATHER"
+base_url = "https://example.weather"
+
+[amap]
+key = "direct-amap"
+key_env = "CUSTOM_AMAP"
+base_url = "https://example.amap"
+"#,
+        )
+        .expect("write config");
+        set_env("MORROW_ROBOT_KEY", "secret");
+
+        let loaded = load_config_from_locations(Some(&config), &root, None).expect("load config");
+
+        assert!(loaded.config.robot.enabled);
+        assert_eq!(loaded.config.robot.default_origin, "深圳市福田区");
+        assert_eq!(loaded.config.robot.meeting_reminder_minutes, vec![30, 10]);
+        assert_eq!(loaded.config.robot.workday_end_time, "17:30");
+        assert_eq!(loaded.config.lark.cli_path, "/usr/local/bin/lark-cli");
+        assert_eq!(
+            loaded.config.qweather.token.as_deref(),
+            Some("direct-weather")
+        );
+        assert_eq!(loaded.config.qweather.token_env, "CUSTOM_QWEATHER");
+        assert_eq!(loaded.config.amap.key.as_deref(), Some("direct-amap"));
+        assert_eq!(loaded.config.amap.key_env, "CUSTOM_AMAP");
     }
 
     #[test]

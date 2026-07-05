@@ -1,3 +1,5 @@
+pub mod robot;
+
 use agent_config::ContextConfig;
 use agent_model::OpenAiCompatClient;
 use agent_protocol::{ApprovalDecision, PermissionProfile, Session, SessionDocument};
@@ -24,6 +26,8 @@ use tokio::net::TcpListener;
 use tokio::sync::{Mutex, broadcast, oneshot};
 use tokio::task::JoinHandle;
 
+pub use robot::{RobotDoctorReport, RobotNotice, RobotServerOptions, robot_doctor};
+
 #[derive(Clone)]
 pub struct ServerOptions {
     pub host: IpAddr,
@@ -35,6 +39,7 @@ pub struct ServerOptions {
     pub config_path: PathBuf,
     pub permissions: PermissionProfile,
     pub default_session_name: String,
+    pub robot: Option<RobotServerOptions>,
 }
 
 #[derive(Debug, Error)]
@@ -54,19 +59,18 @@ pub async fn serve(options: ServerOptions) -> Result<(), ServerError> {
     let listener = TcpListener::bind(addr)
         .await
         .map_err(|source| ServerError::Bind { addr, source })?;
-    axum::serve(listener, router(options))
+    let state = AppState::new(options);
+    spawn_robot_if_enabled(state.clone()).await;
+    axum::serve(listener, router_with_state(state))
         .await
         .map_err(ServerError::Serve)
 }
 
 pub fn router(options: ServerOptions) -> Router {
-    let state = AppState {
-        inner: Arc::new(ServerState {
-            options,
-            sessions: Mutex::new(HashMap::new()),
-        }),
-    };
+    router_with_state(AppState::new(options))
+}
 
+fn router_with_state(state: AppState) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/assets/{*path}", get(asset))
@@ -79,6 +83,40 @@ pub fn router(options: ServerOptions) -> Router {
         .route("/api/sessions/{name}/reset", post(reset_session))
         .route("/api/sessions/{name}/ws", get(session_ws))
         .with_state(state)
+}
+
+impl AppState {
+    fn new(options: ServerOptions) -> Self {
+        Self {
+            inner: Arc::new(ServerState {
+                options,
+                sessions: Mutex::new(HashMap::new()),
+            }),
+        }
+    }
+}
+
+async fn spawn_robot_if_enabled(state: AppState) {
+    let Some(robot_options) = state.inner.options.robot.clone() else {
+        return;
+    };
+    if !robot_options.robot.enabled {
+        return;
+    }
+
+    let session_name = state.inner.options.default_session_name.clone();
+    let tx = session_sender(&state, &session_name).await;
+    let state_path = state
+        .inner
+        .options
+        .config_path
+        .parent()
+        .map(|parent| parent.join("robot-state.json"))
+        .unwrap_or_else(|| PathBuf::from("robot-state.json"));
+    let scheduler = robot::RobotScheduler::new(robot_options, state_path);
+    tokio::spawn(robot::run_scheduler_loop(scheduler, move |notice| {
+        broadcast_message(&tx, ServerMessage::RobotNotice(notice));
+    }));
 }
 
 #[derive(Clone)]
@@ -144,6 +182,7 @@ enum ServerMessage {
         session: String,
         turn_index: usize,
     },
+    RobotNotice(RobotNotice),
     TurnRejected {
         request_id: String,
         reason: String,
@@ -159,6 +198,7 @@ enum ClientMessage {
     StartTurn { request_id: String, prompt: String },
     ApprovalDecision { request_id: String, approved: bool },
     CancelTurn { turn_id: String },
+    ResetSession { request_id: String },
 }
 
 #[derive(Debug)]
@@ -414,9 +454,51 @@ async fn handle_client_ws_message(
         ClientMessage::CancelTurn { turn_id } => {
             cancel_turn(state, session_name, turn_id, tx).await;
         }
+        ClientMessage::ResetSession { request_id } => {
+            reset_session_from_ws(state, session_name, request_id, tx).await;
+        }
     }
 
     true
+}
+
+async fn reset_session_from_ws(
+    state: &AppState,
+    session_name: &str,
+    request_id: String,
+    tx: &broadcast::Sender<ServerMessage>,
+) {
+    if running_snapshot(state, session_name).await.is_some() {
+        broadcast_message(
+            tx,
+            ServerMessage::TurnRejected {
+                request_id,
+                reason: "session has a running turn".to_string(),
+            },
+        );
+        return;
+    }
+
+    let store = match session_store(session_name) {
+        Ok(store) => store,
+        Err(error) => {
+            broadcast_error(tx, error.message);
+            return;
+        }
+    };
+    let session = Session::new();
+    if let Err(error) = store.save(&session) {
+        broadcast_error(tx, error.to_string());
+        return;
+    }
+    broadcast_message(
+        tx,
+        ServerMessage::Snapshot {
+            session,
+            running_turn: None,
+            permissions: state.inner.options.permissions,
+        },
+    );
 }
 
 async fn start_turn(
@@ -545,6 +627,7 @@ async fn run_turn_task_inner(
             context_config: options.context_config,
             workspace_root: &options.workspace_root,
             permissions: options.permissions,
+            lark: options.robot.as_ref().map(|robot| &robot.lark_tools),
             session_name: &session_name,
             turn_index,
         },
@@ -785,7 +868,7 @@ fn broadcast_error(tx: &broadcast::Sender<ServerMessage>, message: impl ToString
 mod tests {
     use super::*;
     use agent_model::OpenAiCompatConfig;
-    use agent_protocol::{PermissionMode, ShellPolicy};
+    use agent_protocol::{Message as ProtocolMessage, PermissionMode, ShellPolicy, Thread};
     use std::fs;
     use std::path::PathBuf;
     use std::sync::OnceLock;
@@ -820,16 +903,12 @@ mod tests {
                 shell: ShellPolicy::Deny,
             },
             default_session_name: "default".to_string(),
+            robot: None,
         }
     }
 
     fn test_state() -> AppState {
-        AppState {
-            inner: Arc::new(ServerState {
-                options: test_options(),
-                sessions: Mutex::new(HashMap::new()),
-            }),
-        }
+        AppState::new(test_options())
     }
 
     fn unique_test_dir(name: &str) -> PathBuf {
@@ -875,6 +954,56 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn websocket_reset_session_saves_empty_session_and_broadcasts_snapshot() {
+        let lock = ENV_LOCK.get_or_init(|| AsyncMutex::new(())).lock().await;
+        let home = unique_test_dir("ws-reset-home");
+        let cwd = unique_test_dir("ws-reset-cwd");
+        let previous_cwd = std::env::current_dir().expect("current dir");
+        let previous_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        std::env::set_current_dir(&cwd).expect("set cwd");
+
+        let mut thread = Thread::new();
+        thread.push(ProtocolMessage::user("hello"));
+        let store = SessionStore::for_current_dir("default").expect("store");
+        store
+            .save(&Session::from_thread(thread))
+            .expect("save session");
+        let state = test_state();
+        let tx = session_sender(&state, "default").await;
+        let mut rx = tx.subscribe();
+
+        let keep_open = handle_client_ws_message(
+            Message::Text(r#"{"type":"reset_session","data":{"request_id":"reset-1"}}"#.into()),
+            &state,
+            "default",
+            &tx,
+        )
+        .await;
+
+        assert!(keep_open);
+        let message = rx.recv().await.expect("snapshot");
+        match message {
+            ServerMessage::Snapshot { session, .. } => assert_eq!(session, Session::new()),
+            other => panic!("expected snapshot, got {other:?}"),
+        }
+        assert_eq!(store.load().expect("load reset session"), Session::new());
+
+        std::env::set_current_dir(previous_cwd).expect("restore cwd");
+        match previous_home {
+            Some(value) => unsafe {
+                std::env::set_var("HOME", value);
+            },
+            None => unsafe {
+                std::env::remove_var("HOME");
+            },
+        }
+        drop(lock);
     }
 
     #[tokio::test]

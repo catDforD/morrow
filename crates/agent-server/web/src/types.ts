@@ -173,6 +173,18 @@ export interface RunningTurnSnapshot {
   pending_approval?: string | null
 }
 
+export type RobotNoticeKind =
+  | 'meeting_reminder'
+  | 'fieldwork_reminder'
+  | 'travel_reminder'
+
+export interface RobotNotice {
+  id: string
+  timestamp_ms: number
+  kind: RobotNoticeKind
+  text: string
+}
+
 export type ServerMessage =
   | {
       type: 'snapshot'
@@ -184,6 +196,7 @@ export type ServerMessage =
     }
   | { type: 'agent_event'; data: AgentEventEnvelope }
   | { type: 'turn_saved'; data: { session: string; turn_index: number } }
+  | { type: 'robot_notice'; data: RobotNotice }
   | { type: 'turn_rejected'; data: { request_id: string; reason: string } }
   | { type: 'error'; data: { message: string } }
 
@@ -194,6 +207,7 @@ export type ClientMessage =
       data: { request_id: string; approved: boolean }
     }
   | { type: 'cancel_turn'; data: { turn_id: string } }
+  | { type: 'reset_session'; data: { request_id: string } }
 
 export interface ToolRun {
   id: string

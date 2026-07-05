@@ -7,3 +7,27 @@ timeout_secs = 120
 [permissions]
 mode = "read_only"
 shell = "deny"
+
+[robot]
+enabled = false
+timezone = "Asia/Shanghai"
+default_origin = "深圳福田区"
+meeting_reminder_minutes = [15, 5]
+fieldwork_reminder_minutes = 60
+workday_end_time = "18:00"
+
+[lark]
+cli_path = "lark-cli"
+calendar_identity = "user"
+message_identity = "user"
+calendar_id = "primary"
+
+[qweather]
+# token = "replace-with-your-qweather-token"
+token_env = "QWEATHER_TOKEN"
+base_url = "https://devapi.qweather.com"
+
+[amap]
+# key = "replace-with-your-amap-key"
+key_env = "AMAP_API_KEY"
+base_url = "https://restapi.amap.com"

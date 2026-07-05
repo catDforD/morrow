@@ -26,6 +26,7 @@ const MAX_SHELL_TIMEOUT_SECS: u64 = 120;
 const MAX_SHELL_OUTPUT_BYTES: usize = 20_000;
 const MAX_FILE_DIFF_LINES: usize = 240;
 const MAX_FILE_DIFF_BYTES: usize = 20_000;
+const DEFAULT_LARK_TIMEOUT_SECS: u64 = 30;
 
 #[derive(Debug, Error)]
 pub enum ToolRegistryError {
@@ -37,6 +38,7 @@ pub enum ToolRegistryError {
 pub struct ToolRegistry {
     evaluator: Option<PermissionEvaluator>,
     definitions: Vec<ToolDefinition>,
+    lark: Option<LarkToolConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,6 +53,14 @@ pub struct ToolResult {
     pub content: String,
     pub error: Option<String>,
     pub summary: Option<ToolExecutionSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LarkToolConfig {
+    pub cli_path: String,
+    pub calendar_identity: String,
+    pub message_identity: String,
+    pub calendar_id: String,
 }
 
 impl ToolExecution {
@@ -70,6 +80,7 @@ impl ToolRegistry {
         Self {
             evaluator: None,
             definitions: Vec::new(),
+            lark: None,
         }
     }
 
@@ -81,7 +92,22 @@ impl ToolRegistry {
 
         Ok(Self {
             evaluator: Some(evaluator),
-            definitions: built_in_definitions(),
+            definitions: built_in_definitions(false),
+            lark: None,
+        })
+    }
+
+    pub fn built_in_with_lark(
+        root: impl Into<PathBuf>,
+        permissions: PermissionProfile,
+        lark: LarkToolConfig,
+    ) -> Result<Self, ToolRegistryError> {
+        let evaluator = PermissionEvaluator::new(root, permissions)?;
+
+        Ok(Self {
+            evaluator: Some(evaluator),
+            definitions: built_in_definitions(true),
+            lark: Some(lark),
         })
     }
 
@@ -115,6 +141,12 @@ impl ToolRegistry {
             "write_file" => return self.write_file(call, approval),
             "apply_patch" => return self.apply_patch(call, approval),
             "shell_command" => return self.shell_command(call, approval),
+            "lark_calendar_list" => self.lark_calendar_list(call).map(tool_ok),
+            "lark_user_search" => self.lark_user_search(call).map(tool_ok),
+            "lark_calendar_create" => self.lark_calendar_create(call).map(tool_ok),
+            "lark_event_get" => self.lark_event_get(call).map(tool_ok),
+            "lark_event_attendees_list" => self.lark_event_attendees_list(call).map(tool_ok),
+            "lark_message_send" => self.lark_message_send(call).map(tool_ok),
             name => Err(format!("unknown tool {name:?}")),
         };
 
@@ -529,6 +561,244 @@ impl ToolRegistry {
         }
     }
 
+    fn lark_calendar_list(&self, call: &ToolCall) -> Result<Value, String> {
+        let args = parse_args::<LarkCalendarListArgs>(call)?;
+        let lark = self.lark_config()?;
+        let calendar_id = args.calendar_id.as_deref().unwrap_or(&lark.calendar_id);
+        let command_args = vec![
+            "calendar".to_string(),
+            "+agenda".to_string(),
+            "--as".to_string(),
+            lark.calendar_identity.clone(),
+            "--calendar-id".to_string(),
+            calendar_id.to_string(),
+            "--start".to_string(),
+            args.start,
+            "--end".to_string(),
+            args.end,
+            "--format".to_string(),
+            "json".to_string(),
+        ];
+
+        self.run_lark_json(command_args)
+    }
+
+    fn lark_user_search(&self, call: &ToolCall) -> Result<Value, String> {
+        let args = parse_args::<LarkUserSearchArgs>(call)?;
+        let mut command_args = vec![
+            "contact".to_string(),
+            "+search-user".to_string(),
+            "--as".to_string(),
+            "user".to_string(),
+            "--format".to_string(),
+            "json".to_string(),
+        ];
+
+        match (args.query, args.queries, args.user_ids) {
+            (Some(query), None, None) if !query.trim().is_empty() => {
+                command_args.push("--query".to_string());
+                command_args.push(query);
+            }
+            (None, Some(queries), None) if !queries.is_empty() => {
+                command_args.push("--queries".to_string());
+                command_args.push(queries.join(","));
+            }
+            (None, None, Some(user_ids)) if !user_ids.is_empty() => {
+                command_args.push("--user-ids".to_string());
+                command_args.push(user_ids.join(","));
+            }
+            _ => {
+                return Err(
+                    "provide exactly one of query, queries, or user_ids for lark_user_search"
+                        .to_string(),
+                );
+            }
+        }
+
+        if args.has_chatted.unwrap_or(false) {
+            command_args.push("--has-chatted".to_string());
+        }
+        if args.exclude_external_users.unwrap_or(false) {
+            command_args.push("--exclude-external-users".to_string());
+        }
+        if let Some(lang) = args.lang.filter(|lang| !lang.trim().is_empty()) {
+            command_args.push("--lang".to_string());
+            command_args.push(lang);
+        }
+        if let Some(page_size) = args.page_size {
+            command_args.push("--page-size".to_string());
+            command_args.push(page_size.clamp(1, 30).to_string());
+        }
+
+        self.run_lark_json(command_args)
+    }
+
+    fn lark_calendar_create(&self, call: &ToolCall) -> Result<Value, String> {
+        let args = parse_args::<LarkCalendarCreateArgs>(call)?;
+        if args.summary.trim().is_empty() {
+            return Err("summary must not be empty".to_string());
+        }
+        let lark = self.lark_config()?;
+        let calendar_id = args.calendar_id.as_deref().unwrap_or(&lark.calendar_id);
+        let mut command_args = vec![
+            "calendar".to_string(),
+            "+create".to_string(),
+            "--as".to_string(),
+            lark.calendar_identity.clone(),
+            "--calendar-id".to_string(),
+            calendar_id.to_string(),
+            "--summary".to_string(),
+            args.summary,
+            "--start".to_string(),
+            args.start,
+            "--end".to_string(),
+            args.end,
+            "--format".to_string(),
+            "json".to_string(),
+        ];
+
+        if let Some(description) = args.description {
+            command_args.push("--description".to_string());
+            command_args.push(description);
+        }
+        if let Some(attendee_ids) = args.attendee_ids.filter(|ids| !ids.is_empty()) {
+            command_args.push("--attendee-ids".to_string());
+            command_args.push(attendee_ids.join(","));
+        }
+
+        self.run_lark_json(command_args)
+    }
+
+    fn lark_event_get(&self, call: &ToolCall) -> Result<Value, String> {
+        let args = parse_args::<LarkEventGetArgs>(call)?;
+        let lark = self.lark_config()?;
+        let calendar_id = args.calendar_id.as_deref().unwrap_or(&lark.calendar_id);
+        let mut command_args = vec![
+            "calendar".to_string(),
+            "events".to_string(),
+            "get".to_string(),
+            "--as".to_string(),
+            lark.calendar_identity.clone(),
+            "--calendar-id".to_string(),
+            calendar_id.to_string(),
+            "--event-id".to_string(),
+            args.event_id,
+            "--user-id-type".to_string(),
+            "open_id".to_string(),
+            "--format".to_string(),
+            "json".to_string(),
+        ];
+        if args.need_attendee.unwrap_or(true) {
+            command_args.push("--need-attendee".to_string());
+        }
+
+        self.run_lark_json(command_args)
+    }
+
+    fn lark_event_attendees_list(&self, call: &ToolCall) -> Result<Value, String> {
+        let args = parse_args::<LarkEventAttendeesListArgs>(call)?;
+        let lark = self.lark_config()?;
+        let calendar_id = args.calendar_id.as_deref().unwrap_or(&lark.calendar_id);
+        let page_size = args.page_size.unwrap_or(100).clamp(10, 100);
+        let mut command_args = vec![
+            "calendar".to_string(),
+            "event.attendees".to_string(),
+            "list".to_string(),
+            "--as".to_string(),
+            lark.calendar_identity.clone(),
+            "--calendar-id".to_string(),
+            calendar_id.to_string(),
+            "--event-id".to_string(),
+            args.event_id,
+            "--page-size".to_string(),
+            page_size.to_string(),
+            "--user-id-type".to_string(),
+            "open_id".to_string(),
+            "--format".to_string(),
+            "json".to_string(),
+        ];
+        if let Some(page_token) = args.page_token.filter(|token| !token.trim().is_empty()) {
+            command_args.push("--page-token".to_string());
+            command_args.push(page_token);
+        }
+
+        self.run_lark_json(command_args)
+    }
+
+    fn lark_message_send(&self, call: &ToolCall) -> Result<Value, String> {
+        let args = parse_args::<LarkMessageSendArgs>(call)?;
+        if args.text.trim().is_empty() {
+            return Err("text must not be empty".to_string());
+        }
+        match (&args.chat_id, &args.user_id) {
+            (Some(_), Some(_)) | (None, None) => {
+                return Err("provide exactly one of chat_id or user_id".to_string());
+            }
+            _ => {}
+        }
+
+        let lark = self.lark_config()?;
+        let mut command_args = vec![
+            "im".to_string(),
+            "+messages-send".to_string(),
+            "--as".to_string(),
+            lark.message_identity.clone(),
+        ];
+        if let Some(chat_id) = args.chat_id {
+            command_args.push("--chat-id".to_string());
+            command_args.push(chat_id);
+        }
+        if let Some(user_id) = args.user_id {
+            command_args.push("--user-id".to_string());
+            command_args.push(user_id);
+        }
+        command_args.push("--text".to_string());
+        command_args.push(args.text);
+        if let Some(idempotency_key) = args
+            .idempotency_key
+            .filter(|idempotency_key| !idempotency_key.trim().is_empty())
+        {
+            command_args.push("--idempotency-key".to_string());
+            command_args.push(idempotency_key);
+        }
+        command_args.push("--format".to_string());
+        command_args.push("json".to_string());
+
+        self.run_lark_json(command_args)
+    }
+
+    fn lark_config(&self) -> Result<&LarkToolConfig, String> {
+        self.lark
+            .as_ref()
+            .ok_or_else(|| "lark tools are not enabled".to_string())
+    }
+
+    fn run_lark_json(&self, args: Vec<String>) -> Result<Value, String> {
+        let lark = self.lark_config()?;
+        let output = run_process_limited(
+            &lark.cli_path,
+            &args,
+            Duration::from_secs(DEFAULT_LARK_TIMEOUT_SECS),
+        )?;
+        if !output.status_success {
+            return Err(format!(
+                "lark-cli failed with exit_code={}: {}{}",
+                output
+                    .exit_code
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+                output.stderr.trim(),
+                if output.stdout.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!("; stdout: {}", output.stdout.trim())
+                }
+            ));
+        }
+
+        parse_json_output(&output.stdout)
+    }
+
     fn resolve_existing_path(&self, input: &str) -> Result<PathBuf, String> {
         self.evaluator()?.resolve_existing_path(input)
     }
@@ -824,8 +1094,8 @@ impl ToolRegistry {
     }
 }
 
-fn built_in_definitions() -> Vec<ToolDefinition> {
-    vec![
+fn built_in_definitions(include_lark: bool) -> Vec<ToolDefinition> {
+    let mut definitions = vec![
         ToolDefinition::function(
             "read_file",
             "Read a UTF-8 text file from the workspace.",
@@ -921,6 +1191,109 @@ fn built_in_definitions() -> Vec<ToolDefinition> {
                     "timeout_secs": {"type": "integer", "minimum": 1, "maximum": MAX_SHELL_TIMEOUT_SECS}
                 },
                 "required": ["command"],
+                "additionalProperties": false
+            }),
+        ),
+    ];
+
+    if include_lark {
+        definitions.extend(lark_definitions());
+    }
+
+    definitions
+}
+
+fn lark_definitions() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition::function(
+            "lark_calendar_list",
+            "Read Feishu calendar events for a time range. Use for agenda review, reminders, fieldwork, and travel checks.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "start": {"type": "string", "description": "ISO 8601 start time."},
+                    "end": {"type": "string", "description": "ISO 8601 end time."},
+                    "calendar_id": {"type": "string", "description": "Optional calendar ID; defaults to configured primary calendar."}
+                },
+                "required": ["start", "end"],
+                "additionalProperties": false
+            }),
+        ),
+        ToolDefinition::function(
+            "lark_user_search",
+            "Resolve Feishu users by name, email, or open_id. Use before inviting named attendees.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "queries": {"type": "array", "items": {"type": "string"}},
+                    "user_ids": {"type": "array", "items": {"type": "string"}},
+                    "has_chatted": {"type": "boolean"},
+                    "exclude_external_users": {"type": "boolean"},
+                    "lang": {"type": "string"},
+                    "page_size": {"type": "integer", "minimum": 1, "maximum": 30}
+                },
+                "additionalProperties": false
+            }),
+        ),
+        ToolDefinition::function(
+            "lark_calendar_create",
+            "Create a Feishu calendar event and optionally invite user, chat, or room attendee IDs.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "summary": {"type": "string"},
+                    "start": {"type": "string", "description": "ISO 8601 start time."},
+                    "end": {"type": "string", "description": "ISO 8601 end time."},
+                    "description": {"type": "string"},
+                    "attendee_ids": {"type": "array", "items": {"type": "string"}},
+                    "calendar_id": {"type": "string"}
+                },
+                "required": ["summary", "start", "end"],
+                "additionalProperties": false
+            }),
+        ),
+        ToolDefinition::function(
+            "lark_event_get",
+            "Get Feishu calendar event details, including attendees when available.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "event_id": {"type": "string"},
+                    "calendar_id": {"type": "string"},
+                    "need_attendee": {"type": "boolean"}
+                },
+                "required": ["event_id"],
+                "additionalProperties": false
+            }),
+        ),
+        ToolDefinition::function(
+            "lark_event_attendees_list",
+            "List Feishu calendar event attendees. Use to find a meeting chat ID before sending delay notifications.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "event_id": {"type": "string"},
+                    "calendar_id": {"type": "string"},
+                    "page_size": {"type": "integer", "minimum": 10, "maximum": 100},
+                    "page_token": {"type": "string"}
+                },
+                "required": ["event_id"],
+                "additionalProperties": false
+            }),
+        ),
+        ToolDefinition::function(
+            "lark_message_send",
+            "Send a plain text Feishu message as the configured user identity. Use only after the user explicitly asks to notify others.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "chat_id": {"type": "string"},
+                    "user_id": {"type": "string"},
+                    "text": {"type": "string"},
+                    "idempotency_key": {"type": "string"}
+                },
+                "required": ["text"],
                 "additionalProperties": false
             }),
         ),
@@ -1628,6 +2001,77 @@ fn run_shell_command(
     Ok((data, summary))
 }
 
+#[derive(Debug, Clone)]
+struct ProcessOutput {
+    exit_code: Option<i32>,
+    status_success: bool,
+    stdout: String,
+    stderr: String,
+}
+
+fn run_process_limited(
+    program: &str,
+    args: &[String],
+    timeout: Duration,
+) -> Result<ProcessOutput, String> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("failed to spawn {program}: {err}"))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("failed to capture {program} stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| format!("failed to capture {program} stderr"))?;
+    let stdout_reader = thread::spawn(move || read_limited(stdout));
+    let stderr_reader = thread::spawn(move || read_limited(stderr));
+    let started = Instant::now();
+    let mut timed_out = false;
+
+    let status = loop {
+        match child
+            .try_wait()
+            .map_err(|err| format!("failed to wait for {program}: {err}"))?
+        {
+            Some(status) => break status,
+            None if started.elapsed() >= timeout => {
+                timed_out = true;
+                let _ = child.kill();
+                break child
+                    .wait()
+                    .map_err(|err| format!("failed to wait for killed {program}: {err}"))?;
+            }
+            None => thread::sleep(Duration::from_millis(20)),
+        }
+    };
+
+    let (stdout, stdout_truncated) = stdout_reader
+        .join()
+        .map_err(|_| format!("failed to join {program} stdout reader"))??;
+    let (stderr, stderr_truncated) = stderr_reader
+        .join()
+        .map_err(|_| format!("failed to join {program} stderr reader"))??;
+    if timed_out {
+        return Err(format!("{program} timed out after {}s", timeout.as_secs()));
+    }
+    if stdout_truncated || stderr_truncated {
+        return Err(format!("{program} output exceeded capture limit"));
+    }
+
+    Ok(ProcessOutput {
+        exit_code: status.code(),
+        status_success: status.success(),
+        stdout,
+        stderr,
+    })
+}
+
 #[cfg(windows)]
 fn shell_command(command: &str) -> Command {
     let mut builder = Command::new("cmd");
@@ -1664,6 +2108,15 @@ fn read_limited(mut reader: impl Read) -> Result<(String, bool), String> {
     }
 
     Ok((String::from_utf8_lossy(&output).to_string(), truncated))
+}
+
+fn parse_json_output(output: &str) -> Result<Value, String> {
+    let output = output.trim();
+    let start = output
+        .find(['{', '['])
+        .ok_or_else(|| "lark-cli did not return JSON output".to_string())?;
+    serde_json::from_str(&output[start..])
+        .map_err(|err| format!("failed to parse lark-cli JSON output: {err}"))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1720,10 +2173,63 @@ struct ShellCommandArgs {
     timeout_secs: Option<u64>,
 }
 
+#[derive(Debug, Deserialize)]
+struct LarkCalendarListArgs {
+    start: String,
+    end: String,
+    calendar_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LarkUserSearchArgs {
+    query: Option<String>,
+    queries: Option<Vec<String>>,
+    user_ids: Option<Vec<String>>,
+    has_chatted: Option<bool>,
+    exclude_external_users: Option<bool>,
+    lang: Option<String>,
+    page_size: Option<i32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LarkCalendarCreateArgs {
+    summary: String,
+    start: String,
+    end: String,
+    description: Option<String>,
+    attendee_ids: Option<Vec<String>>,
+    calendar_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LarkEventGetArgs {
+    event_id: String,
+    calendar_id: Option<String>,
+    need_attendee: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LarkEventAttendeesListArgs {
+    event_id: String,
+    calendar_id: Option<String>,
+    page_size: Option<i32>,
+    page_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LarkMessageSendArgs {
+    chat_id: Option<String>,
+    user_id: Option<String>,
+    text: String,
+    idempotency_key: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use agent_protocol::{ApprovalAction, PermissionMode, ShellPolicy};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn unique_dir(name: &str) -> PathBuf {
@@ -1753,6 +2259,15 @@ mod tests {
 
     fn registry_with_permissions(root: &Path, permissions: PermissionProfile) -> ToolRegistry {
         ToolRegistry::built_in(root, permissions).expect("tool registry")
+    }
+
+    fn registry_with_lark(root: &Path, lark: LarkToolConfig) -> ToolRegistry {
+        ToolRegistry::built_in_with_lark(
+            root,
+            PermissionProfile::for_mode(PermissionMode::ReadOnly),
+            lark,
+        )
+        .expect("tool registry")
     }
 
     fn call(name: &str, arguments: Value) -> ToolCall {
@@ -1792,6 +2307,26 @@ mod tests {
         ))
     }
 
+    #[cfg(unix)]
+    fn fake_lark_cli(root: &Path, output: &str) -> (PathBuf, PathBuf) {
+        let script = root.join("fake-lark-cli");
+        let args_file = root.join("args.txt");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n: > '{}'\nfor arg in \"$@\"; do printf '%s\\n' \"$arg\" >> '{}'; done\ncat <<'JSON'\n{}\nJSON\n",
+                args_file.display(),
+                args_file.display(),
+                output
+            ),
+        )
+        .expect("write fake lark");
+        let mut permissions = fs::metadata(&script).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).expect("chmod fake lark");
+        (script, args_file)
+    }
+
     #[test]
     fn read_file_limits_lines_and_rejects_path_escape() {
         let root = unique_dir("read-root");
@@ -1826,6 +2361,40 @@ mod tests {
                 .expect("error")
                 .contains("outside the workspace root")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lark_calendar_create_uses_configured_cli_and_arguments() {
+        let root = unique_dir("lark-create");
+        let (cli_path, args_file) =
+            fake_lark_cli(&root, r#"{"ok":true,"data":{"event_id":"event_1"}}"#);
+        let tools = registry_with_lark(
+            &root,
+            LarkToolConfig {
+                cli_path: cli_path.display().to_string(),
+                calendar_identity: "user".to_string(),
+                message_identity: "user".to_string(),
+                calendar_id: "primary".to_string(),
+            },
+        );
+
+        let value = content(tools.execute(&call(
+            "lark_calendar_create",
+            json!({
+                "summary": "项目会; rm -rf /",
+                "start": "2026-07-06T10:00:00+08:00",
+                "end": "2026-07-06T11:00:00+08:00",
+                "attendee_ids": ["ou_1", "ou_2"]
+            }),
+        )));
+
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["data"]["data"]["event_id"], "event_1");
+        let args = fs::read_to_string(args_file).expect("read args");
+        assert!(args.contains("+create\n"));
+        assert!(args.contains("--attendee-ids\nou_1,ou_2\n"));
+        assert!(args.contains("--summary\n项目会; rm -rf /\n"));
     }
 
     #[test]

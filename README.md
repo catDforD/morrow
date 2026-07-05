@@ -94,6 +94,26 @@ network protections. The browser UI can approve or deny prompted shell/file
 actions, but it cannot raise permissions beyond the mode used when the server
 started.
 
+Start the robot-enabled server:
+
+```bash
+morrow server --robot
+```
+
+The robot mode keeps the chat experience, adds Feishu calendar tools, and emits
+plain-text proactive reminder events over the session WebSocket. Check local
+setup before running it:
+
+```bash
+morrow robot doctor
+```
+
+Robot mode expects `lark-cli` user auth for calendar/search operations plus the
+`im:message:send_as_user` scope for delay notifications. Weather and route
+reminders can read `[qweather].token` and `[amap].key` from `morrow.toml`, or
+fall back to the configured `QWEATHER_TOKEN` and `AMAP_API_KEY` environment
+variables.
+
 Useful REPL commands:
 
 ```text

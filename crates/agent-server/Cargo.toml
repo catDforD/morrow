@@ -9,7 +9,9 @@ agent-model = { workspace = true }
 agent-protocol = { workspace = true }
 agent-runtime = { workspace = true }
 axum = { workspace = true }
+chrono = { workspace = true }
 futures-util = { workspace = true }
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

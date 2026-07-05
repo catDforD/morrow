@@ -532,6 +532,10 @@ export default function App() {
           setRunningTurn(null)
           recordActivity('Turn saved', `#${message.data.turn_index}`, 'ok')
           break
+        case 'robot_notice':
+          addNotice('neutral', robotNoticeTitle(message.data.kind), message.data.text)
+          recordActivity('Robot notice', message.data.text, 'neutral')
+          break
         case 'turn_rejected':
           setRunningTurn(null)
           showError(message.data.reason)
@@ -542,7 +546,7 @@ export default function App() {
           break
       }
     },
-    [handleAgentEvent, loadSessions, recordActivity, showError],
+    [addNotice, handleAgentEvent, loadSessions, recordActivity, showError],
   )
 
   const closeSocket = useCallback(() => {
@@ -1877,6 +1881,19 @@ function finalAssistantContent(record: Session['turns'][number]): string {
         !message.tool_calls?.length,
     )
   return fallback?.content || ''
+}
+
+function robotNoticeTitle(kind: string): string {
+  switch (kind) {
+    case 'meeting_reminder':
+      return 'Meeting reminder'
+    case 'fieldwork_reminder':
+      return 'Fieldwork reminder'
+    case 'travel_reminder':
+      return 'Travel reminder'
+    default:
+      return 'Robot notice'
+  }
 }
 
 function fallbackMessageTimeline(
