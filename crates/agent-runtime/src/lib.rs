@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
+pub use agent_tools::LarkToolConfig;
 pub use session_store::{SessionEntry, SessionStore, SessionStoreError};
 
 pub const EVENT_SCHEMA_VERSION: u32 = 1;
@@ -67,6 +68,7 @@ pub struct RunAgentTurnContext<'a> {
     pub context_config: ContextConfig,
     pub workspace_root: &'a Path,
     pub permissions: PermissionProfile,
+    pub lark: Option<&'a LarkToolConfig>,
     pub session_name: &'a str,
     pub turn_index: usize,
 }
@@ -115,7 +117,14 @@ pub async fn run_agent_turn(
         });
     }
 
-    let tools = ToolRegistry::built_in(context.workspace_root, context.permissions)?;
+    let tools = match context.lark {
+        Some(lark) => ToolRegistry::built_in_with_lark(
+            context.workspace_root,
+            context.permissions,
+            lark.clone(),
+        )?,
+        None => ToolRegistry::built_in(context.workspace_root, context.permissions)?,
+    };
     let agent = Agent::with_tools(
         context.client.clone(),
         context.system_prompt.to_string(),
@@ -678,6 +687,7 @@ mod tests {
                 context_config: context_config(10_000, 2),
                 workspace_root: &root,
                 permissions: PermissionProfile::for_mode(agent_protocol::PermissionMode::ReadOnly),
+                lark: None,
                 session_name: "default",
                 turn_index: 0,
             },
@@ -746,6 +756,7 @@ mod tests {
                 permissions: PermissionProfile::for_mode(
                     agent_protocol::PermissionMode::WorkspaceWrite,
                 ),
+                lark: None,
                 session_name: "default",
                 turn_index: 0,
             },
@@ -792,6 +803,7 @@ mod tests {
                 context_config: context_config(1, 2),
                 workspace_root: &root,
                 permissions: PermissionProfile::for_mode(agent_protocol::PermissionMode::ReadOnly),
+                lark: None,
                 session_name: "default",
                 turn_index: session.turns.len(),
             },
