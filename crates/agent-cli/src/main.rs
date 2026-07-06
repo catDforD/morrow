@@ -1,4 +1,4 @@
-use agent_config::{ContextConfig, load_config};
+use agent_config::{ContextConfig, ModelContextLimits, load_config};
 use agent_model::{ModelError, OpenAiCompatClient, OpenAiCompatConfig};
 use agent_protocol::{
     AgentEvent, ApprovalAction, ApprovalDecision, ApprovalRequest, FileChangeSummary,
@@ -22,6 +22,8 @@ const INIT_CONFIG_MODEL: &str = "gpt-4.1";
 const INIT_CONFIG_BASE_URL: &str = "https://api.openai.com/v1";
 const INIT_CONFIG_API_KEY_PLACEHOLDER: &str = "replace-with-your-openai-api-key";
 const INIT_CONFIG_TIMEOUT_SECS: u64 = 120;
+const INIT_CONFIG_CONTEXT_WINDOW_TOKENS: usize = 1_047_576;
+const INIT_CONFIG_RESERVED_OUTPUT_TOKENS: usize = 8_192;
 
 #[derive(Debug, Parser)]
 #[command(name = "morrow")]
@@ -181,6 +183,7 @@ async fn run() -> Result<(), CliError> {
 
     let reset_session = args.reset_session || args.reset_thread;
     let loaded = load_config(args.config.as_deref())?;
+    let model_limits = loaded.config.model.context_limits();
     let permissions =
         effective_permissions(loaded.config.permissions, args.permission, args.allow_shell);
     let client = OpenAiCompatClient::new(OpenAiCompatConfig {
@@ -199,6 +202,7 @@ async fn run() -> Result<(), CliError> {
             client,
             system_prompt: loaded.config.agent.system_prompt,
             context_config: loaded.config.context,
+            model_limits,
             workspace_root,
             config_path: loaded.path,
             permissions,
@@ -222,6 +226,7 @@ async fn run() -> Result<(), CliError> {
                 client: &client,
                 system_prompt: &loaded.config.agent.system_prompt,
                 context_config: loaded.config.context,
+                model_limits,
                 session_store: &session_store,
                 session_name: &session_name,
                 workspace_root: &workspace_root,
@@ -240,6 +245,7 @@ async fn run() -> Result<(), CliError> {
             client: &client,
             system_prompt: &loaded.config.agent.system_prompt,
             context_config: loaded.config.context,
+            model_limits,
             workspace_root: &workspace_root,
             permissions,
             interactive_approvals: io::stdin().is_terminal(),
@@ -272,6 +278,7 @@ struct ReplContext<'a> {
     client: &'a OpenAiCompatClient,
     system_prompt: &'a str,
     context_config: ContextConfig,
+    model_limits: ModelContextLimits,
     session_store: &'a SessionStore,
     session_name: &'a str,
     workspace_root: &'a Path,
@@ -283,6 +290,7 @@ struct RunAgentTurnContext<'a> {
     client: &'a OpenAiCompatClient,
     system_prompt: &'a str,
     context_config: ContextConfig,
+    model_limits: ModelContextLimits,
     workspace_root: &'a Path,
     permissions: PermissionProfile,
     interactive_approvals: bool,
@@ -345,6 +353,7 @@ async fn run_repl(
                 client: context.client,
                 system_prompt: context.system_prompt,
                 context_config: context.context_config,
+                model_limits: context.model_limits,
                 workspace_root: context.workspace_root,
                 permissions: *permissions,
                 interactive_approvals: io::stdin().is_terminal(),
@@ -458,6 +467,7 @@ async fn run_agent_turn(
             client: context.client,
             system_prompt: context.system_prompt,
             context_config: context.context_config,
+            model_limits: context.model_limits,
             workspace_root: context.workspace_root,
             permissions: context.permissions,
             session_name,
@@ -688,6 +698,8 @@ base_url = "{INIT_CONFIG_BASE_URL}"
 model = "{INIT_CONFIG_MODEL}"
 OPENAI_API_KEY = "{api_key}"
 timeout_secs = {INIT_CONFIG_TIMEOUT_SECS}
+context_window_tokens = {INIT_CONFIG_CONTEXT_WINDOW_TOKENS}
+reserved_output_tokens = {INIT_CONFIG_RESERVED_OUTPUT_TOKENS}
 
 [permissions]
 mode = "read_only"
@@ -991,11 +1003,12 @@ fn permission_summary(permissions: PermissionProfile) -> String {
 
 fn context_summary(context: ContextConfig) -> String {
     format!(
-        "auto_compact={}, max_context_chars={}, retain_recent_turns={}, summary_target_chars={}",
+        "auto_compact={}, auto_compact_threshold={}, retain_recent_turns={}, summary_target_tokens={}, compact_max_retries={}",
         context.auto_compact,
-        context.max_context_chars,
+        context.auto_compact_threshold,
         context.retain_recent_turns,
-        context.summary_target_chars
+        context.summary_target_tokens,
+        context.compact_max_retries
     )
 }
 
@@ -1112,13 +1125,58 @@ mod tests {
         path
     }
 
-    fn context_config(max_context_chars: usize, retain_recent_turns: usize) -> ContextConfig {
+    fn context_config(retain_recent_turns: usize) -> ContextConfig {
         ContextConfig {
             auto_compact: true,
-            max_context_chars,
+            auto_compact_threshold: 0.835,
             retain_recent_turns,
-            summary_target_chars: 256,
+            summary_target_tokens: 256,
+            compact_max_retries: 2,
         }
+    }
+
+    fn model_limits(context_window_tokens: usize) -> ModelContextLimits {
+        ModelContextLimits {
+            context_window_tokens,
+            reserved_output_tokens: 128,
+        }
+    }
+
+    fn valid_compact_summary_text(current_progress: &str) -> String {
+        format!(
+            r#"User Goals and Constraints
+- keep user intent
+
+Important Decisions
+- compact
+
+Files and Code State
+- none
+
+Commands, Results, and Errors
+- none
+
+Current Progress
+- {current_progress}
+
+Pending Tasks
+- none
+
+Open Questions
+- none"#
+        )
+    }
+
+    fn valid_compact_summary(current_progress: &str) -> String {
+        format!(
+            r#"<analysis>
+compact test
+</analysis>
+<summary>
+{}
+</summary>"#,
+            valid_compact_summary_text(current_progress)
+        )
     }
 
     fn completed_record(user: &str, assistant: &str) -> TurnRecord {
@@ -1421,21 +1479,25 @@ mod tests {
 
     #[tokio::test]
     async fn manual_compaction_summarizes_old_turns_and_rebuilds_active_context() {
-        let (base_url, requests) =
-            spawn_recording_sse_server(vec![sse_text_body("new summary")]).await;
+        let summary = valid_compact_summary("new summary");
+        let summary_text = valid_compact_summary_text("new summary");
+        let (base_url, requests) = spawn_recording_sse_server(vec![sse_text_body(&summary)]).await;
         let mut session = compactable_session();
 
-        let outcome = compact_session(&client(base_url), &mut session, context_config(10_000, 2))
+        let outcome = compact_session(&client(base_url), &mut session, context_config(2))
             .await
             .expect("compact session");
 
         assert_eq!(outcome, CompactionOutcome::Changed);
-        assert_eq!(session.context.summary.as_deref(), Some("new summary"));
+        assert_eq!(
+            session.context.summary.as_deref(),
+            Some(summary_text.as_str())
+        );
         assert_eq!(session.context.summarized_turns, 3);
         assert_eq!(
             session.active_thread.messages,
             vec![
-                Message::system("Session summary:\nnew summary"),
+                Message::system(format!("Session summary:\n{summary_text}")),
                 Message::user("u3"),
                 Message::assistant("a3"),
                 Message::user("u4"),
@@ -1446,7 +1508,7 @@ mod tests {
         let requests = requests.lock().expect("requests lock poisoned");
         assert_eq!(requests.len(), 1);
         assert!(requests[0].contains("failure reason"));
-        assert!(requests[0].contains("Target length: at most 256 characters"));
+        assert!(requests[0].contains("Target length: at most 256 tokens"));
     }
 
     #[tokio::test]
@@ -1461,7 +1523,8 @@ mod tests {
             RunAgentTurnContext {
                 client: &client,
                 system_prompt: "system",
-                context_config: context_config(10_000, 2),
+                context_config: context_config(2),
+                model_limits: model_limits(10_000),
                 workspace_root: &root,
                 permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
                 interactive_approvals: false,
@@ -1503,7 +1566,8 @@ mod tests {
             RunAgentTurnContext {
                 client: &client,
                 system_prompt: "system",
-                context_config: context_config(10_000, 2),
+                context_config: context_config(2),
+                model_limits: model_limits(10_000),
                 workspace_root: &root,
                 permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
                 interactive_approvals: false,
@@ -1563,7 +1627,8 @@ mod tests {
             RunAgentTurnContext {
                 client: &client,
                 system_prompt: "system",
-                context_config: context_config(10_000, 2),
+                context_config: context_config(2),
+                model_limits: model_limits(10_000),
                 workspace_root: &root,
                 permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
                 interactive_approvals: false,
@@ -1602,14 +1667,14 @@ mod tests {
         session.active_thread.push(Message::user(
             "large active context that exceeds the tiny budget",
         ));
-        let original_active_thread = session.active_thread.clone();
         let mut output = Vec::new();
 
         let outcome = run_agent_turn(
             RunAgentTurnContext {
                 client: &client,
                 system_prompt: "system",
-                context_config: context_config(1, 2),
+                context_config: context_config(2),
+                model_limits: model_limits(1),
                 workspace_root: &root,
                 permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
                 interactive_approvals: false,
@@ -1629,7 +1694,8 @@ mod tests {
                 error: Some(_),
             }
         ));
-        assert_eq!(session.active_thread, original_active_thread);
+        assert!(session.context.summary.is_some());
+        assert_ne!(session.context.summarized_turns, 0);
         assert_eq!(session.turns.len(), 6);
         assert_eq!(
             session.turns.last().expect("failed turn").turn.status,
