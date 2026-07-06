@@ -4,7 +4,8 @@ use agent_config::ContextConfig;
 use agent_model::OpenAiCompatClient;
 use agent_protocol::{ApprovalDecision, PermissionProfile, Session, SessionDocument};
 use agent_runtime::{
-    AgentEventEnvelope, RunAgentTurnContext, SessionEntry, SessionStore, TurnEventHandler,
+    AgentEventEnvelope, AmapToolConfig, QWeatherToolConfig, RunAgentTurnContext, SessionEntry,
+    SessionStore, TurnEventHandler,
 };
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
@@ -619,6 +620,16 @@ async fn run_turn_task_inner(
         turn_id,
         tx: tx.clone(),
     };
+    let qweather = options.robot.as_ref().map(|robot| QWeatherToolConfig {
+        token: robot.qweather.token.clone(),
+        token_env: robot.qweather.token_env.clone(),
+        base_url: robot.qweather.base_url.clone(),
+    });
+    let amap = options.robot.as_ref().map(|robot| AmapToolConfig {
+        key: robot.amap.key.clone(),
+        key_env: robot.amap.key_env.clone(),
+        base_url: robot.amap.base_url.clone(),
+    });
 
     let outcome = agent_runtime::run_agent_turn(
         RunAgentTurnContext {
@@ -628,6 +639,8 @@ async fn run_turn_task_inner(
             workspace_root: &options.workspace_root,
             permissions: options.permissions,
             lark: options.robot.as_ref().map(|robot| &robot.lark_tools),
+            qweather: qweather.as_ref(),
+            amap: amap.as_ref(),
             session_name: &session_name,
             turn_index,
         },

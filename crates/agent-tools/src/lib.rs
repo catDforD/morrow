@@ -3,6 +3,7 @@ use agent_protocol::{
     ShellCommandSummary, ToolCall, ToolDefinition, ToolExecutionSummary,
 };
 use agent_sandbox::{PermissionDecision, PermissionEvaluator, PermissionEvaluatorError};
+use reqwest::blocking::Client;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -27,6 +28,7 @@ const MAX_SHELL_OUTPUT_BYTES: usize = 20_000;
 const MAX_FILE_DIFF_LINES: usize = 240;
 const MAX_FILE_DIFF_BYTES: usize = 20_000;
 const DEFAULT_LARK_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 15;
 
 #[derive(Debug, Error)]
 pub enum ToolRegistryError {
@@ -39,6 +41,8 @@ pub struct ToolRegistry {
     evaluator: Option<PermissionEvaluator>,
     definitions: Vec<ToolDefinition>,
     lark: Option<LarkToolConfig>,
+    qweather: Option<QWeatherToolConfig>,
+    amap: Option<AmapToolConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +67,20 @@ pub struct LarkToolConfig {
     pub calendar_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QWeatherToolConfig {
+    pub token: Option<String>,
+    pub token_env: String,
+    pub base_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmapToolConfig {
+    pub key: Option<String>,
+    pub key_env: String,
+    pub base_url: String,
+}
+
 impl ToolExecution {
     pub fn error(error: impl Into<String>) -> Self {
         Self::Completed(tool_error(error.into()))
@@ -81,6 +99,8 @@ impl ToolRegistry {
             evaluator: None,
             definitions: Vec::new(),
             lark: None,
+            qweather: None,
+            amap: None,
         }
     }
 
@@ -92,8 +112,10 @@ impl ToolRegistry {
 
         Ok(Self {
             evaluator: Some(evaluator),
-            definitions: built_in_definitions(false),
+            definitions: built_in_definitions(false, false, false),
             lark: None,
+            qweather: None,
+            amap: None,
         })
     }
 
@@ -106,8 +128,28 @@ impl ToolRegistry {
 
         Ok(Self {
             evaluator: Some(evaluator),
-            definitions: built_in_definitions(true),
+            definitions: built_in_definitions(true, false, false),
             lark: Some(lark),
+            qweather: None,
+            amap: None,
+        })
+    }
+
+    pub fn built_in_with_robot_tools(
+        root: impl Into<PathBuf>,
+        permissions: PermissionProfile,
+        lark: LarkToolConfig,
+        qweather: QWeatherToolConfig,
+        amap: AmapToolConfig,
+    ) -> Result<Self, ToolRegistryError> {
+        let evaluator = PermissionEvaluator::new(root, permissions)?;
+
+        Ok(Self {
+            evaluator: Some(evaluator),
+            definitions: built_in_definitions(true, true, true),
+            lark: Some(lark),
+            qweather: Some(qweather),
+            amap: Some(amap),
         })
     }
 
@@ -147,6 +189,8 @@ impl ToolRegistry {
             "lark_event_get" => self.lark_event_get(call).map(tool_ok),
             "lark_event_attendees_list" => self.lark_event_attendees_list(call).map(tool_ok),
             "lark_message_send" => self.lark_message_send(call).map(tool_ok),
+            "qweather_weather_query" => self.qweather_weather_query(call).map(tool_ok),
+            "amap_route_plan" => self.amap_route_plan(call).map(tool_ok),
             name => Err(format!("unknown tool {name:?}")),
         };
 
@@ -767,10 +811,141 @@ impl ToolRegistry {
         self.run_lark_json(command_args)
     }
 
+    fn qweather_weather_query(&self, call: &ToolCall) -> Result<Value, String> {
+        let args = parse_args::<QWeatherWeatherQueryArgs>(call)?;
+        let location = non_empty_arg(args.location, "location")?;
+        let days = args.days.unwrap_or(1).clamp(1, 3);
+        let config = self.qweather_config()?;
+        let token = configured_secret(
+            config.token.as_deref(),
+            &config.token_env,
+            "[qweather].token",
+        )?;
+        let client = http_client()?;
+
+        let lookup = client
+            .get(integration_url(&config.base_url, "/geo/v2/city/lookup"))
+            .query(&[("location", location.as_str()), ("key", token.as_str())])
+            .send()
+            .map_err(|err| format!("qweather lookup request failed: {err}"))?
+            .error_for_status()
+            .map_err(|err| format!("qweather lookup HTTP failed: {err}"))?
+            .json::<Value>()
+            .map_err(|err| format!("qweather lookup JSON failed: {err}"))?;
+        ensure_qweather_ok(&lookup, "qweather lookup")?;
+        let resolved = lookup
+            .pointer("/location/0")
+            .ok_or_else(|| "qweather lookup response did not include location".to_string())?;
+        let location_id = resolved
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "qweather lookup response did not include location id".to_string())?;
+
+        let weather = client
+            .get(integration_url(&config.base_url, "/v7/weather/3d"))
+            .query(&[("location", location_id), ("key", token.as_str())])
+            .send()
+            .map_err(|err| format!("qweather request failed: {err}"))?
+            .error_for_status()
+            .map_err(|err| format!("qweather HTTP failed: {err}"))?
+            .json::<Value>()
+            .map_err(|err| format!("qweather JSON failed: {err}"))?;
+        ensure_qweather_ok(&weather, "qweather weather")?;
+        let daily = weather
+            .get("daily")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "qweather response did not include daily forecast".to_string())?
+            .iter()
+            .take(days)
+            .map(qweather_daily_json)
+            .collect::<Vec<_>>();
+
+        Ok(json!({
+            "provider": "qweather",
+            "query": location,
+            "resolved_location": {
+                "id": location_id,
+                "name": resolved.get("name").and_then(Value::as_str),
+                "adm1": resolved.get("adm1").and_then(Value::as_str),
+                "adm2": resolved.get("adm2").and_then(Value::as_str),
+                "country": resolved.get("country").and_then(Value::as_str),
+            },
+            "days": daily.len(),
+            "daily": daily,
+        }))
+    }
+
+    fn amap_route_plan(&self, call: &ToolCall) -> Result<Value, String> {
+        let args = parse_args::<AmapRoutePlanArgs>(call)?;
+        let origin = non_empty_arg(args.origin, "origin")?;
+        let destination = non_empty_arg(args.destination, "destination")?;
+        let mode = args.mode.unwrap_or_else(|| "driving".to_string());
+        if mode.trim() != "driving" {
+            return Err("amap_route_plan currently supports driving mode only".to_string());
+        }
+
+        let config = self.amap_config()?;
+        let key = configured_secret(config.key.as_deref(), &config.key_env, "[amap].key")?;
+        let client = http_client()?;
+        let origin_geo = amap_geocode(&client, config, &key, &origin)?;
+        let destination_geo = amap_geocode(&client, config, &key, &destination)?;
+        let route = client
+            .get(integration_url(&config.base_url, "/v5/direction/driving"))
+            .query(&[
+                ("key", key.as_str()),
+                ("origin", origin_geo.location.as_str()),
+                ("destination", destination_geo.location.as_str()),
+                ("show_fields", "cost"),
+            ])
+            .send()
+            .map_err(|err| format!("amap route request failed: {err}"))?
+            .error_for_status()
+            .map_err(|err| format!("amap route HTTP failed: {err}"))?
+            .json::<Value>()
+            .map_err(|err| format!("amap route JSON failed: {err}"))?;
+        ensure_amap_ok(&route, "amap route")?;
+        let path = route
+            .pointer("/route/paths/0")
+            .ok_or_else(|| "amap route response did not include a path".to_string())?;
+        let duration_seconds = parse_amap_duration_seconds(path)?;
+        let duration_minutes = duration_seconds.div_ceil(60);
+
+        Ok(json!({
+            "provider": "amap",
+            "mode": "driving",
+            "origin": {
+                "query": origin,
+                "location": origin_geo.location,
+                "formatted_address": origin_geo.formatted_address,
+            },
+            "destination": {
+                "query": destination,
+                "location": destination_geo.location,
+                "formatted_address": destination_geo.formatted_address,
+            },
+            "distance_meters": path.get("distance").and_then(value_as_u64),
+            "duration_seconds": duration_seconds,
+            "duration_minutes": duration_minutes,
+            "taxi_cost": route.pointer("/route/taxi_cost").and_then(Value::as_str),
+        }))
+    }
+
     fn lark_config(&self) -> Result<&LarkToolConfig, String> {
         self.lark
             .as_ref()
             .ok_or_else(|| "lark tools are not enabled".to_string())
+    }
+
+    fn qweather_config(&self) -> Result<&QWeatherToolConfig, String> {
+        self.qweather
+            .as_ref()
+            .ok_or_else(|| "qweather tools are not enabled".to_string())
+    }
+
+    fn amap_config(&self) -> Result<&AmapToolConfig, String> {
+        self.amap
+            .as_ref()
+            .ok_or_else(|| "amap tools are not enabled".to_string())
     }
 
     fn run_lark_json(&self, args: Vec<String>) -> Result<Value, String> {
@@ -1094,7 +1269,11 @@ impl ToolRegistry {
     }
 }
 
-fn built_in_definitions(include_lark: bool) -> Vec<ToolDefinition> {
+fn built_in_definitions(
+    include_lark: bool,
+    include_qweather: bool,
+    include_amap: bool,
+) -> Vec<ToolDefinition> {
     let mut definitions = vec![
         ToolDefinition::function(
             "read_file",
@@ -1199,6 +1378,12 @@ fn built_in_definitions(include_lark: bool) -> Vec<ToolDefinition> {
     if include_lark {
         definitions.extend(lark_definitions());
     }
+    if include_qweather {
+        definitions.extend(qweather_definitions());
+    }
+    if include_amap {
+        definitions.extend(amap_definitions());
+    }
 
     definitions
 }
@@ -1300,6 +1485,45 @@ fn lark_definitions() -> Vec<ToolDefinition> {
     ]
 }
 
+fn qweather_definitions() -> Vec<ToolDefinition> {
+    vec![ToolDefinition::function(
+        "qweather_weather_query",
+        "Query QWeather forecast for a city or address. Use when the user asks about weather, travel weather, clothing, or outdoor schedule preparation.",
+        json!({
+            "type": "object",
+            "properties": {
+                "location": {"type": "string", "description": "City, district, address, or place name."},
+                "days": {"type": "integer", "minimum": 1, "maximum": 3, "description": "Forecast days to return. Defaults to 1."}
+            },
+            "required": ["location"],
+            "additionalProperties": false
+        }),
+    )]
+}
+
+fn amap_definitions() -> Vec<ToolDefinition> {
+    vec![ToolDefinition::function(
+        "amap_route_plan",
+        "Plan a driving route with Amap and return distance plus estimated travel time. Use for commute, fieldwork, and travel route questions.",
+        json!({
+            "type": "object",
+            "properties": {
+                "origin": {"type": "string", "description": "Starting city, district, address, or place name."},
+                "destination": {"type": "string", "description": "Destination city, district, address, or place name."},
+                "mode": {"type": "string", "enum": ["driving"], "description": "Route mode. Only driving is supported in this version."}
+            },
+            "required": ["origin", "destination"],
+            "additionalProperties": false
+        }),
+    )]
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AmapGeocodeResult {
+    location: String,
+    formatted_address: Option<String>,
+}
+
 fn parse_args<T: DeserializeOwned>(call: &ToolCall) -> Result<T, String> {
     serde_json::from_str(&call.function.arguments)
         .map_err(|err| format!("invalid arguments for tool {}: {err}", call.function.name))
@@ -1311,6 +1535,124 @@ fn clamp_limit(value: Option<usize>, default: usize, max: usize) -> Result<usize
         return Err("limit must be at least 1".to_string());
     }
     Ok(value)
+}
+
+fn non_empty_arg(value: String, name: &str) -> Result<String, String> {
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        return Err(format!("{name} must not be empty"));
+    }
+    Ok(value)
+}
+
+fn configured_secret(
+    direct_value: Option<&str>,
+    env_var: &str,
+    config_field: &str,
+) -> Result<String, String> {
+    if let Some(value) = direct_value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(value.to_string());
+    }
+    match std::env::var(env_var) {
+        Ok(value) if !value.trim().is_empty() => Ok(value.trim().to_string()),
+        _ => Err(format!("set {config_field} or {env_var}")),
+    }
+}
+
+fn integration_url(base_url: &str, path: &str) -> String {
+    format!("{}{}", base_url.trim_end_matches('/'), path)
+}
+
+fn http_client() -> Result<Client, String> {
+    Client::builder()
+        .timeout(Duration::from_secs(DEFAULT_HTTP_TIMEOUT_SECS))
+        .build()
+        .map_err(|err| format!("failed to build HTTP client: {err}"))
+}
+
+fn ensure_qweather_ok(value: &Value, context: &str) -> Result<(), String> {
+    match value.get("code").and_then(Value::as_str) {
+        Some("200") | None => Ok(()),
+        Some(code) => Err(format!("{context} returned code={code}")),
+    }
+}
+
+fn ensure_amap_ok(value: &Value, context: &str) -> Result<(), String> {
+    match value.get("status").and_then(Value::as_str) {
+        Some("1") | None => Ok(()),
+        Some(status) => {
+            let info = value
+                .get("info")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error");
+            Err(format!("{context} returned status={status}: {info}"))
+        }
+    }
+}
+
+fn qweather_daily_json(value: &Value) -> Value {
+    json!({
+        "date": value.get("fxDate").and_then(Value::as_str),
+        "text_day": value.get("textDay").and_then(Value::as_str),
+        "text_night": value.get("textNight").and_then(Value::as_str),
+        "temp_min": value.get("tempMin").and_then(Value::as_str),
+        "temp_max": value.get("tempMax").and_then(Value::as_str),
+        "wind_dir_day": value.get("windDirDay").and_then(Value::as_str),
+        "wind_scale_day": value.get("windScaleDay").and_then(Value::as_str),
+        "precip": value.get("precip").and_then(Value::as_str),
+    })
+}
+
+fn amap_geocode(
+    client: &Client,
+    config: &AmapToolConfig,
+    key: &str,
+    address: &str,
+) -> Result<AmapGeocodeResult, String> {
+    let value = client
+        .get(integration_url(&config.base_url, "/v3/geocode/geo"))
+        .query(&[("key", key), ("address", address)])
+        .send()
+        .map_err(|err| format!("amap geocode request failed: {err}"))?
+        .error_for_status()
+        .map_err(|err| format!("amap geocode HTTP failed: {err}"))?
+        .json::<Value>()
+        .map_err(|err| format!("amap geocode JSON failed: {err}"))?;
+    ensure_amap_ok(&value, "amap geocode")?;
+    let geocode = value
+        .pointer("/geocodes/0")
+        .ok_or_else(|| "amap geocode response did not include geocode".to_string())?;
+    let location = geocode
+        .get("location")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| "amap geocode response did not include a location".to_string())?;
+    let formatted_address = geocode
+        .get("formatted_address")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    Ok(AmapGeocodeResult {
+        location,
+        formatted_address,
+    })
+}
+
+fn parse_amap_duration_seconds(path: &Value) -> Result<u64, String> {
+    path.get("duration")
+        .and_then(Value::as_str)
+        .or_else(|| path.pointer("/cost/duration").and_then(Value::as_str))
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| "amap route response did not include duration".to_string())
+}
+
+fn value_as_u64(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|value| value.parse::<u64>().ok()))
 }
 
 fn should_skip_entry(path: &Path) -> bool {
@@ -2224,12 +2566,29 @@ struct LarkMessageSendArgs {
     idempotency_key: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct QWeatherWeatherQueryArgs {
+    location: String,
+    days: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AmapRoutePlanArgs {
+    origin: String,
+    destination: String,
+    mode: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use agent_protocol::{ApprovalAction, PermissionMode, ShellPolicy};
+    use std::io::Write;
+    use std::net::TcpListener;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::{Arc, Mutex};
+    use std::thread::JoinHandle;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn unique_dir(name: &str) -> PathBuf {
@@ -2266,6 +2625,30 @@ mod tests {
             root,
             PermissionProfile::for_mode(PermissionMode::ReadOnly),
             lark,
+        )
+        .expect("tool registry")
+    }
+
+    fn registry_with_robot_tools(root: &Path, base_url: &str) -> ToolRegistry {
+        ToolRegistry::built_in_with_robot_tools(
+            root,
+            PermissionProfile::for_mode(PermissionMode::ReadOnly),
+            LarkToolConfig {
+                cli_path: "lark-cli".to_string(),
+                calendar_identity: "user".to_string(),
+                message_identity: "user".to_string(),
+                calendar_id: "primary".to_string(),
+            },
+            QWeatherToolConfig {
+                token: Some("weather-token".to_string()),
+                token_env: "MORROW_TEST_QWEATHER_TOKEN".to_string(),
+                base_url: base_url.to_string(),
+            },
+            AmapToolConfig {
+                key: Some("amap-key".to_string()),
+                key_env: "MORROW_TEST_AMAP_KEY".to_string(),
+                base_url: base_url.to_string(),
+            },
         )
         .expect("tool registry")
     }
@@ -2325,6 +2708,70 @@ mod tests {
         permissions.set_mode(0o755);
         fs::set_permissions(&script, permissions).expect("chmod fake lark");
         (script, args_file)
+    }
+
+    struct FakeHttpServer {
+        base_url: String,
+        requests: Arc<Mutex<Vec<String>>>,
+        handle: JoinHandle<()>,
+    }
+
+    impl FakeHttpServer {
+        fn join(self) -> Vec<String> {
+            self.handle.join().expect("fake HTTP server thread");
+            self.requests.lock().expect("requests").clone()
+        }
+    }
+
+    fn fake_http_server(responses: Vec<(&'static str, &'static str)>) -> FakeHttpServer {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind fake HTTP");
+        let addr = listener.local_addr().expect("fake HTTP addr");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let thread_requests = Arc::clone(&requests);
+        let handle = thread::spawn(move || {
+            for (expected_path, body) in responses {
+                let (mut stream, _) = listener.accept().expect("accept fake HTTP");
+                let mut bytes = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                loop {
+                    let read = stream.read(&mut buffer).expect("read fake HTTP request");
+                    if read == 0 {
+                        break;
+                    }
+                    bytes.extend_from_slice(&buffer[..read]);
+                    if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8_lossy(&bytes);
+                let request_path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or_default()
+                    .to_string();
+                assert!(
+                    request_path.starts_with(expected_path),
+                    "expected request path to start with {expected_path}, got {request_path}"
+                );
+                thread_requests.lock().expect("requests").push(request_path);
+
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write fake HTTP response");
+            }
+        });
+
+        FakeHttpServer {
+            base_url: format!("http://{addr}"),
+            requests,
+            handle,
+        }
     }
 
     #[test]
@@ -2395,6 +2842,101 @@ mod tests {
         assert!(args.contains("+create\n"));
         assert!(args.contains("--attendee-ids\nou_1,ou_2\n"));
         assert!(args.contains("--summary\n项目会; rm -rf /\n"));
+    }
+
+    #[test]
+    fn robot_tools_expose_weather_and_route_definitions() {
+        let root = unique_dir("robot-tool-definitions");
+        let base = registry(&root);
+        let robot = registry_with_robot_tools(&root, "http://127.0.0.1:1");
+
+        let base_names = base
+            .definitions()
+            .iter()
+            .map(|definition| definition.function.name.as_str())
+            .collect::<Vec<_>>();
+        let robot_names = robot
+            .definitions()
+            .iter()
+            .map(|definition| definition.function.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(!base_names.contains(&"qweather_weather_query"));
+        assert!(!base_names.contains(&"amap_route_plan"));
+        assert!(robot_names.contains(&"lark_calendar_list"));
+        assert!(robot_names.contains(&"qweather_weather_query"));
+        assert!(robot_names.contains(&"amap_route_plan"));
+    }
+
+    #[test]
+    fn qweather_weather_query_resolves_location_and_forecast() {
+        let server = fake_http_server(vec![
+            (
+                "/geo/v2/city/lookup",
+                r#"{"code":"200","location":[{"id":"101280601","name":"深圳","adm1":"广东省","adm2":"深圳市","country":"中国"}]}"#,
+            ),
+            (
+                "/v7/weather/3d",
+                r#"{"code":"200","daily":[{"fxDate":"2026-07-06","textDay":"多云","textNight":"阴","tempMin":"26","tempMax":"32","windDirDay":"南风","windScaleDay":"3-4","precip":"0.0"}]}"#,
+            ),
+        ]);
+        let root = unique_dir("qweather-tool");
+        let tools = registry_with_robot_tools(&root, &server.base_url);
+
+        let value = content(tools.execute(&call(
+            "qweather_weather_query",
+            json!({"location": "深圳福田", "days": 1}),
+        )));
+
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["data"]["provider"], "qweather");
+        assert_eq!(value["data"]["resolved_location"]["id"], "101280601");
+        assert_eq!(value["data"]["daily"][0]["text_day"], "多云");
+        assert_eq!(value["data"]["daily"][0]["temp_min"], "26");
+        let requests = server.join();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains("key=weather-token"));
+        assert!(requests[1].contains("location=101280601"));
+    }
+
+    #[test]
+    fn amap_route_plan_geocodes_addresses_and_parses_route_cost() {
+        let server = fake_http_server(vec![
+            (
+                "/v3/geocode/geo",
+                r#"{"status":"1","info":"OK","geocodes":[{"formatted_address":"深圳市福田区","location":"114.055000,22.544000"}]}"#,
+            ),
+            (
+                "/v3/geocode/geo",
+                r#"{"status":"1","info":"OK","geocodes":[{"formatted_address":"深圳湾科技生态园","location":"113.944000,22.536000"}]}"#,
+            ),
+            (
+                "/v5/direction/driving",
+                r#"{"status":"1","info":"OK","route":{"paths":[{"distance":"16800","cost":{"duration":"2100"}}],"taxi_cost":"58"}}"#,
+            ),
+        ]);
+        let root = unique_dir("amap-tool");
+        let tools = registry_with_robot_tools(&root, &server.base_url);
+
+        let value = content(tools.execute(&call(
+            "amap_route_plan",
+            json!({"origin": "深圳市福田区", "destination": "深圳湾科技生态园"}),
+        )));
+
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["data"]["provider"], "amap");
+        assert_eq!(value["data"]["origin"]["location"], "114.055000,22.544000");
+        assert_eq!(
+            value["data"]["destination"]["location"],
+            "113.944000,22.536000"
+        );
+        assert_eq!(value["data"]["distance_meters"], 16800);
+        assert_eq!(value["data"]["duration_minutes"], 35);
+        assert_eq!(value["data"]["taxi_cost"], "58");
+        let requests = server.join();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[2].contains("show_fields=cost"));
+        assert!(requests[2].contains("key=amap-key"));
     }
 
     #[test]

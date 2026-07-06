@@ -6,8 +6,8 @@ use agent_protocol::{
     ToolExecutionSummary,
 };
 use agent_runtime::{
-    AgentEventEnvelope, CompactionOutcome, LarkToolConfig, RunAgentTurnOutcome, SessionStore,
-    TurnEventHandler,
+    AgentEventEnvelope, AmapToolConfig, CompactionOutcome, LarkToolConfig, QWeatherToolConfig,
+    RunAgentTurnOutcome, SessionStore, TurnEventHandler,
 };
 use clap::{Parser, Subcommand};
 use futures_util::future::{BoxFuture, FutureExt};
@@ -267,6 +267,8 @@ async fn run() -> Result<(), CliError> {
                 workspace_root: &workspace_root,
                 config_path: &loaded.path,
                 lark: None,
+                qweather: None,
+                amap: None,
             },
             &mut session,
             &mut permissions,
@@ -284,6 +286,8 @@ async fn run() -> Result<(), CliError> {
             workspace_root: &workspace_root,
             permissions,
             lark: None,
+            qweather: None,
+            amap: None,
             interactive_approvals: io::stdin().is_terminal(),
             output: if args.jsonl {
                 OutputMode::Jsonl {
@@ -319,6 +323,8 @@ struct ReplContext<'a> {
     workspace_root: &'a Path,
     config_path: &'a Path,
     lark: Option<&'a LarkToolConfig>,
+    qweather: Option<&'a QWeatherToolConfig>,
+    amap: Option<&'a AmapToolConfig>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -329,6 +335,8 @@ struct RunAgentTurnContext<'a> {
     workspace_root: &'a Path,
     permissions: PermissionProfile,
     lark: Option<&'a LarkToolConfig>,
+    qweather: Option<&'a QWeatherToolConfig>,
+    amap: Option<&'a AmapToolConfig>,
     interactive_approvals: bool,
     output: OutputMode<'a>,
 }
@@ -392,6 +400,8 @@ async fn run_repl(
                 workspace_root: context.workspace_root,
                 permissions: *permissions,
                 lark: context.lark,
+                qweather: context.qweather,
+                amap: context.amap,
                 interactive_approvals: io::stdin().is_terminal(),
                 output: OutputMode::Human,
             },
@@ -506,6 +516,8 @@ async fn run_agent_turn(
             workspace_root: context.workspace_root,
             permissions: context.permissions,
             lark: context.lark,
+            qweather: context.qweather,
+            amap: context.amap,
             session_name,
             turn_index,
         },
@@ -717,7 +729,7 @@ fn lark_tool_config(config: &LarkConfig) -> LarkToolConfig {
 
 fn robot_system_prompt(base: &str) -> String {
     format!(
-        "{base}\n\n机器人特别版规则：你负责飞书日程、会议提醒、外勤出行和出差提醒。面向用户的最终回复必须是适合直接转语音的纯文字。不要输出 Markdown 表格、代码块、项目符号、编号列表、emoji、图标或调试信息。复盘上周工作时，先读取上周一零点到上周日二十三点五十九分的飞书日程，再说明这是基于日程的进度复盘。创建日程前必须解析清楚时间、标题和参会人；参会人姓名需要先解析为飞书 open_id。用户要求代通知迟到时，先查最近一小时内即将开始的会议，读取参会人，只有找到会议群 chat_id 时才发送飞书纯文本通知。"
+        "{base}\n\n机器人特别版规则：你负责飞书日程、会议提醒、外勤出行、天气查询、路线规划和出差提醒。面向用户的最终回复必须是适合直接转语音的纯文字。不要输出 Markdown 表格、代码块、项目符号、编号列表、emoji、图标或调试信息。复盘上周工作时，先读取上周一零点到上周日二十三点五十九分的飞书日程，再说明这是基于日程的进度复盘。创建日程前必须解析清楚时间、标题和参会人；参会人姓名需要先解析为飞书 open_id。用户询问天气、穿搭、外勤准备或出行路线时，优先调用和风天气或高德地图工具获得实时结果，再用口语化纯文字说明。用户要求代通知迟到时，先查最近一小时内即将开始的会议，读取参会人，只有找到会议群 chat_id 时才发送飞书纯文本通知。"
     )
 }
 
@@ -1619,6 +1631,8 @@ mod tests {
                 workspace_root: &root,
                 permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
                 lark: None,
+                qweather: None,
+                amap: None,
                 interactive_approvals: false,
                 output: OutputMode::Human,
             },
@@ -1662,6 +1676,8 @@ mod tests {
                 workspace_root: &root,
                 permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
                 lark: None,
+                qweather: None,
+                amap: None,
                 interactive_approvals: false,
                 output: OutputMode::Jsonl {
                     session_name: "default",
@@ -1723,6 +1739,8 @@ mod tests {
                 workspace_root: &root,
                 permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
                 lark: None,
+                qweather: None,
+                amap: None,
                 interactive_approvals: false,
                 output: OutputMode::Jsonl {
                     session_name: "default",
@@ -1770,6 +1788,8 @@ mod tests {
                 workspace_root: &root,
                 permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
                 lark: None,
+                qweather: None,
+                amap: None,
                 interactive_approvals: false,
                 output: OutputMode::Human,
             },

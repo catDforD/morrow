@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
-pub use agent_tools::LarkToolConfig;
+pub use agent_tools::{AmapToolConfig, LarkToolConfig, QWeatherToolConfig};
 pub use session_store::{SessionEntry, SessionStore, SessionStoreError};
 
 pub const EVENT_SCHEMA_VERSION: u32 = 1;
@@ -69,6 +69,8 @@ pub struct RunAgentTurnContext<'a> {
     pub workspace_root: &'a Path,
     pub permissions: PermissionProfile,
     pub lark: Option<&'a LarkToolConfig>,
+    pub qweather: Option<&'a QWeatherToolConfig>,
+    pub amap: Option<&'a AmapToolConfig>,
     pub session_name: &'a str,
     pub turn_index: usize,
 }
@@ -117,13 +119,20 @@ pub async fn run_agent_turn(
         });
     }
 
-    let tools = match context.lark {
-        Some(lark) => ToolRegistry::built_in_with_lark(
+    let tools = match (context.lark, context.qweather, context.amap) {
+        (Some(lark), Some(qweather), Some(amap)) => ToolRegistry::built_in_with_robot_tools(
+            context.workspace_root,
+            context.permissions,
+            lark.clone(),
+            qweather.clone(),
+            amap.clone(),
+        )?,
+        (Some(lark), _, _) => ToolRegistry::built_in_with_lark(
             context.workspace_root,
             context.permissions,
             lark.clone(),
         )?,
-        None => ToolRegistry::built_in(context.workspace_root, context.permissions)?,
+        (None, _, _) => ToolRegistry::built_in(context.workspace_root, context.permissions)?,
     };
     let agent = Agent::with_tools(
         context.client.clone(),
@@ -688,6 +697,8 @@ mod tests {
                 workspace_root: &root,
                 permissions: PermissionProfile::for_mode(agent_protocol::PermissionMode::ReadOnly),
                 lark: None,
+                qweather: None,
+                amap: None,
                 session_name: "default",
                 turn_index: 0,
             },
@@ -757,6 +768,8 @@ mod tests {
                     agent_protocol::PermissionMode::WorkspaceWrite,
                 ),
                 lark: None,
+                qweather: None,
+                amap: None,
                 session_name: "default",
                 turn_index: 0,
             },
@@ -804,6 +817,8 @@ mod tests {
                 workspace_root: &root,
                 permissions: PermissionProfile::for_mode(agent_protocol::PermissionMode::ReadOnly),
                 lark: None,
+                qweather: None,
+                amap: None,
                 session_name: "default",
                 turn_index: session.turns.len(),
             },
