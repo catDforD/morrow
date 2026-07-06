@@ -8,6 +8,9 @@ on:
 permissions:
   contents: write
 
+env:
+  RIPGREP_VERSION: 15.1.0
+
 jobs:
   build:
     name: Build ${{ matrix.target }}
@@ -19,22 +22,27 @@ jobs:
             os: ubuntu-latest
             archive: tar.gz
             bin: morrow
+            ripgrep_target: x86_64-unknown-linux-musl
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
             archive: tar.gz
             bin: morrow
+            ripgrep_target: aarch64-unknown-linux-gnu
           - target: x86_64-apple-darwin
             os: macos-15-intel
             archive: tar.gz
             bin: morrow
+            ripgrep_target: x86_64-apple-darwin
           - target: aarch64-apple-darwin
             os: macos-15
             archive: tar.gz
             bin: morrow
+            ripgrep_target: aarch64-apple-darwin
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             archive: zip
             bin: morrow.exe
+            ripgrep_target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
@@ -48,14 +56,34 @@ jobs:
       - name: Build
         run: cargo build --release --locked --bin morrow --target ${{ matrix.target }}
 
+      - name: Download ripgrep
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          mkdir -p dist/rg
+          asset="ripgrep-${RIPGREP_VERSION}-${{ matrix.ripgrep_target }}.tar.gz"
+          curl -fsSL "https://github.com/BurntSushi/ripgrep/releases/download/${RIPGREP_VERSION}/${asset}" -o "dist/${asset}"
+          tar -xzf "dist/${asset}" -C dist/rg --strip-components=1 "ripgrep-${RIPGREP_VERSION}-${{ matrix.ripgrep_target }}/rg"
+
+      - name: Download ripgrep
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/rg | Out-Null
+          $asset = "ripgrep-${env:RIPGREP_VERSION}-${{ matrix.ripgrep_target }}.zip"
+          $url = "https://github.com/BurntSushi/ripgrep/releases/download/${env:RIPGREP_VERSION}/$asset"
+          Invoke-WebRequest -Uri $url -OutFile "dist/$asset"
+          Expand-Archive -Path "dist/$asset" -DestinationPath dist/rg
+
       - name: Package Unix
         if: matrix.archive == 'tar.gz'
         shell: bash
         run: |
           mkdir -p dist/pkg
           cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" dist/pkg/morrow
-          chmod +x dist/pkg/morrow
-          tar -C dist/pkg -czf "dist/morrow-${{ matrix.target }}.tar.gz" morrow
+          cp dist/rg/rg dist/pkg/morrow-rg
+          chmod +x dist/pkg/morrow dist/pkg/morrow-rg
+          tar -C dist/pkg -czf "dist/morrow-${{ matrix.target }}.tar.gz" morrow morrow-rg
 
       - name: Package Windows
         if: matrix.archive == 'zip'
@@ -63,7 +91,8 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path dist/pkg | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/pkg/morrow.exe"
-          Compress-Archive -Path "dist/pkg/morrow.exe" -DestinationPath "dist/morrow-${{ matrix.target }}.zip"
+          Copy-Item "dist/rg/ripgrep-${env:RIPGREP_VERSION}-${{ matrix.ripgrep_target }}/rg.exe" "dist/pkg/morrow-rg.exe"
+          Compress-Archive -Path "dist/pkg/morrow.exe","dist/pkg/morrow-rg.exe" -DestinationPath "dist/morrow-${{ matrix.target }}.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
