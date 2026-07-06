@@ -1,6 +1,6 @@
 pub mod session_store;
 
-use agent_config::ContextConfig;
+use agent_config::{ContextConfig, ModelContextLimits};
 use agent_core::{Agent, AgentError};
 use agent_model::{ModelError, ModelEvent, OpenAiCompatClient};
 use agent_protocol::{
@@ -20,6 +20,19 @@ use thiserror::Error;
 pub use session_store::{SessionEntry, SessionStore, SessionStoreError};
 
 pub const EVENT_SCHEMA_VERSION: u32 = 1;
+const MESSAGE_BASE_TOKENS: usize = 6;
+const TOOL_CALL_BASE_TOKENS: usize = 12;
+const REQUEST_PADDING_NUMERATOR: usize = 4;
+const REQUEST_PADDING_DENOMINATOR: usize = 3;
+const REQUIRED_SUMMARY_SECTIONS: [&str; 7] = [
+    "User Goals and Constraints",
+    "Important Decisions",
+    "Files and Code State",
+    "Commands, Results, and Errors",
+    "Current Progress",
+    "Pending Tasks",
+    "Open Questions",
+];
 
 #[derive(Debug, Error)]
 pub enum RuntimeError {
@@ -65,6 +78,7 @@ pub struct RunAgentTurnContext<'a> {
     pub client: &'a OpenAiCompatClient,
     pub system_prompt: &'a str,
     pub context_config: ContextConfig,
+    pub model_limits: ModelContextLimits,
     pub workspace_root: &'a Path,
     pub permissions: PermissionProfile,
     pub session_name: &'a str,
@@ -101,6 +115,7 @@ pub async fn run_agent_turn(
         context.system_prompt,
         session,
         context.context_config,
+        context.model_limits,
         prompt,
     )
     .await
@@ -201,28 +216,39 @@ pub async fn maybe_auto_compact(
     system_prompt: &str,
     session: &mut Session,
     context_config: ContextConfig,
+    model_limits: ModelContextLimits,
     prompt: &str,
 ) -> Result<(), RuntimeError> {
     if !context_config.auto_compact {
         return Ok(());
     }
 
-    let estimate = estimate_context_chars(system_prompt, session, prompt);
-    if estimate <= context_config.max_context_chars {
+    let budget = auto_compact_trigger_tokens(model_limits, context_config);
+    let estimate = estimate_context_tokens(system_prompt, session, prompt);
+    if estimate <= budget {
         return Ok(());
     }
 
     compact_session(client, session, context_config).await?;
 
-    let compacted_estimate = estimate_context_chars(system_prompt, session, prompt);
-    if compacted_estimate > context_config.max_context_chars {
+    let compacted_estimate = estimate_context_tokens(system_prompt, session, prompt);
+    if compacted_estimate > budget {
         return Err(RuntimeError::AgentRun(format!(
-            "context is still over budget after compaction ({compacted_estimate} > {})",
-            context_config.max_context_chars
+            "context is still over token budget after compaction ({compacted_estimate} > {budget})"
         )));
     }
 
     Ok(())
+}
+
+fn auto_compact_trigger_tokens(
+    model_limits: ModelContextLimits,
+    context_config: ContextConfig,
+) -> usize {
+    let input_window = model_limits
+        .context_window_tokens
+        .saturating_sub(model_limits.reserved_output_tokens);
+    ((input_window as f64) * f64::from(context_config.auto_compact_threshold)).floor() as usize
 }
 
 pub async fn compact_session(
@@ -239,7 +265,8 @@ pub async fn compact_session(
     let summary = request_session_summary(
         client,
         session.context.summary.as_deref(),
-        context_config.summary_target_chars,
+        context_config.summary_target_tokens,
+        context_config.compact_max_retries,
         &records,
         session.context.summarized_turns,
     )
@@ -304,33 +331,82 @@ fn compactable_prefix_len(session: &Session, retain_recent_turns: usize) -> usiz
 async fn request_session_summary(
     client: &OpenAiCompatClient,
     existing_summary: Option<&str>,
-    target_chars: usize,
+    target_tokens: usize,
+    max_attempts: usize,
+    records: &[TurnRecord],
+    first_turn_index: usize,
+) -> Result<String, RuntimeError> {
+    let attempts = max_attempts.max(1);
+    let mut repair_feedback = None;
+
+    for _ in 0..attempts {
+        let output = match request_raw_session_summary(
+            client,
+            existing_summary,
+            target_tokens,
+            repair_feedback.as_deref(),
+            records,
+            first_turn_index,
+        )
+        .await
+        {
+            Ok(output) => output,
+            Err(_) => {
+                return Ok(deterministic_session_summary(
+                    existing_summary,
+                    records,
+                    first_turn_index,
+                ));
+            }
+        };
+
+        match parse_compact_summary_output(&output) {
+            Ok(summary) => return Ok(summary),
+            Err(error) => {
+                repair_feedback = Some(error);
+            }
+        }
+    }
+
+    Ok(deterministic_session_summary(
+        existing_summary,
+        records,
+        first_turn_index,
+    ))
+}
+
+async fn request_raw_session_summary(
+    client: &OpenAiCompatClient,
+    existing_summary: Option<&str>,
+    target_tokens: usize,
+    repair_feedback: Option<&str>,
     records: &[TurnRecord],
     first_turn_index: usize,
 ) -> Result<String, RuntimeError> {
     let mut conversation = Conversation::with_system_prompt(
-        "You compact long-running coding agent session history. Produce a concise, factual summary that preserves user goals, constraints, decisions, file and command results, failure reasons, pending tasks, and open questions. Do not include fluff.",
+        "You compact long-running coding agent session history. Respond with text only. Do not call tools. Return one <analysis> block followed by one <summary> block.",
     );
     conversation.push(Message::user(build_summary_prompt(
         existing_summary,
-        target_chars,
+        target_tokens,
+        repair_feedback,
         records,
         first_turn_index,
     )));
 
     let mut stream = client.stream_chat(&conversation, &[]).await?;
-    let mut summary = String::new();
+    let mut output = String::new();
     while let Some(event) = stream.next().await {
         match event? {
-            ModelEvent::TextDelta(text) => summary.push_str(&text),
+            ModelEvent::TextDelta(text) => output.push_str(&text),
             ModelEvent::Completed => {
-                let summary = summary.trim().to_string();
-                if summary.is_empty() {
+                let output = output.trim().to_string();
+                if output.is_empty() {
                     return Err(RuntimeError::AgentRun(
                         "summary model returned an empty summary".to_string(),
                     ));
                 }
-                return Ok(summary);
+                return Ok(output);
             }
             ModelEvent::ToolCalls(_) => {
                 return Err(RuntimeError::AgentRun(
@@ -347,15 +423,40 @@ async fn request_session_summary(
 
 fn build_summary_prompt(
     existing_summary: Option<&str>,
-    target_chars: usize,
+    target_tokens: usize,
+    repair_feedback: Option<&str>,
     records: &[TurnRecord],
     first_turn_index: usize,
 ) -> String {
     let mut prompt = String::new();
     let _ = writeln!(
         prompt,
-        "Update the session summary. Target length: at most {target_chars} characters."
+        "Update the session summary. Target length: at most {target_tokens} tokens."
     );
+    let _ = writeln!(
+        prompt,
+        "Output exactly one <analysis> block followed by one <summary> block."
+    );
+    let _ = writeln!(
+        prompt,
+        "The <summary> block must contain these section headings exactly:"
+    );
+    for section in REQUIRED_SUMMARY_SECTIONS {
+        let _ = writeln!(prompt, "- {section}");
+    }
+    let _ = writeln!(prompt);
+    let _ = writeln!(
+        prompt,
+        "Preserve user goals, constraints, decisions, file paths, code state, commands, results, errors, pending tasks, and open questions. Do not continue the conversation."
+    );
+    if let Some(feedback) = repair_feedback.filter(|feedback| !feedback.trim().is_empty()) {
+        let _ = writeln!(prompt);
+        let _ = writeln!(
+            prompt,
+            "Repair feedback from the previous invalid compact output:"
+        );
+        let _ = writeln!(prompt, "{feedback}");
+    }
     let _ = writeln!(prompt);
     let _ = writeln!(prompt, "Existing summary:");
     let _ = writeln!(prompt, "{}", existing_summary.unwrap_or("(none)"));
@@ -393,31 +494,242 @@ fn append_turn_record_transcript(output: &mut String, index: usize, record: &Tur
     }
 }
 
-fn estimate_context_chars(system_prompt: &str, session: &Session, prompt: &str) -> usize {
-    system_prompt.chars().count()
-        + prompt.chars().count()
+fn parse_compact_summary_output(output: &str) -> Result<String, String> {
+    let normalized = strip_outer_markdown_code_fence(output);
+    let summary = extract_xml_block(&normalized, "summary")?
+        .ok_or_else(|| "compact response missing <summary> block".to_string())?;
+    if summary.trim().is_empty() {
+        return Err("compact summary response was empty".to_string());
+    }
+    if let Some(section) = REQUIRED_SUMMARY_SECTIONS
+        .iter()
+        .find(|section| !summary.contains(**section))
+    {
+        return Err(format!(
+            "compact summary missing required section: {section}"
+        ));
+    }
+    Ok(summary.trim().to_string())
+}
+
+fn extract_xml_block(content: &str, tag: &str) -> Result<Option<String>, String> {
+    let Some((_open_start, open_end)) = find_opening_tag(content, tag) else {
+        return Ok(None);
+    };
+    let Some((close_start, _close_end)) = find_closing_tag(&content[open_end..], tag) else {
+        return Err(format!("compact response missing closing </{tag}> tag"));
+    };
+    let close_start = open_end + close_start;
+    Ok(Some(content[open_end..close_start].trim().to_string()))
+}
+
+fn find_opening_tag(content: &str, tag: &str) -> Option<(usize, usize)> {
+    let lower = content.to_ascii_lowercase();
+    let needle = format!("<{tag}");
+    let mut start = 0;
+    while let Some(relative) = lower[start..].find(&needle) {
+        let tag_start = start + relative;
+        let after = lower[tag_start + needle.len()..].chars().next();
+        if after.is_some_and(|ch| ch != '>' && !ch.is_ascii_whitespace()) {
+            start = tag_start + needle.len();
+            continue;
+        }
+        let tag_end = lower[tag_start..].find('>')? + tag_start + 1;
+        return Some((tag_start, tag_end));
+    }
+    None
+}
+
+fn find_closing_tag(content: &str, tag: &str) -> Option<(usize, usize)> {
+    let lower = content.to_ascii_lowercase();
+    let needle = format!("</{tag}");
+    let start = lower.find(&needle)?;
+    let after = lower[start + needle.len()..].chars().next();
+    if after.is_some_and(|ch| ch != '>' && !ch.is_ascii_whitespace()) {
+        return None;
+    }
+    let end = lower[start..].find('>')? + start + 1;
+    Some((start, end))
+}
+
+fn strip_outer_markdown_code_fence(content: &str) -> String {
+    let mut current = content.trim().to_string();
+    loop {
+        let stripped = strip_markdown_code_fence(&current);
+        if stripped == current {
+            return current;
+        }
+        current = stripped;
+    }
+}
+
+fn strip_markdown_code_fence(content: &str) -> String {
+    let trimmed = content.trim();
+    if !trimmed.starts_with("```") {
+        return trimmed.to_string();
+    }
+
+    let mut lines = trimmed.lines();
+    let Some(first_line) = lines.next() else {
+        return trimmed.to_string();
+    };
+    if !first_line.trim_start().starts_with("```") {
+        return trimmed.to_string();
+    }
+
+    let body = lines.collect::<Vec<_>>().join("\n");
+    let body = body.trim_end();
+    body.strip_suffix("```").unwrap_or(body).trim().to_string()
+}
+
+fn deterministic_session_summary(
+    existing_summary: Option<&str>,
+    records: &[TurnRecord],
+    first_turn_index: usize,
+) -> String {
+    let mut summary = String::new();
+    let _ = writeln!(summary, "User Goals and Constraints");
+    let _ = writeln!(
+        summary,
+        "- Previous summary: {}",
+        existing_summary
+            .map(|summary| truncate_summary_text(summary, 1_200))
+            .unwrap_or_else(|| "(none)".to_string())
+    );
+    let _ = writeln!(
+        summary,
+        "- Compacted {} turn records with deterministic fallback.",
+        records.len()
+    );
+    let _ = writeln!(summary);
+    let _ = writeln!(summary, "Important Decisions");
+    let _ = writeln!(summary, "- (unknown from deterministic fallback)");
+    let _ = writeln!(summary);
+    let _ = writeln!(summary, "Files and Code State");
+    let _ = writeln!(summary, "- (unknown from deterministic fallback)");
+    let _ = writeln!(summary);
+    let _ = writeln!(summary, "Commands, Results, and Errors");
+    append_fallback_errors(&mut summary, records, first_turn_index);
+    let _ = writeln!(summary);
+    let _ = writeln!(summary, "Current Progress");
+    for (offset, record) in records.iter().enumerate().rev().take(6).rev() {
+        let index = first_turn_index + offset;
+        let _ = writeln!(
+            summary,
+            "- Turn {index}: status={}",
+            turn_status_label(record.turn.status)
+        );
+        if let Some(content) = record.turn.user_message.content.as_ref() {
+            let _ = writeln!(summary, "  user: {}", truncate_summary_text(content, 240));
+        }
+        if let Some(message) = record.turn.assistant_message.as_ref()
+            && let Some(content) = message.content.as_ref()
+        {
+            let _ = writeln!(
+                summary,
+                "  assistant: {}",
+                truncate_summary_text(content, 240)
+            );
+        }
+    }
+    let _ = writeln!(summary);
+    let _ = writeln!(summary, "Pending Tasks");
+    let _ = writeln!(summary, "- (unknown from deterministic fallback)");
+    let _ = writeln!(summary);
+    let _ = writeln!(summary, "Open Questions");
+    let _ = writeln!(summary, "- (unknown from deterministic fallback)");
+
+    summary.trim().to_string()
+}
+
+fn append_fallback_errors(output: &mut String, records: &[TurnRecord], first_turn_index: usize) {
+    let mut wrote = false;
+    for (offset, record) in records.iter().enumerate() {
+        if let Some(error) = record.turn.error.as_ref() {
+            let _ = writeln!(
+                output,
+                "- Turn {} error: {}",
+                first_turn_index + offset,
+                truncate_summary_text(error, 320)
+            );
+            wrote = true;
+        }
+    }
+    if !wrote {
+        let _ = writeln!(output, "- (none recorded)");
+    }
+}
+
+fn truncate_summary_text(content: &str, max_chars: usize) -> String {
+    if content.chars().count() <= max_chars {
+        return content.trim().to_string();
+    }
+    let mut truncated = content.chars().take(max_chars).collect::<String>();
+    truncated.push_str("...");
+    truncated
+}
+
+fn estimate_context_tokens(system_prompt: &str, session: &Session, prompt: &str) -> usize {
+    let raw_total = message_text_tokens(agent_protocol::Role::System, system_prompt)
+        + message_text_tokens(agent_protocol::Role::User, prompt)
         + session
             .active_thread
             .messages
             .iter()
-            .map(message_context_chars)
-            .sum::<usize>()
+            .map(message_context_tokens)
+            .sum::<usize>();
+    raw_total
+        .saturating_mul(REQUEST_PADDING_NUMERATOR)
+        .div_ceil(REQUEST_PADDING_DENOMINATOR)
 }
 
-fn message_context_chars(message: &Message) -> usize {
-    let mut total = message_role_label(message).len();
+fn message_context_tokens(message: &Message) -> usize {
+    let mut total = MESSAGE_BASE_TOKENS + estimate_text_tokens(message_role_label(message));
     if let Some(content) = message.content.as_ref() {
-        total += content.chars().count();
+        total += estimate_text_tokens(content);
     }
     if let Some(tool_call_id) = message.tool_call_id.as_ref() {
-        total += tool_call_id.chars().count();
+        total += estimate_text_tokens(tool_call_id);
     }
     if let Some(tool_calls) = message.tool_calls.as_ref() {
-        total += serde_json::to_string(tool_calls)
-            .map(|value| value.chars().count())
-            .unwrap_or_default();
+        total += TOOL_CALL_BASE_TOKENS
+            + serde_json::to_string(tool_calls)
+                .map(|value| estimate_text_tokens(&value))
+                .unwrap_or_default();
     }
     total
+}
+
+fn message_text_tokens(role: agent_protocol::Role, content: &str) -> usize {
+    let mut total = MESSAGE_BASE_TOKENS + estimate_text_tokens(role_label(role));
+    total += estimate_text_tokens(content);
+    total
+}
+
+fn estimate_text_tokens(text: &str) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
+
+    let mut ascii_chars = 0usize;
+    let mut non_ascii_tokens = 0usize;
+    for ch in text.chars() {
+        if ch.is_ascii() {
+            ascii_chars += 1;
+        } else {
+            non_ascii_tokens += 1;
+        }
+    }
+    ascii_chars.div_ceil(4) + non_ascii_tokens
+}
+
+fn role_label(role: agent_protocol::Role) -> &'static str {
+    match role {
+        agent_protocol::Role::System => "system",
+        agent_protocol::Role::User => "user",
+        agent_protocol::Role::Assistant => "assistant",
+        agent_protocol::Role::Tool => "tool",
+    }
 }
 
 fn message_role_label(message: &Message) -> &'static str {
@@ -547,13 +859,58 @@ mod tests {
         path
     }
 
-    fn context_config(max_context_chars: usize, retain_recent_turns: usize) -> ContextConfig {
+    fn context_config(retain_recent_turns: usize) -> ContextConfig {
         ContextConfig {
             auto_compact: true,
-            max_context_chars,
+            auto_compact_threshold: 0.835,
             retain_recent_turns,
-            summary_target_chars: 256,
+            summary_target_tokens: 256,
+            compact_max_retries: 2,
         }
+    }
+
+    fn model_limits(context_window_tokens: usize) -> ModelContextLimits {
+        ModelContextLimits {
+            context_window_tokens,
+            reserved_output_tokens: 1,
+        }
+    }
+
+    fn valid_compact_summary_text(current_progress: &str) -> String {
+        format!(
+            r#"User Goals and Constraints
+- keep user intent
+
+Important Decisions
+- compact
+
+Files and Code State
+- none
+
+Commands, Results, and Errors
+- none
+
+Current Progress
+- {current_progress}
+
+Pending Tasks
+- none
+
+Open Questions
+- none"#
+        )
+    }
+
+    fn valid_compact_summary(current_progress: &str) -> String {
+        format!(
+            r#"<analysis>
+compact test
+</analysis>
+<summary>
+{}
+</summary>"#,
+            valid_compact_summary_text(current_progress)
+        )
     }
 
     fn completed_record(user: &str, assistant: &str) -> TurnRecord {
@@ -635,21 +992,25 @@ mod tests {
 
     #[tokio::test]
     async fn manual_compaction_summarizes_old_turns_and_rebuilds_active_context() {
-        let (base_url, requests) =
-            spawn_recording_sse_server(vec![sse_text_body("new summary")]).await;
+        let summary = valid_compact_summary("new summary");
+        let summary_text = valid_compact_summary_text("new summary");
+        let (base_url, requests) = spawn_recording_sse_server(vec![sse_text_body(&summary)]).await;
         let mut session = compactable_session();
 
-        let outcome = compact_session(&client(base_url), &mut session, context_config(10_000, 2))
+        let outcome = compact_session(&client(base_url), &mut session, context_config(2))
             .await
             .expect("compact session");
 
         assert_eq!(outcome, CompactionOutcome::Changed);
-        assert_eq!(session.context.summary.as_deref(), Some("new summary"));
+        assert_eq!(
+            session.context.summary.as_deref(),
+            Some(summary_text.as_str())
+        );
         assert_eq!(session.context.summarized_turns, 3);
         assert_eq!(
             session.active_thread.messages,
             vec![
-                Message::system("Session summary:\nnew summary"),
+                Message::system(format!("Session summary:\n{summary_text}")),
                 Message::user("u3"),
                 Message::assistant("a3"),
                 Message::user("u4"),
@@ -660,7 +1021,45 @@ mod tests {
         let requests = requests.lock().expect("requests lock poisoned");
         assert_eq!(requests.len(), 1);
         assert!(requests[0].contains("failure reason"));
-        assert!(requests[0].contains("Target length: at most 256 characters"));
+        assert!(requests[0].contains("Target length: at most 256 tokens"));
+    }
+
+    #[test]
+    fn compact_summary_parser_accepts_markdown_fenced_contract() {
+        let summary_text = valid_compact_summary_text("fenced summary");
+        let raw = format!(
+            "```xml\n<analysis>\nprivate\n</analysis>\n<summary>\n{summary_text}\n</summary>\n```"
+        );
+
+        let parsed = parse_compact_summary_output(&raw).expect("parse summary");
+
+        assert_eq!(parsed, summary_text);
+    }
+
+    #[tokio::test]
+    async fn compaction_retries_invalid_contract_with_repair_feedback() {
+        let valid_summary = valid_compact_summary("retry summary");
+        let valid_summary_text = valid_compact_summary_text("retry summary");
+        let (base_url, requests) = spawn_recording_sse_server(vec![
+            sse_text_body("<analysis>bad</analysis><summary>too short</summary>"),
+            sse_text_body(&valid_summary),
+        ])
+        .await;
+        let mut session = compactable_session();
+
+        let outcome = compact_session(&client(base_url), &mut session, context_config(2))
+            .await
+            .expect("compact session");
+
+        assert_eq!(outcome, CompactionOutcome::Changed);
+        assert_eq!(
+            session.context.summary.as_deref(),
+            Some(valid_summary_text.as_str())
+        );
+        let requests = requests.lock().expect("requests lock poisoned");
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].contains("Repair feedback"));
+        assert!(requests[1].contains("missing required section"));
     }
 
     #[tokio::test]
@@ -675,7 +1074,8 @@ mod tests {
             RunAgentTurnContext {
                 client: &client,
                 system_prompt: "system",
-                context_config: context_config(10_000, 2),
+                context_config: context_config(2),
+                model_limits: model_limits(10_000),
                 workspace_root: &root,
                 permissions: PermissionProfile::for_mode(agent_protocol::PermissionMode::ReadOnly),
                 session_name: "default",
@@ -741,7 +1141,8 @@ mod tests {
             RunAgentTurnContext {
                 client: &client,
                 system_prompt: "system",
-                context_config: context_config(10_000, 2),
+                context_config: context_config(2),
+                model_limits: model_limits(10_000),
                 workspace_root: &root,
                 permissions: PermissionProfile::for_mode(
                     agent_protocol::PermissionMode::WorkspaceWrite,
@@ -774,22 +1175,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auto_compaction_failure_records_failed_turn_without_main_model_call() {
-        let root = unique_dir("run-compact-fail");
-        let (base_url, requests) = spawn_recording_sse_server(vec!["data: {not-json}\n\n"]).await;
+    async fn auto_compaction_llm_failure_falls_back_and_runs_main_turn() {
+        let root = unique_dir("run-compact-fallback");
+        let (base_url, requests) =
+            spawn_recording_sse_server(vec!["data: {not-json}\n\n", sse_text_body("ok")]).await;
         let client = client(base_url);
         let mut session = compactable_session();
-        session.active_thread.push(Message::user(
-            "large active context that exceeds the tiny budget",
-        ));
-        let original_active_thread = session.active_thread.clone();
+        session.turns[0] = completed_record(&"older user context ".repeat(1_000), "a0");
+        rebuild_active_thread(&mut session);
         let mut handler = RecordingHandler::default();
 
         let outcome = run_agent_turn(
             RunAgentTurnContext {
                 client: &client,
                 system_prompt: "system",
-                context_config: context_config(1, 2),
+                context_config: context_config(2),
+                model_limits: model_limits(2_000),
                 workspace_root: &root,
                 permissions: PermissionProfile::for_mode(agent_protocol::PermissionMode::ReadOnly),
                 session_name: "default",
@@ -802,32 +1203,28 @@ mod tests {
         .await
         .expect("run turn");
 
-        assert!(matches!(
+        assert_eq!(
             outcome,
             RunAgentTurnOutcome {
                 session_changed: true,
-                error: Some(_),
+                error: None,
             }
-        ));
-        assert_eq!(session.active_thread, original_active_thread);
+        );
         assert_eq!(session.turns.len(), 6);
         assert_eq!(
             session.turns.last().expect("failed turn").turn.status,
-            TurnStatus::Failed
+            TurnStatus::Completed
         );
         assert!(
             session
-                .turns
-                .last()
-                .expect("failed turn")
-                .turn
-                .error
+                .context
+                .summary
                 .as_deref()
-                .expect("error")
-                .contains("context compaction failed")
+                .expect("fallback summary")
+                .contains("deterministic fallback")
         );
-        assert_eq!(requests.lock().expect("requests lock poisoned").len(), 1);
-        assert!(handler.events.is_empty());
+        assert_eq!(requests.lock().expect("requests lock poisoned").len(), 2);
+        assert!(!handler.events.is_empty());
     }
 
     #[test]

@@ -8,13 +8,15 @@ use thiserror::Error;
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_API_KEY_ENV: &str = "OPENAI_API_KEY";
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
+const DEFAULT_RESERVED_OUTPUT_TOKENS: usize = 8_192;
 const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful assistant.";
 const DEFAULT_AUTO_COMPACT: bool = true;
-const DEFAULT_MAX_CONTEXT_CHARS: usize = 64_000;
+const DEFAULT_AUTO_COMPACT_THRESHOLD: f32 = 0.835;
 const DEFAULT_RETAIN_RECENT_TURNS: usize = 6;
-const DEFAULT_SUMMARY_TARGET_CHARS: usize = 8_000;
+const DEFAULT_SUMMARY_TARGET_TOKENS: usize = 12_000;
+const DEFAULT_COMPACT_MAX_RETRIES: usize = 2;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AppConfig {
     pub model: ModelConfig,
     pub agent: AgentConfig,
@@ -28,6 +30,23 @@ pub struct ModelConfig {
     pub model: String,
     pub api_key_env: String,
     pub timeout_secs: u64,
+    pub context_window_tokens: usize,
+    pub reserved_output_tokens: usize,
+}
+
+impl ModelConfig {
+    pub fn context_limits(&self) -> ModelContextLimits {
+        ModelContextLimits {
+            context_window_tokens: self.context_window_tokens,
+            reserved_output_tokens: self.reserved_output_tokens,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelContextLimits {
+    pub context_window_tokens: usize,
+    pub reserved_output_tokens: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,15 +54,16 @@ pub struct AgentConfig {
     pub system_prompt: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ContextConfig {
     pub auto_compact: bool,
-    pub max_context_chars: usize,
+    pub auto_compact_threshold: f32,
     pub retain_recent_turns: usize,
-    pub summary_target_chars: usize,
+    pub summary_target_tokens: usize,
+    pub compact_max_retries: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LoadedConfig {
     pub config: AppConfig,
     pub path: PathBuf,
@@ -70,10 +90,16 @@ pub enum ConfigError {
     },
     #[error("missing required config value: [model].model")]
     MissingModel,
+    #[error("missing required config value: [model].context_window_tokens")]
+    MissingContextWindowTokens,
     #[error("configured API key environment variable {env_var} is not set")]
     MissingApiKey { env_var: String },
-    #[error("invalid context config value: [context].{field} must be greater than 0")]
-    InvalidContextValue { field: &'static str },
+    #[error("invalid config value: {field} must be greater than 0")]
+    InvalidPositiveValue { field: &'static str },
+    #[error(
+        "invalid config value: [context].auto_compact_threshold must be greater than 0 and less than or equal to 1"
+    )]
+    InvalidAutoCompactThreshold,
 }
 
 #[derive(Debug, Deserialize)]
@@ -94,6 +120,8 @@ struct RawModelConfig {
     #[serde(rename = "OPENAI_API_KEY")]
     openai_api_key: Option<String>,
     timeout_secs: Option<u64>,
+    context_window_tokens: Option<usize>,
+    reserved_output_tokens: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -106,9 +134,10 @@ struct RawAgentConfig {
 #[serde(deny_unknown_fields)]
 struct RawContextConfig {
     auto_compact: Option<bool>,
-    max_context_chars: Option<usize>,
+    auto_compact_threshold: Option<f32>,
     retain_recent_turns: Option<usize>,
-    summary_target_chars: Option<usize>,
+    summary_target_tokens: Option<usize>,
+    compact_max_retries: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -205,6 +234,18 @@ impl TryFrom<RawAppConfig> for AppConfig {
             .map(|model| model.trim().to_string())
             .filter(|model| !model.is_empty())
             .ok_or(ConfigError::MissingModel)?;
+        let context_window_tokens = positive_config_value(
+            "[model].context_window_tokens",
+            model
+                .context_window_tokens
+                .ok_or(ConfigError::MissingContextWindowTokens)?,
+        )?;
+        let reserved_output_tokens = positive_config_value(
+            "[model].reserved_output_tokens",
+            model
+                .reserved_output_tokens
+                .unwrap_or(DEFAULT_RESERVED_OUTPUT_TOKENS),
+        )?;
 
         let agent = value.agent.unwrap_or_default();
         let context = ContextConfig::try_from(value.context.unwrap_or_default())?;
@@ -225,6 +266,8 @@ impl TryFrom<RawAppConfig> for AppConfig {
                     .api_key_env
                     .unwrap_or_else(|| DEFAULT_API_KEY_ENV.to_string()),
                 timeout_secs: model.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS),
+                context_window_tokens,
+                reserved_output_tokens,
             },
             agent: AgentConfig {
                 system_prompt: agent
@@ -241,35 +284,48 @@ impl TryFrom<RawContextConfig> for ContextConfig {
     type Error = ConfigError;
 
     fn try_from(value: RawContextConfig) -> Result<Self, Self::Error> {
-        let max_context_chars = non_zero_context_value(
-            "max_context_chars",
-            value.max_context_chars.unwrap_or(DEFAULT_MAX_CONTEXT_CHARS),
-        )?;
-        let retain_recent_turns = non_zero_context_value(
-            "retain_recent_turns",
+        let auto_compact_threshold = value
+            .auto_compact_threshold
+            .unwrap_or(DEFAULT_AUTO_COMPACT_THRESHOLD);
+        if !auto_compact_threshold.is_finite()
+            || auto_compact_threshold <= 0.0
+            || auto_compact_threshold > 1.0
+        {
+            return Err(ConfigError::InvalidAutoCompactThreshold);
+        }
+
+        let retain_recent_turns = positive_config_value(
+            "[context].retain_recent_turns",
             value
                 .retain_recent_turns
                 .unwrap_or(DEFAULT_RETAIN_RECENT_TURNS),
         )?;
-        let summary_target_chars = non_zero_context_value(
-            "summary_target_chars",
+        let summary_target_tokens = positive_config_value(
+            "[context].summary_target_tokens",
             value
-                .summary_target_chars
-                .unwrap_or(DEFAULT_SUMMARY_TARGET_CHARS),
+                .summary_target_tokens
+                .unwrap_or(DEFAULT_SUMMARY_TARGET_TOKENS),
+        )?;
+        let compact_max_retries = positive_config_value(
+            "[context].compact_max_retries",
+            value
+                .compact_max_retries
+                .unwrap_or(DEFAULT_COMPACT_MAX_RETRIES),
         )?;
 
         Ok(Self {
             auto_compact: value.auto_compact.unwrap_or(DEFAULT_AUTO_COMPACT),
-            max_context_chars,
+            auto_compact_threshold,
             retain_recent_turns,
-            summary_target_chars,
+            summary_target_tokens,
+            compact_max_retries,
         })
     }
 }
 
-fn non_zero_context_value(field: &'static str, value: usize) -> Result<usize, ConfigError> {
+fn positive_config_value(field: &'static str, value: usize) -> Result<usize, ConfigError> {
     if value == 0 {
-        return Err(ConfigError::InvalidContextValue { field });
+        return Err(ConfigError::InvalidPositiveValue { field });
     }
     Ok(value)
 }
@@ -300,6 +356,7 @@ mod tests {
 [model]
 model = "{model}"
 api_key_env = "{api_key_env}"
+context_window_tokens = 65536
 "#
             ),
         )
@@ -317,6 +374,7 @@ api_key_env = "{api_key_env}"
 [model]
 model = "{model}"
 OPENAI_API_KEY = "inline-secret"
+context_window_tokens = 65536
 "#
             ),
         )
@@ -334,6 +392,7 @@ OPENAI_API_KEY = "inline-secret"
 [model]
 model = "{model}"
 api_key_env = "MORROW_PERMISSIONS_KEY"
+context_window_tokens = 65536
 
 [permissions]
 mode = "workspace_write"
@@ -355,12 +414,15 @@ shell = "deny"
 [model]
 model = "{model}"
 api_key_env = "MORROW_CONTEXT_KEY"
+context_window_tokens = 131072
+reserved_output_tokens = 4096
 
 [context]
 auto_compact = false
-max_context_chars = 1024
+auto_compact_threshold = 0.75
 retain_recent_turns = 2
-summary_target_chars = 256
+summary_target_tokens = 256
+compact_max_retries = 3
 "#
             ),
         )
@@ -428,7 +490,7 @@ summary_target_chars = 256
         let config = root.join("morrow.toml");
         fs::write(
             &config,
-            "[model]\napi_key_env = \"MORROW_MISSING_MODEL_KEY\"\n",
+            "[model]\napi_key_env = \"MORROW_MISSING_MODEL_KEY\"\ncontext_window_tokens = 65536\n",
         )
         .expect("write config");
         set_env("MORROW_MISSING_MODEL_KEY", "secret");
@@ -475,14 +537,20 @@ summary_target_chars = 256
 
         assert_eq!(loaded.config.model.base_url, DEFAULT_BASE_URL);
         assert_eq!(loaded.config.model.timeout_secs, DEFAULT_TIMEOUT_SECS);
+        assert_eq!(loaded.config.model.context_window_tokens, 65_536);
+        assert_eq!(
+            loaded.config.model.reserved_output_tokens,
+            DEFAULT_RESERVED_OUTPUT_TOKENS
+        );
         assert_eq!(loaded.config.agent.system_prompt, DEFAULT_SYSTEM_PROMPT);
         assert_eq!(
             loaded.config.context,
             ContextConfig {
                 auto_compact: DEFAULT_AUTO_COMPACT,
-                max_context_chars: DEFAULT_MAX_CONTEXT_CHARS,
+                auto_compact_threshold: DEFAULT_AUTO_COMPACT_THRESHOLD,
                 retain_recent_turns: DEFAULT_RETAIN_RECENT_TURNS,
-                summary_target_chars: DEFAULT_SUMMARY_TARGET_CHARS,
+                summary_target_tokens: DEFAULT_SUMMARY_TARGET_TOKENS,
+                compact_max_retries: DEFAULT_COMPACT_MAX_RETRIES,
             }
         );
         assert_eq!(
@@ -522,15 +590,38 @@ summary_target_chars = 256
             loaded.config.context,
             ContextConfig {
                 auto_compact: false,
-                max_context_chars: 1024,
+                auto_compact_threshold: 0.75,
                 retain_recent_turns: 2,
-                summary_target_chars: 256,
+                summary_target_tokens: 256,
+                compact_max_retries: 3,
             }
         );
+        assert_eq!(loaded.config.model.context_window_tokens, 131_072);
+        assert_eq!(loaded.config.model.reserved_output_tokens, 4_096);
     }
 
     #[test]
-    fn rejects_zero_context_values() {
+    fn rejects_missing_context_window_tokens() {
+        let root = unique_dir("missing-context-window");
+        let config = root.join("morrow.toml");
+        fs::write(
+            &config,
+            r#"
+[model]
+model = "test-model"
+api_key_env = "MORROW_MISSING_CONTEXT_WINDOW_KEY"
+"#,
+        )
+        .expect("write config");
+        set_env("MORROW_MISSING_CONTEXT_WINDOW_KEY", "secret");
+
+        let err = load_config_from_locations(Some(&config), &root, None).expect_err("must fail");
+
+        assert!(matches!(err, ConfigError::MissingContextWindowTokens));
+    }
+
+    #[test]
+    fn rejects_zero_positive_values() {
         let root = unique_dir("context-zero");
         let config = root.join("morrow.toml");
         fs::write(
@@ -539,9 +630,10 @@ summary_target_chars = 256
 [model]
 model = "test-model"
 api_key_env = "MORROW_CONTEXT_ZERO_KEY"
+context_window_tokens = 0
 
 [context]
-max_context_chars = 0
+summary_target_tokens = 128
 "#,
         )
         .expect("write config");
@@ -551,9 +643,57 @@ max_context_chars = 0
 
         assert!(matches!(
             err,
-            ConfigError::InvalidContextValue {
-                field: "max_context_chars"
+            ConfigError::InvalidPositiveValue {
+                field: "[model].context_window_tokens"
             }
         ));
+    }
+
+    #[test]
+    fn rejects_invalid_auto_compact_threshold() {
+        let root = unique_dir("context-threshold");
+        let config = root.join("morrow.toml");
+        fs::write(
+            &config,
+            r#"
+[model]
+model = "test-model"
+api_key_env = "MORROW_CONTEXT_THRESHOLD_KEY"
+context_window_tokens = 65536
+
+[context]
+auto_compact_threshold = 1.5
+"#,
+        )
+        .expect("write config");
+        set_env("MORROW_CONTEXT_THRESHOLD_KEY", "secret");
+
+        let err = load_config_from_locations(Some(&config), &root, None).expect_err("must fail");
+
+        assert!(matches!(err, ConfigError::InvalidAutoCompactThreshold));
+    }
+
+    #[test]
+    fn rejects_legacy_max_context_chars() {
+        let root = unique_dir("legacy-context");
+        let config = root.join("morrow.toml");
+        fs::write(
+            &config,
+            r#"
+[model]
+model = "test-model"
+api_key_env = "MORROW_LEGACY_CONTEXT_KEY"
+context_window_tokens = 65536
+
+[context]
+max_context_chars = 1024
+"#,
+        )
+        .expect("write config");
+        set_env("MORROW_LEGACY_CONTEXT_KEY", "secret");
+
+        let err = load_config_from_locations(Some(&config), &root, None).expect_err("must fail");
+
+        assert!(matches!(err, ConfigError::Parse { .. }));
     }
 }

@@ -1,4 +1,4 @@
-use agent_config::ContextConfig;
+use agent_config::{ContextConfig, ModelContextLimits};
 use agent_model::OpenAiCompatClient;
 use agent_protocol::{ApprovalDecision, PermissionProfile, Session, SessionDocument};
 use agent_runtime::{
@@ -31,6 +31,7 @@ pub struct ServerOptions {
     pub client: OpenAiCompatClient,
     pub system_prompt: String,
     pub context_config: ContextConfig,
+    pub model_limits: ModelContextLimits,
     pub workspace_root: PathBuf,
     pub config_path: PathBuf,
     pub permissions: PermissionProfile,
@@ -543,6 +544,7 @@ async fn run_turn_task_inner(
             client: &options.client,
             system_prompt: &options.system_prompt,
             context_config: options.context_config,
+            model_limits: options.model_limits,
             workspace_root: &options.workspace_root,
             permissions: options.permissions,
             session_name: &session_name,
@@ -809,9 +811,14 @@ mod tests {
             system_prompt: "system".to_string(),
             context_config: ContextConfig {
                 auto_compact: false,
-                max_context_chars: 10_000,
+                auto_compact_threshold: 0.835,
                 retain_recent_turns: 2,
-                summary_target_chars: 256,
+                summary_target_tokens: 256,
+                compact_max_retries: 2,
+            },
+            model_limits: ModelContextLimits {
+                context_window_tokens: 65_536,
+                reserved_output_tokens: 8_192,
             },
             workspace_root: root.clone(),
             config_path: root.join("morrow.toml"),
