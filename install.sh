@@ -85,8 +85,14 @@ fi
 tar -xzf "$WORK_DIR/$ARCHIVE" -C "$WORK_DIR"
 mkdir -p "$INSTALL_DIR"
 install -m 755 "$WORK_DIR/morrow" "$INSTALL_DIR/morrow"
+if [ -f "$WORK_DIR/morrow-rg" ]; then
+    install -m 755 "$WORK_DIR/morrow-rg" "$INSTALL_DIR/morrow-rg"
+fi
 
 echo "Installed morrow to $INSTALL_DIR/morrow"
+if [ -f "$INSTALL_DIR/morrow-rg" ]; then
+    echo "Installed ripgrep sidecar to $INSTALL_DIR/morrow-rg"
+fi
 case ":$PATH:" in
     *":$INSTALL_DIR:"*) ;;
     *)

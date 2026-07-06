@@ -7,8 +7,9 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::collections::HashSet;
+use std::env;
 use std::fs;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -21,11 +22,14 @@ const DEFAULT_LIST_ENTRIES: usize = 100;
 const MAX_LIST_ENTRIES: usize = 500;
 const DEFAULT_SEARCH_RESULTS: usize = 100;
 const MAX_SEARCH_RESULTS: usize = 200;
+const MAX_SEARCH_LINE_CHARS: usize = 500;
+const MAX_SEARCH_TOTAL_BYTES: usize = 20_000;
 const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 30;
 const MAX_SHELL_TIMEOUT_SECS: u64 = 120;
 const MAX_SHELL_OUTPUT_BYTES: usize = 20_000;
 const MAX_FILE_DIFF_LINES: usize = 240;
 const MAX_FILE_DIFF_BYTES: usize = 20_000;
+const SEARCH_SKIP_NAMES: &[&str] = &[".git", "node_modules", "dist", "build", "target"];
 
 #[derive(Debug, Error)]
 pub enum ToolRegistryError {
@@ -190,43 +194,136 @@ impl ToolRegistry {
         let max_results =
             clamp_limit(args.max_results, DEFAULT_SEARCH_RESULTS, MAX_SEARCH_RESULTS)?;
         let case_sensitive = args.case_sensitive.unwrap_or(false);
-        let mut results = Vec::new();
-        let mut truncated = false;
+        let options = SearchOptions {
+            query: &args.query,
+            case_sensitive,
+            max_results,
+        };
+
+        if let Some(ripgrep) = ripgrep_binary() {
+            match self.search_text_with_ripgrep(&ripgrep, &path, &options) {
+                Ok(output) => return Ok(output.into_value()),
+                Err(RipgrepSearchError::Unavailable) => {}
+                Err(RipgrepSearchError::Failed(error)) => return Err(error),
+            }
+        }
+
+        Ok(self.search_text_fallback(&path, &options)?.into_value())
+    }
+
+    fn search_text_fallback(
+        &self,
+        path: &Path,
+        options: &SearchOptions<'_>,
+    ) -> Result<SearchOutput, String> {
+        let mut output = SearchOutput::new(
+            options.query,
+            self.display_path(path),
+            options.case_sensitive,
+            options.max_results,
+        );
 
         if path.is_file() {
-            let options = SearchOptions {
-                query: &args.query,
-                case_sensitive,
-                max_results,
-                fail_on_read_error: true,
-            };
-            self.search_file(&path, &options, &mut results, &mut truncated)?;
+            self.search_file(path, options, true, &mut output)?;
         } else if path.is_dir() {
             let mut files = Vec::new();
-            self.collect_search_files(&path, &mut files)?;
-            let options = SearchOptions {
-                query: &args.query,
-                case_sensitive,
-                max_results,
-                fail_on_read_error: false,
-            };
+            self.collect_search_files(path, &mut files)?;
             for file in files {
-                self.search_file(&file, &options, &mut results, &mut truncated)?;
-                if truncated {
+                self.search_file(&file, options, false, &mut output)?;
+                if output.result_truncated {
                     break;
                 }
             }
         } else {
-            return Err(format!("{} is not searchable", self.display_path(&path)));
+            return Err(format!("{} is not searchable", self.display_path(path)));
         }
 
-        Ok(json!({
-            "query": args.query,
-            "path": self.display_path(&path),
-            "case_sensitive": case_sensitive,
-            "truncated": truncated,
-            "results": results,
-        }))
+        Ok(output)
+    }
+
+    fn search_text_with_ripgrep(
+        &self,
+        ripgrep: &Path,
+        path: &Path,
+        options: &SearchOptions<'_>,
+    ) -> Result<SearchOutput, RipgrepSearchError> {
+        let evaluator = self.evaluator().map_err(RipgrepSearchError::Failed)?;
+        let search_path = self.display_path(path);
+        let mut output = SearchOutput::new(
+            options.query,
+            search_path.clone(),
+            options.case_sensitive,
+            options.max_results,
+        );
+        let mut command = Command::new(ripgrep);
+        command
+            .current_dir(evaluator.root())
+            .arg("--json")
+            .arg("--fixed-strings")
+            .arg("--color")
+            .arg("never")
+            .arg("--no-messages");
+        if !options.case_sensitive {
+            command.arg("--ignore-case");
+        }
+        for skipped in SEARCH_SKIP_NAMES {
+            command.arg("--glob").arg(format!("!**/{skipped}/**"));
+            command.arg("--glob").arg(format!("!{skipped}/**"));
+        }
+        command
+            .arg(options.query)
+            .arg(search_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+
+        let mut child = command.spawn().map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                RipgrepSearchError::Unavailable
+            } else {
+                RipgrepSearchError::Failed(format!("failed to start ripgrep: {err}"))
+            }
+        })?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            RipgrepSearchError::Failed("failed to capture ripgrep stdout".to_string())
+        })?;
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        let mut stopped_early = false;
+
+        loop {
+            line.clear();
+            let read = reader.read_line(&mut line).map_err(|err| {
+                RipgrepSearchError::Failed(format!("failed to read ripgrep output: {err}"))
+            })?;
+            if read == 0 {
+                break;
+            }
+            let frame = line.trim_end_matches(['\r', '\n']);
+            if let Some(match_event) = parse_ripgrep_match(frame)? {
+                let match_path = Path::new(&match_event.path);
+                let display_path = if match_path.is_absolute() {
+                    self.display_path(match_path)
+                } else {
+                    self.display_path(&evaluator.root().join(match_path))
+                };
+                if !output.push_match(display_path, match_event.line, match_event.text) {
+                    stopped_early = true;
+                    let _ = child.kill();
+                    break;
+                }
+            }
+        }
+
+        let status = child.wait().map_err(|err| {
+            RipgrepSearchError::Failed(format!("failed to wait for ripgrep: {err}"))
+        })?;
+        if !stopped_early && !matches!(status.code(), Some(0 | 1)) {
+            return Err(RipgrepSearchError::Failed(format!(
+                "ripgrep search failed with status {status}"
+            )));
+        }
+
+        Ok(output)
     }
 
     fn edit_file(
@@ -782,12 +879,12 @@ impl ToolRegistry {
         &self,
         path: &Path,
         options: &SearchOptions<'_>,
-        results: &mut Vec<Value>,
-        truncated: &mut bool,
+        fail_on_read_error: bool,
+        output: &mut SearchOutput,
     ) -> Result<(), String> {
         let content = match fs::read_to_string(path) {
             Ok(content) => content,
-            Err(err) if options.fail_on_read_error => {
+            Err(err) if fail_on_read_error => {
                 return Err(format!(
                     "failed to read {} as UTF-8 text: {err}",
                     self.display_path(path)
@@ -807,16 +904,10 @@ impl ToolRegistry {
             } else {
                 line.to_lowercase()
             };
-            if haystack.contains(&needle) {
-                if results.len() >= options.max_results {
-                    *truncated = true;
-                    return Ok(());
-                }
-                results.push(json!({
-                    "path": self.display_path(path),
-                    "line": index + 1,
-                    "text": line,
-                }));
+            if haystack.contains(&needle)
+                && !output.push_match(self.display_path(path), index + 1, line.to_string())
+            {
+                return Ok(());
             }
         }
 
@@ -941,10 +1032,186 @@ fn clamp_limit(value: Option<usize>, default: usize, max: usize) -> Result<usize
 }
 
 fn should_skip_entry(path: &Path) -> bool {
-    matches!(
-        path.file_name().and_then(|name| name.to_str()),
-        Some(".git" | "target")
-    )
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| SEARCH_SKIP_NAMES.contains(&name))
+}
+
+#[cfg(windows)]
+fn ripgrep_sidecar_name() -> &'static str {
+    "morrow-rg.exe"
+}
+
+#[cfg(not(windows))]
+fn ripgrep_sidecar_name() -> &'static str {
+    "morrow-rg"
+}
+
+#[cfg(windows)]
+fn path_ripgrep_name() -> &'static str {
+    "rg.exe"
+}
+
+#[cfg(not(windows))]
+fn path_ripgrep_name() -> &'static str {
+    "rg"
+}
+
+fn ripgrep_binary() -> Option<PathBuf> {
+    if let Ok(current_exe) = env::current_exe()
+        && let Some(dir) = current_exe.parent()
+    {
+        let sidecar = dir.join(ripgrep_sidecar_name());
+        if sidecar.is_file() {
+            return Some(sidecar);
+        }
+    }
+
+    env::var_os("PATH").and_then(|paths| {
+        env::split_paths(&paths)
+            .map(|dir| dir.join(path_ripgrep_name()))
+            .find(|candidate| candidate.is_file())
+    })
+}
+
+#[derive(Debug)]
+enum RipgrepSearchError {
+    Unavailable,
+    Failed(String),
+}
+
+struct SearchOutput {
+    query: String,
+    path: String,
+    case_sensitive: bool,
+    max_results: usize,
+    total_result_bytes: usize,
+    result_truncated: bool,
+    results: Vec<Value>,
+}
+
+impl SearchOutput {
+    fn new(
+        query: impl Into<String>,
+        path: impl Into<String>,
+        case_sensitive: bool,
+        max_results: usize,
+    ) -> Self {
+        Self {
+            query: query.into(),
+            path: path.into(),
+            case_sensitive,
+            max_results,
+            total_result_bytes: 0,
+            result_truncated: false,
+            results: Vec::new(),
+        }
+    }
+
+    fn push_match(&mut self, path: String, line: usize, text: String) -> bool {
+        if self.results.len() >= self.max_results {
+            self.result_truncated = true;
+            return false;
+        }
+
+        let (text, text_truncated) = truncate_chars(trim_line_endings(text), MAX_SEARCH_LINE_CHARS);
+        let item = json!({
+            "path": path,
+            "line": line,
+            "text": text,
+            "text_truncated": text_truncated,
+        });
+        let item_bytes = serde_json::to_vec(&item)
+            .map(|bytes| bytes.len())
+            .unwrap_or(usize::MAX);
+        if self.total_result_bytes.saturating_add(item_bytes) > MAX_SEARCH_TOTAL_BYTES {
+            self.result_truncated = true;
+            return false;
+        }
+
+        self.total_result_bytes += item_bytes;
+        self.results.push(item);
+        true
+    }
+
+    fn into_value(self) -> Value {
+        json!({
+            "query": self.query,
+            "path": self.path,
+            "case_sensitive": self.case_sensitive,
+            "truncated": self.result_truncated,
+            "result_truncated": self.result_truncated,
+            "results": self.results,
+        })
+    }
+}
+
+fn trim_line_endings(mut text: String) -> String {
+    while text.ends_with('\n') || text.ends_with('\r') {
+        text.pop();
+    }
+    text
+}
+
+fn truncate_chars(text: String, max_chars: usize) -> (String, bool) {
+    let mut chars = text.chars();
+    let truncated = chars.clone().nth(max_chars).is_some();
+    if !truncated {
+        return (text, false);
+    }
+    (chars.by_ref().take(max_chars).collect(), true)
+}
+
+#[derive(Debug, Deserialize)]
+struct RipgrepEvent {
+    #[serde(rename = "type")]
+    kind: String,
+    data: Option<RipgrepEventData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RipgrepEventData {
+    path: Option<RipgrepText>,
+    lines: Option<RipgrepText>,
+    line_number: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RipgrepText {
+    text: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RipgrepMatch {
+    path: String,
+    line: usize,
+    text: String,
+}
+
+fn parse_ripgrep_match(frame: &str) -> Result<Option<RipgrepMatch>, RipgrepSearchError> {
+    if frame.trim().is_empty() {
+        return Ok(None);
+    }
+    let event = serde_json::from_str::<RipgrepEvent>(frame).map_err(|err| {
+        RipgrepSearchError::Failed(format!("failed to parse ripgrep JSON output: {err}"))
+    })?;
+    if event.kind != "match" {
+        return Ok(None);
+    }
+    let Some(data) = event.data else {
+        return Ok(None);
+    };
+    let Some(path) = data.path.and_then(|path| path.text) else {
+        return Ok(None);
+    };
+    let Some(text) = data.lines.and_then(|lines| lines.text) else {
+        return Ok(None);
+    };
+    let Some(line) = data.line_number else {
+        return Ok(None);
+    };
+
+    Ok(Some(RipgrepMatch { path, line, text }))
 }
 
 fn file_change_summary_json(summary: &FileChangeSummary) -> Value {
@@ -1692,7 +1959,6 @@ struct SearchOptions<'a> {
     query: &'a str,
     case_sensitive: bool,
     max_results: usize,
-    fail_on_read_error: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1863,10 +2129,166 @@ mod tests {
 
         assert_eq!(value["ok"], true);
         assert_eq!(value["data"]["truncated"], true);
+        assert_eq!(value["data"]["result_truncated"], true);
         let results = value["data"]["results"].as_array().expect("results");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0]["path"], "a.txt");
         assert_eq!(results[0]["line"], 1);
+        assert_eq!(results[0]["text_truncated"], false);
+    }
+
+    #[test]
+    fn ripgrep_json_parser_reads_match_events_only() {
+        let match_frame = json!({
+            "type": "match",
+            "data": {
+                "path": {"text": "src/lib.rs"},
+                "lines": {"text": "robot doctor\n"},
+                "line_number": 42
+            }
+        })
+        .to_string();
+        let begin_frame = json!({
+            "type": "begin",
+            "data": {"path": {"text": "src/lib.rs"}}
+        })
+        .to_string();
+
+        assert_eq!(parse_ripgrep_match(&begin_frame).expect("begin"), None);
+        assert_eq!(
+            parse_ripgrep_match(&match_frame).expect("match"),
+            Some(RipgrepMatch {
+                path: "src/lib.rs".to_string(),
+                line: 42,
+                text: "robot doctor\n".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn search_output_truncates_long_lines() {
+        let mut output = SearchOutput::new("needle", ".", false, 10);
+        assert!(output.push_match(
+            "long.txt".to_string(),
+            1,
+            format!("needle {}", "x".repeat(MAX_SEARCH_LINE_CHARS + 20)),
+        ));
+
+        let value = output.into_value();
+        let result = &value["results"][0];
+        assert_eq!(value["result_truncated"], false);
+        assert_eq!(result["text_truncated"], true);
+        assert_eq!(
+            result["text"].as_str().expect("text").chars().count(),
+            MAX_SEARCH_LINE_CHARS
+        );
+    }
+
+    #[test]
+    fn search_output_marks_result_truncation_for_limits() {
+        let mut output = SearchOutput::new("needle", ".", false, 1);
+        assert!(output.push_match("a.txt".to_string(), 1, "needle".to_string()));
+        assert!(!output.push_match("b.txt".to_string(), 1, "needle".to_string()));
+
+        let value = output.into_value();
+        assert_eq!(value["truncated"], true);
+        assert_eq!(value["result_truncated"], true);
+        assert_eq!(value["results"].as_array().expect("results").len(), 1);
+    }
+
+    #[test]
+    fn search_output_marks_result_truncation_for_total_budget() {
+        let mut output = SearchOutput::new("needle", ".", false, MAX_SEARCH_RESULTS);
+        let long = format!("needle {}", "x".repeat(MAX_SEARCH_LINE_CHARS));
+
+        while output.push_match("budget.txt".to_string(), 1, long.clone()) {}
+
+        let value = output.into_value();
+        assert_eq!(value["result_truncated"], true);
+        assert!(
+            value["results"].as_array().expect("results").len() < MAX_SEARCH_RESULTS,
+            "total byte budget should truncate before max_results"
+        );
+    }
+
+    #[test]
+    fn search_text_respects_case_sensitivity() {
+        let root = unique_dir("search-case-root");
+        fs::write(root.join("a.txt"), "Alpha\n").expect("write file");
+        let tools = registry(&root);
+
+        let insensitive = content(tools.execute(&call(
+            "search_text",
+            json!({"query": "alpha", "path": ".", "case_sensitive": false}),
+        )));
+        let sensitive = content(tools.execute(&call(
+            "search_text",
+            json!({"query": "alpha", "path": ".", "case_sensitive": true}),
+        )));
+
+        assert_eq!(
+            insensitive["data"]["results"]
+                .as_array()
+                .expect("insensitive results")
+                .len(),
+            1
+        );
+        assert_eq!(
+            sensitive["data"]["results"]
+                .as_array()
+                .expect("sensitive results")
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn search_text_skips_generated_directories() {
+        let root = unique_dir("search-skip-root");
+        fs::write(root.join("keep.txt"), "needle\n").expect("write keep");
+        for dir in SEARCH_SKIP_NAMES {
+            let skipped = root.join(dir);
+            fs::create_dir_all(&skipped).expect("create skipped dir");
+            fs::write(skipped.join("skip.txt"), "needle\n").expect("write skipped");
+        }
+        let tools = registry(&root);
+
+        let value = content(tools.execute(&call(
+            "search_text",
+            json!({"query": "needle", "path": ".", "max_results": 10}),
+        )));
+
+        let paths = value["data"]["results"]
+            .as_array()
+            .expect("results")
+            .iter()
+            .map(|result| result["path"].as_str().expect("path"))
+            .collect::<Vec<_>>();
+        assert_eq!(paths, vec!["keep.txt"]);
+    }
+
+    #[test]
+    fn fallback_search_applies_output_budget() {
+        let root = unique_dir("search-fallback-root");
+        let path = root.join("long.txt");
+        fs::write(
+            &path,
+            format!("needle {}\n", "x".repeat(MAX_SEARCH_LINE_CHARS + 20)),
+        )
+        .expect("write long file");
+        let tools = registry(&root);
+        let options = SearchOptions {
+            query: "needle",
+            case_sensitive: false,
+            max_results: 10,
+        };
+
+        let output = tools
+            .search_text_fallback(&path.canonicalize().expect("canonical path"), &options)
+            .expect("fallback search")
+            .into_value();
+
+        assert_eq!(output["results"][0]["text_truncated"], true);
     }
 
     #[test]
