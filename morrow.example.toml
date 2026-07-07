@@ -1,9 +1,18 @@
 [model]
-base_url = "https://api.openai.com/v1"
-model = "gpt-4.1"
-OPENAI_API_KEY = "replace-with-your-openai-api-key"
+base_url = "https://opencode.ai/zen/go/v1"
+model = "deepseek-v4-flash"
+OPENAI_API_KEY = "replace-with-your-api-key"
 timeout_secs = 120
+context_window_tokens = 256000
+reserved_output_tokens = 8192
 
 [permissions]
 mode = "read_only"
 shell = "deny"
+
+[context]
+auto_compact = true
+auto_compact_threshold = 0.835
+retain_recent_turns = 2
+summary_target_tokens = 12000
+compact_max_retries = 2
