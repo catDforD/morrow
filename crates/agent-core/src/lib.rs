@@ -63,7 +63,7 @@ impl Agent {
         conversation.push(user_message.clone());
         let client = self.client.clone();
         let conversation_for_model = conversation.clone();
-        let tools = self.tools.definitions().to_vec();
+        let tools = self.tools.definitions();
 
         Ok(AgentTurnStream {
             client: self.client.clone(),
@@ -315,7 +315,7 @@ impl AgentTurnStream<'_> {
         self.turn.steps.push(TurnStep::running_model_call());
         let client = self.client.clone();
         let conversation = self.conversation.clone();
-        let tools = self.tools.definitions().to_vec();
+        let tools = self.tools.definitions();
         self.model_start =
             Some(async move { client.stream_chat(&conversation, &tools).await }.boxed());
     }

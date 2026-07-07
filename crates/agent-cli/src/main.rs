@@ -1,4 +1,4 @@
-use agent_config::{ContextConfig, ModelContextLimits, load_config};
+use agent_config::{ContextConfig, McpServerConfig, ModelContextLimits, load_config};
 use agent_model::{ModelError, OpenAiCompatClient, OpenAiCompatConfig};
 use agent_protocol::{
     AgentEvent, ApprovalAction, ApprovalDecision, ApprovalRequest, FileChangeSummary,
@@ -206,6 +206,7 @@ async fn run() -> Result<(), CliError> {
             workspace_root,
             config_path: loaded.path,
             permissions,
+            mcp_servers: loaded.config.mcp_servers,
             default_session_name: session_name,
         })
         .await?;
@@ -231,6 +232,7 @@ async fn run() -> Result<(), CliError> {
                 session_name: &session_name,
                 workspace_root: &workspace_root,
                 config_path: &loaded.path,
+                mcp_servers: &loaded.config.mcp_servers,
             },
             &mut session,
             &mut permissions,
@@ -248,6 +250,7 @@ async fn run() -> Result<(), CliError> {
             model_limits,
             workspace_root: &workspace_root,
             permissions,
+            mcp_servers: &loaded.config.mcp_servers,
             interactive_approvals: io::stdin().is_terminal(),
             output: if args.jsonl {
                 OutputMode::Jsonl {
@@ -283,6 +286,7 @@ struct ReplContext<'a> {
     session_name: &'a str,
     workspace_root: &'a Path,
     config_path: &'a Path,
+    mcp_servers: &'a [McpServerConfig],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -293,6 +297,7 @@ struct RunAgentTurnContext<'a> {
     model_limits: ModelContextLimits,
     workspace_root: &'a Path,
     permissions: PermissionProfile,
+    mcp_servers: &'a [McpServerConfig],
     interactive_approvals: bool,
     output: OutputMode<'a>,
 }
@@ -356,6 +361,7 @@ async fn run_repl(
                 model_limits: context.model_limits,
                 workspace_root: context.workspace_root,
                 permissions: *permissions,
+                mcp_servers: context.mcp_servers,
                 interactive_approvals: io::stdin().is_terminal(),
                 output: OutputMode::Human,
             },
@@ -470,6 +476,7 @@ async fn run_agent_turn(
             model_limits: context.model_limits,
             workspace_root: context.workspace_root,
             permissions: context.permissions,
+            mcp_servers: context.mcp_servers,
             session_name,
             turn_index,
         },
@@ -1527,6 +1534,7 @@ compact test
                 model_limits: model_limits(10_000),
                 workspace_root: &root,
                 permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
+                mcp_servers: &[],
                 interactive_approvals: false,
                 output: OutputMode::Human,
             },
@@ -1570,6 +1578,7 @@ compact test
                 model_limits: model_limits(10_000),
                 workspace_root: &root,
                 permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
+                mcp_servers: &[],
                 interactive_approvals: false,
                 output: OutputMode::Jsonl {
                     session_name: "default",
@@ -1631,6 +1640,7 @@ compact test
                 model_limits: model_limits(10_000),
                 workspace_root: &root,
                 permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
+                mcp_servers: &[],
                 interactive_approvals: false,
                 output: OutputMode::Jsonl {
                     session_name: "default",
@@ -1677,6 +1687,7 @@ compact test
                 model_limits: model_limits(1),
                 workspace_root: &root,
                 permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
+                mcp_servers: &[],
                 interactive_approvals: false,
                 output: OutputMode::Human,
             },

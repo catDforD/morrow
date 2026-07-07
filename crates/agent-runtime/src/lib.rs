@@ -1,6 +1,6 @@
 pub mod session_store;
 
-use agent_config::{ContextConfig, ModelContextLimits};
+use agent_config::{ContextConfig, McpServerConfig, ModelContextLimits};
 use agent_core::{Agent, AgentError};
 use agent_model::{ModelError, ModelEvent, OpenAiCompatClient};
 use agent_protocol::{
@@ -81,6 +81,7 @@ pub struct RunAgentTurnContext<'a> {
     pub model_limits: ModelContextLimits,
     pub workspace_root: &'a Path,
     pub permissions: PermissionProfile,
+    pub mcp_servers: &'a [McpServerConfig],
     pub session_name: &'a str,
     pub turn_index: usize,
 }
@@ -130,7 +131,11 @@ pub async fn run_agent_turn(
         });
     }
 
-    let tools = ToolRegistry::built_in(context.workspace_root, context.permissions)?;
+    let tools = ToolRegistry::with_mcp_servers(
+        context.workspace_root,
+        context.permissions,
+        context.mcp_servers,
+    )?;
     let agent = Agent::with_tools(
         context.client.clone(),
         context.system_prompt.to_string(),
@@ -1078,6 +1083,7 @@ compact test
                 model_limits: model_limits(10_000),
                 workspace_root: &root,
                 permissions: PermissionProfile::for_mode(agent_protocol::PermissionMode::ReadOnly),
+                mcp_servers: &[],
                 session_name: "default",
                 turn_index: 0,
             },
@@ -1117,6 +1123,67 @@ compact test
         );
     }
 
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn run_agent_turn_includes_mcp_tool_definitions_in_model_request() {
+        let root = unique_dir("run-mcp-tools");
+        let server_script = root.join("fake-mcp.sh");
+        fs::write(
+            &server_script,
+            r#"#!/bin/sh
+count=0
+while IFS= read -r line; do
+  count=$((count + 1))
+  if [ "$count" -eq 1 ]; then
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"fake","version":"1"}}}'
+  elif [ "$count" -eq 3 ]; then
+    printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"Search Docs","description":"Search docs","inputSchema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}]}}'
+  fi
+done
+"#,
+        )
+        .expect("write fake MCP server");
+        let (base_url, requests) = spawn_recording_sse_server(vec![sse_text_body("ok")]).await;
+        let client = client(base_url);
+        let mut session = Session::new();
+        let mut handler = RecordingHandler::default();
+        let mcp_servers = vec![McpServerConfig {
+            name: "Docs".to_string(),
+            command: "sh".to_string(),
+            args: vec![server_script.display().to_string()],
+            env: Default::default(),
+            cwd: None,
+            enabled: true,
+            startup_timeout_sec: 5,
+            tool_timeout_sec: 5,
+        }];
+
+        let outcome = run_agent_turn(
+            RunAgentTurnContext {
+                client: &client,
+                system_prompt: "system",
+                context_config: context_config(2),
+                model_limits: model_limits(10_000),
+                workspace_root: &root,
+                permissions: PermissionProfile::for_mode(agent_protocol::PermissionMode::ReadOnly),
+                mcp_servers: &mcp_servers,
+                session_name: "default",
+                turn_index: 0,
+            },
+            &mut session,
+            "hello",
+            &mut handler,
+        )
+        .await
+        .expect("run turn");
+
+        assert_eq!(outcome.error, None);
+        let requests = requests.lock().expect("requests lock poisoned");
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("mcp__docs__search_docs"));
+        assert!(requests[0].contains("Search docs"));
+    }
+
     #[tokio::test]
     async fn approval_deny_path_resumes_stream_and_records_turn() {
         let root = unique_dir("approval-deny");
@@ -1147,6 +1214,7 @@ compact test
                 permissions: PermissionProfile::for_mode(
                     agent_protocol::PermissionMode::WorkspaceWrite,
                 ),
+                mcp_servers: &[],
                 session_name: "default",
                 turn_index: 0,
             },
@@ -1193,6 +1261,7 @@ compact test
                 model_limits: model_limits(2_000),
                 workspace_root: &root,
                 permissions: PermissionProfile::for_mode(agent_protocol::PermissionMode::ReadOnly),
+                mcp_servers: &[],
                 session_name: "default",
                 turn_index: session.turns.len(),
             },

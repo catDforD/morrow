@@ -1,4 +1,4 @@
-use agent_config::{ContextConfig, ModelContextLimits};
+use agent_config::{ContextConfig, McpServerConfig, ModelContextLimits};
 use agent_model::OpenAiCompatClient;
 use agent_protocol::{ApprovalDecision, PermissionProfile, Session, SessionDocument};
 use agent_runtime::{
@@ -35,6 +35,7 @@ pub struct ServerOptions {
     pub workspace_root: PathBuf,
     pub config_path: PathBuf,
     pub permissions: PermissionProfile,
+    pub mcp_servers: Vec<McpServerConfig>,
     pub default_session_name: String,
 }
 
@@ -547,6 +548,7 @@ async fn run_turn_task_inner(
             model_limits: options.model_limits,
             workspace_root: &options.workspace_root,
             permissions: options.permissions,
+            mcp_servers: &options.mcp_servers,
             session_name: &session_name,
             turn_index,
         },
@@ -826,6 +828,7 @@ mod tests {
                 mode: PermissionMode::ReadOnly,
                 shell: ShellPolicy::Deny,
             },
+            mcp_servers: Vec::new(),
             default_session_name: "default".to_string(),
         }
     }

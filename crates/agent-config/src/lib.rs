@@ -1,5 +1,6 @@
 use agent_protocol::{PermissionMode, PermissionProfile, ShellPolicy};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -15,6 +16,8 @@ const DEFAULT_AUTO_COMPACT_THRESHOLD: f32 = 0.835;
 const DEFAULT_RETAIN_RECENT_TURNS: usize = 6;
 const DEFAULT_SUMMARY_TARGET_TOKENS: usize = 12_000;
 const DEFAULT_COMPACT_MAX_RETRIES: usize = 2;
+const DEFAULT_MCP_STARTUP_TIMEOUT_SECS: u64 = 10;
+const DEFAULT_MCP_TOOL_TIMEOUT_SECS: u64 = 60;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AppConfig {
@@ -22,6 +25,7 @@ pub struct AppConfig {
     pub agent: AgentConfig,
     pub context: ContextConfig,
     pub permissions: PermissionProfile,
+    pub mcp_servers: Vec<McpServerConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +67,18 @@ pub struct ContextConfig {
     pub compact_max_retries: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpServerConfig {
+    pub name: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub env: BTreeMap<String, String>,
+    pub cwd: Option<PathBuf>,
+    pub enabled: bool,
+    pub startup_timeout_sec: u64,
+    pub tool_timeout_sec: u64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct LoadedConfig {
     pub config: AppConfig,
@@ -100,6 +116,12 @@ pub enum ConfigError {
         "invalid config value: [context].auto_compact_threshold must be greater than 0 and less than or equal to 1"
     )]
     InvalidAutoCompactThreshold,
+    #[error("invalid config value: [mcp_servers.{server}].{field} must be greater than 0")]
+    InvalidMcpPositiveValue { server: String, field: &'static str },
+    #[error("missing required config value: [mcp_servers.{server}].command")]
+    MissingMcpCommand { server: String },
+    #[error("unsupported MCP stdio v1 config value: [mcp_servers.{server}].{field}")]
+    UnsupportedMcpField { server: String, field: &'static str },
 }
 
 #[derive(Debug, Deserialize)]
@@ -109,6 +131,8 @@ struct RawAppConfig {
     agent: Option<RawAgentConfig>,
     context: Option<RawContextConfig>,
     permissions: Option<RawPermissionsConfig>,
+    #[serde(default)]
+    mcp_servers: BTreeMap<String, RawMcpServerConfig>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -145,6 +169,28 @@ struct RawContextConfig {
 struct RawPermissionsConfig {
     mode: Option<PermissionMode>,
     shell: Option<ShellPolicy>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawMcpServerConfig {
+    command: Option<String>,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+    cwd: Option<String>,
+    enabled: Option<bool>,
+    startup_timeout_sec: Option<u64>,
+    tool_timeout_sec: Option<u64>,
+    url: Option<String>,
+    bearer_token_env_var: Option<String>,
+    #[serde(default)]
+    http_headers: BTreeMap<String, String>,
+    #[serde(default)]
+    env_http_headers: BTreeMap<String, String>,
+    oauth_client_id: Option<String>,
+    oauth_resource: Option<String>,
 }
 
 pub fn load_config(explicit_path: Option<&Path>) -> Result<LoadedConfig, ConfigError> {
@@ -276,6 +322,7 @@ impl TryFrom<RawAppConfig> for AppConfig {
             },
             context,
             permissions: permissions_profile,
+            mcp_servers: parse_mcp_servers(value.mcp_servers)?,
         })
     }
 }
@@ -328,6 +375,88 @@ fn positive_config_value(field: &'static str, value: usize) -> Result<usize, Con
         return Err(ConfigError::InvalidPositiveValue { field });
     }
     Ok(value)
+}
+
+fn parse_mcp_servers(
+    raw_servers: BTreeMap<String, RawMcpServerConfig>,
+) -> Result<Vec<McpServerConfig>, ConfigError> {
+    let mut servers = Vec::with_capacity(raw_servers.len());
+    for (name, raw) in raw_servers {
+        if raw.url.is_some() {
+            return Err(ConfigError::UnsupportedMcpField {
+                server: name,
+                field: "url",
+            });
+        }
+        if raw.bearer_token_env_var.is_some() {
+            return Err(ConfigError::UnsupportedMcpField {
+                server: name,
+                field: "bearer_token_env_var",
+            });
+        }
+        if !raw.http_headers.is_empty() {
+            return Err(ConfigError::UnsupportedMcpField {
+                server: name,
+                field: "http_headers",
+            });
+        }
+        if !raw.env_http_headers.is_empty() {
+            return Err(ConfigError::UnsupportedMcpField {
+                server: name,
+                field: "env_http_headers",
+            });
+        }
+        if raw.oauth_client_id.is_some() {
+            return Err(ConfigError::UnsupportedMcpField {
+                server: name,
+                field: "oauth_client_id",
+            });
+        }
+        if raw.oauth_resource.is_some() {
+            return Err(ConfigError::UnsupportedMcpField {
+                server: name,
+                field: "oauth_resource",
+            });
+        }
+
+        let command = raw
+            .command
+            .map(|command| command.trim().to_string())
+            .filter(|command| !command.is_empty())
+            .ok_or_else(|| ConfigError::MissingMcpCommand {
+                server: name.clone(),
+            })?;
+        let startup_timeout_sec = raw
+            .startup_timeout_sec
+            .unwrap_or(DEFAULT_MCP_STARTUP_TIMEOUT_SECS);
+        if startup_timeout_sec == 0 {
+            return Err(ConfigError::InvalidMcpPositiveValue {
+                server: name,
+                field: "startup_timeout_sec",
+            });
+        }
+        let tool_timeout_sec = raw
+            .tool_timeout_sec
+            .unwrap_or(DEFAULT_MCP_TOOL_TIMEOUT_SECS);
+        if tool_timeout_sec == 0 {
+            return Err(ConfigError::InvalidMcpPositiveValue {
+                server: name,
+                field: "tool_timeout_sec",
+            });
+        }
+
+        servers.push(McpServerConfig {
+            name,
+            command,
+            args: raw.args,
+            env: raw.env,
+            cwd: raw.cwd.map(PathBuf::from),
+            enabled: raw.enabled.unwrap_or(true),
+            startup_timeout_sec,
+            tool_timeout_sec,
+        });
+    }
+    Ok(servers)
 }
 
 #[cfg(test)]
@@ -557,6 +686,161 @@ compact_max_retries = 3
             loaded.config.permissions,
             PermissionProfile::for_mode(PermissionMode::ReadOnly)
         );
+        assert!(loaded.config.mcp_servers.is_empty());
+    }
+
+    #[test]
+    fn loads_mcp_stdio_server_config() {
+        let root = unique_dir("mcp-stdio");
+        let config = root.join("morrow.toml");
+        fs::write(
+            &config,
+            r#"
+[model]
+model = "test-model"
+api_key_env = "MORROW_MCP_KEY"
+context_window_tokens = 65536
+
+[mcp_servers.filesystem]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
+env = { FOO = "bar" }
+cwd = "."
+startup_timeout_sec = 11
+tool_timeout_sec = 22
+"#,
+        )
+        .expect("write config");
+        set_env("MORROW_MCP_KEY", "secret");
+
+        let loaded = load_config_from_locations(Some(&config), &root, None).expect("load config");
+
+        assert_eq!(loaded.config.mcp_servers.len(), 1);
+        let server = &loaded.config.mcp_servers[0];
+        assert_eq!(server.name, "filesystem");
+        assert_eq!(server.command, "npx");
+        assert_eq!(
+            server.args,
+            ["-y", "@modelcontextprotocol/server-filesystem", "."]
+        );
+        assert_eq!(server.env.get("FOO").map(String::as_str), Some("bar"));
+        assert_eq!(server.cwd.as_deref(), Some(Path::new(".")));
+        assert!(server.enabled);
+        assert_eq!(server.startup_timeout_sec, 11);
+        assert_eq!(server.tool_timeout_sec, 22);
+    }
+
+    #[test]
+    fn loads_disabled_mcp_server_config_with_defaults() {
+        let root = unique_dir("mcp-disabled");
+        let config = root.join("morrow.toml");
+        fs::write(
+            &config,
+            r#"
+[model]
+model = "test-model"
+api_key_env = "MORROW_MCP_DISABLED_KEY"
+context_window_tokens = 65536
+
+[mcp_servers.docs]
+command = "docs-mcp"
+enabled = false
+"#,
+        )
+        .expect("write config");
+        set_env("MORROW_MCP_DISABLED_KEY", "secret");
+
+        let loaded = load_config_from_locations(Some(&config), &root, None).expect("load config");
+
+        let server = &loaded.config.mcp_servers[0];
+        assert!(!server.enabled);
+        assert_eq!(server.startup_timeout_sec, DEFAULT_MCP_STARTUP_TIMEOUT_SECS);
+        assert_eq!(server.tool_timeout_sec, DEFAULT_MCP_TOOL_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn rejects_mcp_server_without_command() {
+        let root = unique_dir("mcp-missing-command");
+        let config = root.join("morrow.toml");
+        fs::write(
+            &config,
+            r#"
+[model]
+model = "test-model"
+api_key_env = "MORROW_MCP_MISSING_KEY"
+context_window_tokens = 65536
+
+[mcp_servers.bad]
+args = ["--serve"]
+"#,
+        )
+        .expect("write config");
+        set_env("MORROW_MCP_MISSING_KEY", "secret");
+
+        let err = load_config_from_locations(Some(&config), &root, None).expect_err("must fail");
+
+        assert!(matches!(
+            err,
+            ConfigError::MissingMcpCommand { server } if server == "bad"
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_mcp_timeout() {
+        let root = unique_dir("mcp-timeout");
+        let config = root.join("morrow.toml");
+        fs::write(
+            &config,
+            r#"
+[model]
+model = "test-model"
+api_key_env = "MORROW_MCP_TIMEOUT_KEY"
+context_window_tokens = 65536
+
+[mcp_servers.bad]
+command = "mcp"
+tool_timeout_sec = 0
+"#,
+        )
+        .expect("write config");
+        set_env("MORROW_MCP_TIMEOUT_KEY", "secret");
+
+        let err = load_config_from_locations(Some(&config), &root, None).expect_err("must fail");
+
+        assert!(matches!(
+            err,
+            ConfigError::InvalidMcpPositiveValue { server, field }
+                if server == "bad" && field == "tool_timeout_sec"
+        ));
+    }
+
+    #[test]
+    fn rejects_http_mcp_config_for_stdio_v1() {
+        let root = unique_dir("mcp-http");
+        let config = root.join("morrow.toml");
+        fs::write(
+            &config,
+            r#"
+[model]
+model = "test-model"
+api_key_env = "MORROW_MCP_HTTP_KEY"
+context_window_tokens = 65536
+
+[mcp_servers.remote]
+command = "ignored"
+url = "https://example.com/mcp"
+"#,
+        )
+        .expect("write config");
+        set_env("MORROW_MCP_HTTP_KEY", "secret");
+
+        let err = load_config_from_locations(Some(&config), &root, None).expect_err("must fail");
+
+        assert!(matches!(
+            err,
+            ConfigError::UnsupportedMcpField { server, field }
+                if server == "remote" && field == "url"
+        ));
     }
 
     #[test]

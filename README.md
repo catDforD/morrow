@@ -79,15 +79,18 @@ base_url = "https://api.openai.com/v1"
 model = "gpt-4.1"
 api_key_env = "OPENAI_API_KEY"
 timeout_secs = 120
+context_window_tokens = 128000
+reserved_output_tokens = 8192
 
 [agent]
 system_prompt = "You are a helpful assistant."
 
 [context]
 auto_compact = true
-max_context_chars = 64000
+auto_compact_threshold = 0.835
 retain_recent_turns = 6
-summary_target_chars = 8000
+summary_target_tokens = 12000
+compact_max_retries = 2
 
 [permissions]
 mode = "read_only"
@@ -95,6 +98,23 @@ shell = "deny"
 ```
 
 The inline `[model].OPENAI_API_KEY` value takes priority when present. Otherwise Morrow reads the environment variable named by `api_key_env`, which defaults to `OPENAI_API_KEY`.
+
+### MCP stdio tools
+
+Morrow can register stdio MCP servers from the same config file. Tools are exposed directly to the model as `mcp__server__tool` names after Morrow starts the server and calls `tools/list`.
+
+```toml
+[mcp_servers.filesystem]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
+env = {}
+cwd = "."
+enabled = true
+startup_timeout_sec = 10
+tool_timeout_sec = 60
+```
+
+MCP support is intentionally narrow in v1: only stdio servers are supported. HTTP, OAuth, deferred search, persistent process pools, and per-tool approval policies are not implemented yet. MCP tools are treated as explicitly configured trusted tools, so review server commands before enabling them.
 
 ## Run
 
