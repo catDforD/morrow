@@ -1,3 +1,6 @@
+pub mod mcp;
+
+use agent_config::McpServerConfig;
 use agent_protocol::{
     ApprovalDecision, ApprovalRequest, FileChangeOperation, FileChangeSummary, PermissionProfile,
     ShellCommandSummary, ToolCall, ToolDefinition, ToolExecutionSummary,
@@ -12,6 +15,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -35,12 +39,45 @@ const SEARCH_SKIP_NAMES: &[&str] = &[".git", "node_modules", "dist", "build", "t
 pub enum ToolRegistryError {
     #[error(transparent)]
     PermissionEvaluator(#[from] PermissionEvaluatorError),
+    #[error("duplicate tool registered: {name}")]
+    DuplicateTool { name: String },
+    #[error("mcp server {server}: {message}")]
+    McpServer { server: String, message: String },
 }
 
-#[derive(Debug, Clone)]
+pub trait Tool: Send + Sync {
+    fn definitions(&self) -> Vec<ToolDefinition>;
+
+    fn execute(
+        &self,
+        call: &ToolCall,
+        approval: Option<(&ApprovalDecision, &ApprovalRequest)>,
+    ) -> ToolExecution;
+}
+
+#[derive(Clone)]
+struct RegisteredTool {
+    definition: ToolDefinition,
+    tool: Arc<dyn Tool>,
+}
+
+#[derive(Clone)]
 pub struct ToolRegistry {
-    evaluator: Option<PermissionEvaluator>,
-    definitions: Vec<ToolDefinition>,
+    tools: Vec<RegisteredTool>,
+}
+
+impl std::fmt::Debug for ToolRegistry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let tools = self
+            .tools
+            .iter()
+            .map(|registered| registered.definition.function.name.as_str())
+            .collect::<Vec<_>>();
+        formatter
+            .debug_struct("ToolRegistry")
+            .field("tools", &tools)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,10 +108,7 @@ impl ToolResult {
 
 impl ToolRegistry {
     pub fn empty() -> Self {
-        Self {
-            evaluator: None,
-            definitions: Vec::new(),
-        }
+        Self { tools: Vec::new() }
     }
 
     pub fn built_in(
@@ -82,15 +116,52 @@ impl ToolRegistry {
         permissions: PermissionProfile,
     ) -> Result<Self, ToolRegistryError> {
         let evaluator = PermissionEvaluator::new(root, permissions)?;
-
-        Ok(Self {
-            evaluator: Some(evaluator),
-            definitions: built_in_definitions(),
-        })
+        let mut registry = Self::empty();
+        registry.register(Arc::new(BuiltInTools { evaluator }))?;
+        Ok(registry)
     }
 
-    pub fn definitions(&self) -> &[ToolDefinition] {
-        &self.definitions
+    pub fn with_mcp_servers(
+        root: impl Into<PathBuf>,
+        permissions: PermissionProfile,
+        mcp_servers: &[McpServerConfig],
+    ) -> Result<Self, ToolRegistryError> {
+        let root = root.into();
+        let mut registry = Self::built_in(&root, permissions)?;
+        for tool in mcp::discover_stdio_tools(&root, mcp_servers)? {
+            registry.register(tool)?;
+        }
+        Ok(registry)
+    }
+
+    pub fn register(&mut self, tool: Arc<dyn Tool>) -> Result<(), ToolRegistryError> {
+        let definitions = tool.definitions();
+        let mut new_names = HashSet::new();
+        for definition in &definitions {
+            let name = definition.function.name.clone();
+            if !new_names.insert(name.clone())
+                || self.tools.iter().any(|registered| {
+                    registered.definition.function.name == definition.function.name
+                })
+            {
+                return Err(ToolRegistryError::DuplicateTool { name });
+            }
+        }
+
+        for definition in definitions {
+            self.tools.push(RegisteredTool {
+                definition,
+                tool: tool.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn definitions(&self) -> Vec<ToolDefinition> {
+        self.tools
+            .iter()
+            .map(|registered| registered.definition.clone())
+            .collect()
     }
 
     pub fn execute(&self, call: &ToolCall) -> ToolExecution {
@@ -106,6 +177,42 @@ impl ToolRegistry {
         self.execute_inner(call, Some((decision, request)))
     }
 
+    fn execute_inner(
+        &self,
+        call: &ToolCall,
+        approval: Option<(&ApprovalDecision, &ApprovalRequest)>,
+    ) -> ToolExecution {
+        match self
+            .tools
+            .iter()
+            .find(|registered| registered.definition.function.name == call.function.name)
+        {
+            Some(registered) => registered.tool.execute(call, approval),
+            None => ToolExecution::error(format!("unknown tool {:?}", call.function.name)),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct BuiltInTools {
+    evaluator: PermissionEvaluator,
+}
+
+impl Tool for BuiltInTools {
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        built_in_definitions()
+    }
+
+    fn execute(
+        &self,
+        call: &ToolCall,
+        approval: Option<(&ApprovalDecision, &ApprovalRequest)>,
+    ) -> ToolExecution {
+        self.execute_inner(call, approval)
+    }
+}
+
+impl BuiltInTools {
     fn execute_inner(
         &self,
         call: &ToolCall,
@@ -778,9 +885,7 @@ impl ToolRegistry {
     }
 
     fn evaluator(&self) -> Result<&PermissionEvaluator, String> {
-        self.evaluator
-            .as_ref()
-            .ok_or_else(|| "built-in tools are not available".to_string())
+        Ok(&self.evaluator)
     }
 
     fn path_allowed(&self, path: &Path) -> Result<bool, String> {
@@ -1225,7 +1330,7 @@ fn file_change_summary_json(summary: &FileChangeSummary) -> Value {
     })
 }
 
-fn render_file_diff(changes: &[StagedPatchChange], tools: &ToolRegistry) -> String {
+fn render_file_diff(changes: &[StagedPatchChange], tools: &BuiltInTools) -> String {
     let mut builder = DiffBuilder::default();
 
     for change in changes {
@@ -1324,7 +1429,7 @@ fn write_temp_file(
     temp_path: &Path,
     content: &str,
     permissions: Option<fs::Permissions>,
-    tools: &ToolRegistry,
+    tools: &BuiltInTools,
 ) -> Result<(), String> {
     fs::write(temp_path, content).map_err(|err| {
         format!(
@@ -1347,7 +1452,7 @@ fn write_temp_file(
 
 fn commit_patch_changes(
     mut changes: Vec<StagedPatchChange>,
-    tools: &ToolRegistry,
+    tools: &BuiltInTools,
 ) -> Result<(), String> {
     for index in 0..changes.len() {
         let Some(content) = changes[index].content.as_deref() else {
@@ -1484,7 +1589,7 @@ fn fail_patch_commit(
     error: String,
     changes: &[StagedPatchChange],
     applied: Vec<AppliedPatchChange>,
-    tools: &ToolRegistry,
+    tools: &BuiltInTools,
 ) -> Result<(), String> {
     cleanup_patch_temps(changes);
     let rollback_errors = rollback_patch_changes(applied, tools);
@@ -1500,7 +1605,7 @@ fn fail_patch_commit(
 
 fn rollback_patch_changes(
     mut applied: Vec<AppliedPatchChange>,
-    tools: &ToolRegistry,
+    tools: &BuiltInTools,
 ) -> Vec<String> {
     let mut errors = Vec::new();
     while let Some(change) = applied.pop() {
@@ -1992,6 +2097,31 @@ mod tests {
     use agent_protocol::{ApprovalAction, PermissionMode, ShellPolicy};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    struct TestTool(&'static str);
+
+    impl Tool for TestTool {
+        fn definitions(&self) -> Vec<ToolDefinition> {
+            vec![ToolDefinition::function(
+                self.0,
+                "test tool",
+                json!({"type": "object", "properties": {}}),
+            )]
+        }
+
+        fn execute(
+            &self,
+            _call: &ToolCall,
+            _approval: Option<(&ApprovalDecision, &ApprovalRequest)>,
+        ) -> ToolExecution {
+            ToolExecution::Completed(ToolResult {
+                ok: true,
+                content: "{}".to_string(),
+                error: None,
+                summary: None,
+            })
+        }
+    }
+
     fn unique_dir(name: &str) -> PathBuf {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2056,6 +2186,20 @@ mod tests {
             &ApprovalDecision::approve(request.id.clone()),
             &request,
         ))
+    }
+
+    #[test]
+    fn registry_rejects_duplicate_tool_names() {
+        let mut registry = ToolRegistry::empty();
+        registry
+            .register(Arc::new(TestTool("same")))
+            .expect("first registration");
+
+        let error = registry
+            .register(Arc::new(TestTool("same")))
+            .expect_err("duplicate must fail");
+
+        assert!(matches!(error, ToolRegistryError::DuplicateTool { name } if name == "same"));
     }
 
     #[test]
@@ -2276,7 +2420,13 @@ mod tests {
             format!("needle {}\n", "x".repeat(MAX_SEARCH_LINE_CHARS + 20)),
         )
         .expect("write long file");
-        let tools = registry(&root);
+        let tools = BuiltInTools {
+            evaluator: PermissionEvaluator::new(
+                &root,
+                PermissionProfile::for_mode(PermissionMode::WorkspaceWrite),
+            )
+            .expect("permission evaluator"),
+        };
         let options = SearchOptions {
             query: "needle",
             case_sensitive: false,

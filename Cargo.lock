@@ -111,6 +111,7 @@ dependencies = [
 name = "agent-tools"
 version = "0.1.2"
 dependencies = [
+ "agent-config",
  "agent-protocol",
  "agent-sandbox",
  "serde",

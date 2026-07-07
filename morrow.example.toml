@@ -16,3 +16,13 @@ auto_compact_threshold = 0.835
 retain_recent_turns = 2
 summary_target_tokens = 12000
 compact_max_retries = 2
+
+# MCP support is stdio-only. HTTP/OAuth MCP servers are not supported yet.
+# [mcp_servers.filesystem]
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
+# env = {}
+# cwd = "."
+# enabled = true
+# startup_timeout_sec = 10
+# tool_timeout_sec = 60
