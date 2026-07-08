@@ -6,9 +6,11 @@ use agent_protocol::{
     ShellCommandSummary, ToolCall, ToolDefinition, ToolExecutionSummary,
 };
 use agent_sandbox::{PermissionDecision, PermissionEvaluator, PermissionEvaluatorError};
+use async_trait::async_trait;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
+use std::borrow::Borrow;
 use std::collections::HashSet;
 use std::env;
 use std::fs;
@@ -47,14 +49,27 @@ pub enum ToolRegistryError {
     McpServer { server: String, message: String },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolExecutionMode {
+    Concurrent,
+    Serial,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolApproval {
+    pub decision: ApprovalDecision,
+    pub request: ApprovalRequest,
+}
+
+#[async_trait]
 pub trait Tool: Send + Sync {
     fn definitions(&self) -> Vec<ToolDefinition>;
 
-    fn execute(
-        &self,
-        call: &ToolCall,
-        approval: Option<(&ApprovalDecision, &ApprovalRequest)>,
-    ) -> ToolExecution;
+    fn execution_mode(&self, _call: &ToolCall) -> ToolExecutionMode {
+        ToolExecutionMode::Concurrent
+    }
+
+    async fn execute(&self, call: ToolCall, approval: Option<ToolApproval>) -> ToolExecution;
 }
 
 #[derive(Clone)]
@@ -129,7 +144,7 @@ impl ToolRegistry {
         Ok(registry)
     }
 
-    pub fn with_mcp_cache(
+    pub async fn with_mcp_cache_async(
         root: impl Into<PathBuf>,
         permissions: PermissionProfile,
         mcp_servers: &[McpServerConfig],
@@ -137,7 +152,7 @@ impl ToolRegistry {
     ) -> Result<ToolRegistryBuild, ToolRegistryError> {
         let root = root.into();
         let mut registry = Self::built_in(&root, permissions)?;
-        let discovery = mcp::discover_stdio_tools(&root, mcp_servers, mcp_cache);
+        let discovery = mcp::discover_tools(&root, mcp_servers, mcp_cache).await;
         for tool in discovery.tools {
             registry.register(tool)?;
         }
@@ -177,51 +192,83 @@ impl ToolRegistry {
             .collect()
     }
 
-    pub fn execute(&self, call: &ToolCall) -> ToolExecution {
-        self.execute_inner(call, None)
+    pub fn execution_mode(&self, call: &ToolCall) -> ToolExecutionMode {
+        self.tools
+            .iter()
+            .find(|registered| registered.definition.function.name == call.function.name)
+            .map(|registered| registered.tool.execution_mode(call))
+            .unwrap_or(ToolExecutionMode::Concurrent)
     }
 
-    pub fn execute_approved(
-        &self,
-        call: &ToolCall,
-        decision: &ApprovalDecision,
-        request: &ApprovalRequest,
-    ) -> ToolExecution {
-        self.execute_inner(call, Some((decision, request)))
+    pub async fn execute<C>(&self, call: C) -> ToolExecution
+    where
+        C: Borrow<ToolCall> + Send,
+    {
+        let call = call.borrow().clone();
+        self.execute_inner(call, None).await
     }
 
-    fn execute_inner(
-        &self,
-        call: &ToolCall,
-        approval: Option<(&ApprovalDecision, &ApprovalRequest)>,
-    ) -> ToolExecution {
+    pub async fn execute_approved<C, D, R>(&self, call: C, decision: D, request: R) -> ToolExecution
+    where
+        C: Borrow<ToolCall> + Send,
+        D: Borrow<ApprovalDecision> + Send,
+        R: Borrow<ApprovalRequest> + Send,
+    {
+        let call = call.borrow().clone();
+        let decision = decision.borrow().clone();
+        let request = request.borrow().clone();
+        self.execute_inner(call, Some(ToolApproval { decision, request }))
+            .await
+    }
+
+    async fn execute_inner(&self, call: ToolCall, approval: Option<ToolApproval>) -> ToolExecution {
         match self
             .tools
             .iter()
             .find(|registered| registered.definition.function.name == call.function.name)
         {
-            Some(registered) => registered.tool.execute(call, approval),
+            Some(registered) => registered.tool.execute(call, approval).await,
             None => ToolExecution::error(format!("unknown tool {:?}", call.function.name)),
         }
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct BuiltInTools {
     evaluator: PermissionEvaluator,
 }
 
+#[async_trait]
 impl Tool for BuiltInTools {
     fn definitions(&self) -> Vec<ToolDefinition> {
         built_in_definitions()
     }
 
-    fn execute(
-        &self,
-        call: &ToolCall,
-        approval: Option<(&ApprovalDecision, &ApprovalRequest)>,
-    ) -> ToolExecution {
-        self.execute_inner(call, approval)
+    fn execution_mode(&self, call: &ToolCall) -> ToolExecutionMode {
+        match call.function.name.as_str() {
+            "read_file" | "list_files" | "search_text" => ToolExecutionMode::Concurrent,
+            "edit_file" | "write_file" | "apply_patch" | "shell_command" => {
+                ToolExecutionMode::Serial
+            }
+            _ => ToolExecutionMode::Concurrent,
+        }
+    }
+
+    async fn execute(&self, call: ToolCall, approval: Option<ToolApproval>) -> ToolExecution {
+        let tools = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let approval = approval.as_ref().map(|approval| {
+                (
+                    &approval.decision as &ApprovalDecision,
+                    &approval.request as &ApprovalRequest,
+                )
+            });
+            tools.execute_inner(&call, approval)
+        })
+        .await
+        .unwrap_or_else(|error| {
+            ToolExecution::error(format!("tool execution task failed: {error}"))
+        })
     }
 }
 
@@ -2108,10 +2155,13 @@ struct ShellCommandArgs {
 mod tests {
     use super::*;
     use agent_protocol::{ApprovalAction, PermissionMode, ShellPolicy};
+    use async_trait::async_trait;
+    use std::future::Future;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct TestTool(&'static str);
 
+    #[async_trait]
     impl Tool for TestTool {
         fn definitions(&self) -> Vec<ToolDefinition> {
             vec![ToolDefinition::function(
@@ -2121,11 +2171,7 @@ mod tests {
             )]
         }
 
-        fn execute(
-            &self,
-            _call: &ToolCall,
-            _approval: Option<(&ApprovalDecision, &ApprovalRequest)>,
-        ) -> ToolExecution {
+        async fn execute(&self, _call: ToolCall, _approval: Option<ToolApproval>) -> ToolExecution {
             ToolExecution::Completed(ToolResult {
                 ok: true,
                 content: "{}".to_string(),
@@ -2172,19 +2218,41 @@ mod tests {
         call("apply_patch", json!({"patch": patch}))
     }
 
-    fn content(execution: ToolExecution) -> Value {
+    fn wait_tool<F>(execution: F) -> ToolExecution
+    where
+        F: Future<Output = ToolExecution>,
+    {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(execution)
+    }
+
+    fn content<F>(execution: F) -> Value
+    where
+        F: Future<Output = ToolExecution>,
+    {
         let result = completed_result(execution);
         serde_json::from_str(&result.content).expect("tool JSON")
     }
 
-    fn completed_result(execution: ToolExecution) -> ToolResult {
+    fn completed_result<F>(execution: F) -> ToolResult
+    where
+        F: Future<Output = ToolExecution>,
+    {
+        let execution = wait_tool(execution);
         let ToolExecution::Completed(result) = execution else {
             panic!("expected completed tool execution");
         };
         result
     }
 
-    fn approval_request(execution: ToolExecution) -> ApprovalRequest {
+    fn approval_request<F>(execution: F) -> ApprovalRequest
+    where
+        F: Future<Output = ToolExecution>,
+    {
+        let execution = wait_tool(execution);
         let ToolExecution::ApprovalRequired(request) = execution else {
             panic!("expected approval request");
         };

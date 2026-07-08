@@ -3,15 +3,16 @@ use agent_protocol::{
     AgentEvent, ApprovalDecision, ApprovalRequest, Conversation, Message, Thread, ToolCall, Turn,
     TurnRecord, TurnStep,
 };
-use agent_tools::{ToolExecution, ToolRegistry, ToolResult};
-use futures_util::Stream;
+use agent_tools::{ToolExecution, ToolExecutionMode, ToolRegistry, ToolResult};
 use futures_util::future::{BoxFuture, FutureExt};
-use std::collections::VecDeque;
+use futures_util::stream::{FuturesUnordered, Stream};
+use std::collections::{BTreeMap, VecDeque};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use thiserror::Error;
 
 const DEFAULT_MAX_TOOL_ROUNDS: usize = 8;
+const MAX_CONCURRENT_TOOL_CALLS: usize = 4;
 
 #[derive(Debug, Clone)]
 pub struct Agent {
@@ -75,7 +76,11 @@ impl Agent {
                 async move { client.stream_chat(&conversation_for_model, &tools).await }.boxed(),
             ),
             pending_tool_calls: VecDeque::new(),
-            tool_future: None,
+            tool_futures: FuturesUnordered::new(),
+            pending_tool_results: BTreeMap::new(),
+            next_tool_result_index: 0,
+            active_serial_tool: false,
+            processing_tool_calls: false,
             pending_approval: None,
             thread,
             turn: Turn::running(user_message.clone()),
@@ -89,10 +94,18 @@ impl Agent {
 }
 
 type ModelStartFuture = BoxFuture<'static, Result<ChatCompletionStream, ModelError>>;
-type ToolCallFuture = BoxFuture<'static, (ToolCall, ToolExecution)>;
+type ToolCallFuture = BoxFuture<'static, ToolCallOutcome>;
+
+struct ToolCallOutcome {
+    index: usize,
+    tool_call: ToolCall,
+    execution: ToolExecution,
+    serial: bool,
+}
 
 #[derive(Debug, Clone)]
 struct PendingApproval {
+    index: usize,
     tool_call: ToolCall,
     request: ApprovalRequest,
 }
@@ -104,8 +117,12 @@ pub struct AgentTurnStream<'a> {
     conversation: Conversation,
     model_stream: Option<ChatCompletionStream>,
     model_start: Option<ModelStartFuture>,
-    pending_tool_calls: VecDeque<ToolCall>,
-    tool_future: Option<ToolCallFuture>,
+    pending_tool_calls: VecDeque<(usize, ToolCall)>,
+    tool_futures: FuturesUnordered<ToolCallFuture>,
+    pending_tool_results: BTreeMap<usize, (ToolCall, ToolExecution)>,
+    next_tool_result_index: usize,
+    active_serial_tool: bool,
+    processing_tool_calls: bool,
     pending_approval: Option<PendingApproval>,
     thread: &'a mut Thread,
     turn: Turn,
@@ -150,6 +167,7 @@ impl AgentTurnStream<'_> {
 
         if decision.approved {
             self.start_approved_tool_call(
+                pending_approval.index,
                 pending_approval.tool_call,
                 decision,
                 pending_approval.request,
@@ -157,6 +175,10 @@ impl AgentTurnStream<'_> {
         } else {
             let result = ToolResult::error("approval denied");
             self.finish_tool_call(pending_approval.tool_call, result);
+            self.next_tool_result_index = pending_approval.index + 1;
+            self.emit_ready_tool_results();
+            self.start_ready_tool_calls();
+            self.maybe_finish_tool_batch();
         }
 
         Ok(())
@@ -209,16 +231,41 @@ impl AgentTurnStream<'_> {
         self.assistant_text.clear();
         self.conversation.push(assistant_message.clone());
         self.turn_messages.push(assistant_message);
-        self.pending_tool_calls = VecDeque::from(tool_calls);
-        self.start_next_tool_call();
+        self.pending_tool_calls = tool_calls.into_iter().enumerate().collect();
+        self.pending_tool_results.clear();
+        self.next_tool_result_index = 0;
+        self.active_serial_tool = false;
+        self.processing_tool_calls = true;
+        self.start_ready_tool_calls();
     }
 
-    fn start_next_tool_call(&mut self) {
-        let Some(tool_call) = self.pending_tool_calls.pop_front() else {
-            self.start_next_model_call();
+    fn start_ready_tool_calls(&mut self) {
+        if !self.processing_tool_calls || self.pending_approval.is_some() || self.active_serial_tool
+        {
             return;
-        };
+        }
 
+        while self.tool_futures.len() < MAX_CONCURRENT_TOOL_CALLS {
+            let Some((_, tool_call)) = self.pending_tool_calls.front() else {
+                return;
+            };
+            let mode = self.tools.execution_mode(tool_call);
+            let serial = mode == ToolExecutionMode::Serial;
+            if serial && !self.tool_futures.is_empty() {
+                return;
+            }
+            let (index, tool_call) = self
+                .pending_tool_calls
+                .pop_front()
+                .expect("front pending tool call must exist");
+            self.start_tool_call(index, tool_call, serial);
+            if serial {
+                return;
+            }
+        }
+    }
+
+    fn start_tool_call(&mut self, index: usize, tool_call: ToolCall, serial: bool) {
         let id = tool_call.id.clone();
         let name = tool_call.function.name.clone();
         self.turn
@@ -231,16 +278,18 @@ impl AgentTurnStream<'_> {
 
         let tools = self.tools.clone();
         let call_for_result = tool_call.clone();
-        self.tool_future = Some(
+        if serial {
+            self.active_serial_tool = true;
+        }
+        self.tool_futures.push(
             async move {
-                let call_for_execution = call_for_result.clone();
-                let execution =
-                    tokio::task::spawn_blocking(move || tools.execute(&call_for_execution))
-                        .await
-                        .unwrap_or_else(|err| {
-                            ToolExecution::error(format!("tool execution task failed: {err}"))
-                        });
-                (call_for_result, execution)
+                let execution = tools.execute(call_for_result.clone()).await;
+                ToolCallOutcome {
+                    index,
+                    tool_call: call_for_result,
+                    execution,
+                    serial,
+                }
             }
             .boxed(),
         );
@@ -248,40 +297,77 @@ impl AgentTurnStream<'_> {
 
     fn start_approved_tool_call(
         &mut self,
+        index: usize,
         tool_call: ToolCall,
         decision: ApprovalDecision,
         request: ApprovalRequest,
     ) {
         let tools = self.tools.clone();
         let call_for_result = tool_call.clone();
-        self.tool_future = Some(
+        self.active_serial_tool = true;
+        self.tool_futures.push(
             async move {
-                let call_for_execution = call_for_result.clone();
-                let execution = tokio::task::spawn_blocking(move || {
-                    tools.execute_approved(&call_for_execution, &decision, &request)
-                })
-                .await
-                .unwrap_or_else(|err| {
-                    ToolExecution::error(format!("tool execution task failed: {err}"))
-                });
-                (call_for_result, execution)
+                let execution = tools
+                    .execute_approved(call_for_result.clone(), decision, request)
+                    .await;
+                ToolCallOutcome {
+                    index,
+                    tool_call: call_for_result,
+                    execution,
+                    serial: true,
+                }
             }
             .boxed(),
         );
     }
 
-    fn finish_tool_execution(&mut self, tool_call: ToolCall, execution: ToolExecution) {
-        match execution {
-            ToolExecution::Completed(result) => self.finish_tool_call(tool_call, result),
-            ToolExecution::ApprovalRequired(request) => {
-                self.pending_approval = Some(PendingApproval {
-                    tool_call,
-                    request: request.clone(),
-                });
-                self.pending
-                    .push_back(AgentEvent::ApprovalRequested(request));
+    fn emit_ready_tool_results(&mut self) {
+        while self.pending_approval.is_none() {
+            let Some((tool_call, execution)) = self
+                .pending_tool_results
+                .remove(&self.next_tool_result_index)
+            else {
+                break;
+            };
+            match execution {
+                ToolExecution::Completed(result) => {
+                    self.finish_tool_call(tool_call, result);
+                    self.next_tool_result_index += 1;
+                }
+                ToolExecution::ApprovalRequired(request) => {
+                    self.pending_approval = Some(PendingApproval {
+                        index: self.next_tool_result_index,
+                        tool_call,
+                        request: request.clone(),
+                    });
+                    self.pending
+                        .push_back(AgentEvent::ApprovalRequested(request));
+                }
             }
         }
+    }
+
+    fn maybe_finish_tool_batch(&mut self) {
+        if self.processing_tool_calls
+            && self.pending_tool_calls.is_empty()
+            && self.tool_futures.is_empty()
+            && self.pending_tool_results.is_empty()
+            && self.pending_approval.is_none()
+        {
+            self.processing_tool_calls = false;
+            self.start_next_model_call();
+        }
+    }
+
+    fn finish_tool_execution(
+        &mut self,
+        index: usize,
+        tool_call: ToolCall,
+        execution: ToolExecution,
+    ) {
+        self.pending_tool_results
+            .insert(index, (tool_call, execution));
+        self.emit_ready_tool_results();
     }
 
     fn finish_tool_call(&mut self, tool_call: ToolCall, result: ToolResult) {
@@ -294,7 +380,12 @@ impl AgentTurnStream<'_> {
         self.conversation.push(tool_message.clone());
         self.turn_messages.push(tool_message);
 
-        if let Some(step) = self.turn.steps.last_mut() {
+        if let Some(step) = self
+            .turn
+            .steps
+            .iter_mut()
+            .find(|step| step.tool_call_id.as_deref() == Some(id.as_str()))
+        {
             if ok {
                 step.complete();
             } else {
@@ -308,7 +399,6 @@ impl AgentTurnStream<'_> {
             ok,
             summary,
         });
-        self.start_next_tool_call();
     }
 
     fn start_next_model_call(&mut self) {
@@ -338,16 +428,25 @@ impl Stream for AgentTurnStream<'_> {
         }
 
         loop {
-            if let Some(future) = this.tool_future.as_mut() {
-                match future.as_mut().poll(cx) {
-                    Poll::Ready((tool_call, execution)) => {
-                        this.tool_future = None;
-                        this.finish_tool_execution(tool_call, execution);
+            if !this.tool_futures.is_empty() {
+                match Pin::new(&mut this.tool_futures).poll_next(cx) {
+                    Poll::Ready(Some(outcome)) => {
+                        if outcome.serial {
+                            this.active_serial_tool = false;
+                        }
+                        this.finish_tool_execution(
+                            outcome.index,
+                            outcome.tool_call,
+                            outcome.execution,
+                        );
+                        this.start_ready_tool_calls();
+                        this.maybe_finish_tool_batch();
                         if let Some(event) = this.pending.pop_front() {
                             return Poll::Ready(Some(event));
                         }
                         continue;
                     }
+                    Poll::Ready(None) => {}
                     Poll::Pending => return Poll::Pending,
                 }
             }
@@ -597,6 +696,10 @@ mod tests {
             PermissionProfile::for_mode(PermissionMode::WorkspaceWrite),
         )
         .expect("tools")
+    }
+
+    fn tools_with_permissions(root: &Path, mode: PermissionMode) -> ToolRegistry {
+        ToolRegistry::built_in(root, PermissionProfile::for_mode(mode)).expect("tools")
     }
 
     async fn collect_events(mut stream: AgentTurnStream<'_>) -> (Vec<AgentEvent>, Turn) {
@@ -910,12 +1013,12 @@ mod tests {
             [
                 AgentEvent::TurnStarted,
                 AgentEvent::ToolCallStarted { id: first_id, .. },
+                AgentEvent::ToolCallStarted { id: second_id, .. },
                 AgentEvent::ToolCallFinished {
                     id: first_finish,
                     ok: true,
                     ..
                 },
-                AgentEvent::ToolCallStarted { id: second_id, .. },
                 AgentEvent::ToolCallFinished {
                     id: second_finish,
                     ok: true,
@@ -936,6 +1039,85 @@ mod tests {
         assert!(requests[1].contains(r#""tool_call_id":"call_2""#));
         assert!(requests[1].contains("alpha"));
         assert!(requests[1].contains("bravo"));
+    }
+
+    #[tokio::test]
+    async fn serial_tool_call_drains_concurrent_batch_before_starting_next_tool() {
+        let root = unique_dir("serial-tool-barrier");
+        fs::write(root.join("a.txt"), "alpha\n").expect("write a");
+        fs::write(root.join("b.txt"), "bravo\n").expect("write b");
+        let first_body = tool_calls_body(vec![
+            (
+                "call_1",
+                "read_file",
+                json!({"path": "a.txt", "max_lines": 5}),
+            ),
+            (
+                "call_2",
+                "write_file",
+                json!({"path": "created.txt", "content": "created\n"}),
+            ),
+            (
+                "call_3",
+                "read_file",
+                json!({"path": "b.txt", "max_lines": 5}),
+            ),
+        ]);
+        let second_body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Done\"},\"finish_reason\":null}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (base_url, _) = spawn_recording_sse_server(vec![first_body, second_body]).await;
+        let agent = Agent::with_tools(
+            client(base_url),
+            "You are helpful.",
+            tools_with_permissions(&root, PermissionMode::DangerFullAccess),
+        );
+        let mut thread = Thread::new();
+
+        let stream = agent
+            .run_turn(&mut thread, "Read, write, read")
+            .await
+            .expect("run turn");
+        let (events, turn) = collect_events(stream).await;
+
+        assert_eq!(turn.status, TurnStatus::Completed);
+        assert_eq!(
+            fs::read_to_string(root.join("created.txt")).expect("read created"),
+            "created\n"
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [
+                AgentEvent::TurnStarted,
+                AgentEvent::ToolCallStarted { id: first_start, .. },
+                AgentEvent::ToolCallFinished {
+                    id: first_finish,
+                    ok: true,
+                    ..
+                },
+                AgentEvent::ToolCallStarted { id: second_start, .. },
+                AgentEvent::ToolCallFinished {
+                    id: second_finish,
+                    ok: true,
+                    ..
+                },
+                AgentEvent::ToolCallStarted { id: third_start, .. },
+                AgentEvent::ToolCallFinished {
+                    id: third_finish,
+                    ok: true,
+                    ..
+                },
+                AgentEvent::TextDelta(_),
+                AgentEvent::AgentMessage(_),
+                AgentEvent::TurnCompleted,
+            ] if first_start == "call_1"
+                && first_finish == "call_1"
+                && second_start == "call_2"
+                && second_finish == "call_2"
+                && third_start == "call_3"
+                && third_finish == "call_3"
+        ));
     }
 
     #[tokio::test]

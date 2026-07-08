@@ -17,12 +17,22 @@ retain_recent_turns = 2
 summary_target_tokens = 12000
 compact_max_retries = 2
 
-# MCP support is stdio-only. HTTP/OAuth MCP servers are not supported yet.
+# MCP stdio server example.
 # [mcp_servers.filesystem]
 # command = "npx"
 # args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
 # env = {}
 # cwd = "."
+# enabled = true
+# startup_timeout_sec = 10
+# tool_timeout_sec = 60
+
+# MCP Streamable HTTP server example. OAuth is not supported yet.
+# [mcp_servers.remote]
+# url = "https://example.com/mcp"
+# http_headers = { "X-Client" = "morrow" }
+# env_http_headers = { "X-Api-Key" = "REMOTE_MCP_API_KEY" }
+# bearer_token_env_var = "REMOTE_MCP_TOKEN"
 # enabled = true
 # startup_timeout_sec = 10
 # tool_timeout_sec = 60

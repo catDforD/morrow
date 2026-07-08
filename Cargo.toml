@@ -25,6 +25,7 @@ agent-runtime = { path = "crates/agent-runtime" }
 agent-server = { path = "crates/agent-server" }
 agent-sandbox = { path = "crates/agent-sandbox" }
 agent-tools = { path = "crates/agent-tools" }
+async-trait = "0.1"
 axum = { version = "0.8", features = ["ws"] }
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
@@ -34,6 +35,6 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
 toml = "0.9"
 tower = "0.5"

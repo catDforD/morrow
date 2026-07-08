@@ -133,12 +133,13 @@ pub async fn run_agent_turn(
         });
     }
 
-    let build = ToolRegistry::with_mcp_cache(
+    let build = ToolRegistry::with_mcp_cache_async(
         context.workspace_root,
         context.permissions,
         context.mcp_servers,
         context.mcp_cache,
-    )?;
+    )
+    .await?;
     let tools = build.registry;
     let agent = Agent::with_tools(
         context.client.clone(),
@@ -1169,10 +1170,13 @@ done
         let mcp_cache = McpToolCache::new();
         let mcp_servers = vec![McpServerConfig {
             name: "Docs".to_string(),
+            transport: agent_config::McpTransport::Stdio,
             command: "sh".to_string(),
             args: vec![server_script.display().to_string()],
             env: Default::default(),
             cwd: None,
+            url: None,
+            http_headers: Default::default(),
             enabled: true,
             startup_timeout_sec: 5,
             tool_timeout_sec: 5,
@@ -1215,10 +1219,13 @@ done
         let mcp_cache = McpToolCache::new();
         let mcp_servers = vec![McpServerConfig {
             name: "bad".to_string(),
+            transport: agent_config::McpTransport::Stdio,
             command: "definitely-not-a-real-morrow-mcp-command".to_string(),
             args: Vec::new(),
             env: Default::default(),
             cwd: None,
+            url: None,
+            http_headers: Default::default(),
             enabled: true,
             startup_timeout_sec: 1,
             tool_timeout_sec: 1,
@@ -1291,10 +1298,13 @@ done
         let mcp_cache = McpToolCache::new();
         let mcp_servers = vec![McpServerConfig {
             name: "Docs".to_string(),
+            transport: agent_config::McpTransport::Stdio,
             command: "sh".to_string(),
             args: vec![server_script.display().to_string()],
             env: Default::default(),
             cwd: None,
+            url: None,
+            http_headers: Default::default(),
             enabled: true,
             startup_timeout_sec: 5,
             tool_timeout_sec: 5,

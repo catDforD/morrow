@@ -1644,10 +1644,13 @@ compact test
         let mcp_cache = McpToolCache::new();
         let mcp_servers = vec![McpServerConfig {
             name: "bad".to_string(),
+            transport: agent_config::McpTransport::Stdio,
             command: "definitely-not-a-real-morrow-mcp-command".to_string(),
             args: Vec::new(),
             env: Default::default(),
             cwd: None,
+            url: None,
+            http_headers: Default::default(),
             enabled: true,
             startup_timeout_sec: 1,
             tool_timeout_sec: 1,
