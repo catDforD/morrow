@@ -133,12 +133,13 @@ pub async fn run_agent_turn(
         });
     }
 
-    let build = ToolRegistry::with_mcp_cache(
+    let build = ToolRegistry::with_mcp_cache_async(
         context.workspace_root,
         context.permissions,
         context.mcp_servers,
         context.mcp_cache,
-    )?;
+    )
+    .await?;
     let tools = build.registry;
     let agent = Agent::with_tools(
         context.client.clone(),

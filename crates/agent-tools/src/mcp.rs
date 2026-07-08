@@ -1,24 +1,28 @@
 use crate::{Tool, ToolExecution, ToolResult};
 use agent_config::{McpServerConfig, McpTransport};
 use agent_protocol::{ToolCall, ToolDefinition, ToolExecutionSummary};
+use async_trait::async_trait;
+use futures_util::future::join_all;
 use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStderr, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStderr, ChildStdin, Command};
+use tokio::sync::{Notify, mpsc, oneshot};
 
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const STDERR_TAIL_BYTES: usize = 8192;
+const MCP_ACTOR_QUEUE_CAPACITY: usize = 64;
 
 #[derive(Default)]
 pub struct McpToolCache {
-    entries: Mutex<HashMap<McpServerKey, Arc<CachedMcpServer>>>,
+    entries: tokio::sync::Mutex<HashMap<McpServerKey, McpCacheEntry>>,
 }
 
 impl McpToolCache {
@@ -26,42 +30,71 @@ impl McpToolCache {
         Self::default()
     }
 
-    fn get_or_start(
+    async fn get_or_start(
         &self,
         config: &McpServerConfig,
         cwd: PathBuf,
     ) -> Result<Arc<CachedMcpServer>, String> {
         let key = McpServerKey::from_config(config, &cwd);
-        let mut entries = self
-            .entries
-            .lock()
-            .map_err(|_| "MCP cache lock poisoned".to_string())?;
 
-        if let Some(entry) = entries.get(&key) {
-            if entry.runtime.is_healthy() {
-                return Ok(entry.clone());
+        loop {
+            match self.cache_action(&key).await {
+                McpCacheAction::Ready(entry) => {
+                    if entry.runtime.is_healthy().await {
+                        return Ok(entry);
+                    }
+                    let mut entries = self.entries.lock().await;
+                    entries.remove(&key);
+                }
+                McpCacheAction::Starting(notify) => {
+                    notify.notified().await;
+                }
+                McpCacheAction::Start(notify) => {
+                    let result = start_mcp_server(config, cwd.clone()).await;
+                    let mut entries = self.entries.lock().await;
+                    entries.remove(&key);
+                    if let Ok(entry) = result.as_ref() {
+                        entries.insert(key.clone(), McpCacheEntry::Ready(entry.clone()));
+                    }
+                    notify.notify_waiters();
+                    return result;
+                }
             }
-            entries.remove(&key);
         }
+    }
 
-        let entry = start_mcp_server(config, cwd)?;
-        entries.insert(key, entry.clone());
-        Ok(entry)
+    async fn cache_action(&self, key: &McpServerKey) -> McpCacheAction {
+        let mut entries = self.entries.lock().await;
+        match entries.get(key) {
+            Some(McpCacheEntry::Ready(entry)) => McpCacheAction::Ready(entry.clone()),
+            Some(McpCacheEntry::Starting(notify)) => McpCacheAction::Starting(notify.clone()),
+            None => {
+                let notify = Arc::new(Notify::new());
+                entries.insert(key.clone(), McpCacheEntry::Starting(notify.clone()));
+                McpCacheAction::Start(notify)
+            }
+        }
     }
 }
 
 impl std::fmt::Debug for McpToolCache {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let entry_count = self
-            .entries
-            .lock()
-            .map(|entries| entries.len())
-            .unwrap_or(0);
         formatter
             .debug_struct("McpToolCache")
-            .field("entry_count", &entry_count)
+            .field("entries", &"<async mutex>")
             .finish()
     }
+}
+
+enum McpCacheEntry {
+    Ready(Arc<CachedMcpServer>),
+    Starting(Arc<Notify>),
+}
+
+enum McpCacheAction {
+    Ready(Arc<CachedMcpServer>),
+    Starting(Arc<Notify>),
+    Start(Arc<Notify>),
 }
 
 pub struct McpDiscovery {
@@ -101,31 +134,41 @@ impl McpServerKey {
 }
 
 struct CachedMcpServer {
-    runtime: Arc<McpServerRuntime>,
+    runtime: McpServerRuntime,
     listed_tools: Vec<ListedTool>,
 }
 
-pub fn discover_tools(
+pub async fn discover_tools(
     workspace_root: &Path,
     servers: &[McpServerConfig],
     cache: &McpToolCache,
 ) -> McpDiscovery {
+    let discoveries = join_all(
+        servers
+            .iter()
+            .filter(|server| server.enabled)
+            .map(|server| {
+                let cwd = resolve_cwd(workspace_root, server.cwd.as_deref());
+                async move { (server.name.clone(), cache.get_or_start(server, cwd).await) }
+            }),
+    )
+    .await;
+
     let mut tools = Vec::new();
     let mut diagnostics = Vec::new();
     let mut emitted_names = BTreeSet::new();
 
-    for server in servers.iter().filter(|server| server.enabled) {
-        let cwd = resolve_cwd(workspace_root, server.cwd.as_deref());
-        let entry = match cache.get_or_start(server, cwd) {
+    for (server_name, result) in discoveries {
+        let entry = match result {
             Ok(entry) => entry,
             Err(message) => {
-                diagnostics.push(format!("mcp server {}: {message}", server.name));
+                diagnostics.push(format!("mcp server {server_name}: {message}"));
                 continue;
             }
         };
 
         if let Some(tool) =
-            build_tool_provider(&server.name, entry, &mut emitted_names, &mut diagnostics)
+            build_tool_provider(&server_name, entry, &mut emitted_names, &mut diagnostics)
         {
             tools.push(tool as Arc<dyn Tool>);
         }
@@ -134,19 +177,15 @@ pub fn discover_tools(
     McpDiscovery { tools, diagnostics }
 }
 
-fn start_mcp_server(
+async fn start_mcp_server(
     config: &McpServerConfig,
     cwd: PathBuf,
 ) -> Result<Arc<CachedMcpServer>, String> {
     let startup_timeout = Duration::from_secs(config.startup_timeout_sec);
     let tool_timeout = Duration::from_secs(config.tool_timeout_sec);
-    let mut transport = McpTransportClient::start(config, cwd, startup_timeout)?;
-    let listed_tools = initialize_and_list_tools(&mut transport, startup_timeout)?;
-    let runtime = Arc::new(McpServerRuntime {
-        name: config.name.clone(),
-        transport: Mutex::new(transport),
-        tool_timeout,
-    });
+    let mut transport = McpTransportClient::start(config, cwd, startup_timeout).await?;
+    let listed_tools = initialize_and_list_tools(&mut transport, startup_timeout).await?;
+    let runtime = McpServerRuntime::start(config.name.clone(), transport, tool_timeout);
 
     Ok(Arc::new(CachedMcpServer {
         runtime,
@@ -237,23 +276,21 @@ fn build_tool_definitions(
 }
 
 struct McpToolProvider {
-    runtime: Arc<McpServerRuntime>,
+    runtime: McpServerRuntime,
     definitions: Vec<ToolDefinition>,
     lookup: HashMap<String, String>,
 }
 
+#[async_trait]
 impl Tool for McpToolProvider {
     fn definitions(&self) -> Vec<ToolDefinition> {
         self.definitions.clone()
     }
 
-    fn execute(
+    async fn execute(
         &self,
-        call: &ToolCall,
-        _approval: Option<(
-            &agent_protocol::ApprovalDecision,
-            &agent_protocol::ApprovalRequest,
-        )>,
+        call: ToolCall,
+        _approval: Option<crate::ToolApproval>,
     ) -> ToolExecution {
         let Some(original_name) = self.lookup.get(&call.function.name) else {
             return ToolExecution::error(format!("unknown MCP tool {:?}", call.function.name));
@@ -268,7 +305,7 @@ impl Tool for McpToolProvider {
             }
         };
 
-        let result = self.runtime.call_tool(original_name, arguments);
+        let result = self.runtime.call_tool(original_name, arguments).await;
         ToolExecution::Completed(match result {
             Ok(result) => mcp_call_result(&self.runtime.name, original_name, result),
             Err(error) => tool_error_json(error),
@@ -276,33 +313,141 @@ impl Tool for McpToolProvider {
     }
 }
 
+#[derive(Clone)]
 struct McpServerRuntime {
     name: String,
-    transport: Mutex<McpTransportClient>,
+    tx: mpsc::Sender<McpActorCommand>,
+    healthy: Arc<AtomicBool>,
     tool_timeout: Duration,
 }
 
 impl McpServerRuntime {
-    fn call_tool(&self, tool_name: &str, arguments: Value) -> Result<CallToolResult, String> {
-        let mut transport = self
-            .transport
-            .lock()
-            .map_err(|_| "MCP transport lock poisoned".to_string())?;
-        call_tool(&mut *transport, tool_name, arguments, self.tool_timeout)
+    fn start(name: String, transport: McpTransportClient, tool_timeout: Duration) -> Self {
+        let (tx, rx) = mpsc::channel(MCP_ACTOR_QUEUE_CAPACITY);
+        let healthy = Arc::new(AtomicBool::new(true));
+        let actor = McpServerActor {
+            transport,
+            rx,
+            healthy: healthy.clone(),
+        };
+        tokio::spawn(actor.run());
+        Self {
+            name,
+            tx,
+            healthy,
+            tool_timeout,
+        }
     }
 
-    fn is_healthy(&self) -> bool {
-        self.transport
-            .lock()
-            .map(|mut transport| transport.is_healthy())
-            .unwrap_or(false)
+    async fn call_tool(&self, tool_name: &str, arguments: Value) -> Result<CallToolResult, String> {
+        if !self.is_healthy().await {
+            return Err("MCP server actor is not healthy".to_string());
+        }
+        let (reply, response) = oneshot::channel();
+        self.tx
+            .send(McpActorCommand::CallTool {
+                tool_name: tool_name.to_string(),
+                arguments,
+                timeout: self.tool_timeout,
+                reply,
+            })
+            .await
+            .map_err(|_| "MCP server actor stopped".to_string())?;
+        response
+            .await
+            .map_err(|_| "MCP server actor dropped response".to_string())?
+    }
+
+    async fn is_healthy(&self) -> bool {
+        if !self.healthy.load(Ordering::SeqCst) || self.tx.is_closed() {
+            return false;
+        }
+        let (reply, response) = oneshot::channel();
+        if self
+            .tx
+            .send(McpActorCommand::Health { reply })
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        response.await.unwrap_or(false)
     }
 }
 
-trait JsonRpcTransport {
-    fn request(&mut self, method: &str, params: Value, timeout: Duration) -> Result<Value, String>;
+enum McpActorCommand {
+    Health {
+        reply: oneshot::Sender<bool>,
+    },
+    CallTool {
+        tool_name: String,
+        arguments: Value,
+        timeout: Duration,
+        reply: oneshot::Sender<Result<CallToolResult, String>>,
+    },
+}
 
-    fn notify(&mut self, method: &str, params: Value, timeout: Duration) -> Result<(), String>;
+struct McpServerActor {
+    transport: McpTransportClient,
+    rx: mpsc::Receiver<McpActorCommand>,
+    healthy: Arc<AtomicBool>,
+}
+
+impl McpServerActor {
+    async fn run(mut self) {
+        while let Some(command) = self.rx.recv().await {
+            match command {
+                McpActorCommand::Health { reply } => {
+                    let healthy = self.transport.is_healthy().await;
+                    let _ = reply.send(healthy);
+                    if !healthy {
+                        self.healthy.store(false, Ordering::SeqCst);
+                        break;
+                    }
+                }
+                McpActorCommand::CallTool {
+                    tool_name,
+                    arguments,
+                    timeout,
+                    reply,
+                } => {
+                    let result =
+                        call_tool(&mut self.transport, &tool_name, arguments, timeout).await;
+                    let failed = result.is_err() && !self.transport.is_healthy().await;
+                    let _ = reply.send(result);
+                    if failed {
+                        self.healthy.store(false, Ordering::SeqCst);
+                        break;
+                    }
+                }
+            }
+        }
+        self.healthy.store(false, Ordering::SeqCst);
+        self.transport.shutdown().await;
+    }
+}
+
+#[async_trait]
+trait JsonRpcTransport {
+    async fn request(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, String>;
+
+    async fn notify(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<(), String>;
+
+    async fn is_healthy(&mut self) -> bool {
+        true
+    }
+
+    async fn shutdown(&mut self) {}
 }
 
 enum McpTransportClient {
@@ -311,39 +456,57 @@ enum McpTransportClient {
 }
 
 impl McpTransportClient {
-    fn start(
+    async fn start(
         config: &McpServerConfig,
         cwd: PathBuf,
         startup_timeout: Duration,
     ) -> Result<Self, String> {
         match config.transport {
-            McpTransport::Stdio => {
-                StdioTransport::start(config, cwd, startup_timeout).map(Self::Stdio)
-            }
+            McpTransport::Stdio => StdioTransport::start(config, cwd, startup_timeout)
+                .await
+                .map(Self::Stdio),
             McpTransport::Http => HttpTransport::start(config).map(Self::Http),
-        }
-    }
-
-    fn is_healthy(&mut self) -> bool {
-        match self {
-            Self::Stdio(transport) => transport.is_healthy(),
-            Self::Http(_) => true,
         }
     }
 }
 
+#[async_trait]
 impl JsonRpcTransport for McpTransportClient {
-    fn request(&mut self, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
+    async fn request(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, String> {
         match self {
-            Self::Stdio(transport) => transport.request(method, params, timeout),
-            Self::Http(transport) => transport.request(method, params, timeout),
+            Self::Stdio(transport) => transport.request(method, params, timeout).await,
+            Self::Http(transport) => transport.request(method, params, timeout).await,
         }
     }
 
-    fn notify(&mut self, method: &str, params: Value, timeout: Duration) -> Result<(), String> {
+    async fn notify(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<(), String> {
         match self {
-            Self::Stdio(transport) => transport.notify(method, params, timeout),
-            Self::Http(transport) => transport.notify(method, params, timeout),
+            Self::Stdio(transport) => transport.notify(method, params, timeout).await,
+            Self::Http(transport) => transport.notify(method, params, timeout).await,
+        }
+    }
+
+    async fn shutdown(&mut self) {
+        match self {
+            Self::Stdio(transport) => transport.shutdown().await,
+            Self::Http(transport) => transport.shutdown().await,
+        }
+    }
+
+    async fn is_healthy(&mut self) -> bool {
+        match self {
+            Self::Stdio(transport) => transport.is_healthy().await,
+            Self::Http(transport) => transport.is_healthy().await,
         }
     }
 }
@@ -351,14 +514,14 @@ impl JsonRpcTransport for McpTransportClient {
 struct StdioTransport {
     child: Child,
     stdin: ChildStdin,
-    responses: Receiver<Result<Value, String>>,
+    stdout: BufReader<tokio::process::ChildStdout>,
     stderr_tail: Arc<Mutex<TailBuffer>>,
     next_id: u64,
     failed: bool,
 }
 
 impl StdioTransport {
-    fn start(
+    async fn start(
         config: &McpServerConfig,
         cwd: PathBuf,
         startup_timeout: Duration,
@@ -389,28 +552,12 @@ impl StdioTransport {
             .ok_or_else(|| "failed to capture MCP server stderr".to_string())?;
         let stderr_tail = Arc::new(Mutex::new(TailBuffer::new(STDERR_TAIL_BYTES)));
 
-        let (tx, responses) = mpsc::channel();
-        thread::spawn(move || {
-            let reader = BufReader::new(stdout);
-            for line in reader.lines() {
-                let message = match line {
-                    Ok(line) if line.trim().is_empty() => continue,
-                    Ok(line) => serde_json::from_str::<Value>(&line).map_err(|error| {
-                        format!("failed to parse MCP JSON-RPC message: {error}; line: {line}")
-                    }),
-                    Err(error) => Err(format!("failed to read MCP server stdout: {error}")),
-                };
-                if tx.send(message).is_err() {
-                    break;
-                }
-            }
-        });
         spawn_stderr_tail(stderr, stderr_tail.clone());
 
         let mut transport = Self {
             child,
             stdin,
-            responses,
+            stdout: BufReader::new(stdout),
             stderr_tail,
             next_id: 1,
             failed: false,
@@ -435,7 +582,7 @@ impl StdioTransport {
         }
     }
 
-    fn is_healthy(&mut self) -> bool {
+    async fn is_healthy(&mut self) -> bool {
         if self.failed {
             return false;
         }
@@ -448,15 +595,15 @@ impl StdioTransport {
         }
     }
 
-    fn write_message(&mut self, message: Value) -> Result<(), String> {
-        if let Err(error) = serde_json::to_writer(&mut self.stdin, &message) {
-            return self.fail(format!("failed to encode MCP JSON-RPC message: {error}"));
+    async fn write_message(&mut self, message: Value) -> Result<(), String> {
+        let mut bytes = serde_json::to_vec(&message)
+            .map_err(|error| format!("failed to encode MCP JSON-RPC message: {error}"))?;
+        bytes.push(b'\n');
+        if let Err(error) = self.stdin.write_all(&bytes).await {
+            return Err(self.with_failed(format!("failed to write MCP JSON-RPC message: {error}")));
         }
-        if let Err(error) = self.stdin.write_all(b"\n") {
-            return self.fail(format!("failed to write MCP JSON-RPC message: {error}"));
-        }
-        if let Err(error) = self.stdin.flush() {
-            return self.fail(format!("failed to flush MCP JSON-RPC message: {error}"));
+        if let Err(error) = self.stdin.flush().await {
+            return Err(self.with_failed(format!("failed to flush MCP JSON-RPC message: {error}")));
         }
         Ok(())
     }
@@ -464,6 +611,11 @@ impl StdioTransport {
     fn fail<T>(&mut self, message: String) -> Result<T, String> {
         self.failed = true;
         Err(self.with_stderr_tail(message))
+    }
+
+    fn with_failed(&mut self, message: String) -> String {
+        self.failed = true;
+        self.with_stderr_tail(message)
     }
 
     fn with_stderr_tail(&self, message: String) -> String {
@@ -485,13 +637,18 @@ impl StdioTransport {
 
 impl Drop for StdioTransport {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.child.start_kill();
     }
 }
 
+#[async_trait]
 impl JsonRpcTransport for StdioTransport {
-    fn request(&mut self, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
+    async fn request(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, String> {
         let id = self.next_id;
         self.next_id += 1;
         self.write_message(json!({
@@ -499,21 +656,32 @@ impl JsonRpcTransport for StdioTransport {
             "id": id,
             "method": method,
             "params": params,
-        }))?;
+        }))
+        .await?;
 
         loop {
-            let message = match self.responses.recv_timeout(timeout) {
-                Ok(Ok(message)) => message,
-                Ok(Err(error)) => return self.fail(error),
-                Err(RecvTimeoutError::Timeout) => {
-                    return self.fail(format!("MCP request {method} timed out"));
+            let mut line = String::new();
+            let read = match tokio::time::timeout(timeout, self.stdout.read_line(&mut line)).await {
+                Ok(Ok(read)) => read,
+                Ok(Err(error)) => {
+                    return self.fail(format!("failed to read MCP server stdout: {error}"));
                 }
-                Err(RecvTimeoutError::Disconnected) => {
-                    return self.fail(format!(
-                        "MCP request {method} failed: MCP server stdout closed"
-                    ));
-                }
+                Err(_) => return self.fail(format!("MCP request {method} timed out")),
             };
+            if read == 0 {
+                return self.fail(format!(
+                    "MCP request {method} failed: MCP server stdout closed"
+                ));
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+            let message = serde_json::from_str::<Value>(&line).map_err(|error| {
+                self.with_failed(format!(
+                    "failed to parse MCP JSON-RPC message: {error}; line: {}",
+                    line.trim_end()
+                ))
+            })?;
 
             let Some(response_id) = message.get("id") else {
                 continue;
@@ -530,17 +698,28 @@ impl JsonRpcTransport for StdioTransport {
         }
     }
 
-    fn notify(&mut self, method: &str, params: Value, _timeout: Duration) -> Result<(), String> {
+    async fn notify(
+        &mut self,
+        method: &str,
+        params: Value,
+        _timeout: Duration,
+    ) -> Result<(), String> {
         self.write_message(json!({
             "jsonrpc": "2.0",
             "method": method,
             "params": params,
         }))
+        .await
+    }
+
+    async fn shutdown(&mut self) {
+        let _ = self.child.start_kill();
+        let _ = self.child.wait().await;
     }
 }
 
 struct HttpTransport {
-    client: reqwest::blocking::Client,
+    client: reqwest::Client,
     url: String,
     headers: BTreeMap<String, String>,
     session_id: Option<String>,
@@ -554,7 +733,7 @@ impl HttpTransport {
             .url
             .clone()
             .ok_or_else(|| "HTTP MCP server is missing url".to_string())?;
-        let client = reqwest::blocking::Client::builder()
+        let client = reqwest::Client::builder()
             .build()
             .map_err(|error| format!("failed to build MCP HTTP client: {error}"))?;
         Ok(Self {
@@ -573,39 +752,52 @@ impl HttpTransport {
         id
     }
 
-    fn request_message(
+    async fn request_message(
         &mut self,
         message: Value,
         id: u64,
         timeout: Duration,
     ) -> Result<Value, String> {
         let had_session = self.session_id.is_some();
-        match self.post_jsonrpc(
-            &message,
-            HttpResponseKind::Request { expected_id: id },
-            timeout,
-        ) {
+        match self
+            .post_jsonrpc(
+                &message,
+                HttpResponseKind::Request { expected_id: id },
+                timeout,
+            )
+            .await
+        {
             Ok(result) => Ok(result),
             Err(HttpPostError::SessionExpired) if had_session => {
-                self.reinitialize(timeout)?;
+                self.reinitialize(timeout).await?;
                 self.post_jsonrpc(
                     &message,
                     HttpResponseKind::Request { expected_id: id },
                     timeout,
                 )
+                .await
                 .map_err(HttpPostError::into_message)
             }
             Err(error) => Err(error.into_message()),
         }
     }
 
-    fn reinitialize(&mut self, timeout: Duration) -> Result<(), String> {
+    async fn reinitialize(&mut self, timeout: Duration) -> Result<(), String> {
         self.session_id = None;
         self.protocol_version = MCP_PROTOCOL_VERSION.to_string();
         let id = self.next_request_id();
-        let result = self.request_message(initialize_request(id), id, timeout)?;
+        let message = initialize_request(id);
+        let result = self
+            .post_jsonrpc(
+                &message,
+                HttpResponseKind::Request { expected_id: id },
+                timeout,
+            )
+            .await
+            .map_err(HttpPostError::into_message)?;
         self.apply_initialize_result(&result);
         self.notify("notifications/initialized", json!({}), timeout)
+            .await
     }
 
     fn apply_initialize_result(&mut self, result: &Value) {
@@ -618,7 +810,7 @@ impl HttpTransport {
         }
     }
 
-    fn post_jsonrpc(
+    async fn post_jsonrpc(
         &mut self,
         message: &Value,
         kind: HttpResponseKind,
@@ -638,7 +830,7 @@ impl HttpTransport {
             request = request.header("Mcp-Session-Id", session_id);
         }
 
-        let response = request.send().map_err(|error| {
+        let response = request.send().await.map_err(|error| {
             if error.is_timeout() {
                 HttpPostError::Failed(format!("MCP HTTP request to {} timed out", self.url))
             } else {
@@ -657,7 +849,7 @@ impl HttpTransport {
             .get("Content-Type")
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
-        let body = response.text().map_err(|error| {
+        let body = response.text().await.map_err(|error| {
             HttpPostError::Failed(format!("failed to read MCP HTTP body: {error}"))
         })?;
 
@@ -673,30 +865,43 @@ impl HttpTransport {
     }
 }
 
+#[async_trait]
 impl JsonRpcTransport for HttpTransport {
-    fn request(&mut self, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
+    async fn request(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, String> {
         let id = self.next_request_id();
         if method == "initialize" {
             self.session_id = None;
             self.protocol_version = MCP_PROTOCOL_VERSION.to_string();
         }
-        let result = self.request_message(
-            json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "method": method,
-                "params": params,
-            }),
-            id,
-            timeout,
-        )?;
+        let result = self
+            .request_message(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": method,
+                    "params": params,
+                }),
+                id,
+                timeout,
+            )
+            .await?;
         if method == "initialize" {
             self.apply_initialize_result(&result);
         }
         Ok(result)
     }
 
-    fn notify(&mut self, method: &str, params: Value, timeout: Duration) -> Result<(), String> {
+    async fn notify(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<(), String> {
         self.post_jsonrpc(
             &json!({
                 "jsonrpc": "2.0",
@@ -706,6 +911,7 @@ impl JsonRpcTransport for HttpTransport {
             HttpResponseKind::Notification,
             timeout,
         )
+        .await
         .map(|_| ())
         .map_err(HttpPostError::into_message)
     }
@@ -849,11 +1055,11 @@ fn response_result(response: HttpJsonRpcResponse, kind: HttpResponseKind) -> Res
 }
 
 fn spawn_stderr_tail(stderr: ChildStderr, tail: Arc<Mutex<TailBuffer>>) {
-    thread::spawn(move || {
+    tokio::spawn(async move {
         let mut stderr = stderr;
         let mut buffer = [0u8; 4096];
         loop {
-            match stderr.read(&mut buffer) {
+            match stderr.read(&mut buffer).await {
                 Ok(0) => break,
                 Ok(bytes) => {
                     if let Ok(mut tail) = tail.lock() {
@@ -897,27 +1103,31 @@ impl TailBuffer {
     }
 }
 
-fn initialize_and_list_tools<T: JsonRpcTransport>(
+async fn initialize_and_list_tools<T: JsonRpcTransport>(
     transport: &mut T,
     timeout: Duration,
 ) -> Result<Vec<ListedTool>, String> {
-    transport.request(
-        "initialize",
-        json!({
-            "protocolVersion": MCP_PROTOCOL_VERSION,
-            "capabilities": {},
-            "clientInfo": {
-                "name": "morrow",
-                "version": env!("CARGO_PKG_VERSION"),
-            }
-        }),
-        timeout,
-    )?;
-    transport.notify("notifications/initialized", json!({}), timeout)?;
-    list_tools(transport, timeout)
+    transport
+        .request(
+            "initialize",
+            json!({
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "morrow",
+                    "version": env!("CARGO_PKG_VERSION"),
+                }
+            }),
+            timeout,
+        )
+        .await?;
+    transport
+        .notify("notifications/initialized", json!({}), timeout)
+        .await?;
+    list_tools(transport, timeout).await
 }
 
-fn list_tools<T: JsonRpcTransport>(
+async fn list_tools<T: JsonRpcTransport>(
     transport: &mut T,
     timeout: Duration,
 ) -> Result<Vec<ListedTool>, String> {
@@ -928,7 +1138,7 @@ fn list_tools<T: JsonRpcTransport>(
             Some(cursor) => json!({ "cursor": cursor }),
             None => json!({}),
         };
-        let result = transport.request("tools/list", params, timeout)?;
+        let result = transport.request("tools/list", params, timeout).await?;
         let list = serde_json::from_value::<ListToolsResult>(result)
             .map_err(|error| format!("invalid tools/list response: {error}"))?;
         tools.extend(list.tools);
@@ -940,20 +1150,22 @@ fn list_tools<T: JsonRpcTransport>(
     Ok(tools)
 }
 
-fn call_tool<T: JsonRpcTransport>(
+async fn call_tool<T: JsonRpcTransport>(
     transport: &mut T,
     tool_name: &str,
     arguments: Value,
     timeout: Duration,
 ) -> Result<CallToolResult, String> {
-    let result = transport.request(
-        "tools/call",
-        json!({
-            "name": tool_name,
-            "arguments": arguments,
-        }),
-        timeout,
-    )?;
+    let result = transport
+        .request(
+            "tools/call",
+            json!({
+                "name": tool_name,
+                "arguments": arguments,
+            }),
+            timeout,
+        )
+        .await?;
     serde_json::from_value::<CallToolResult>(result)
         .map_err(|error| format!("invalid tools/call response: {error}"))
 }
@@ -1087,7 +1299,9 @@ mod tests {
     use serde_json::json;
     use std::collections::VecDeque;
     use std::fs;
+    use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct FakeTransport {
@@ -1106,8 +1320,9 @@ mod tests {
         }
     }
 
+    #[async_trait]
     impl JsonRpcTransport for FakeTransport {
-        fn request(
+        async fn request(
             &mut self,
             method: &str,
             _params: Value,
@@ -1119,7 +1334,7 @@ mod tests {
                 .ok_or_else(|| "missing fake response".to_string())
         }
 
-        fn notify(
+        async fn notify(
             &mut self,
             method: &str,
             _params: Value,
@@ -1140,8 +1355,8 @@ mod tests {
         assert_eq!(build_tool_name("server", "???"), None);
     }
 
-    #[test]
-    fn initialize_and_list_tools_handles_pagination() {
+    #[tokio::test]
+    async fn initialize_and_list_tools_handles_pagination() {
         let mut transport = FakeTransport::new(vec![
             json!({"serverInfo": {"name": "fake"}}),
             json!({
@@ -1160,8 +1375,9 @@ mod tests {
             }),
         ]);
 
-        let tools =
-            initialize_and_list_tools(&mut transport, Duration::from_secs(1)).expect("list tools");
+        let tools = initialize_and_list_tools(&mut transport, Duration::from_secs(1))
+            .await
+            .expect("list tools");
 
         assert_eq!(
             transport.requests,
@@ -1181,8 +1397,8 @@ mod tests {
         assert_eq!(lookup["mcp__docs__search"], "search");
     }
 
-    #[test]
-    fn call_tool_wraps_success_and_error_results() {
+    #[tokio::test]
+    async fn call_tool_wraps_success_and_error_results() {
         let mut success_transport = FakeTransport::new(vec![json!({
             "content": [{"type": "text", "text": "ok"}],
             "structuredContent": {"value": 1}
@@ -1194,6 +1410,7 @@ mod tests {
             json!({"path": "a.txt"}),
             Duration::from_secs(1),
         )
+        .await
         .expect("call tool");
         let result = mcp_call_result("fs", "read", success);
         assert!(result.ok);
@@ -1209,6 +1426,7 @@ mod tests {
             json!({"path": "a.txt"}),
             Duration::from_secs(1),
         )
+        .await
         .expect("call error tool");
         let result = mcp_call_result("fs", "write", error);
         assert!(!result.ok);
@@ -1267,13 +1485,15 @@ mod tests {
     }
 
     #[cfg(not(windows))]
-    #[test]
-    fn mcp_tool_cache_reuses_stdio_process_between_discoveries() {
+    #[tokio::test]
+    async fn mcp_tool_cache_reuses_stdio_process_between_discoveries() {
         let fixture = fake_server(false, false);
         let cache = McpToolCache::new();
 
-        let first = discover_tools(&fixture.root, std::slice::from_ref(&fixture.config), &cache);
-        let second = discover_tools(&fixture.root, std::slice::from_ref(&fixture.config), &cache);
+        let first =
+            discover_tools(&fixture.root, std::slice::from_ref(&fixture.config), &cache).await;
+        let second =
+            discover_tools(&fixture.root, std::slice::from_ref(&fixture.config), &cache).await;
 
         assert!(first.diagnostics.is_empty());
         assert!(second.diagnostics.is_empty());
@@ -1283,14 +1503,16 @@ mod tests {
     }
 
     #[cfg(not(windows))]
-    #[test]
-    fn mcp_tool_cache_restarts_dead_stdio_process_on_next_discovery() {
+    #[tokio::test]
+    async fn mcp_tool_cache_restarts_dead_stdio_process_on_next_discovery() {
         let fixture = fake_server(true, false);
         let cache = McpToolCache::new();
 
-        let first = discover_tools(&fixture.root, std::slice::from_ref(&fixture.config), &cache);
+        let first =
+            discover_tools(&fixture.root, std::slice::from_ref(&fixture.config), &cache).await;
         thread::sleep(Duration::from_millis(100));
-        let second = discover_tools(&fixture.root, std::slice::from_ref(&fixture.config), &cache);
+        let second =
+            discover_tools(&fixture.root, std::slice::from_ref(&fixture.config), &cache).await;
 
         assert!(first.diagnostics.is_empty());
         assert!(second.diagnostics.is_empty());
@@ -1300,15 +1522,15 @@ mod tests {
     }
 
     #[cfg(not(windows))]
-    #[test]
-    fn bad_mcp_server_is_skipped_without_blocking_good_server() {
+    #[tokio::test]
+    async fn bad_mcp_server_is_skipped_without_blocking_good_server() {
         let fixture = fake_server(false, false);
         let mut bad = fixture.config.clone();
         bad.name = "bad".to_string();
         bad.command = "definitely-not-a-real-morrow-mcp-command".to_string();
 
         let cache = McpToolCache::new();
-        let discovery = discover_tools(&fixture.root, &[bad, fixture.config.clone()], &cache);
+        let discovery = discover_tools(&fixture.root, &[bad, fixture.config.clone()], &cache).await;
 
         assert_eq!(discovery.tools.len(), 1);
         assert_eq!(discovery.diagnostics.len(), 1);
@@ -1316,13 +1538,13 @@ mod tests {
     }
 
     #[cfg(not(windows))]
-    #[test]
-    fn stderr_tail_is_included_in_discovery_diagnostics() {
+    #[tokio::test]
+    async fn stderr_tail_is_included_in_discovery_diagnostics() {
         let fixture = fake_server(false, true);
         let cache = McpToolCache::new();
 
         let discovery =
-            discover_tools(&fixture.root, std::slice::from_ref(&fixture.config), &cache);
+            discover_tools(&fixture.root, std::slice::from_ref(&fixture.config), &cache).await;
 
         assert!(discovery.tools.is_empty());
         assert_eq!(discovery.diagnostics.len(), 1);
@@ -1330,8 +1552,8 @@ mod tests {
         assert!(discovery.diagnostics[0].contains("tail-message"));
     }
 
-    #[test]
-    fn http_mcp_server_lists_and_calls_tools_with_session_headers() {
+    #[tokio::test]
+    async fn http_mcp_server_lists_and_calls_tools_with_session_headers() {
         let server = TestHttpServer::start(vec![
             TestHttpResponse::json(json!({
                 "jsonrpc": "2.0",
@@ -1368,7 +1590,7 @@ mod tests {
         );
         let cache = McpToolCache::new();
 
-        let discovery = discover_tools(&root, std::slice::from_ref(&config), &cache);
+        let discovery = discover_tools(&root, std::slice::from_ref(&config), &cache).await;
         assert!(discovery.diagnostics.is_empty());
         assert_eq!(discovery.tools.len(), 1);
         assert_eq!(
@@ -1376,10 +1598,12 @@ mod tests {
             "mcp__remote__echo"
         );
 
-        let execution = discovery.tools[0].execute(
-            &ToolCall::function("call_1", "mcp__remote__echo", r#"{"text":"hello"}"#),
-            None,
-        );
+        let execution = discovery.tools[0]
+            .execute(
+                ToolCall::function("call_1", "mcp__remote__echo", r#"{"text":"hello"}"#),
+                None,
+            )
+            .await;
         let ToolExecution::Completed(result) = execution else {
             panic!("expected completed MCP call");
         };
@@ -1425,8 +1649,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn http_mcp_tools_list_accepts_sse_response() {
+    #[tokio::test]
+    async fn http_mcp_tools_list_accepts_sse_response() {
         let server = TestHttpServer::start(vec![
             TestHttpResponse::json(json!({
                 "jsonrpc": "2.0",
@@ -1449,7 +1673,7 @@ mod tests {
         let config = http_config("remote", server.url(), BTreeMap::new());
         let cache = McpToolCache::new();
 
-        let discovery = discover_tools(&root, std::slice::from_ref(&config), &cache);
+        let discovery = discover_tools(&root, std::slice::from_ref(&config), &cache).await;
 
         assert!(discovery.diagnostics.is_empty());
         assert_eq!(discovery.tools.len(), 1);
@@ -1459,8 +1683,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn http_mcp_reinitializes_once_after_session_expiry() {
+    #[tokio::test]
+    async fn http_mcp_reinitializes_once_after_session_expiry() {
         let server = TestHttpServer::start(vec![
             TestHttpResponse::json(json!({
                 "jsonrpc": "2.0",
@@ -1487,7 +1711,7 @@ mod tests {
         let config = http_config("remote", server.url(), BTreeMap::new());
         let cache = McpToolCache::new();
 
-        let discovery = discover_tools(&root, std::slice::from_ref(&config), &cache);
+        let discovery = discover_tools(&root, std::slice::from_ref(&config), &cache).await;
 
         assert!(discovery.diagnostics.is_empty());
         assert_eq!(discovery.tools.len(), 1);
@@ -1513,8 +1737,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn http_mcp_cache_reuses_session_between_discoveries() {
+    #[tokio::test]
+    async fn http_mcp_cache_reuses_session_between_discoveries() {
         let server = TestHttpServer::start(vec![
             TestHttpResponse::json(json!({
                 "jsonrpc": "2.0",
@@ -1533,8 +1757,8 @@ mod tests {
         let config = http_config("remote", server.url(), BTreeMap::new());
         let cache = McpToolCache::new();
 
-        let first = discover_tools(&root, std::slice::from_ref(&config), &cache);
-        let second = discover_tools(&root, std::slice::from_ref(&config), &cache);
+        let first = discover_tools(&root, std::slice::from_ref(&config), &cache).await;
+        let second = discover_tools(&root, std::slice::from_ref(&config), &cache).await;
 
         assert!(first.diagnostics.is_empty());
         assert!(second.diagnostics.is_empty());
@@ -1544,8 +1768,8 @@ mod tests {
     }
 
     #[cfg(not(windows))]
-    #[test]
-    fn bad_http_mcp_server_is_skipped_without_blocking_good_server() {
+    #[tokio::test]
+    async fn bad_http_mcp_server_is_skipped_without_blocking_good_server() {
         let http = TestHttpServer::start(vec![TestHttpResponse::status(
             StatusCode::INTERNAL_SERVER_ERROR,
             "nope",
@@ -1554,7 +1778,7 @@ mod tests {
         let bad = http_config("bad-http", http.url(), BTreeMap::new());
         let cache = McpToolCache::new();
 
-        let discovery = discover_tools(&good.root, &[bad, good.config.clone()], &cache);
+        let discovery = discover_tools(&good.root, &[bad, good.config.clone()], &cache).await;
 
         assert_eq!(discovery.tools.len(), 1);
         assert_eq!(discovery.diagnostics.len(), 1);
