@@ -141,6 +141,7 @@ export interface ApprovalDecision {
 
 export type AgentEvent =
   | { type: 'turn_started' }
+  | { type: 'warning'; data: string }
   | { type: 'text_delta'; data: string }
   | { type: 'agent_message'; data: string }
   | { type: 'tool_call_started'; data: { id: string; name: string } }

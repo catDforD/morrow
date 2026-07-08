@@ -20,6 +20,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
+pub use mcp::McpToolCache;
+
 const DEFAULT_READ_LINES: usize = 200;
 const MAX_READ_LINES: usize = 1000;
 const DEFAULT_LIST_ENTRIES: usize = 100;
@@ -64,6 +66,12 @@ struct RegisteredTool {
 #[derive(Clone)]
 pub struct ToolRegistry {
     tools: Vec<RegisteredTool>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolRegistryBuild {
+    pub registry: ToolRegistry,
+    pub diagnostics: Vec<String>,
 }
 
 impl std::fmt::Debug for ToolRegistry {
@@ -121,17 +129,22 @@ impl ToolRegistry {
         Ok(registry)
     }
 
-    pub fn with_mcp_servers(
+    pub fn with_mcp_cache(
         root: impl Into<PathBuf>,
         permissions: PermissionProfile,
         mcp_servers: &[McpServerConfig],
-    ) -> Result<Self, ToolRegistryError> {
+        mcp_cache: &McpToolCache,
+    ) -> Result<ToolRegistryBuild, ToolRegistryError> {
         let root = root.into();
         let mut registry = Self::built_in(&root, permissions)?;
-        for tool in mcp::discover_stdio_tools(&root, mcp_servers)? {
+        let discovery = mcp::discover_stdio_tools(&root, mcp_servers, mcp_cache);
+        for tool in discovery.tools {
             registry.register(tool)?;
         }
-        Ok(registry)
+        Ok(ToolRegistryBuild {
+            registry,
+            diagnostics: discovery.diagnostics,
+        })
     }
 
     pub fn register(&mut self, tool: Arc<dyn Tool>) -> Result<(), ToolRegistryError> {

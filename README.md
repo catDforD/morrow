@@ -101,7 +101,7 @@ The inline `[model].OPENAI_API_KEY` value takes priority when present. Otherwise
 
 ### MCP stdio tools
 
-Morrow can register stdio MCP servers from the same config file. Tools are exposed directly to the model as `mcp__server__tool` names after Morrow starts the server and calls `tools/list`.
+Morrow can register stdio MCP servers from the same config file. Tools are exposed directly to the model as `mcp__server__tool` names after Morrow starts the server and calls `tools/list`. Stdio MCP servers are kept in a process cache for the CLI/server lifetime, so repeated turns reuse the initialized server and cached tool list when the server configuration has not changed.
 
 ```toml
 [mcp_servers.filesystem]
@@ -114,7 +114,7 @@ startup_timeout_sec = 10
 tool_timeout_sec = 60
 ```
 
-MCP support is intentionally narrow in v1: only stdio servers are supported. HTTP, OAuth, deferred search, persistent process pools, and per-tool approval policies are not implemented yet. MCP tools are treated as explicitly configured trusted tools, so review server commands before enabling them.
+MCP support is intentionally narrow in v1: only stdio servers are supported. HTTP, OAuth, deferred search, and per-tool approval policies are not implemented yet. MCP tools are treated as explicitly configured trusted tools, so review server commands before enabling them.
 
 ## Run
 

@@ -6,7 +6,8 @@ use agent_protocol::{
     ToolExecutionSummary,
 };
 use agent_runtime::{
-    AgentEventEnvelope, CompactionOutcome, RunAgentTurnOutcome, SessionStore, TurnEventHandler,
+    AgentEventEnvelope, CompactionOutcome, McpToolCache, RunAgentTurnOutcome, SessionStore,
+    TurnEventHandler,
 };
 use clap::{Parser, Subcommand};
 use futures_util::future::{BoxFuture, FutureExt};
@@ -219,6 +220,7 @@ async fn run() -> Result<(), CliError> {
     } else {
         session_store.load()?
     };
+    let mcp_cache = McpToolCache::new();
 
     if prompt.trim().is_empty() {
         let mut permissions = permissions;
@@ -233,6 +235,7 @@ async fn run() -> Result<(), CliError> {
                 workspace_root: &workspace_root,
                 config_path: &loaded.path,
                 mcp_servers: &loaded.config.mcp_servers,
+                mcp_cache: &mcp_cache,
             },
             &mut session,
             &mut permissions,
@@ -251,6 +254,7 @@ async fn run() -> Result<(), CliError> {
             workspace_root: &workspace_root,
             permissions,
             mcp_servers: &loaded.config.mcp_servers,
+            mcp_cache: &mcp_cache,
             interactive_approvals: io::stdin().is_terminal(),
             output: if args.jsonl {
                 OutputMode::Jsonl {
@@ -287,6 +291,7 @@ struct ReplContext<'a> {
     workspace_root: &'a Path,
     config_path: &'a Path,
     mcp_servers: &'a [McpServerConfig],
+    mcp_cache: &'a McpToolCache,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -298,6 +303,7 @@ struct RunAgentTurnContext<'a> {
     workspace_root: &'a Path,
     permissions: PermissionProfile,
     mcp_servers: &'a [McpServerConfig],
+    mcp_cache: &'a McpToolCache,
     interactive_approvals: bool,
     output: OutputMode<'a>,
 }
@@ -362,6 +368,7 @@ async fn run_repl(
                 workspace_root: context.workspace_root,
                 permissions: *permissions,
                 mcp_servers: context.mcp_servers,
+                mcp_cache: context.mcp_cache,
                 interactive_approvals: io::stdin().is_terminal(),
                 output: OutputMode::Human,
             },
@@ -477,6 +484,7 @@ async fn run_agent_turn(
             workspace_root: context.workspace_root,
             permissions: context.permissions,
             mcp_servers: context.mcp_servers,
+            mcp_cache: context.mcp_cache,
             session_name,
             turn_index,
         },
@@ -520,6 +528,11 @@ impl TurnEventHandler for CliTurnHandler<'_, '_> {
 
         match &envelope.event {
             AgentEvent::TurnStarted => {}
+            AgentEvent::Warning(message) => {
+                if self.context.output == OutputMode::Human {
+                    eprintln!("warning: {message}");
+                }
+            }
             AgentEvent::TextDelta(text) => {
                 if self.context.output == OutputMode::Human {
                     self.wrote_text = true;
@@ -1525,6 +1538,7 @@ compact test
         let client = client(base_url);
         let mut session = Session::new();
         let mut output = Vec::new();
+        let mcp_cache = McpToolCache::new();
 
         let outcome = run_agent_turn(
             RunAgentTurnContext {
@@ -1535,6 +1549,7 @@ compact test
                 workspace_root: &root,
                 permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
                 mcp_servers: &[],
+                mcp_cache: &mcp_cache,
                 interactive_approvals: false,
                 output: OutputMode::Human,
             },
@@ -1569,6 +1584,7 @@ compact test
         let client = client(base_url);
         let mut session = Session::new();
         let mut output = Vec::new();
+        let mcp_cache = McpToolCache::new();
 
         let outcome = run_agent_turn(
             RunAgentTurnContext {
@@ -1579,6 +1595,7 @@ compact test
                 workspace_root: &root,
                 permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
                 mcp_servers: &[],
+                mcp_cache: &mcp_cache,
                 interactive_approvals: false,
                 output: OutputMode::Jsonl {
                     session_name: "default",
@@ -1618,6 +1635,68 @@ compact test
     }
 
     #[tokio::test]
+    async fn run_agent_turn_jsonl_outputs_mcp_warning_events() {
+        let root = unique_cli_dir("jsonl-mcp-warning");
+        let (base_url, _) = spawn_recording_sse_server(vec![sse_text_body("ok")]).await;
+        let client = client(base_url);
+        let mut session = Session::new();
+        let mut output = Vec::new();
+        let mcp_cache = McpToolCache::new();
+        let mcp_servers = vec![McpServerConfig {
+            name: "bad".to_string(),
+            command: "definitely-not-a-real-morrow-mcp-command".to_string(),
+            args: Vec::new(),
+            env: Default::default(),
+            cwd: None,
+            enabled: true,
+            startup_timeout_sec: 1,
+            tool_timeout_sec: 1,
+        }];
+
+        let outcome = run_agent_turn(
+            RunAgentTurnContext {
+                client: &client,
+                system_prompt: "system",
+                context_config: context_config(2),
+                model_limits: model_limits(10_000),
+                workspace_root: &root,
+                permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
+                mcp_servers: &mcp_servers,
+                mcp_cache: &mcp_cache,
+                interactive_approvals: false,
+                output: OutputMode::Jsonl {
+                    session_name: "default",
+                    turn_index: 0,
+                },
+            },
+            &mut session,
+            "hello",
+            &mut output,
+        )
+        .await
+        .expect("run turn");
+
+        assert_eq!(outcome.error, None);
+        let text = String::from_utf8(output).expect("utf8 output");
+        let lines = text
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json line"))
+            .collect::<Vec<_>>();
+        assert_eq!(lines[0]["event"]["type"], "warning");
+        assert!(
+            lines[0]["event"]["data"]
+                .as_str()
+                .expect("warning text")
+                .contains("mcp server bad")
+        );
+        assert_eq!(lines[1]["event"], json!({"type": "turn_started"}));
+        assert_eq!(
+            lines.last().expect("last")["event"]["type"],
+            "turn_completed"
+        );
+    }
+
+    #[tokio::test]
     async fn run_agent_turn_jsonl_suppresses_human_execution_summary() {
         let root = unique_cli_dir("jsonl-tool");
         fs::write(root.join("note.txt"), "tool result\n").expect("write note");
@@ -1631,6 +1710,7 @@ compact test
         let client = client(base_url);
         let mut session = Session::new();
         let mut output = Vec::new();
+        let mcp_cache = McpToolCache::new();
 
         let outcome = run_agent_turn(
             RunAgentTurnContext {
@@ -1641,6 +1721,7 @@ compact test
                 workspace_root: &root,
                 permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
                 mcp_servers: &[],
+                mcp_cache: &mcp_cache,
                 interactive_approvals: false,
                 output: OutputMode::Jsonl {
                     session_name: "default",
@@ -1678,6 +1759,7 @@ compact test
             "large active context that exceeds the tiny budget",
         ));
         let mut output = Vec::new();
+        let mcp_cache = McpToolCache::new();
 
         let outcome = run_agent_turn(
             RunAgentTurnContext {
@@ -1688,6 +1770,7 @@ compact test
                 workspace_root: &root,
                 permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
                 mcp_servers: &[],
+                mcp_cache: &mcp_cache,
                 interactive_approvals: false,
                 output: OutputMode::Human,
             },

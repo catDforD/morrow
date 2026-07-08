@@ -601,6 +601,7 @@ impl TurnRecord {
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum AgentEvent {
     TurnStarted,
+    Warning(String),
     TextDelta(String),
     AgentMessage(String),
     ToolCallStarted {
@@ -789,6 +790,21 @@ mod tests {
                     }
                 }
             ])
+        );
+    }
+
+    #[test]
+    fn serializes_warning_event() {
+        let event = AgentEvent::Warning("mcp server docs: failed to start".to_string());
+
+        let value = serde_json::to_value(&event).expect("serialize warning event");
+
+        assert_eq!(
+            value,
+            json!({
+                "type": "warning",
+                "data": "mcp server docs: failed to start"
+            })
         );
     }
 

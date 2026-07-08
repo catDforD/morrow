@@ -2,7 +2,8 @@ use agent_config::{ContextConfig, McpServerConfig, ModelContextLimits};
 use agent_model::OpenAiCompatClient;
 use agent_protocol::{ApprovalDecision, PermissionProfile, Session, SessionDocument};
 use agent_runtime::{
-    AgentEventEnvelope, RunAgentTurnContext, SessionEntry, SessionStore, TurnEventHandler,
+    AgentEventEnvelope, McpToolCache, RunAgentTurnContext, SessionEntry, SessionStore,
+    TurnEventHandler,
 };
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
@@ -66,6 +67,7 @@ pub fn router(options: ServerOptions) -> Router {
         inner: Arc::new(ServerState {
             options,
             sessions: Mutex::new(HashMap::new()),
+            mcp_cache: McpToolCache::new(),
         }),
     };
 
@@ -91,6 +93,7 @@ struct AppState {
 struct ServerState {
     options: ServerOptions,
     sessions: Mutex<HashMap<String, SessionRuntime>>,
+    mcp_cache: McpToolCache,
 }
 
 struct SessionRuntime {
@@ -549,6 +552,7 @@ async fn run_turn_task_inner(
             workspace_root: &options.workspace_root,
             permissions: options.permissions,
             mcp_servers: &options.mcp_servers,
+            mcp_cache: &state.inner.mcp_cache,
             session_name: &session_name,
             turn_index,
         },
@@ -838,6 +842,7 @@ mod tests {
             inner: Arc::new(ServerState {
                 options: test_options(),
                 sessions: Mutex::new(HashMap::new()),
+                mcp_cache: McpToolCache::new(),
             }),
         }
     }

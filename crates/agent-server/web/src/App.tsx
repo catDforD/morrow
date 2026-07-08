@@ -440,6 +440,9 @@ export default function App() {
           refreshCurrentModelStep('Model call started', selectedRef.current)
           recordActivity('Turn started', selectedRef.current, 'running')
           break
+        case 'warning':
+          recordActivity('Warning', event.data, 'error')
+          break
         case 'text_delta':
           appendAssistantDelta(event.data)
           break

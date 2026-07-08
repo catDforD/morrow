@@ -1,56 +1,149 @@
-use crate::{Tool, ToolExecution, ToolRegistryError, ToolResult};
+use crate::{Tool, ToolExecution, ToolResult};
 use agent_config::McpServerConfig;
 use agent_protocol::{ToolCall, ToolDefinition, ToolExecutionSummary};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::{BTreeSet, HashMap};
-use std::io::{BufRead, BufReader, Write};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{self, Receiver};
+use std::process::{Child, ChildStderr, ChildStdin, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
+const STDERR_TAIL_BYTES: usize = 8192;
+
+#[derive(Default)]
+pub struct McpToolCache {
+    entries: Mutex<HashMap<McpServerKey, Arc<CachedMcpServer>>>,
+}
+
+impl McpToolCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn get_or_start(
+        &self,
+        config: &McpServerConfig,
+        cwd: PathBuf,
+    ) -> Result<Arc<CachedMcpServer>, String> {
+        let key = McpServerKey::from_config(config, &cwd);
+        let mut entries = self
+            .entries
+            .lock()
+            .map_err(|_| "MCP cache lock poisoned".to_string())?;
+
+        if let Some(entry) = entries.get(&key) {
+            if entry.runtime.is_healthy() {
+                return Ok(entry.clone());
+            }
+            entries.remove(&key);
+        }
+
+        let entry = start_stdio_server(config, cwd)?;
+        entries.insert(key, entry.clone());
+        Ok(entry)
+    }
+}
+
+impl std::fmt::Debug for McpToolCache {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let entry_count = self
+            .entries
+            .lock()
+            .map(|entries| entries.len())
+            .unwrap_or(0);
+        formatter
+            .debug_struct("McpToolCache")
+            .field("entry_count", &entry_count)
+            .finish()
+    }
+}
+
+pub struct McpDiscovery {
+    pub tools: Vec<Arc<dyn Tool>>,
+    pub diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct McpServerKey {
+    name: String,
+    command: String,
+    args: Vec<String>,
+    env: BTreeMap<String, String>,
+    cwd: PathBuf,
+    startup_timeout_sec: u64,
+    tool_timeout_sec: u64,
+}
+
+impl McpServerKey {
+    fn from_config(config: &McpServerConfig, cwd: &Path) -> Self {
+        Self {
+            name: config.name.clone(),
+            command: config.command.clone(),
+            args: config.args.clone(),
+            env: config.env.clone(),
+            cwd: cwd.to_path_buf(),
+            startup_timeout_sec: config.startup_timeout_sec,
+            tool_timeout_sec: config.tool_timeout_sec,
+        }
+    }
+}
+
+struct CachedMcpServer {
+    runtime: Arc<McpServerRuntime>,
+    listed_tools: Vec<ListedTool>,
+}
 
 pub fn discover_stdio_tools(
     workspace_root: &Path,
     servers: &[McpServerConfig],
-) -> Result<Vec<Arc<dyn Tool>>, ToolRegistryError> {
+    cache: &McpToolCache,
+) -> McpDiscovery {
     let mut tools = Vec::new();
+    let mut diagnostics = Vec::new();
+    let mut emitted_names = BTreeSet::new();
+
     for server in servers.iter().filter(|server| server.enabled) {
-        let tool = discover_stdio_server(workspace_root, server).map_err(|message| {
-            ToolRegistryError::McpServer {
-                server: server.name.clone(),
-                message,
+        let cwd = resolve_cwd(workspace_root, server.cwd.as_deref());
+        let entry = match cache.get_or_start(server, cwd) {
+            Ok(entry) => entry,
+            Err(message) => {
+                diagnostics.push(format!("mcp server {}: {message}", server.name));
+                continue;
             }
-        })?;
-        tools.push(tool as Arc<dyn Tool>);
+        };
+
+        if let Some(tool) =
+            build_tool_provider(&server.name, entry, &mut emitted_names, &mut diagnostics)
+        {
+            tools.push(tool as Arc<dyn Tool>);
+        }
     }
-    Ok(tools)
+
+    McpDiscovery { tools, diagnostics }
 }
 
-fn discover_stdio_server(
-    workspace_root: &Path,
+fn start_stdio_server(
     config: &McpServerConfig,
-) -> Result<Arc<McpToolProvider>, String> {
+    cwd: PathBuf,
+) -> Result<Arc<CachedMcpServer>, String> {
     let startup_timeout = Duration::from_secs(config.startup_timeout_sec);
     let tool_timeout = Duration::from_secs(config.tool_timeout_sec);
-    let cwd = resolve_cwd(workspace_root, config.cwd.as_deref());
     let mut transport = StdioTransport::start(config, cwd, startup_timeout)?;
     let listed_tools = initialize_and_list_tools(&mut transport, startup_timeout)?;
-    let (definitions, lookup) = build_tool_definitions(&config.name, listed_tools)?;
     let runtime = Arc::new(McpServerRuntime {
         name: config.name.clone(),
         transport: Mutex::new(transport),
         tool_timeout,
     });
 
-    Ok(Arc::new(McpToolProvider {
+    Ok(Arc::new(CachedMcpServer {
         runtime,
-        definitions,
-        lookup,
+        listed_tools,
     }))
 }
 
@@ -60,6 +153,80 @@ fn resolve_cwd(workspace_root: &Path, configured: Option<&Path>) -> PathBuf {
         Some(path) => workspace_root.join(path),
         None => workspace_root.to_path_buf(),
     }
+}
+
+fn build_tool_provider(
+    server_name: &str,
+    entry: Arc<CachedMcpServer>,
+    emitted_names: &mut BTreeSet<String>,
+    diagnostics: &mut Vec<String>,
+) -> Option<Arc<McpToolProvider>> {
+    let (definitions, lookup) =
+        build_tool_definitions(server_name, &entry.listed_tools, emitted_names, diagnostics);
+
+    (!definitions.is_empty()).then(|| {
+        Arc::new(McpToolProvider {
+            runtime: entry.runtime.clone(),
+            definitions,
+            lookup,
+        })
+    })
+}
+
+fn build_tool_definitions(
+    server_name: &str,
+    tools: &[ListedTool],
+    emitted_names: &mut BTreeSet<String>,
+    diagnostics: &mut Vec<String>,
+) -> (Vec<ToolDefinition>, HashMap<String, String>) {
+    let mut server_names = BTreeSet::new();
+    let mut definitions = Vec::with_capacity(tools.len());
+    let mut lookup = HashMap::with_capacity(tools.len());
+
+    for tool in tools {
+        let Some(normalized) = build_tool_name(server_name, &tool.name) else {
+            diagnostics.push(format!(
+                "mcp server {server_name}: skipped tool {:?}: normalized tool name is empty",
+                tool.name
+            ));
+            continue;
+        };
+
+        if !server_names.insert(normalized.clone()) {
+            diagnostics.push(format!(
+                "mcp server {server_name}: skipped duplicate tool after normalization: {normalized}"
+            ));
+            continue;
+        }
+
+        if !emitted_names.insert(normalized.clone()) {
+            diagnostics.push(format!(
+                "mcp server {server_name}: skipped duplicate MCP tool name after normalization: {normalized}"
+            ));
+            continue;
+        }
+
+        let description = match tool
+            .description
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+        {
+            Some(description) => format!("MCP tool from server '{server_name}': {description}"),
+            None => format!("MCP tool from server '{server_name}'."),
+        };
+        let parameters = tool
+            .input_schema
+            .clone()
+            .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+        definitions.push(ToolDefinition::function(
+            normalized.clone(),
+            description,
+            parameters,
+        ));
+        lookup.insert(normalized, tool.name.clone());
+    }
+
+    (definitions, lookup)
 }
 
 struct McpToolProvider {
@@ -116,6 +283,13 @@ impl McpServerRuntime {
             .map_err(|_| "MCP transport lock poisoned".to_string())?;
         call_tool(&mut *transport, tool_name, arguments, self.tool_timeout)
     }
+
+    fn is_healthy(&self) -> bool {
+        self.transport
+            .lock()
+            .map(|mut transport| transport.is_healthy())
+            .unwrap_or(false)
+    }
 }
 
 trait JsonRpcTransport {
@@ -128,7 +302,9 @@ struct StdioTransport {
     child: Child,
     stdin: ChildStdin,
     responses: Receiver<Result<Value, String>>,
+    stderr_tail: Arc<Mutex<TailBuffer>>,
     next_id: u64,
+    failed: bool,
 }
 
 impl StdioTransport {
@@ -144,7 +320,7 @@ impl StdioTransport {
             .envs(&config.env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
 
         let mut child = command
             .spawn()
@@ -157,14 +333,21 @@ impl StdioTransport {
             .stdout
             .take()
             .ok_or_else(|| "failed to capture MCP server stdout".to_string())?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| "failed to capture MCP server stderr".to_string())?;
+        let stderr_tail = Arc::new(Mutex::new(TailBuffer::new(STDERR_TAIL_BYTES)));
+
         let (tx, responses) = mpsc::channel();
         thread::spawn(move || {
             let reader = BufReader::new(stdout);
             for line in reader.lines() {
                 let message = match line {
                     Ok(line) if line.trim().is_empty() => continue,
-                    Ok(line) => serde_json::from_str::<Value>(&line)
-                        .map_err(|error| format!("failed to parse MCP JSON-RPC message: {error}")),
+                    Ok(line) => serde_json::from_str::<Value>(&line).map_err(|error| {
+                        format!("failed to parse MCP JSON-RPC message: {error}; line: {line}")
+                    }),
                     Err(error) => Err(format!("failed to read MCP server stdout: {error}")),
                 };
                 if tx.send(message).is_err() {
@@ -172,12 +355,15 @@ impl StdioTransport {
                 }
             }
         });
+        spawn_stderr_tail(stderr, stderr_tail.clone());
 
         let mut transport = Self {
             child,
             stdin,
             responses,
+            stderr_tail,
             next_id: 1,
+            failed: false,
         };
         transport.ensure_started(startup_timeout)?;
         Ok(transport)
@@ -185,27 +371,65 @@ impl StdioTransport {
 
     fn ensure_started(&mut self, timeout: Duration) -> Result<(), String> {
         match self.child.try_wait() {
-            Ok(Some(status)) => Err(format!("MCP stdio server exited during startup: {status}")),
+            Ok(Some(status)) => {
+                self.fail(format!("MCP stdio server exited during startup: {status}"))
+            }
             Ok(None) => {
                 if timeout.is_zero() {
-                    Err("MCP startup timeout must be greater than zero".to_string())
+                    self.fail("MCP startup timeout must be greater than zero".to_string())
                 } else {
                     Ok(())
                 }
             }
-            Err(error) => Err(format!("failed to inspect MCP server status: {error}")),
+            Err(error) => self.fail(format!("failed to inspect MCP server status: {error}")),
+        }
+    }
+
+    fn is_healthy(&mut self) -> bool {
+        if self.failed {
+            return false;
+        }
+        match self.child.try_wait() {
+            Ok(None) => true,
+            Ok(Some(_)) | Err(_) => {
+                self.failed = true;
+                false
+            }
         }
     }
 
     fn write_message(&mut self, message: Value) -> Result<(), String> {
-        serde_json::to_writer(&mut self.stdin, &message)
-            .map_err(|error| format!("failed to encode MCP JSON-RPC message: {error}"))?;
-        self.stdin
-            .write_all(b"\n")
-            .map_err(|error| format!("failed to write MCP JSON-RPC message: {error}"))?;
-        self.stdin
-            .flush()
-            .map_err(|error| format!("failed to flush MCP JSON-RPC message: {error}"))
+        if let Err(error) = serde_json::to_writer(&mut self.stdin, &message) {
+            return self.fail(format!("failed to encode MCP JSON-RPC message: {error}"));
+        }
+        if let Err(error) = self.stdin.write_all(b"\n") {
+            return self.fail(format!("failed to write MCP JSON-RPC message: {error}"));
+        }
+        if let Err(error) = self.stdin.flush() {
+            return self.fail(format!("failed to flush MCP JSON-RPC message: {error}"));
+        }
+        Ok(())
+    }
+
+    fn fail<T>(&mut self, message: String) -> Result<T, String> {
+        self.failed = true;
+        Err(self.with_stderr_tail(message))
+    }
+
+    fn with_stderr_tail(&self, message: String) -> String {
+        let tail = self.stderr_tail();
+        if tail.is_empty() {
+            message
+        } else {
+            format!("{message}; stderr tail: {tail}")
+        }
+    }
+
+    fn stderr_tail(&self) -> String {
+        self.stderr_tail
+            .lock()
+            .map(|tail| tail.as_string())
+            .unwrap_or_else(|_| "stderr tail unavailable: lock poisoned".to_string())
     }
 }
 
@@ -228,12 +452,26 @@ impl JsonRpcTransport for StdioTransport {
         }))?;
 
         loop {
-            let message = self
-                .responses
-                .recv_timeout(timeout)
-                .map_err(|_| format!("MCP request {method} timed out"))??;
-            if message.get("id") != Some(&json!(id)) {
+            let message = match self.responses.recv_timeout(timeout) {
+                Ok(Ok(message)) => message,
+                Ok(Err(error)) => return self.fail(error),
+                Err(RecvTimeoutError::Timeout) => {
+                    return self.fail(format!("MCP request {method} timed out"));
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    return self.fail(format!(
+                        "MCP request {method} failed: MCP server stdout closed"
+                    ));
+                }
+            };
+
+            let Some(response_id) = message.get("id") else {
                 continue;
+            };
+            if response_id != &json!(id) {
+                return self.fail(format!(
+                    "MCP response id mismatch for {method}: expected {id}, got {response_id}"
+                ));
             }
             if let Some(error) = message.get("error") {
                 return Err(format!("MCP request {method} failed: {error}"));
@@ -248,6 +486,55 @@ impl JsonRpcTransport for StdioTransport {
             "method": method,
             "params": params,
         }))
+    }
+}
+
+fn spawn_stderr_tail(stderr: ChildStderr, tail: Arc<Mutex<TailBuffer>>) {
+    thread::spawn(move || {
+        let mut stderr = stderr;
+        let mut buffer = [0u8; 4096];
+        loop {
+            match stderr.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(bytes) => {
+                    if let Ok(mut tail) = tail.lock() {
+                        tail.push(&buffer[..bytes]);
+                    }
+                }
+                Err(error) => {
+                    if let Ok(mut tail) = tail.lock() {
+                        tail.push(format!("\n[stderr read error: {error}]").as_bytes());
+                    }
+                    break;
+                }
+            }
+        }
+    });
+}
+
+struct TailBuffer {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl TailBuffer {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            limit,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        self.bytes.extend_from_slice(bytes);
+        if self.bytes.len() > self.limit {
+            let overflow = self.bytes.len() - self.limit;
+            self.bytes.drain(..overflow);
+        }
+    }
+
+    fn as_string(&self) -> String {
+        String::from_utf8_lossy(&self.bytes).trim().to_string()
     }
 }
 
@@ -310,46 +597,6 @@ fn call_tool<T: JsonRpcTransport>(
     )?;
     serde_json::from_value::<CallToolResult>(result)
         .map_err(|error| format!("invalid tools/call response: {error}"))
-}
-
-fn build_tool_definitions(
-    server_name: &str,
-    tools: Vec<ListedTool>,
-) -> Result<(Vec<ToolDefinition>, HashMap<String, String>), String> {
-    let mut names = BTreeSet::new();
-    let mut definitions = Vec::with_capacity(tools.len());
-    let mut lookup = HashMap::with_capacity(tools.len());
-    for tool in tools {
-        let normalized = build_tool_name(server_name, &tool.name).ok_or_else(|| {
-            format!(
-                "MCP tool name normalizes to empty: server={server_name}, tool={}",
-                tool.name
-            )
-        })?;
-        if !names.insert(normalized.clone()) {
-            return Err(format!(
-                "duplicate MCP tool name after normalization: {normalized}"
-            ));
-        }
-        let description = match tool
-            .description
-            .as_deref()
-            .filter(|text| !text.trim().is_empty())
-        {
-            Some(description) => format!("MCP tool from server '{server_name}': {description}"),
-            None => format!("MCP tool from server '{server_name}'."),
-        };
-        let parameters = tool
-            .input_schema
-            .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
-        definitions.push(ToolDefinition::function(
-            normalized.clone(),
-            description,
-            parameters,
-        ));
-        lookup.insert(normalized, tool.name);
-    }
-    Ok((definitions, lookup))
 }
 
 pub fn build_tool_name(server: &str, tool: &str) -> Option<String> {
@@ -480,6 +727,8 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::collections::VecDeque;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     struct FakeTransport {
         requests: Vec<String>,
@@ -555,7 +804,13 @@ mod tests {
         );
         assert_eq!(transport.notifications, ["notifications/initialized"]);
         assert_eq!(tools.len(), 2);
-        let (definitions, lookup) = build_tool_definitions("Docs", tools).expect("definitions");
+
+        let mut emitted = BTreeSet::new();
+        let mut diagnostics = Vec::new();
+        let (definitions, lookup) =
+            build_tool_definitions("Docs", &tools, &mut emitted, &mut diagnostics);
+
+        assert!(diagnostics.is_empty());
         assert_eq!(definitions[0].function.name, "mcp__docs__search");
         assert_eq!(definitions[1].function.name, "mcp__docs__fetch");
         assert_eq!(lookup["mcp__docs__search"], "search");
@@ -597,7 +852,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_mcp_tool_names_are_rejected() {
+    fn duplicate_mcp_tool_names_are_reported_as_diagnostics() {
         let tools = vec![
             ListedTool {
                 name: "Read File".into(),
@@ -610,9 +865,185 @@ mod tests {
                 input_schema: None,
             },
         ];
+        let mut emitted = BTreeSet::new();
+        let mut diagnostics = Vec::new();
 
-        let error = build_tool_definitions("fs", tools).expect_err("duplicate");
+        let (definitions, _) = build_tool_definitions("fs", &tools, &mut emitted, &mut diagnostics);
 
-        assert!(error.contains("duplicate MCP tool name"));
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].contains("skipped duplicate tool"));
+    }
+
+    #[test]
+    fn cross_server_duplicate_mcp_tool_names_are_reported_as_diagnostics() {
+        let first_tools = vec![ListedTool {
+            name: "read".into(),
+            description: None,
+            input_schema: None,
+        }];
+        let second_tools = vec![ListedTool {
+            name: "read".into(),
+            description: None,
+            input_schema: None,
+        }];
+        let mut emitted = BTreeSet::new();
+        let mut diagnostics = Vec::new();
+
+        let (first, _) =
+            build_tool_definitions("FS!", &first_tools, &mut emitted, &mut diagnostics);
+        let (second, _) =
+            build_tool_definitions("FS?", &second_tools, &mut emitted, &mut diagnostics);
+
+        assert_eq!(first.len(), 1);
+        assert!(second.is_empty());
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].contains("duplicate MCP tool name"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn mcp_tool_cache_reuses_stdio_process_between_discoveries() {
+        let fixture = fake_server(false, false);
+        let cache = McpToolCache::new();
+
+        let first =
+            discover_stdio_tools(&fixture.root, std::slice::from_ref(&fixture.config), &cache);
+        let second =
+            discover_stdio_tools(&fixture.root, std::slice::from_ref(&fixture.config), &cache);
+
+        assert!(first.diagnostics.is_empty());
+        assert!(second.diagnostics.is_empty());
+        assert_eq!(first.tools.len(), 1);
+        assert_eq!(second.tools.len(), 1);
+        assert_eq!(started_count(&fixture.marker), 1);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn mcp_tool_cache_restarts_dead_stdio_process_on_next_discovery() {
+        let fixture = fake_server(true, false);
+        let cache = McpToolCache::new();
+
+        let first =
+            discover_stdio_tools(&fixture.root, std::slice::from_ref(&fixture.config), &cache);
+        thread::sleep(Duration::from_millis(100));
+        let second =
+            discover_stdio_tools(&fixture.root, std::slice::from_ref(&fixture.config), &cache);
+
+        assert!(first.diagnostics.is_empty());
+        assert!(second.diagnostics.is_empty());
+        assert_eq!(first.tools.len(), 1);
+        assert_eq!(second.tools.len(), 1);
+        assert_eq!(started_count(&fixture.marker), 2);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn bad_mcp_server_is_skipped_without_blocking_good_server() {
+        let fixture = fake_server(false, false);
+        let mut bad = fixture.config.clone();
+        bad.name = "bad".to_string();
+        bad.command = "definitely-not-a-real-morrow-mcp-command".to_string();
+
+        let cache = McpToolCache::new();
+        let discovery = discover_stdio_tools(&fixture.root, &[bad, fixture.config.clone()], &cache);
+
+        assert_eq!(discovery.tools.len(), 1);
+        assert_eq!(discovery.diagnostics.len(), 1);
+        assert!(discovery.diagnostics[0].contains("mcp server bad"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn stderr_tail_is_included_in_discovery_diagnostics() {
+        let fixture = fake_server(false, true);
+        let cache = McpToolCache::new();
+
+        let discovery =
+            discover_stdio_tools(&fixture.root, std::slice::from_ref(&fixture.config), &cache);
+
+        assert!(discovery.tools.is_empty());
+        assert_eq!(discovery.diagnostics.len(), 1);
+        assert!(discovery.diagnostics[0].contains("MCP request tools/list timed out"));
+        assert!(discovery.diagnostics[0].contains("tail-message"));
+    }
+
+    #[cfg(not(windows))]
+    struct FakeServer {
+        root: PathBuf,
+        marker: PathBuf,
+        config: McpServerConfig,
+    }
+
+    #[cfg(not(windows))]
+    fn fake_server(exit_after_list: bool, hang_on_list: bool) -> FakeServer {
+        let root = unique_dir("mcp");
+        let script = root.join("fake-mcp.sh");
+        let marker = root.join("started.txt");
+        let exit_after_list = if exit_after_list { "1" } else { "0" };
+        let hang_on_list = if hang_on_list { "1" } else { "0" };
+        fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+printf 'started\n' >> '{}'
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":"2025-06-18","capabilities":{{}},"serverInfo":{{"name":"fake","version":"1"}}}}}}'
+      ;;
+    *'"method":"tools/list"'*)
+      if [ "{}" = "1" ]; then
+        printf '%s\n' 'tail-message' >&2
+        sleep 3
+      fi
+      printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"tools":[{{"name":"echo","description":"Echo","inputSchema":{{"type":"object"}}}}]}}}}'
+      if [ "{}" = "1" ]; then
+        exit 0
+      fi
+      ;;
+    *'"method":"tools/call"'*)
+      printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{"content":[{{"type":"text","text":"called"}}]}}}}'
+      ;;
+  esac
+done
+"#,
+                marker.display(),
+                hang_on_list,
+                exit_after_list
+            ),
+        )
+        .expect("write fake server");
+
+        FakeServer {
+            root: root.clone(),
+            marker,
+            config: McpServerConfig {
+                name: "fake".to_string(),
+                command: "sh".to_string(),
+                args: vec![script.display().to_string()],
+                env: BTreeMap::new(),
+                cwd: None,
+                enabled: true,
+                startup_timeout_sec: 1,
+                tool_timeout_sec: 1,
+            },
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn started_count(marker: &Path) -> usize {
+        fs::read_to_string(marker).expect("marker").lines().count()
+    }
+
+    fn unique_dir(name: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("morrow-mcp-{name}-{stamp}"));
+        fs::create_dir_all(&path).expect("create temp dir");
+        path
     }
 }

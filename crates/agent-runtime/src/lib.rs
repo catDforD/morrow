@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
+pub use agent_tools::McpToolCache;
 pub use session_store::{SessionEntry, SessionStore, SessionStoreError};
 
 pub const EVENT_SCHEMA_VERSION: u32 = 1;
@@ -82,6 +83,7 @@ pub struct RunAgentTurnContext<'a> {
     pub workspace_root: &'a Path,
     pub permissions: PermissionProfile,
     pub mcp_servers: &'a [McpServerConfig],
+    pub mcp_cache: &'a McpToolCache,
     pub session_name: &'a str,
     pub turn_index: usize,
 }
@@ -131,11 +133,13 @@ pub async fn run_agent_turn(
         });
     }
 
-    let tools = ToolRegistry::with_mcp_servers(
+    let build = ToolRegistry::with_mcp_cache(
         context.workspace_root,
         context.permissions,
         context.mcp_servers,
+        context.mcp_cache,
     )?;
+    let tools = build.registry;
     let agent = Agent::with_tools(
         context.client.clone(),
         context.system_prompt.to_string(),
@@ -144,6 +148,18 @@ pub async fn run_agent_turn(
     let mut agent_error = None;
     let mut turn_completed = false;
     let mut event_index = 0;
+
+    for diagnostic in build.diagnostics {
+        let envelope = make_event_envelope(
+            context.session_name,
+            context.workspace_root,
+            context.turn_index,
+            event_index,
+            AgentEvent::Warning(diagnostic),
+        );
+        event_index += 1;
+        handler.on_event(&envelope)?;
+    }
 
     {
         let mut stream = agent
@@ -173,6 +189,7 @@ pub async fn run_agent_turn(
                     agent_error = Some(message);
                 }
                 AgentEvent::TurnStarted
+                | AgentEvent::Warning(_)
                 | AgentEvent::TextDelta(_)
                 | AgentEvent::AgentMessage(_)
                 | AgentEvent::ToolCallStarted { .. }
@@ -1074,6 +1091,7 @@ compact test
         let client = client(base_url);
         let mut session = Session::new();
         let mut handler = RecordingHandler::default();
+        let mcp_cache = McpToolCache::new();
 
         let outcome = run_agent_turn(
             RunAgentTurnContext {
@@ -1084,6 +1102,7 @@ compact test
                 workspace_root: &root,
                 permissions: PermissionProfile::for_mode(agent_protocol::PermissionMode::ReadOnly),
                 mcp_servers: &[],
+                mcp_cache: &mcp_cache,
                 session_name: "default",
                 turn_index: 0,
             },
@@ -1147,6 +1166,7 @@ done
         let client = client(base_url);
         let mut session = Session::new();
         let mut handler = RecordingHandler::default();
+        let mcp_cache = McpToolCache::new();
         let mcp_servers = vec![McpServerConfig {
             name: "Docs".to_string(),
             command: "sh".to_string(),
@@ -1167,6 +1187,7 @@ done
                 workspace_root: &root,
                 permissions: PermissionProfile::for_mode(agent_protocol::PermissionMode::ReadOnly),
                 mcp_servers: &mcp_servers,
+                mcp_cache: &mcp_cache,
                 session_name: "default",
                 turn_index: 0,
             },
@@ -1182,6 +1203,136 @@ done
         assert_eq!(requests.len(), 1);
         assert!(requests[0].contains("mcp__docs__search_docs"));
         assert!(requests[0].contains("Search docs"));
+    }
+
+    #[tokio::test]
+    async fn run_agent_turn_emits_mcp_diagnostics_as_warnings() {
+        let root = unique_dir("run-mcp-warning");
+        let (base_url, requests) = spawn_recording_sse_server(vec![sse_text_body("ok")]).await;
+        let client = client(base_url);
+        let mut session = Session::new();
+        let mut handler = RecordingHandler::default();
+        let mcp_cache = McpToolCache::new();
+        let mcp_servers = vec![McpServerConfig {
+            name: "bad".to_string(),
+            command: "definitely-not-a-real-morrow-mcp-command".to_string(),
+            args: Vec::new(),
+            env: Default::default(),
+            cwd: None,
+            enabled: true,
+            startup_timeout_sec: 1,
+            tool_timeout_sec: 1,
+        }];
+
+        let outcome = run_agent_turn(
+            RunAgentTurnContext {
+                client: &client,
+                system_prompt: "system",
+                context_config: context_config(2),
+                model_limits: model_limits(10_000),
+                workspace_root: &root,
+                permissions: PermissionProfile::for_mode(agent_protocol::PermissionMode::ReadOnly),
+                mcp_servers: &mcp_servers,
+                mcp_cache: &mcp_cache,
+                session_name: "default",
+                turn_index: 0,
+            },
+            &mut session,
+            "hello",
+            &mut handler,
+        )
+        .await
+        .expect("run turn");
+
+        assert_eq!(outcome.error, None);
+        assert_eq!(requests.lock().expect("requests lock poisoned").len(), 1);
+        assert!(matches!(
+            &handler.events[0].event,
+            AgentEvent::Warning(message)
+                if message.contains("mcp server bad")
+                    && message.contains("failed to start MCP stdio server")
+        ));
+        assert_eq!(handler.events[0].event_index, 0);
+        assert_eq!(handler.events[1].event, AgentEvent::TurnStarted);
+        assert_eq!(handler.events[1].event_index, 1);
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn run_agent_turn_reuses_mcp_cache_across_turns() {
+        let root = unique_dir("run-mcp-cache");
+        let server_script = root.join("fake-mcp.sh");
+        let marker = root.join("started.txt");
+        fs::write(
+            &server_script,
+            format!(
+                r#"#!/bin/sh
+printf 'started\n' >> '{}'
+count=0
+while IFS= read -r line; do
+  count=$((count + 1))
+  if [ "$count" -eq 1 ]; then
+    printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":"2025-06-18","capabilities":{{}},"serverInfo":{{"name":"fake","version":"1"}}}}}}'
+  elif [ "$count" -eq 3 ]; then
+    printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"tools":[{{"name":"Search Docs","description":"Search docs","inputSchema":{{"type":"object"}}}}]}}}}'
+  fi
+done
+"#,
+                marker.display()
+            ),
+        )
+        .expect("write fake MCP server");
+        let (base_url, requests) =
+            spawn_recording_sse_server(vec![sse_text_body("one"), sse_text_body("two")]).await;
+        let client = client(base_url);
+        let mut session = Session::new();
+        let mut first_handler = RecordingHandler::default();
+        let mut second_handler = RecordingHandler::default();
+        let mcp_cache = McpToolCache::new();
+        let mcp_servers = vec![McpServerConfig {
+            name: "Docs".to_string(),
+            command: "sh".to_string(),
+            args: vec![server_script.display().to_string()],
+            env: Default::default(),
+            cwd: None,
+            enabled: true,
+            startup_timeout_sec: 5,
+            tool_timeout_sec: 5,
+        }];
+
+        for (turn_index, prompt, handler) in [
+            (0, "hello", &mut first_handler),
+            (1, "again", &mut second_handler),
+        ] {
+            let outcome = run_agent_turn(
+                RunAgentTurnContext {
+                    client: &client,
+                    system_prompt: "system",
+                    context_config: context_config(2),
+                    model_limits: model_limits(10_000),
+                    workspace_root: &root,
+                    permissions: PermissionProfile::for_mode(
+                        agent_protocol::PermissionMode::ReadOnly,
+                    ),
+                    mcp_servers: &mcp_servers,
+                    mcp_cache: &mcp_cache,
+                    session_name: "default",
+                    turn_index,
+                },
+                &mut session,
+                prompt,
+                handler,
+            )
+            .await
+            .expect("run turn");
+            assert_eq!(outcome.error, None);
+        }
+
+        assert_eq!(requests.lock().expect("requests lock poisoned").len(), 2);
+        assert_eq!(
+            fs::read_to_string(marker).expect("marker").lines().count(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -1203,6 +1354,7 @@ done
             events: Vec::new(),
             approved: false,
         };
+        let mcp_cache = McpToolCache::new();
 
         let outcome = run_agent_turn(
             RunAgentTurnContext {
@@ -1215,6 +1367,7 @@ done
                     agent_protocol::PermissionMode::WorkspaceWrite,
                 ),
                 mcp_servers: &[],
+                mcp_cache: &mcp_cache,
                 session_name: "default",
                 turn_index: 0,
             },
@@ -1252,6 +1405,7 @@ done
         session.turns[0] = completed_record(&"older user context ".repeat(1_000), "a0");
         rebuild_active_thread(&mut session);
         let mut handler = RecordingHandler::default();
+        let mcp_cache = McpToolCache::new();
 
         let outcome = run_agent_turn(
             RunAgentTurnContext {
@@ -1262,6 +1416,7 @@ done
                 workspace_root: &root,
                 permissions: PermissionProfile::for_mode(agent_protocol::PermissionMode::ReadOnly),
                 mcp_servers: &[],
+                mcp_cache: &mcp_cache,
                 session_name: "default",
                 turn_index: session.turns.len(),
             },
