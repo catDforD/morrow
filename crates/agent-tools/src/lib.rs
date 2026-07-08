@@ -137,7 +137,7 @@ impl ToolRegistry {
     ) -> Result<ToolRegistryBuild, ToolRegistryError> {
         let root = root.into();
         let mut registry = Self::built_in(&root, permissions)?;
-        let discovery = mcp::discover_stdio_tools(&root, mcp_servers, mcp_cache);
+        let discovery = mcp::discover_tools(&root, mcp_servers, mcp_cache);
         for tool in discovery.tools {
             registry.register(tool)?;
         }

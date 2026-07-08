@@ -1,6 +1,7 @@
 use crate::{Tool, ToolExecution, ToolResult};
-use agent_config::McpServerConfig;
+use agent_config::{McpServerConfig, McpTransport};
 use agent_protocol::{ToolCall, ToolDefinition, ToolExecutionSummary};
+use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -43,7 +44,7 @@ impl McpToolCache {
             entries.remove(&key);
         }
 
-        let entry = start_stdio_server(config, cwd)?;
+        let entry = start_mcp_server(config, cwd)?;
         entries.insert(key, entry.clone());
         Ok(entry)
     }
@@ -71,10 +72,13 @@ pub struct McpDiscovery {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct McpServerKey {
     name: String,
+    transport: McpTransport,
     command: String,
     args: Vec<String>,
     env: BTreeMap<String, String>,
     cwd: PathBuf,
+    url: Option<String>,
+    http_headers: BTreeMap<String, String>,
     startup_timeout_sec: u64,
     tool_timeout_sec: u64,
 }
@@ -83,10 +87,13 @@ impl McpServerKey {
     fn from_config(config: &McpServerConfig, cwd: &Path) -> Self {
         Self {
             name: config.name.clone(),
+            transport: config.transport,
             command: config.command.clone(),
             args: config.args.clone(),
             env: config.env.clone(),
             cwd: cwd.to_path_buf(),
+            url: config.url.clone(),
+            http_headers: config.http_headers.clone(),
             startup_timeout_sec: config.startup_timeout_sec,
             tool_timeout_sec: config.tool_timeout_sec,
         }
@@ -98,7 +105,7 @@ struct CachedMcpServer {
     listed_tools: Vec<ListedTool>,
 }
 
-pub fn discover_stdio_tools(
+pub fn discover_tools(
     workspace_root: &Path,
     servers: &[McpServerConfig],
     cache: &McpToolCache,
@@ -127,13 +134,13 @@ pub fn discover_stdio_tools(
     McpDiscovery { tools, diagnostics }
 }
 
-fn start_stdio_server(
+fn start_mcp_server(
     config: &McpServerConfig,
     cwd: PathBuf,
 ) -> Result<Arc<CachedMcpServer>, String> {
     let startup_timeout = Duration::from_secs(config.startup_timeout_sec);
     let tool_timeout = Duration::from_secs(config.tool_timeout_sec);
-    let mut transport = StdioTransport::start(config, cwd, startup_timeout)?;
+    let mut transport = McpTransportClient::start(config, cwd, startup_timeout)?;
     let listed_tools = initialize_and_list_tools(&mut transport, startup_timeout)?;
     let runtime = Arc::new(McpServerRuntime {
         name: config.name.clone(),
@@ -271,7 +278,7 @@ impl Tool for McpToolProvider {
 
 struct McpServerRuntime {
     name: String,
-    transport: Mutex<StdioTransport>,
+    transport: Mutex<McpTransportClient>,
     tool_timeout: Duration,
 }
 
@@ -295,7 +302,50 @@ impl McpServerRuntime {
 trait JsonRpcTransport {
     fn request(&mut self, method: &str, params: Value, timeout: Duration) -> Result<Value, String>;
 
-    fn notify(&mut self, method: &str, params: Value) -> Result<(), String>;
+    fn notify(&mut self, method: &str, params: Value, timeout: Duration) -> Result<(), String>;
+}
+
+enum McpTransportClient {
+    Stdio(StdioTransport),
+    Http(HttpTransport),
+}
+
+impl McpTransportClient {
+    fn start(
+        config: &McpServerConfig,
+        cwd: PathBuf,
+        startup_timeout: Duration,
+    ) -> Result<Self, String> {
+        match config.transport {
+            McpTransport::Stdio => {
+                StdioTransport::start(config, cwd, startup_timeout).map(Self::Stdio)
+            }
+            McpTransport::Http => HttpTransport::start(config).map(Self::Http),
+        }
+    }
+
+    fn is_healthy(&mut self) -> bool {
+        match self {
+            Self::Stdio(transport) => transport.is_healthy(),
+            Self::Http(_) => true,
+        }
+    }
+}
+
+impl JsonRpcTransport for McpTransportClient {
+    fn request(&mut self, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
+        match self {
+            Self::Stdio(transport) => transport.request(method, params, timeout),
+            Self::Http(transport) => transport.request(method, params, timeout),
+        }
+    }
+
+    fn notify(&mut self, method: &str, params: Value, timeout: Duration) -> Result<(), String> {
+        match self {
+            Self::Stdio(transport) => transport.notify(method, params, timeout),
+            Self::Http(transport) => transport.notify(method, params, timeout),
+        }
+    }
 }
 
 struct StdioTransport {
@@ -480,13 +530,322 @@ impl JsonRpcTransport for StdioTransport {
         }
     }
 
-    fn notify(&mut self, method: &str, params: Value) -> Result<(), String> {
+    fn notify(&mut self, method: &str, params: Value, _timeout: Duration) -> Result<(), String> {
         self.write_message(json!({
             "jsonrpc": "2.0",
             "method": method,
             "params": params,
         }))
     }
+}
+
+struct HttpTransport {
+    client: reqwest::blocking::Client,
+    url: String,
+    headers: BTreeMap<String, String>,
+    session_id: Option<String>,
+    protocol_version: String,
+    next_id: u64,
+}
+
+impl HttpTransport {
+    fn start(config: &McpServerConfig) -> Result<Self, String> {
+        let url = config
+            .url
+            .clone()
+            .ok_or_else(|| "HTTP MCP server is missing url".to_string())?;
+        let client = reqwest::blocking::Client::builder()
+            .build()
+            .map_err(|error| format!("failed to build MCP HTTP client: {error}"))?;
+        Ok(Self {
+            client,
+            url,
+            headers: config.http_headers.clone(),
+            session_id: None,
+            protocol_version: MCP_PROTOCOL_VERSION.to_string(),
+            next_id: 1,
+        })
+    }
+
+    fn next_request_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
+    fn request_message(
+        &mut self,
+        message: Value,
+        id: u64,
+        timeout: Duration,
+    ) -> Result<Value, String> {
+        let had_session = self.session_id.is_some();
+        match self.post_jsonrpc(
+            &message,
+            HttpResponseKind::Request { expected_id: id },
+            timeout,
+        ) {
+            Ok(result) => Ok(result),
+            Err(HttpPostError::SessionExpired) if had_session => {
+                self.reinitialize(timeout)?;
+                self.post_jsonrpc(
+                    &message,
+                    HttpResponseKind::Request { expected_id: id },
+                    timeout,
+                )
+                .map_err(HttpPostError::into_message)
+            }
+            Err(error) => Err(error.into_message()),
+        }
+    }
+
+    fn reinitialize(&mut self, timeout: Duration) -> Result<(), String> {
+        self.session_id = None;
+        self.protocol_version = MCP_PROTOCOL_VERSION.to_string();
+        let id = self.next_request_id();
+        let result = self.request_message(initialize_request(id), id, timeout)?;
+        self.apply_initialize_result(&result);
+        self.notify("notifications/initialized", json!({}), timeout)
+    }
+
+    fn apply_initialize_result(&mut self, result: &Value) {
+        if let Some(protocol_version) = result
+            .get("protocolVersion")
+            .and_then(Value::as_str)
+            .filter(|version| !version.trim().is_empty())
+        {
+            self.protocol_version = protocol_version.to_string();
+        }
+    }
+
+    fn post_jsonrpc(
+        &mut self,
+        message: &Value,
+        kind: HttpResponseKind,
+        timeout: Duration,
+    ) -> Result<Value, HttpPostError> {
+        let had_session = self.session_id.is_some();
+        let mut request = self.client.post(&self.url).timeout(timeout).json(message);
+
+        for (name, value) in &self.headers {
+            request = request.header(name.as_str(), value.as_str());
+        }
+        request = request
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header("MCP-Protocol-Version", self.protocol_version.as_str());
+        if let Some(session_id) = self.session_id.as_deref() {
+            request = request.header("Mcp-Session-Id", session_id);
+        }
+
+        let response = request.send().map_err(|error| {
+            if error.is_timeout() {
+                HttpPostError::Failed(format!("MCP HTTP request to {} timed out", self.url))
+            } else {
+                HttpPostError::Failed(format!("failed to send MCP HTTP request: {error}"))
+            }
+        })?;
+        let status = response.status();
+        let session_id = response
+            .headers()
+            .get("Mcp-Session-Id")
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string);
+        let content_type = response
+            .headers()
+            .get("Content-Type")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let body = response.text().map_err(|error| {
+            HttpPostError::Failed(format!("failed to read MCP HTTP body: {error}"))
+        })?;
+
+        if status == StatusCode::NOT_FOUND && had_session {
+            return Err(HttpPostError::SessionExpired);
+        }
+        if let Some(session_id) = session_id {
+            self.session_id = Some(session_id);
+        }
+
+        parse_http_response(status, content_type.as_deref(), &body, kind)
+            .map_err(HttpPostError::Failed)
+    }
+}
+
+impl JsonRpcTransport for HttpTransport {
+    fn request(&mut self, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
+        let id = self.next_request_id();
+        if method == "initialize" {
+            self.session_id = None;
+            self.protocol_version = MCP_PROTOCOL_VERSION.to_string();
+        }
+        let result = self.request_message(
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": method,
+                "params": params,
+            }),
+            id,
+            timeout,
+        )?;
+        if method == "initialize" {
+            self.apply_initialize_result(&result);
+        }
+        Ok(result)
+    }
+
+    fn notify(&mut self, method: &str, params: Value, timeout: Duration) -> Result<(), String> {
+        self.post_jsonrpc(
+            &json!({
+                "jsonrpc": "2.0",
+                "method": method,
+                "params": params,
+            }),
+            HttpResponseKind::Notification,
+            timeout,
+        )
+        .map(|_| ())
+        .map_err(HttpPostError::into_message)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum HttpResponseKind {
+    Request { expected_id: u64 },
+    Notification,
+}
+
+enum HttpPostError {
+    SessionExpired,
+    Failed(String),
+}
+
+impl HttpPostError {
+    fn into_message(self) -> String {
+        match self {
+            Self::SessionExpired => "MCP HTTP session expired".to_string(),
+            Self::Failed(message) => message,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct HttpJsonRpcResponse {
+    #[serde(default)]
+    id: Option<Value>,
+    #[serde(default)]
+    result: Option<Value>,
+    #[serde(default)]
+    error: Option<Value>,
+}
+
+fn initialize_request(id: u64) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {
+                "name": "morrow",
+                "version": env!("CARGO_PKG_VERSION"),
+            }
+        }
+    })
+}
+
+fn parse_http_response(
+    status: StatusCode,
+    content_type: Option<&str>,
+    body: &str,
+    kind: HttpResponseKind,
+) -> Result<Value, String> {
+    if matches!(kind, HttpResponseKind::Notification) && status == StatusCode::ACCEPTED {
+        return Ok(Value::Null);
+    }
+    if !status.is_success() {
+        return Err(format!("MCP HTTP status {status}: {body}"));
+    }
+    if body.trim().is_empty() {
+        return match kind {
+            HttpResponseKind::Notification => Ok(Value::Null),
+            HttpResponseKind::Request { .. } => Err("MCP HTTP response body was empty".to_string()),
+        };
+    }
+
+    match content_type.map(str::to_ascii_lowercase) {
+        Some(content_type) if content_type.starts_with("text/event-stream") => {
+            parse_sse_http_response(body, kind)
+        }
+        _ => parse_json_http_response(body, kind),
+    }
+}
+
+fn parse_json_http_response(body: &str, kind: HttpResponseKind) -> Result<Value, String> {
+    let response = serde_json::from_str::<HttpJsonRpcResponse>(body).map_err(|error| {
+        format!("failed to parse MCP HTTP JSON-RPC response: {error}; body: {body}")
+    })?;
+    response_result(response, kind)
+}
+
+fn parse_sse_http_response(body: &str, kind: HttpResponseKind) -> Result<Value, String> {
+    let expected_id = match kind {
+        HttpResponseKind::Request { expected_id } => expected_id,
+        HttpResponseKind::Notification => return Ok(Value::Null),
+    };
+    let mut data_lines = Vec::new();
+    for line in body.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            if let Some(result) = parse_sse_event(&data_lines, expected_id)? {
+                return Ok(result);
+            }
+            data_lines.clear();
+            continue;
+        }
+        if let Some(data) = line.strip_prefix("data:") {
+            data_lines.push(data.trim_start().to_string());
+        }
+    }
+    if let Some(result) = parse_sse_event(&data_lines, expected_id)? {
+        return Ok(result);
+    }
+    Err("MCP HTTP SSE response did not contain a matching JSON-RPC response".to_string())
+}
+
+fn parse_sse_event(data_lines: &[String], expected_id: u64) -> Result<Option<Value>, String> {
+    if data_lines.is_empty() {
+        return Ok(None);
+    }
+    let data = data_lines.join("\n");
+    let response = serde_json::from_str::<HttpJsonRpcResponse>(&data)
+        .map_err(|error| format!("failed to parse MCP HTTP SSE event: {error}; data: {data}"))?;
+    if response.id != Some(json!(expected_id)) {
+        return Ok(None);
+    }
+    response_result(response, HttpResponseKind::Request { expected_id }).map(Some)
+}
+
+fn response_result(response: HttpJsonRpcResponse, kind: HttpResponseKind) -> Result<Value, String> {
+    if let Some(error) = response.error {
+        return Err(format!("MCP HTTP JSON-RPC error: {error}"));
+    }
+    match kind {
+        HttpResponseKind::Request { expected_id } => {
+            let expected = json!(expected_id);
+            if response.id.as_ref() != Some(&expected) {
+                return Err(format!(
+                    "MCP HTTP response id mismatch: expected {expected}, got {:?}",
+                    response.id
+                ));
+            }
+        }
+        HttpResponseKind::Notification => {}
+    }
+    Ok(response.result.unwrap_or(Value::Null))
 }
 
 fn spawn_stderr_tail(stderr: ChildStderr, tail: Arc<Mutex<TailBuffer>>) {
@@ -554,7 +913,7 @@ fn initialize_and_list_tools<T: JsonRpcTransport>(
         }),
         timeout,
     )?;
-    transport.notify("notifications/initialized", json!({}))?;
+    transport.notify("notifications/initialized", json!({}), timeout)?;
     list_tools(transport, timeout)
 }
 
@@ -728,6 +1087,7 @@ mod tests {
     use serde_json::json;
     use std::collections::VecDeque;
     use std::fs;
+    use std::net::{TcpListener, TcpStream};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct FakeTransport {
@@ -759,7 +1119,12 @@ mod tests {
                 .ok_or_else(|| "missing fake response".to_string())
         }
 
-        fn notify(&mut self, method: &str, _params: Value) -> Result<(), String> {
+        fn notify(
+            &mut self,
+            method: &str,
+            _params: Value,
+            _timeout: Duration,
+        ) -> Result<(), String> {
             self.notifications.push(method.to_string());
             Ok(())
         }
@@ -907,10 +1272,8 @@ mod tests {
         let fixture = fake_server(false, false);
         let cache = McpToolCache::new();
 
-        let first =
-            discover_stdio_tools(&fixture.root, std::slice::from_ref(&fixture.config), &cache);
-        let second =
-            discover_stdio_tools(&fixture.root, std::slice::from_ref(&fixture.config), &cache);
+        let first = discover_tools(&fixture.root, std::slice::from_ref(&fixture.config), &cache);
+        let second = discover_tools(&fixture.root, std::slice::from_ref(&fixture.config), &cache);
 
         assert!(first.diagnostics.is_empty());
         assert!(second.diagnostics.is_empty());
@@ -925,11 +1288,9 @@ mod tests {
         let fixture = fake_server(true, false);
         let cache = McpToolCache::new();
 
-        let first =
-            discover_stdio_tools(&fixture.root, std::slice::from_ref(&fixture.config), &cache);
+        let first = discover_tools(&fixture.root, std::slice::from_ref(&fixture.config), &cache);
         thread::sleep(Duration::from_millis(100));
-        let second =
-            discover_stdio_tools(&fixture.root, std::slice::from_ref(&fixture.config), &cache);
+        let second = discover_tools(&fixture.root, std::slice::from_ref(&fixture.config), &cache);
 
         assert!(first.diagnostics.is_empty());
         assert!(second.diagnostics.is_empty());
@@ -947,7 +1308,7 @@ mod tests {
         bad.command = "definitely-not-a-real-morrow-mcp-command".to_string();
 
         let cache = McpToolCache::new();
-        let discovery = discover_stdio_tools(&fixture.root, &[bad, fixture.config.clone()], &cache);
+        let discovery = discover_tools(&fixture.root, &[bad, fixture.config.clone()], &cache);
 
         assert_eq!(discovery.tools.len(), 1);
         assert_eq!(discovery.diagnostics.len(), 1);
@@ -961,12 +1322,243 @@ mod tests {
         let cache = McpToolCache::new();
 
         let discovery =
-            discover_stdio_tools(&fixture.root, std::slice::from_ref(&fixture.config), &cache);
+            discover_tools(&fixture.root, std::slice::from_ref(&fixture.config), &cache);
 
         assert!(discovery.tools.is_empty());
         assert_eq!(discovery.diagnostics.len(), 1);
         assert!(discovery.diagnostics[0].contains("MCP request tools/list timed out"));
         assert!(discovery.diagnostics[0].contains("tail-message"));
+    }
+
+    #[test]
+    fn http_mcp_server_lists_and_calls_tools_with_session_headers() {
+        let server = TestHttpServer::start(vec![
+            TestHttpResponse::json(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {"protocolVersion": "2025-06-18"}
+            }))
+            .header("Mcp-Session-Id", "session-1"),
+            TestHttpResponse::accepted(),
+            TestHttpResponse::json(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "tools": [{
+                        "name": "echo",
+                        "description": "Echo text",
+                        "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}}
+                    }]
+                }
+            })),
+            TestHttpResponse::json(json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {"content": [{"type": "text", "text": "called"}]}
+            })),
+        ]);
+        let root = unique_dir("http-mcp");
+        let config = http_config(
+            "remote",
+            server.url(),
+            BTreeMap::from([
+                ("Authorization".to_string(), "Bearer token".to_string()),
+                ("X-Morrow".to_string(), "static".to_string()),
+            ]),
+        );
+        let cache = McpToolCache::new();
+
+        let discovery = discover_tools(&root, std::slice::from_ref(&config), &cache);
+        assert!(discovery.diagnostics.is_empty());
+        assert_eq!(discovery.tools.len(), 1);
+        assert_eq!(
+            discovery.tools[0].definitions()[0].function.name,
+            "mcp__remote__echo"
+        );
+
+        let execution = discovery.tools[0].execute(
+            &ToolCall::function("call_1", "mcp__remote__echo", r#"{"text":"hello"}"#),
+            None,
+        );
+        let ToolExecution::Completed(result) = execution else {
+            panic!("expected completed MCP call");
+        };
+        assert!(result.ok);
+        assert!(result.content.contains("called"));
+
+        let requests = server.requests();
+        assert_eq!(requests.len(), 4);
+        assert!(requests[0].body.contains(r#""method":"initialize""#));
+        assert!(
+            requests[1]
+                .body
+                .contains(r#""method":"notifications/initialized""#)
+        );
+        assert!(requests[2].body.contains(r#""method":"tools/list""#));
+        assert!(requests[3].body.contains(r#""method":"tools/call""#));
+        for request in &requests {
+            assert_eq!(
+                request.headers.get("accept").map(String::as_str),
+                Some("application/json, text/event-stream")
+            );
+            assert_eq!(
+                request
+                    .headers
+                    .get("mcp-protocol-version")
+                    .map(String::as_str),
+                Some("2025-06-18")
+            );
+            assert_eq!(
+                request.headers.get("authorization").map(String::as_str),
+                Some("Bearer token")
+            );
+            assert_eq!(
+                request.headers.get("x-morrow").map(String::as_str),
+                Some("static")
+            );
+        }
+        for request in &requests[1..] {
+            assert_eq!(
+                request.headers.get("mcp-session-id").map(String::as_str),
+                Some("session-1")
+            );
+        }
+    }
+
+    #[test]
+    fn http_mcp_tools_list_accepts_sse_response() {
+        let server = TestHttpServer::start(vec![
+            TestHttpResponse::json(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {"protocolVersion": "2025-06-18"}
+            }))
+            .header("Mcp-Session-Id", "session-1"),
+            TestHttpResponse::accepted(),
+            TestHttpResponse::sse(format!(
+                "data: {}\n\ndata: {}\n\n",
+                json!({"jsonrpc":"2.0","method":"notifications/progress","params":{}}),
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "result": {"tools": [{"name": "search", "inputSchema": {"type": "object"}}]}
+                })
+            )),
+        ]);
+        let root = unique_dir("http-mcp-sse");
+        let config = http_config("remote", server.url(), BTreeMap::new());
+        let cache = McpToolCache::new();
+
+        let discovery = discover_tools(&root, std::slice::from_ref(&config), &cache);
+
+        assert!(discovery.diagnostics.is_empty());
+        assert_eq!(discovery.tools.len(), 1);
+        assert_eq!(
+            discovery.tools[0].definitions()[0].function.name,
+            "mcp__remote__search"
+        );
+    }
+
+    #[test]
+    fn http_mcp_reinitializes_once_after_session_expiry() {
+        let server = TestHttpServer::start(vec![
+            TestHttpResponse::json(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {"protocolVersion": "2025-06-18"}
+            }))
+            .header("Mcp-Session-Id", "session-1"),
+            TestHttpResponse::accepted(),
+            TestHttpResponse::status(StatusCode::NOT_FOUND, "expired"),
+            TestHttpResponse::json(json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {"protocolVersion": "2025-06-18"}
+            }))
+            .header("Mcp-Session-Id", "session-2"),
+            TestHttpResponse::accepted(),
+            TestHttpResponse::json(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {"tools": [{"name": "echo", "inputSchema": {"type": "object"}}]}
+            })),
+        ]);
+        let root = unique_dir("http-mcp-expired");
+        let config = http_config("remote", server.url(), BTreeMap::new());
+        let cache = McpToolCache::new();
+
+        let discovery = discover_tools(&root, std::slice::from_ref(&config), &cache);
+
+        assert!(discovery.diagnostics.is_empty());
+        assert_eq!(discovery.tools.len(), 1);
+        let requests = server.requests();
+        assert_eq!(requests.len(), 6);
+        assert!(requests[2].body.contains(r#""method":"tools/list""#));
+        assert_eq!(
+            requests[2]
+                .headers
+                .get("mcp-session-id")
+                .map(String::as_str),
+            Some("session-1")
+        );
+        assert!(requests[3].body.contains(r#""method":"initialize""#));
+        assert!(!requests[3].headers.contains_key("mcp-session-id"));
+        assert!(requests[5].body.contains(r#""method":"tools/list""#));
+        assert_eq!(
+            requests[5]
+                .headers
+                .get("mcp-session-id")
+                .map(String::as_str),
+            Some("session-2")
+        );
+    }
+
+    #[test]
+    fn http_mcp_cache_reuses_session_between_discoveries() {
+        let server = TestHttpServer::start(vec![
+            TestHttpResponse::json(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {"protocolVersion": "2025-06-18"}
+            }))
+            .header("Mcp-Session-Id", "session-1"),
+            TestHttpResponse::accepted(),
+            TestHttpResponse::json(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {"tools": [{"name": "echo", "inputSchema": {"type": "object"}}]}
+            })),
+        ]);
+        let root = unique_dir("http-mcp-cache");
+        let config = http_config("remote", server.url(), BTreeMap::new());
+        let cache = McpToolCache::new();
+
+        let first = discover_tools(&root, std::slice::from_ref(&config), &cache);
+        let second = discover_tools(&root, std::slice::from_ref(&config), &cache);
+
+        assert!(first.diagnostics.is_empty());
+        assert!(second.diagnostics.is_empty());
+        assert_eq!(first.tools.len(), 1);
+        assert_eq!(second.tools.len(), 1);
+        assert_eq!(server.requests().len(), 3);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn bad_http_mcp_server_is_skipped_without_blocking_good_server() {
+        let http = TestHttpServer::start(vec![TestHttpResponse::status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "nope",
+        )]);
+        let good = fake_server(false, false);
+        let bad = http_config("bad-http", http.url(), BTreeMap::new());
+        let cache = McpToolCache::new();
+
+        let discovery = discover_tools(&good.root, &[bad, good.config.clone()], &cache);
+
+        assert_eq!(discovery.tools.len(), 1);
+        assert_eq!(discovery.diagnostics.len(), 1);
+        assert!(discovery.diagnostics[0].contains("mcp server bad-http"));
     }
 
     #[cfg(not(windows))]
@@ -1021,10 +1613,13 @@ done
             marker,
             config: McpServerConfig {
                 name: "fake".to_string(),
+                transport: McpTransport::Stdio,
                 command: "sh".to_string(),
                 args: vec![script.display().to_string()],
                 env: BTreeMap::new(),
                 cwd: None,
+                url: None,
+                http_headers: BTreeMap::new(),
                 enabled: true,
                 startup_timeout_sec: 1,
                 tool_timeout_sec: 1,
@@ -1035,6 +1630,174 @@ done
     #[cfg(not(windows))]
     fn started_count(marker: &Path) -> usize {
         fs::read_to_string(marker).expect("marker").lines().count()
+    }
+
+    fn http_config(
+        name: &str,
+        url: String,
+        http_headers: BTreeMap<String, String>,
+    ) -> McpServerConfig {
+        McpServerConfig {
+            name: name.to_string(),
+            transport: McpTransport::Http,
+            command: String::new(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            cwd: None,
+            url: Some(url),
+            http_headers,
+            enabled: true,
+            startup_timeout_sec: 5,
+            tool_timeout_sec: 5,
+        }
+    }
+
+    #[derive(Clone)]
+    struct TestHttpRequest {
+        headers: BTreeMap<String, String>,
+        body: String,
+    }
+
+    struct TestHttpServer {
+        addr: std::net::SocketAddr,
+        requests: Arc<Mutex<Vec<TestHttpRequest>>>,
+    }
+
+    impl TestHttpServer {
+        fn start(responses: Vec<TestHttpResponse>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+            let addr = listener.local_addr().expect("test server addr");
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let server_requests = requests.clone();
+            thread::spawn(move || {
+                for response in responses {
+                    let (mut stream, _) = listener.accept().expect("accept test request");
+                    server_requests
+                        .lock()
+                        .expect("request lock")
+                        .push(read_http_request(&mut stream));
+                    stream
+                        .write_all(response.as_http().as_bytes())
+                        .expect("write test response");
+                }
+            });
+            Self { addr, requests }
+        }
+
+        fn url(&self) -> String {
+            format!("http://{}/mcp", self.addr)
+        }
+
+        fn requests(&self) -> Vec<TestHttpRequest> {
+            self.requests.lock().expect("request lock").clone()
+        }
+    }
+
+    struct TestHttpResponse {
+        status: StatusCode,
+        headers: BTreeMap<String, String>,
+        body: String,
+    }
+
+    impl TestHttpResponse {
+        fn json(body: Value) -> Self {
+            Self {
+                status: StatusCode::OK,
+                headers: BTreeMap::from([(
+                    "Content-Type".to_string(),
+                    "application/json".to_string(),
+                )]),
+                body: body.to_string(),
+            }
+        }
+
+        fn sse(body: String) -> Self {
+            Self {
+                status: StatusCode::OK,
+                headers: BTreeMap::from([(
+                    "Content-Type".to_string(),
+                    "text/event-stream".to_string(),
+                )]),
+                body,
+            }
+        }
+
+        fn accepted() -> Self {
+            Self {
+                status: StatusCode::ACCEPTED,
+                headers: BTreeMap::new(),
+                body: String::new(),
+            }
+        }
+
+        fn status(status: StatusCode, body: impl Into<String>) -> Self {
+            Self {
+                status,
+                headers: BTreeMap::new(),
+                body: body.into(),
+            }
+        }
+
+        fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+            self.headers.insert(name.into(), value.into());
+            self
+        }
+
+        fn as_http(&self) -> String {
+            let reason = self.status.canonical_reason().unwrap_or("status");
+            let mut response = format!(
+                "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n",
+                self.status.as_u16(),
+                reason,
+                self.body.len()
+            );
+            for (name, value) in &self.headers {
+                response.push_str(name);
+                response.push_str(": ");
+                response.push_str(value);
+                response.push_str("\r\n");
+            }
+            response.push_str("\r\n");
+            response.push_str(&self.body);
+            response
+        }
+    }
+
+    fn read_http_request(stream: &mut TcpStream) -> TestHttpRequest {
+        let mut bytes = Vec::new();
+        let mut buffer = [0u8; 1024];
+        let header_end = loop {
+            let read = stream.read(&mut buffer).expect("read test request");
+            assert!(read > 0, "test request closed before headers");
+            bytes.extend_from_slice(&buffer[..read]);
+            if let Some(index) = find_header_end(&bytes) {
+                break index;
+            }
+        };
+        let headers_text = String::from_utf8_lossy(&bytes[..header_end]);
+        let mut headers = BTreeMap::new();
+        for line in headers_text.lines().skip(1) {
+            if let Some((name, value)) = line.split_once(':') {
+                headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+            }
+        }
+        let content_length = headers
+            .get("content-length")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        let body_start = header_end + 4;
+        while bytes.len() < body_start + content_length {
+            let read = stream.read(&mut buffer).expect("read test body");
+            assert!(read > 0, "test request closed before body");
+            bytes.extend_from_slice(&buffer[..read]);
+        }
+        let body =
+            String::from_utf8_lossy(&bytes[body_start..body_start + content_length]).to_string();
+        TestHttpRequest { headers, body }
+    }
+
+    fn find_header_end(bytes: &[u8]) -> Option<usize> {
+        bytes.windows(4).position(|window| window == b"\r\n\r\n")
     }
 
     fn unique_dir(name: &str) -> PathBuf {
