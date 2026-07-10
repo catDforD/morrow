@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Activity,
   Bot,
+  CalendarClock,
   Check,
   ChevronDown,
   ChevronRight,
@@ -10,13 +11,16 @@ import {
   CircleAlert,
   Clock3,
   FileText,
-  Files,
+  Folder,
   ListTree,
   Moon,
+  PanelLeft,
+  Plug,
   Plus,
   RefreshCw,
-  RotateCcw,
+  Search,
   Send,
+  Settings,
   Shield,
   Square,
   Sun,
@@ -48,15 +52,8 @@ import type {
   ToolRun,
 } from './types'
 
-type Tab = 'chat' | 'activity' | 'tools' | 'sessions'
+type InspectorPanel = 'run' | 'tools' | 'recent'
 type ConnectionStatus = 'connecting' | 'connected' | 'disconnected'
-
-const tabs: { id: Tab; label: string; icon: ReactNode }[] = [
-  { id: 'chat', label: 'Chat', icon: <Bot size={18} /> },
-  { id: 'activity', label: 'Activity', icon: <Activity size={18} /> },
-  { id: 'tools', label: 'Tools', icon: <Wrench size={18} /> },
-  { id: 'sessions', label: 'Sessions', icon: <ListTree size={18} /> },
-]
 
 const markdownPlugins = [remarkGfm]
 
@@ -70,13 +67,20 @@ const emptySessionEntry = (name: string): SessionEntryResponse => ({
 })
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<Tab>('chat')
   const [status, setStatus] = useState<StatusResponse | null>(null)
   const [sessions, setSessions] = useState<SessionEntryResponse[]>([])
   const [selected, setSelected] = useState('default')
   const [timeline, setTimeline] = useState<TimelineItem[]>([])
   const [tools, setTools] = useState<ToolRun[]>([])
   const [activity, setActivity] = useState<ActivityItem[]>([])
+  const [sessionFilter, setSessionFilter] = useState('')
+  const [isSearchOpen, setIsSearchOpen] = useState(false)
+  const [isSidebarOpen, setIsSidebarOpen] = useState(false)
+  const [isNarrowViewport, setIsNarrowViewport] = useState(() =>
+    window.matchMedia('(max-width: 900px)').matches,
+  )
+  const [inspectorPanel, setInspectorPanel] = useState<InspectorPanel>('run')
+  const [isInspectorOpen, setIsInspectorOpen] = useState(false)
   const [isCreatingSession, setIsCreatingSession] = useState(false)
   const [newSessionName, setNewSessionName] = useState('')
   const [createSessionError, setCreateSessionError] = useState<string | null>(
@@ -101,6 +105,7 @@ export default function App() {
   const idRef = useRef(0)
   const selectionRef = useRef(0)
   const messagesEndRef = useRef<HTMLDivElement | null>(null)
+  const sessionSearchRef = useRef<HTMLInputElement | null>(null)
 
   const nextId = useCallback((prefix: string) => {
     idRef.current += 1
@@ -592,6 +597,7 @@ export default function App() {
       selectionRef.current = selectionId
       selectedRef.current = name
       setSelected(name)
+      setIsSidebarOpen(false)
       setRunningTurn(null)
       setPendingApproval(null)
       setTools([])
@@ -629,9 +635,43 @@ export default function App() {
   }, [selected])
 
   useEffect(() => {
+    if (isSearchOpen) {
+      sessionSearchRef.current?.focus()
+    }
+  }, [isSearchOpen])
+
+  useEffect(() => {
+    if (!isInspectorOpen && !isSidebarOpen) return
+
+    const handleKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        if (isInspectorOpen) {
+          setIsInspectorOpen(false)
+        } else {
+          setIsSidebarOpen(false)
+        }
+      }
+    }
+
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [isInspectorOpen, isSidebarOpen])
+
+  useEffect(() => {
     document.documentElement.classList.toggle('dark', theme === 'dark')
     localStorage.setItem('morrow-theme', theme)
   }, [theme])
+
+  useEffect(() => {
+    const media = window.matchMedia('(max-width: 900px)')
+    const handleChange = (event: MediaQueryListEvent) => {
+      setIsNarrowViewport(event.matches)
+      if (!event.matches) setIsSidebarOpen(false)
+    }
+
+    media.addEventListener('change', handleChange)
+    return () => media.removeEventListener('change', handleChange)
+  }, [])
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ block: 'end' })
@@ -664,10 +704,33 @@ export default function App() {
     () => sessions.find((session) => session.name === selected),
     [selected, sessions],
   )
+  const filteredSessions = useMemo(() => {
+    const query = sessionFilter.trim().toLowerCase()
+    if (!query) return sessions
+    return sessions.filter((session) =>
+      session.name.toLowerCase().includes(query),
+    )
+  }, [sessionFilter, sessions])
 
   const isRunning = Boolean(runningTurn)
   const canSend = connection === 'connected' && !isRunning && prompt.trim().length > 0
   const canCancel = Boolean(runningTurn?.turn_id && runningTurn.turn_id !== 'pending')
+
+  const openInspector = (panel: InspectorPanel) => {
+    setIsSidebarOpen(false)
+    setInspectorPanel(panel)
+    setIsInspectorOpen(true)
+  }
+
+  const openSidebar = () => {
+    setIsInspectorOpen(false)
+    setIsSidebarOpen(true)
+  }
+
+  const toggleSearch = () => {
+    if (isSearchOpen) setSessionFilter('')
+    setIsSearchOpen((open) => !open)
+  }
 
   const handleSubmit = (event: FormEvent) => {
     event.preventDefault()
@@ -723,7 +786,6 @@ export default function App() {
       setNewSessionName('')
       await loadSessions()
       await selectSession(name)
-      setActiveTab('chat')
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       setCreateSessionError(message)
@@ -733,18 +795,6 @@ export default function App() {
   const refresh = async () => {
     try {
       await loadSessions()
-      await selectSession(selectedRef.current)
-    } catch (error) {
-      showError(error)
-    }
-  }
-
-  const resetSession = async () => {
-    try {
-      await fetchJson<SessionDocument>(
-        `/api/sessions/${encodeURIComponent(selectedRef.current)}/reset`,
-        { method: 'POST' },
-      )
       await selectSession(selectedRef.current)
     } catch (error) {
       showError(error)
@@ -782,88 +832,91 @@ export default function App() {
 
   return (
     <>
-      <div className="app-frame">
-        <BrandRail />
+      <div className={`app-frame${isSidebarOpen ? ' sidebar-open' : ''}`}>
+        <button
+          className="mobile-sidebar-backdrop"
+          type="button"
+          aria-label="Close task navigation"
+          aria-hidden={!isSidebarOpen}
+          tabIndex={isSidebarOpen ? 0 : -1}
+          onClick={() => setIsSidebarOpen(false)}
+        />
+        <AppSidebar
+          sessions={filteredSessions}
+          sessionCount={sessions.length}
+          status={status}
+          connection={connection}
+          runningTurn={runningTurn}
+          selected={selected}
+          isCreatingSession={isCreatingSession}
+          newSessionName={newSessionName}
+          createSessionError={createSessionError}
+          isSearchOpen={isSearchOpen}
+          sessionFilter={sessionFilter}
+          theme={theme}
+          searchInputRef={sessionSearchRef}
+          isHidden={isNarrowViewport && !isSidebarOpen}
+          onSelectSession={(name) => void selectSession(name)}
+          onStartCreateSession={startCreateSession}
+          onCancelCreateSession={cancelCreateSession}
+          onNewSessionNameChange={setNewSessionName}
+          onCreateSession={() => void createSession()}
+          onToggleSearch={toggleSearch}
+          onSessionFilterChange={setSessionFilter}
+          onRefresh={() => void refresh()}
+          onClose={() => setIsSidebarOpen(false)}
+          onThemeToggle={() =>
+            setTheme((current) => (current === 'dark' ? 'light' : 'dark'))
+          }
+        />
         <main className="window-main">
-          <TopTabs
-            activeTab={activeTab}
+          <ChatView
+            selected={selected}
+            status={status}
             connection={connection}
-            theme={theme}
-            onRefresh={() => void refresh()}
-            onThemeToggle={() =>
-              setTheme((current) => (current === 'dark' ? 'light' : 'dark'))
-            }
-            onTabChange={setActiveTab}
+            timeline={timeline}
+            runningTurn={runningTurn}
+            pendingApproval={pendingApproval}
+            prompt={prompt}
+            canSend={canSend}
+            canCancel={canCancel}
+            isRunning={isRunning}
+            isSidebarOpen={isSidebarOpen}
+            onPromptChange={setPrompt}
+            onPromptKeyDown={handlePromptKeyDown}
+            onSubmit={handleSubmit}
+            onCancel={cancelTurn}
+            onOpenSidebar={openSidebar}
+            onOpenInspector={openInspector}
+            onToggleRun={(id) => {
+              setTimeline((items) =>
+                items.map((item) =>
+                  item.kind === 'run' && item.id === id
+                    ? {
+                        ...item,
+                        trace: {
+                          ...item.trace,
+                          collapsed: !item.trace.collapsed,
+                        },
+                      }
+                    : item,
+                ),
+              )
+            }}
+            messagesEndRef={messagesEndRef}
           />
-          {activeTab === 'chat' ? (
-            <ChatView
-              sessions={sessions}
-              status={status}
-              connection={connection}
-              selected={selected}
-              selectedEntry={selectedEntry}
-              timeline={timeline}
-              tools={tools}
-              activity={activity}
-              isCreatingSession={isCreatingSession}
-              newSessionName={newSessionName}
-              createSessionError={createSessionError}
-              runningTurn={runningTurn}
-              pendingApproval={pendingApproval}
-              prompt={prompt}
-              canSend={canSend}
-              canCancel={canCancel}
-              isRunning={isRunning}
-              onPromptChange={setPrompt}
-              onPromptKeyDown={handlePromptKeyDown}
-              onSubmit={handleSubmit}
-              onCancel={cancelTurn}
-              onReset={() => void resetSession()}
-              onSelectSession={(name) => void selectSession(name)}
-              onStartCreateSession={startCreateSession}
-              onCancelCreateSession={cancelCreateSession}
-              onNewSessionNameChange={setNewSessionName}
-              onCreateSession={() => void createSession()}
-              onToggleRun={(id) => {
-                setTimeline((items) =>
-                  items.map((item) =>
-                    item.kind === 'run' && item.id === id
-                      ? {
-                          ...item,
-                          trace: {
-                            ...item.trace,
-                            collapsed: !item.trace.collapsed,
-                          },
-                        }
-                      : item,
-                  ),
-                )
-              }}
-              messagesEndRef={messagesEndRef}
-            />
-          ) : activeTab === 'activity' ? (
-            <ActivityView activity={activity} />
-          ) : activeTab === 'tools' ? (
-            <ToolsView tools={tools} />
-          ) : (
-            <SessionsView
-              sessions={sessions}
-              selected={selected}
-              isCreatingSession={isCreatingSession}
-              newSessionName={newSessionName}
-              createSessionError={createSessionError}
-              onSelect={(name) => {
-                setActiveTab('chat')
-                void selectSession(name)
-              }}
-              onStartCreateSession={startCreateSession}
-              onCancelCreateSession={cancelCreateSession}
-              onNewSessionNameChange={setNewSessionName}
-              onCreateSession={() => void createSession()}
-              onRefresh={() => void refresh()}
-            />
-          )}
         </main>
+        <InspectorDrawer
+          open={isInspectorOpen}
+          panel={inspectorPanel}
+          tools={tools}
+          activity={activity}
+          selectedEntry={selectedEntry}
+          runningTurn={runningTurn}
+          pendingApproval={pendingApproval}
+          onClose={() => setIsInspectorOpen(false)}
+          onPanelChange={setInspectorPanel}
+        />
       </div>
       <ApprovalDialog
         request={pendingApproval}
@@ -874,289 +927,414 @@ export default function App() {
   )
 }
 
-function BrandRail() {
+function AppSidebar({
+  sessions,
+  sessionCount,
+  status,
+  connection,
+  runningTurn,
+  selected,
+  isCreatingSession,
+  newSessionName,
+  createSessionError,
+  isSearchOpen,
+  sessionFilter,
+  theme,
+  searchInputRef,
+  isHidden,
+  onSelectSession,
+  onStartCreateSession,
+  onCancelCreateSession,
+  onNewSessionNameChange,
+  onCreateSession,
+  onToggleSearch,
+  onSessionFilterChange,
+  onRefresh,
+  onClose,
+  onThemeToggle,
+}: {
+  sessions: SessionEntryResponse[]
+  sessionCount: number
+  status: StatusResponse | null
+  connection: ConnectionStatus
+  runningTurn: RunningTurnSnapshot | null
+  selected: string
+  isCreatingSession: boolean
+  newSessionName: string
+  createSessionError: string | null
+  isSearchOpen: boolean
+  sessionFilter: string
+  theme: 'light' | 'dark'
+  searchInputRef: React.RefObject<HTMLInputElement | null>
+  isHidden: boolean
+  onSelectSession: (name: string) => void
+  onStartCreateSession: () => void
+  onCancelCreateSession: () => void
+  onNewSessionNameChange: (value: string) => void
+  onCreateSession: () => void
+  onToggleSearch: () => void
+  onSessionFilterChange: (value: string) => void
+  onRefresh: () => void
+  onClose: () => void
+  onThemeToggle: () => void
+}) {
+  const workspace = status ? workspaceName(status.workspace_root) : 'loading'
+  const permission = status
+    ? formatPermissionMode(status.permissions.mode)
+    : 'unknown mode'
+  const connectionState = runningTurn ? 'running' : connection
+  const selectedSessionRef = useRef<HTMLButtonElement | null>(null)
+
+  useEffect(() => {
+    selectedSessionRef.current?.scrollIntoView({ block: 'nearest' })
+  }, [selected, sessions])
+
   return (
-    <aside className="brand-rail">
-      <div className="brand-word">MORROW</div>
+    <aside
+      id="task-navigation"
+      className="app-sidebar"
+      aria-label="Task navigation"
+      aria-hidden={isHidden}
+      inert={isHidden}
+    >
+      <div className="sidebar-brand">
+        <div className="brand-mark">M</div>
+        <div className="sidebar-brand-copy">
+          <strong>Morrow</strong>
+          <span>Agent workspace</span>
+        </div>
+        <MiniIconButton title="Close task navigation" onClick={onClose}>
+          <X size={17} />
+        </MiniIconButton>
+      </div>
+
+      <nav className="sidebar-actions" aria-label="Primary">
+        <SidebarAction
+          icon={<Plus size={18} />}
+          label="New task"
+          onClick={onStartCreateSession}
+        />
+        <SidebarAction
+          icon={<Search size={18} />}
+          label="Search"
+          onClick={onToggleSearch}
+        />
+        <SidebarAction
+          icon={<Folder size={18} />}
+          label="Projects"
+          badge="Soon"
+          disabled
+        />
+        <SidebarAction
+          icon={<CalendarClock size={18} />}
+          label="Scheduled"
+          badge="Soon"
+          disabled
+        />
+        <SidebarAction
+          icon={<Plug size={18} />}
+          label="Plugins"
+          badge="Soon"
+          disabled
+        />
+      </nav>
+
+      <section className="session-browser" aria-label="Tasks">
+        <div className="session-browser-head">
+          <div>
+            <p className="eyebrow">Tasks</p>
+            <span>{sessionCount}</span>
+          </div>
+          <MiniIconButton title="New task" onClick={onStartCreateSession}>
+            <Plus size={16} />
+          </MiniIconButton>
+        </div>
+
+        {isSearchOpen ? (
+          <label className="session-search">
+            <Search size={16} />
+            <input
+              ref={searchInputRef}
+              value={sessionFilter}
+              placeholder="Search tasks"
+              onChange={(event) => onSessionFilterChange(event.target.value)}
+            />
+          </label>
+        ) : null}
+
+        <div className="sidebar-session-list main-scroll">
+          {isCreatingSession ? (
+            <CreateSessionRow
+              value={newSessionName}
+              error={createSessionError}
+              onChange={onNewSessionNameChange}
+              onCancel={onCancelCreateSession}
+              onSubmit={onCreateSession}
+            />
+          ) : null}
+          {sessions.length === 0 ? (
+            <p className="muted-line">
+              {sessionFilter.trim() ? 'No matching sessions.' : 'No sessions.'}
+            </p>
+          ) : (
+            sessions.map((session) => (
+              <button
+                key={session.name}
+                type="button"
+                className={`sidebar-session${session.name === selected ? ' active' : ''}`}
+                ref={session.name === selected ? selectedSessionRef : undefined}
+                onClick={() => onSelectSession(session.name)}
+              >
+                <span className="session-name">{session.name}</span>
+                <span>
+                  {session.turns} turns
+                  {session.has_summary ? ' / summary' : ''}
+                </span>
+              </button>
+            ))
+          )}
+        </div>
+      </section>
+
+      <div className="sidebar-footer">
+        <div className="workspace-summary">
+          <Folder size={17} />
+          <div title={status?.workspace_root || ''}>
+            <strong>{workspace}</strong>
+            <span>{permission}</span>
+          </div>
+          <span
+            className={`workspace-connection ${connectionState}`}
+            title={connectionState}
+          />
+        </div>
+        <div className="sidebar-footer-row">
+          <button
+            className="sidebar-settings"
+            type="button"
+            title="Settings coming soon"
+            disabled
+          >
+            <Settings size={17} />
+            <span>Settings</span>
+            <small>Soon</small>
+          </button>
+          <div className="sidebar-footer-actions">
+            <MiniIconButton title="Refresh sessions" onClick={onRefresh}>
+              <RefreshCw size={16} />
+            </MiniIconButton>
+            <MiniIconButton title="Toggle theme" onClick={onThemeToggle}>
+              {theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}
+            </MiniIconButton>
+          </div>
+        </div>
+      </div>
     </aside>
   )
 }
 
-function TopTabs({
-  activeTab,
-  connection,
-  theme,
-  onRefresh,
-  onThemeToggle,
-  onTabChange,
+function SidebarAction({
+  icon,
+  label,
+  badge,
+  disabled = false,
+  onClick,
 }: {
-  activeTab: Tab
-  connection: ConnectionStatus
-  theme: 'light' | 'dark'
-  onRefresh: () => void
-  onThemeToggle: () => void
-  onTabChange: (tab: Tab) => void
+  icon: ReactNode
+  label: string
+  badge?: string
+  disabled?: boolean
+  onClick?: () => void
 }) {
   return (
-    <nav className="top-tabs">
-      <div className="tab-list">
-        {tabs.map((tab) => (
-          <button
-            key={tab.id}
-            type="button"
-            className={`tab-button${activeTab === tab.id ? ' active' : ''}`}
-            onClick={() => onTabChange(tab.id)}
-          >
-            {tab.icon}
-            <span>{tab.label}</span>
-          </button>
-        ))}
-      </div>
-      <div className="toolbar">
-        <span className={`connection-dot ${connection}`} title={connection} />
-        <IconButton title="Refresh" onClick={onRefresh}>
-          <RefreshCw size={18} />
-        </IconButton>
-        <IconButton title="Toggle theme" onClick={onThemeToggle}>
-          {theme === 'dark' ? <Sun size={18} /> : <Moon size={18} />}
-        </IconButton>
-      </div>
-    </nav>
+    <button
+      className="sidebar-action"
+      type="button"
+      title={disabled ? `${label} coming soon` : label}
+      disabled={disabled}
+      onClick={onClick}
+    >
+      {icon}
+      <span>{label}</span>
+      {badge ? <small>{badge}</small> : null}
+    </button>
   )
 }
 
 function ChatView({
-  sessions,
+  selected,
   status,
   connection,
-  selected,
-  selectedEntry,
   timeline,
-  tools,
-  activity,
-  isCreatingSession,
-  newSessionName,
-  createSessionError,
   runningTurn,
   pendingApproval,
   prompt,
   canSend,
   canCancel,
   isRunning,
+  isSidebarOpen,
   onPromptChange,
   onPromptKeyDown,
   onSubmit,
   onCancel,
-  onReset,
-  onSelectSession,
-  onStartCreateSession,
-  onCancelCreateSession,
-  onNewSessionNameChange,
-  onCreateSession,
+  onOpenSidebar,
+  onOpenInspector,
   onToggleRun,
   messagesEndRef,
 }: {
-  sessions: SessionEntryResponse[]
+  selected: string
   status: StatusResponse | null
   connection: ConnectionStatus
-  selected: string
-  selectedEntry?: SessionEntryResponse
   timeline: TimelineItem[]
-  tools: ToolRun[]
-  activity: ActivityItem[]
-  isCreatingSession: boolean
-  newSessionName: string
-  createSessionError: string | null
   runningTurn: RunningTurnSnapshot | null
   pendingApproval: ApprovalRequest | null
   prompt: string
   canSend: boolean
   canCancel: boolean
   isRunning: boolean
+  isSidebarOpen: boolean
   onPromptChange: (value: string) => void
   onPromptKeyDown: (event: KeyboardEvent<HTMLTextAreaElement>) => void
   onSubmit: (event: FormEvent) => void
   onCancel: () => void
-  onReset: () => void
-  onSelectSession: (name: string) => void
-  onStartCreateSession: () => void
-  onCancelCreateSession: () => void
-  onNewSessionNameChange: (value: string) => void
-  onCreateSession: () => void
+  onOpenSidebar: () => void
+  onOpenInspector: (panel: InspectorPanel) => void
   onToggleRun: (id: string) => void
   messagesEndRef: React.RefObject<HTMLDivElement | null>
 }) {
-  return (
-    <section className="chat-grid">
-      <SessionRail
-        sessions={sessions}
-        status={status}
-        connection={connection}
-        runningTurn={runningTurn}
-        selected={selected}
-        isCreating={isCreatingSession}
-        newSessionName={newSessionName}
-        createError={createSessionError}
-        onSelect={onSelectSession}
-        onStartCreate={onStartCreateSession}
-        onCancelCreate={onCancelCreateSession}
-        onNameChange={onNewSessionNameChange}
-        onCreate={onCreateSession}
-      />
-      <section className="conversation-panel">
-        <ConversationHeader selected={selected} selectedEntry={selectedEntry} />
-        <ConversationTimeline
-          items={timeline}
-          messagesEndRef={messagesEndRef}
-          onToggleRun={onToggleRun}
-        />
-        <Composer
-          prompt={prompt}
-          canSend={canSend}
-          canCancel={canCancel}
-          isRunning={isRunning}
-          onPromptChange={onPromptChange}
-          onPromptKeyDown={onPromptKeyDown}
-          onSubmit={onSubmit}
-          onCancel={onCancel}
-          onReset={onReset}
-        />
-      </section>
-      <RunInspector
-        tools={tools}
-        activity={activity}
-        runningTurn={runningTurn}
-        pendingApproval={pendingApproval}
-      />
-    </section>
+  const isEmpty = timeline.length === 0
+  const composer = (
+    <Composer
+      prompt={prompt}
+      canSend={canSend}
+      canCancel={canCancel}
+      isRunning={isRunning}
+      status={status}
+      variant={isEmpty ? 'home' : 'dock'}
+      onPromptChange={onPromptChange}
+      onPromptKeyDown={onPromptKeyDown}
+      onSubmit={onSubmit}
+      onCancel={onCancel}
+    />
   )
-}
 
-function SessionRail({
-  sessions,
-  status,
-  connection,
-  runningTurn,
-  selected,
-  isCreating,
-  newSessionName,
-  createError,
-  onSelect,
-  onStartCreate,
-  onCancelCreate,
-  onNameChange,
-  onCreate,
-}: {
-  sessions: SessionEntryResponse[]
-  status: StatusResponse | null
-  connection: ConnectionStatus
-  runningTurn: RunningTurnSnapshot | null
-  selected: string
-  isCreating: boolean
-  newSessionName: string
-  createError: string | null
-  onSelect: (name: string) => void
-  onStartCreate: () => void
-  onCancelCreate: () => void
-  onNameChange: (value: string) => void
-  onCreate: () => void
-}) {
   return (
-    <aside className="session-rail">
-      <div className="panel-title split-title">
-        <div className="panel-title-label">
-          <Files size={18} />
-          <span>Sessions</span>
-        </div>
-        <MiniIconButton title="New session" onClick={onStartCreate}>
-          <Plus size={17} />
-        </MiniIconButton>
-      </div>
-      <div className="session-list main-scroll">
-        {isCreating ? (
-          <CreateSessionRow
-            value={newSessionName}
-            error={createError}
-            onChange={onNameChange}
-            onCancel={onCancelCreate}
-            onSubmit={onCreate}
-          />
-        ) : null}
-        {sessions.map((session) => (
+    <section className={`conversation-panel${isEmpty ? ' home-mode' : ''}`}>
+      {isEmpty ? (
+        <>
           <button
-            key={session.name}
+            className="mobile-menu-button home-menu-button"
             type="button"
-            className={`session-card${session.name === selected ? ' active' : ''}`}
-            onClick={() => onSelect(session.name)}
+            aria-label="Open task navigation"
+            aria-controls="task-navigation"
+            aria-expanded={isSidebarOpen}
+            onClick={onOpenSidebar}
           >
-            <span className="session-name">{session.name}</span>
-            <span className="session-stats">
-              {session.turns} turns
-              {session.has_summary ? ' / summary' : ''}
-            </span>
+            <PanelLeft size={19} />
           </button>
-        ))}
-      </div>
-      <WorkspaceCard
-        status={status}
-        connection={connection}
-        running={Boolean(runningTurn)}
-      />
-    </aside>
+          <HomePrompt status={status}>{composer}</HomePrompt>
+        </>
+      ) : (
+        <>
+          <ConversationHeader
+            selected={selected}
+            connection={connection}
+            runningTurn={runningTurn}
+            pendingApproval={pendingApproval}
+            isSidebarOpen={isSidebarOpen}
+            onOpenSidebar={onOpenSidebar}
+            onOpenInspector={onOpenInspector}
+          />
+          <ConversationTimeline
+            items={timeline}
+            messagesEndRef={messagesEndRef}
+            onToggleRun={onToggleRun}
+          />
+          {composer}
+        </>
+      )}
+    </section>
   )
 }
 
-function WorkspaceCard({
+function HomePrompt({
   status,
-  connection,
-  running,
+  children,
 }: {
   status: StatusResponse | null
-  connection: ConnectionStatus
-  running: boolean
+  children: ReactNode
 }) {
+  const workspace = status ? workspaceName(status.workspace_root) : 'this workspace'
+
   return (
-    <section className="workspace-card">
-      <div>
-        <p className="rail-label">Workspace</p>
-        <p className="rail-value" title={status?.workspace_root || ''}>
-          {status ? workspaceName(status.workspace_root) : 'loading'}
-        </p>
+    <div className="home-prompt">
+      <div className="home-copy">
+        <div className="home-mark" aria-hidden="true">
+          <Bot size={29} />
+        </div>
+        <h1>
+          What should we build in <span>{workspace}</span>?
+        </h1>
       </div>
-      <div>
-        <p className="rail-label">Mode</p>
-        <p className="rail-value">
-          {status ? formatPermissionMode(status.permissions.mode) : 'unknown'}
-        </p>
-      </div>
-      <StatusPill status={connection} running={running} />
-    </section>
+      {children}
+    </div>
   )
 }
 
 function ConversationHeader({
   selected,
-  selectedEntry,
+  connection,
+  runningTurn,
+  pendingApproval,
+  isSidebarOpen,
+  onOpenSidebar,
+  onOpenInspector,
 }: {
   selected: string
-  selectedEntry?: SessionEntryResponse
+  connection: ConnectionStatus
+  runningTurn: RunningTurnSnapshot | null
+  pendingApproval: ApprovalRequest | null
+  isSidebarOpen: boolean
+  onOpenSidebar: () => void
+  onOpenInspector: (panel: InspectorPanel) => void
 }) {
+  const connectionState = runningTurn ? 'running' : connection
+
   return (
     <header className="conversation-header">
-      <div>
-        <p className="eyebrow">Current session</p>
-        <h1>{selected}</h1>
+      <div className="conversation-title">
+        <button
+          className="mobile-menu-button"
+          type="button"
+          aria-label="Open task navigation"
+          aria-controls="task-navigation"
+          aria-expanded={isSidebarOpen}
+          onClick={onOpenSidebar}
+        >
+          <PanelLeft size={19} />
+        </button>
+        <div>
+          <p className="eyebrow">Current task</p>
+          <h1 title={selected}>{selected}</h1>
+        </div>
       </div>
-      <div className="metric-strip">
-        <Metric label="turns" value={String(selectedEntry?.turns ?? 0)} />
-        <Metric
-          label="active"
-          value={String(selectedEntry?.active_messages ?? 0)}
-        />
-        <Metric
-          label="summary"
-          value={selectedEntry?.has_summary ? 'yes' : 'no'}
-        />
+      <div className="conversation-actions">
+        <span className={`connection-badge ${connectionState}`}>
+          <span />
+          {pendingApproval ? 'approval' : connectionState}
+        </span>
+        <MiniIconButton title="Open run status" onClick={() => onOpenInspector('run')}>
+          <Shield size={16} />
+        </MiniIconButton>
+        <MiniIconButton title="Open tools" onClick={() => onOpenInspector('tools')}>
+          <Wrench size={16} />
+        </MiniIconButton>
+        <MiniIconButton
+          title="Open recent activity"
+          onClick={() => onOpenInspector('recent')}
+        >
+          <Clock3 size={16} />
+        </MiniIconButton>
       </div>
     </header>
   )
@@ -1173,10 +1351,8 @@ function ConversationTimeline({
 }) {
   return (
     <div className="message-scroll main-scroll">
-      {items.length === 0 ? (
-        <EmptyState />
-      ) : (
-        items.map((item) => {
+      <div className="message-column">
+        {items.map((item) => {
           if (item.kind === 'message') {
             return <TimelineMessage key={item.id} message={item} />
           }
@@ -1190,9 +1366,9 @@ function ConversationTimeline({
             )
           }
           return <TimelineNotice key={item.id} notice={item} />
-        })
-      )}
-      <div ref={messagesEndRef} />
+        })}
+        <div ref={messagesEndRef} />
+      </div>
     </div>
   )
 }
@@ -1344,82 +1520,248 @@ function RunStepDetails({ step }: { step: RunStep }) {
   )
 }
 
-function EmptyState() {
-  return (
-    <div className="empty-state">
-      <Bot size={32} />
-      <p>Morrow is ready.</p>
-    </div>
-  )
-}
-
 function Composer({
   prompt,
   canSend,
   canCancel,
   isRunning,
+  status,
+  variant = 'dock',
   onPromptChange,
   onPromptKeyDown,
   onSubmit,
   onCancel,
-  onReset,
 }: {
   prompt: string
   canSend: boolean
   canCancel: boolean
   isRunning: boolean
+  status: StatusResponse | null
+  variant?: 'home' | 'dock'
   onPromptChange: (value: string) => void
   onPromptKeyDown: (event: KeyboardEvent<HTMLTextAreaElement>) => void
   onSubmit: (event: FormEvent) => void
   onCancel: () => void
-  onReset: () => void
 }) {
+  const primaryLabel = isRunning ? 'Stop turn' : 'Send'
+  const primaryDisabled = isRunning ? !canCancel : !canSend
+  const workspace = status ? workspaceName(status.workspace_root) : 'loading'
+  const permission = status
+    ? formatPermissionMode(status.permissions.mode)
+    : 'unknown mode'
+
   return (
-    <form className="composer" onSubmit={onSubmit}>
-      <textarea
-        value={prompt}
-        rows={3}
-        disabled={isRunning}
-        onChange={(event) => onPromptChange(event.target.value)}
-        onKeyDown={onPromptKeyDown}
-      />
-      <div className="composer-actions">
-        <IconButton title="Reset session" disabled={isRunning} onClick={onReset}>
-          <RotateCcw size={18} />
-        </IconButton>
-        <IconButton title="Cancel turn" disabled={!canCancel} onClick={onCancel}>
-          <Square size={18} />
-        </IconButton>
-        <button className="send-button" type="submit" disabled={!canSend}>
-          <Send size={18} />
-          <span>Send</span>
-        </button>
+    <form className={`composer ${variant}`} onSubmit={onSubmit}>
+      <div className="composer-shell">
+        <div className="composer-context" aria-label="Workspace context">
+          <span title={status?.workspace_root || ''}>
+            <Folder size={14} />
+            {workspace}
+          </span>
+          <span>
+            <Terminal size={14} />
+            Local
+          </span>
+          <span>
+            <Shield size={14} />
+            {permission}
+          </span>
+        </div>
+        <div className="composer-card">
+          <textarea
+            value={prompt}
+            rows={variant === 'home' ? 3 : 2}
+            disabled={isRunning}
+            placeholder="Ask Morrow to edit, inspect, or explain this workspace"
+            onChange={(event) => onPromptChange(event.target.value)}
+            onKeyDown={onPromptKeyDown}
+          />
+          <div className="composer-bar">
+            <div className="composer-left">
+              <button
+                className="composer-chip icon-only"
+                type="button"
+                title="Attachments coming soon"
+                disabled
+              >
+                <Plus size={16} />
+              </button>
+              <button
+                className="composer-chip labeled"
+                type="button"
+                title="Plan mode coming soon"
+                disabled
+              >
+                <ListTree size={15} />
+                <span>Plan mode</span>
+              </button>
+            </div>
+            <div className="composer-primary">
+              <button
+                className="composer-chip labeled"
+                type="button"
+                title="Model selection coming soon"
+                disabled
+              >
+                <Bot size={15} />
+                <span>Model</span>
+              </button>
+              <button
+                aria-label={primaryLabel}
+                className={`send-button composer-primary-button${isRunning ? ' stop-button' : ''}`}
+                type={isRunning ? 'button' : 'submit'}
+                disabled={primaryDisabled}
+                onClick={isRunning ? onCancel : undefined}
+              >
+                {isRunning ? <Square size={17} /> : <Send size={17} />}
+              </button>
+            </div>
+          </div>
+        </div>
       </div>
     </form>
   )
 }
 
-function RunInspector({
+function InspectorDrawer({
+  open,
+  panel,
   tools,
   activity,
+  selectedEntry,
+  runningTurn,
+  pendingApproval,
+  onClose,
+  onPanelChange,
+}: {
+  open: boolean
+  panel: InspectorPanel
+  tools: ToolRun[]
+  activity: ActivityItem[]
+  selectedEntry?: SessionEntryResponse
+  runningTurn: RunningTurnSnapshot | null
+  pendingApproval: ApprovalRequest | null
+  onClose: () => void
+  onPanelChange: (panel: InspectorPanel) => void
+}) {
+  return (
+    <aside
+      className={`inspector-drawer${open ? ' open' : ''}`}
+      aria-hidden={!open}
+      inert={!open}
+    >
+      <button
+        className="drawer-backdrop"
+        type="button"
+        aria-label="Close inspector"
+        onClick={onClose}
+      />
+      <section className="drawer-panel main-scroll" aria-label="Inspector">
+        <header className="drawer-header">
+          <div>
+            <p className="eyebrow">Inspector</p>
+            <h2>{inspectorPanelTitle(panel)}</h2>
+          </div>
+          <MiniIconButton title="Close inspector" onClick={onClose}>
+            <X size={18} />
+          </MiniIconButton>
+        </header>
+        <nav className="drawer-tabs" aria-label="Inspector panels">
+          <DrawerTab
+            active={panel === 'run'}
+            icon={<Shield size={16} />}
+            label="Run"
+            onClick={() => onPanelChange('run')}
+          />
+          <DrawerTab
+            active={panel === 'tools'}
+            icon={<Wrench size={16} />}
+            label="Tools"
+            onClick={() => onPanelChange('tools')}
+          />
+          <DrawerTab
+            active={panel === 'recent'}
+            icon={<Clock3 size={16} />}
+            label="Recent"
+            onClick={() => onPanelChange('recent')}
+          />
+        </nav>
+        <InspectorPanelContent
+          panel={panel}
+          tools={tools}
+          activity={activity}
+          selectedEntry={selectedEntry}
+          runningTurn={runningTurn}
+          pendingApproval={pendingApproval}
+        />
+      </section>
+    </aside>
+  )
+}
+
+function DrawerTab({
+  active,
+  icon,
+  label,
+  onClick,
+}: {
+  active: boolean
+  icon: ReactNode
+  label: string
+  onClick: () => void
+}) {
+  return (
+    <button
+      className={`drawer-tab${active ? ' active' : ''}`}
+      type="button"
+      onClick={onClick}
+    >
+      {icon}
+      <span>{label}</span>
+    </button>
+  )
+}
+
+function InspectorPanelContent({
+  panel,
+  tools,
+  activity,
+  selectedEntry,
   runningTurn,
   pendingApproval,
 }: {
+  panel: InspectorPanel
   tools: ToolRun[]
   activity: ActivityItem[]
+  selectedEntry?: SessionEntryResponse
   runningTurn: RunningTurnSnapshot | null
   pendingApproval: ApprovalRequest | null
 }) {
-  const lastItems = activity.slice(-5).reverse()
+  if (panel === 'tools') {
+    return <ToolList tools={tools} />
+  }
+
+  if (panel === 'recent') {
+    return <ActivityList items={[...activity].reverse()} />
+  }
+
   return (
-    <aside className="inspector main-scroll">
-      <div className="panel-title">
-        <Shield size={18} />
-        <span>Run</span>
+    <div className="drawer-run">
+      <div className="inspector-metrics">
+        <InspectorMetric label="turns" value={String(selectedEntry?.turns ?? 0)} />
+        <InspectorMetric
+          label="active"
+          value={String(selectedEntry?.active_messages ?? 0)}
+        />
+        <InspectorMetric
+          label="summary"
+          value={selectedEntry?.has_summary ? 'yes' : 'no'}
+        />
       </div>
       <div className="status-card">
         <p className="eyebrow">Turn</p>
-        <strong>{runningTurn ? runningTurn.turn_id : 'idle'}</strong>
+        <strong>{pendingApproval ? 'approval' : runningTurn ? 'running' : 'idle'}</strong>
+        {runningTurn ? <small>{runningTurn.turn_id}</small> : null}
         {pendingApproval ? (
           <span className="notice-pill approval">approval pending</span>
         ) : null}
@@ -1433,101 +1775,17 @@ function RunInspector({
         <Clock3 size={18} />
         <span>Recent</span>
       </div>
-      <ActivityList items={lastItems} compact />
-    </aside>
+      <ActivityList items={activity.slice(-5).reverse()} compact />
+    </div>
   )
 }
 
-function ActivityView({ activity }: { activity: ActivityItem[] }) {
+function InspectorMetric({ label, value }: { label: string; value: string }) {
   return (
-    <section className="single-view main-scroll">
-      <div className="single-header">
-        <Activity size={22} />
-        <h1>Activity</h1>
-      </div>
-      <ActivityList items={[...activity].reverse()} />
-    </section>
-  )
-}
-
-function ToolsView({ tools }: { tools: ToolRun[] }) {
-  return (
-    <section className="single-view main-scroll">
-      <div className="single-header">
-        <Wrench size={22} />
-        <h1>Tools</h1>
-      </div>
-      <ToolList tools={tools} />
-    </section>
-  )
-}
-
-function SessionsView({
-  sessions,
-  selected,
-  isCreatingSession,
-  newSessionName,
-  createSessionError,
-  onSelect,
-  onStartCreateSession,
-  onCancelCreateSession,
-  onNewSessionNameChange,
-  onCreateSession,
-  onRefresh,
-}: {
-  sessions: SessionEntryResponse[]
-  selected: string
-  isCreatingSession: boolean
-  newSessionName: string
-  createSessionError: string | null
-  onSelect: (name: string) => void
-  onStartCreateSession: () => void
-  onCancelCreateSession: () => void
-  onNewSessionNameChange: (value: string) => void
-  onCreateSession: () => void
-  onRefresh: () => void
-}) {
-  return (
-    <section className="single-view main-scroll">
-      <div className="single-header split">
-        <div>
-          <Files size={22} />
-          <h1>Sessions</h1>
-        </div>
-        <div className="single-header-actions">
-          <MiniIconButton title="New session" onClick={onStartCreateSession}>
-            <Plus size={17} />
-          </MiniIconButton>
-          <IconButton title="Refresh sessions" onClick={onRefresh}>
-            <RefreshCw size={18} />
-          </IconButton>
-        </div>
-      </div>
-      <div className="session-table">
-        {isCreatingSession ? (
-          <CreateSessionRow
-            value={newSessionName}
-            error={createSessionError}
-            onChange={onNewSessionNameChange}
-            onCancel={onCancelCreateSession}
-            onSubmit={onCreateSession}
-          />
-        ) : null}
-        {sessions.map((session) => (
-          <button
-            key={session.name}
-            type="button"
-            className={`session-row${session.name === selected ? ' active' : ''}`}
-            onClick={() => onSelect(session.name)}
-          >
-            <span>{session.name}</span>
-            <span>{session.turns}</span>
-            <span>{session.active_messages}</span>
-            <span>{session.has_summary ? 'yes' : 'no'}</span>
-          </button>
-        ))}
-      </div>
-    </section>
+    <span className="inspector-metric">
+      <strong>{value}</strong>
+      <span>{label}</span>
+    </span>
   )
 }
 
@@ -1750,26 +2008,6 @@ function MiniIconButton({
       <span className="sr-only">{title}</span>
       {children}
     </button>
-  )
-}
-
-function StatusPill({
-  status,
-  running,
-}: {
-  status: ConnectionStatus
-  running: boolean
-}) {
-  const text = running ? 'running' : status
-  return <span className={`status-pill ${running ? 'running' : status}`}>{text}</span>
-}
-
-function Metric({ label, value }: { label: string; value: string }) {
-  return (
-    <span className="metric">
-      <strong>{value}</strong>
-      <span>{label}</span>
-    </span>
   )
 }
 
@@ -2019,6 +2257,17 @@ function currentTime(): string {
     minute: '2-digit',
     second: '2-digit',
   })
+}
+
+function inspectorPanelTitle(panel: InspectorPanel): string {
+  switch (panel) {
+    case 'run':
+      return 'Run'
+    case 'tools':
+      return 'Tools'
+    case 'recent':
+      return 'Recent'
+  }
 }
 
 function approvalTitle(request: ApprovalRequest): string {
