@@ -1,80 +1,322 @@
-use agent_model::{ChatCompletionStream, ModelError, ModelEvent, OpenAiCompatClient};
 use agent_protocol::{
-    AgentEvent, ApprovalDecision, ApprovalRequest, Conversation, Message, Thread, ToolCall, Turn,
-    TurnRecord, TurnStep,
+    AgentEvent, ApprovalDecision, ApprovalRequest, Conversation, Message, Thread, ToolCall,
+    ToolDefinition, ToolExecutionSummary, Turn, TurnRecord, TurnStep,
 };
-use agent_tools::{ToolExecution, ToolExecutionMode, ToolRegistry, ToolResult};
 use futures_util::future::{BoxFuture, FutureExt};
-use futures_util::stream::{FuturesUnordered, Stream};
-use std::collections::{BTreeMap, VecDeque};
+use futures_util::stream::{BoxStream, FuturesUnordered, Stream};
+use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::error::Error as StdError;
+use std::fmt;
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc as Shared, Mutex as StdMutex};
+use std::task::{Context, Poll, Waker};
 use thiserror::Error;
 
 const DEFAULT_MAX_TOOL_ROUNDS: usize = 8;
 const MAX_CONCURRENT_TOOL_CALLS: usize = 4;
 
 #[derive(Debug, Clone)]
-pub struct Agent {
-    client: OpenAiCompatClient,
+pub struct ModelRequest {
+    pub conversation: Conversation,
+    pub tools: Vec<ToolDefinition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelEvent {
+    TextDelta(String),
+    ToolCalls(Vec<ToolCall>),
+    Completed,
+}
+
+type BoxError = Box<dyn StdError + Send + Sync + 'static>;
+
+#[derive(Debug)]
+pub struct ModelFailure {
+    source: BoxError,
+}
+
+impl ModelFailure {
+    pub fn new(error: impl StdError + Send + Sync + 'static) -> Self {
+        Self {
+            source: Box::new(error),
+        }
+    }
+}
+
+impl fmt::Display for ModelFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl StdError for ModelFailure {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+pub type ModelStream = BoxStream<'static, Result<ModelEvent, ModelFailure>>;
+pub type ModelFuture = BoxFuture<'static, Result<ModelStream, ModelFailure>>;
+
+pub trait Model: Send + Sync {
+    /// 返回拥有所有数据的 future，便于 turn 状态机跨多次 poll 持有模型请求。
+    fn stream(&self, request: ModelRequest) -> ModelFuture;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolExecutionMode {
+    Concurrent,
+    Serial,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolApproval {
+    pub decision: ApprovalDecision,
+    pub request: ApprovalRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolExecution {
+    Completed(ToolResult),
+    ApprovalRequired(ApprovalRequest),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolResult {
+    pub ok: bool,
+    pub content: String,
+    pub error: Option<String>,
+    pub summary: Option<ToolExecutionSummary>,
+}
+
+impl ToolExecution {
+    pub fn error(error: impl Into<String>) -> Self {
+        Self::Completed(ToolResult::error(error))
+    }
+}
+
+impl ToolResult {
+    pub fn error(error: impl Into<String>) -> Self {
+        let error = error.into();
+        let content = serde_json::to_string(&serde_json::json!({
+            "ok": false,
+            "error": &error,
+        }))
+        .expect("tool error JSON must serialize");
+        Self {
+            ok: false,
+            error: Some(error.clone()),
+            content,
+            summary: Some(ToolExecutionSummary::error(error)),
+        }
+    }
+}
+
+pub type ToolFuture = BoxFuture<'static, ToolExecution>;
+
+#[derive(Default)]
+struct CancellationState {
+    cancelled: AtomicBool,
+    waiters: StdMutex<Vec<Waker>>,
+}
+
+/// 可在 runtime、核心状态机和工具适配器之间传递的轻量取消信号。
+#[derive(Clone, Default)]
+pub struct CancellationToken {
+    state: Shared<CancellationState>,
+}
+
+impl CancellationToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        if self.state.cancelled.swap(true, Ordering::AcqRel) {
+            return;
+        }
+
+        let waiters = {
+            let mut waiters = self
+                .state
+                .waiters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::take(&mut *waiters)
+        };
+        for waiter in waiters {
+            waiter.wake();
+        }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.state.cancelled.load(Ordering::Acquire)
+    }
+
+    pub async fn cancelled(&self) {
+        futures_util::future::poll_fn(|context| {
+            if self.is_cancelled() {
+                return Poll::Ready(());
+            }
+
+            let mut waiters = self
+                .state
+                .waiters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if self.is_cancelled() {
+                return Poll::Ready(());
+            }
+            if !waiters
+                .iter()
+                .any(|waiter| waiter.will_wake(context.waker()))
+            {
+                waiters.push(context.waker().clone());
+            }
+            Poll::Pending
+        })
+        .await
+    }
+}
+
+impl fmt::Debug for CancellationToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CancellationToken")
+            .field("cancelled", &self.is_cancelled())
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ToolExecutionContext {
+    pub cancellation: CancellationToken,
+}
+
+pub trait ToolRuntime: Send + Sync {
+    fn definitions(&self) -> Vec<ToolDefinition>;
+
+    fn execution_mode(&self, call: &ToolCall) -> ToolExecutionMode;
+
+    fn execute(
+        &self,
+        call: ToolCall,
+        approval: Option<ToolApproval>,
+        context: ToolExecutionContext,
+    ) -> ToolFuture;
+}
+
+#[derive(Debug)]
+struct EmptyToolRuntime;
+
+impl ToolRuntime for EmptyToolRuntime {
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        Vec::new()
+    }
+
+    fn execution_mode(&self, _call: &ToolCall) -> ToolExecutionMode {
+        ToolExecutionMode::Concurrent
+    }
+
+    fn execute(
+        &self,
+        call: ToolCall,
+        _approval: Option<ToolApproval>,
+        _context: ToolExecutionContext,
+    ) -> ToolFuture {
+        let name = call.function.name;
+        async move { ToolExecution::error(format!("unknown tool {name:?}")) }.boxed()
+    }
+}
+
+static EMPTY_TOOL_RUNTIME: EmptyToolRuntime = EmptyToolRuntime;
+
+#[derive(Clone)]
+pub struct Agent<'a> {
+    model: &'a dyn Model,
     system_prompt: String,
-    tools: ToolRegistry,
+    tools: &'a dyn ToolRuntime,
     max_tool_rounds: usize,
+}
+
+impl fmt::Debug for Agent<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Agent")
+            .field("system_prompt", &self.system_prompt)
+            .field("tool_count", &self.tools.definitions().len())
+            .field("max_tool_rounds", &self.max_tool_rounds)
+            .finish()
+    }
 }
 
 #[derive(Debug, Error)]
 pub enum AgentError {
     #[error("{0}")]
-    Model(#[from] ModelError),
+    Model(#[from] ModelFailure),
     #[error("{0}")]
     Approval(String),
 }
 
-impl Agent {
-    pub fn new(client: OpenAiCompatClient, system_prompt: impl Into<String>) -> Self {
+impl<'a> Agent<'a> {
+    pub fn new(model: &'a dyn Model, system_prompt: impl Into<String>) -> Self {
         Self {
-            client,
+            model,
             system_prompt: system_prompt.into(),
-            tools: ToolRegistry::empty(),
+            tools: &EMPTY_TOOL_RUNTIME,
             max_tool_rounds: DEFAULT_MAX_TOOL_ROUNDS,
         }
     }
 
     pub fn with_tools(
-        client: OpenAiCompatClient,
+        model: &'a dyn Model,
         system_prompt: impl Into<String>,
-        tools: ToolRegistry,
+        tools: &'a dyn ToolRuntime,
     ) -> Self {
         Self {
-            client,
+            model,
             system_prompt: system_prompt.into(),
             tools,
             max_tool_rounds: DEFAULT_MAX_TOOL_ROUNDS,
         }
     }
 
-    pub async fn run_turn<'a>(
-        &self,
-        thread: &'a mut Thread,
+    pub async fn run_turn<'b>(
+        &'b self,
+        thread: &Thread,
         prompt: impl Into<String>,
-    ) -> Result<AgentTurnStream<'a>, AgentError> {
+    ) -> Result<AgentTurnStream<'b>, AgentError> {
+        self.run_turn_with_context(thread, prompt, ToolExecutionContext::default())
+            .await
+    }
+
+    pub async fn run_turn_with_context<'b>(
+        &'b self,
+        thread: &Thread,
+        prompt: impl Into<String>,
+        tool_context: ToolExecutionContext,
+    ) -> Result<AgentTurnStream<'b>, AgentError> {
         let user_message = Message::user(prompt.into());
         let mut conversation = Conversation::with_system_prompt(self.system_prompt.clone());
         conversation.messages.extend(thread.messages.clone());
         conversation.push(user_message.clone());
-        let client = self.client.clone();
-        let conversation_for_model = conversation.clone();
-        let tools = self.tools.definitions();
+        // 工具定义在一个 turn 内保持不变，避免模型的后续调用看到不同的 schema。
+        let tool_definitions = self.tools.definitions();
+        let model_start = self.model.stream(ModelRequest {
+            conversation: conversation.clone(),
+            tools: tool_definitions.clone(),
+        });
 
         Ok(AgentTurnStream {
-            client: self.client.clone(),
-            tools: self.tools.clone(),
+            model: self.model,
+            tools: self.tools,
+            tool_context,
+            tool_definitions,
             max_tool_rounds: self.max_tool_rounds,
             conversation,
             model_stream: None,
-            model_start: Some(
-                async move { client.stream_chat(&conversation_for_model, &tools).await }.boxed(),
-            ),
+            model_start: Some(model_start),
             pending_tool_calls: VecDeque::new(),
             tool_futures: FuturesUnordered::new(),
             pending_tool_results: BTreeMap::new(),
@@ -82,7 +324,6 @@ impl Agent {
             active_serial_tool: false,
             processing_tool_calls: false,
             pending_approval: None,
-            thread,
             turn: Turn::running(user_message.clone()),
             turn_messages: vec![user_message.clone()],
             assistant_text: String::new(),
@@ -93,7 +334,7 @@ impl Agent {
     }
 }
 
-type ModelStartFuture = BoxFuture<'static, Result<ChatCompletionStream, ModelError>>;
+type ModelStartFuture = ModelFuture;
 type ToolCallFuture = BoxFuture<'static, ToolCallOutcome>;
 
 struct ToolCallOutcome {
@@ -111,11 +352,13 @@ struct PendingApproval {
 }
 
 pub struct AgentTurnStream<'a> {
-    client: OpenAiCompatClient,
-    tools: ToolRegistry,
+    model: &'a dyn Model,
+    tools: &'a dyn ToolRuntime,
+    tool_context: ToolExecutionContext,
+    tool_definitions: Vec<ToolDefinition>,
     max_tool_rounds: usize,
     conversation: Conversation,
-    model_stream: Option<ChatCompletionStream>,
+    model_stream: Option<ModelStream>,
     model_start: Option<ModelStartFuture>,
     pending_tool_calls: VecDeque<(usize, ToolCall)>,
     tool_futures: FuturesUnordered<ToolCallFuture>,
@@ -124,7 +367,6 @@ pub struct AgentTurnStream<'a> {
     active_serial_tool: bool,
     processing_tool_calls: bool,
     pending_approval: Option<PendingApproval>,
-    thread: &'a mut Thread,
     turn: Turn,
     turn_messages: Vec<Message>,
     assistant_text: String,
@@ -138,12 +380,40 @@ impl AgentTurnStream<'_> {
         &self.turn
     }
 
-    pub fn into_turn(self) -> Turn {
-        self.turn
+    pub fn into_turn(mut self) -> Turn {
+        if !self.finished {
+            self.cancel();
+        }
+        self.turn.clone()
     }
 
-    pub fn into_turn_record(self) -> TurnRecord {
-        TurnRecord::new(self.turn, self.turn_messages)
+    pub fn into_turn_record(mut self) -> TurnRecord {
+        if !self.finished {
+            self.cancel();
+        }
+        TurnRecord::new(self.turn.clone(), self.turn_messages.clone())
+    }
+
+    /// 停止继续轮询模型和工具，并把当前 turn 作为失败记录收束。
+    pub fn cancel(&mut self) {
+        self.cancel_with_reason("turn cancelled");
+    }
+
+    pub fn cancel_with_reason(&mut self, error: impl ToString) {
+        if self.finished {
+            return;
+        }
+
+        self.tool_context.cancellation.cancel();
+        self.model_start = None;
+        self.model_stream = None;
+        self.tool_futures = FuturesUnordered::new();
+        self.pending_tool_calls.clear();
+        self.pending_tool_results.clear();
+        self.pending_approval = None;
+        self.processing_tool_calls = false;
+        self.pending.clear();
+        self.fail_turn(error);
     }
 
     pub fn resolve_approval(&mut self, decision: ApprovalDecision) -> Result<(), AgentError> {
@@ -188,7 +458,6 @@ impl AgentTurnStream<'_> {
         let assistant_text = self.assistant_text.clone();
         let assistant_message = Message::assistant(assistant_text.clone());
         self.turn_messages.push(assistant_message.clone());
-        self.thread.messages.extend(self.turn_messages.clone());
         self.turn.complete(assistant_message);
         self.pending
             .push_back(AgentEvent::AgentMessage(assistant_text));
@@ -214,6 +483,25 @@ impl AgentTurnStream<'_> {
         if tool_calls.is_empty() {
             self.fail_turn("model requested tool_calls but did not provide any tool call");
             return;
+        }
+        let mut ids = HashSet::with_capacity(tool_calls.len());
+        for tool_call in &tool_calls {
+            if tool_call.id.trim().is_empty() {
+                self.fail_turn("model returned a tool call with an empty id");
+                return;
+            }
+            let already_used = self
+                .turn
+                .steps
+                .iter()
+                .any(|step| step.tool_call_id.as_deref() == Some(tool_call.id.as_str()));
+            if already_used || !ids.insert(tool_call.id.as_str()) {
+                self.fail_turn(format!(
+                    "model returned duplicate tool call id {:?}",
+                    tool_call.id
+                ));
+                return;
+            }
         }
 
         if let Some(step) = self.turn.steps.last_mut() {
@@ -276,18 +564,19 @@ impl AgentTurnStream<'_> {
             name: name.clone(),
         });
 
-        let tools = self.tools.clone();
         let call_for_result = tool_call.clone();
+        let execution =
+            self.tools
+                .execute(call_for_result.clone(), None, self.tool_context.clone());
         if serial {
             self.active_serial_tool = true;
         }
         self.tool_futures.push(
             async move {
-                let execution = tools.execute(call_for_result.clone()).await;
                 ToolCallOutcome {
                     index,
                     tool_call: call_for_result,
-                    execution,
+                    execution: execution.await,
                     serial,
                 }
             }
@@ -302,18 +591,19 @@ impl AgentTurnStream<'_> {
         decision: ApprovalDecision,
         request: ApprovalRequest,
     ) {
-        let tools = self.tools.clone();
         let call_for_result = tool_call.clone();
+        let execution = self.tools.execute(
+            call_for_result.clone(),
+            Some(ToolApproval { decision, request }),
+            self.tool_context.clone(),
+        );
         self.active_serial_tool = true;
         self.tool_futures.push(
             async move {
-                let execution = tools
-                    .execute_approved(call_for_result.clone(), decision, request)
-                    .await;
                 ToolCallOutcome {
                     index,
                     tool_call: call_for_result,
-                    execution,
+                    execution: execution.await,
                     serial: true,
                 }
             }
@@ -365,6 +655,10 @@ impl AgentTurnStream<'_> {
         tool_call: ToolCall,
         execution: ToolExecution,
     ) {
+        if let ToolExecution::Completed(result) = &execution {
+            // 模型消息仍按原始 call 顺序回灌，但审计状态应在工具真实完成时更新。
+            self.finish_tool_step(&tool_call, result);
+        }
         self.pending_tool_results
             .insert(index, (tool_call, execution));
         self.emit_ready_tool_results();
@@ -374,24 +668,11 @@ impl AgentTurnStream<'_> {
         let id = tool_call.id.clone();
         let name = tool_call.function.name.clone();
         let ok = result.ok;
-        let error = result.error.clone();
         let summary = result.summary.clone();
+        self.finish_tool_step(&tool_call, &result);
         let tool_message = Message::tool_result(id.clone(), result.content);
         self.conversation.push(tool_message.clone());
         self.turn_messages.push(tool_message);
-
-        if let Some(step) = self
-            .turn
-            .steps
-            .iter_mut()
-            .find(|step| step.tool_call_id.as_deref() == Some(id.as_str()))
-        {
-            if ok {
-                step.complete();
-            } else {
-                step.fail(error.unwrap_or_else(|| "tool call failed".to_string()));
-            }
-        }
 
         self.pending.push_back(AgentEvent::ToolCallFinished {
             id,
@@ -401,17 +682,46 @@ impl AgentTurnStream<'_> {
         });
     }
 
+    fn finish_tool_step(&mut self, tool_call: &ToolCall, result: &ToolResult) {
+        if let Some(step) = self
+            .turn
+            .steps
+            .iter_mut()
+            .find(|step| step.tool_call_id.as_deref() == Some(tool_call.id.as_str()))
+        {
+            if result.ok {
+                step.complete();
+            } else {
+                step.fail(
+                    result
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "tool call failed".to_string()),
+                );
+            }
+        }
+    }
+
     fn start_next_model_call(&mut self) {
         self.turn.steps.push(TurnStep::running_model_call());
-        let client = self.client.clone();
-        let conversation = self.conversation.clone();
-        let tools = self.tools.definitions();
-        self.model_start =
-            Some(async move { client.stream_chat(&conversation, &tools).await }.boxed());
+        self.model_start = Some(self.model.stream(ModelRequest {
+            conversation: self.conversation.clone(),
+            tools: self.tool_definitions.clone(),
+        }));
     }
 }
 
 impl Unpin for AgentTurnStream<'_> {}
+
+impl Drop for AgentTurnStream<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            // 调用方提前退出时也要通知工具。字段随后按正常 Drop 顺序释放，shell 的
+            // 进程组 guard 等资源清理逻辑因此仍会执行。
+            self.tool_context.cancellation.cancel();
+        }
+    }
+}
 
 impl Stream for AgentTurnStream<'_> {
     type Item = AgentEvent;
@@ -472,7 +782,7 @@ impl Stream for AgentTurnStream<'_> {
             }
 
             if let Some(model_stream) = this.model_stream.as_mut() {
-                match Pin::new(model_stream).poll_next(cx) {
+                match model_stream.as_mut().poll_next(cx) {
                     Poll::Ready(Some(Ok(ModelEvent::TextDelta(text)))) => {
                         this.assistant_text.push_str(&text);
                         return Poll::Ready(Some(AgentEvent::TextDelta(text)));
@@ -513,106 +823,191 @@ impl Stream for AgentTurnStream<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_model::OpenAiCompatConfig;
     use agent_protocol::{
-        ApprovalAction, ApprovalDecision, PermissionMode, PermissionProfile, ToolCallKind,
-        TurnStatus, TurnStepKind,
+        ApprovalAction, ApprovalDecision, FileChangeOperation, FileChangeSummary, PermissionMode,
+        ToolCallKind, TurnStatus, TurnStepKind,
     };
-    use agent_tools::ToolRegistry;
-    use futures_util::StreamExt;
-    use serde_json::json;
+    use futures_util::{StreamExt, stream};
+    use serde_json::{Value, json};
+    use std::collections::VecDeque;
+    use std::fmt;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
 
-    async fn spawn_sse_server(body: &'static str) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind server");
-        let addr = listener.local_addr().expect("server addr");
-        tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.expect("accept request");
-            let mut request = vec![0_u8; 4096];
-            let _ = socket.read(&mut request).await.expect("read request");
-            let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            socket
-                .write_all(response.as_bytes())
-                .await
-                .expect("write response");
-        });
-        format!("http://{addr}/v1")
+    #[derive(Debug)]
+    struct TestModelError(String);
+
+    impl fmt::Display for TestModelError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            self.0.fmt(formatter)
+        }
+    }
+
+    impl StdError for TestModelError {}
+
+    enum ScriptedResponse {
+        Events(Vec<Result<ModelEvent, String>>),
+        Gated {
+            first: Vec<Result<ModelEvent, String>>,
+            rest: Vec<Result<ModelEvent, String>>,
+            release: tokio::sync::oneshot::Receiver<()>,
+        },
+    }
+
+    #[derive(Clone)]
+    struct ScriptedModel {
+        responses: Arc<Mutex<VecDeque<ScriptedResponse>>>,
+        requests: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ScriptedModel {
+        fn new(responses: Vec<ScriptedResponse>) -> Self {
+            Self {
+                responses: Arc::new(Mutex::new(responses.into())),
+                requests: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn recorded_requests(&self) -> Arc<Mutex<Vec<String>>> {
+            Arc::clone(&self.requests)
+        }
+    }
+
+    impl Model for ScriptedModel {
+        fn stream(&self, request: ModelRequest) -> ModelFuture {
+            let messages = serde_json::to_string(&request.conversation.messages)
+                .expect("serialize model messages");
+            let tools = serde_json::to_string(&request.tools).expect("serialize model tools");
+            let serialized = format!(r#"{{"messages":{messages},"tools":{tools}}}"#);
+            self.requests
+                .lock()
+                .expect("requests lock poisoned")
+                .push(serialized);
+            let response = self
+                .responses
+                .lock()
+                .expect("responses lock poisoned")
+                .pop_front()
+                .unwrap_or_else(|| {
+                    ScriptedResponse::Events(vec![Err(
+                        "scripted model has no remaining response".to_string()
+                    )])
+                });
+
+            async move {
+                let stream: ModelStream = match response {
+                    ScriptedResponse::Events(events) => {
+                        stream::iter(events.into_iter().map(model_result)).boxed()
+                    }
+                    ScriptedResponse::Gated {
+                        first,
+                        rest,
+                        release,
+                    } => {
+                        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+                        tokio::spawn(async move {
+                            for event in first {
+                                let _ = sender.send(model_result(event));
+                            }
+                            let _ = release.await;
+                            for event in rest {
+                                let _ = sender.send(model_result(event));
+                            }
+                        });
+                        stream::unfold(receiver, |mut receiver| async move {
+                            receiver.recv().await.map(|event| (event, receiver))
+                        })
+                        .boxed()
+                    }
+                };
+                Ok(stream)
+            }
+            .boxed()
+        }
+    }
+
+    fn model_result(event: Result<ModelEvent, String>) -> Result<ModelEvent, ModelFailure> {
+        event.map_err(|error| ModelFailure::new(TestModelError(error)))
+    }
+
+    async fn spawn_sse_server(body: &'static str) -> ScriptedModel {
+        ScriptedModel::new(vec![ScriptedResponse::Events(parse_sse_body(body))])
     }
 
     async fn spawn_gated_sse_server(
         first_chunk: &'static str,
         rest: &'static str,
-    ) -> (String, tokio::sync::oneshot::Sender<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind server");
-        let addr = listener.local_addr().expect("server addr");
+    ) -> (ScriptedModel, tokio::sync::oneshot::Sender<()>) {
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.expect("accept request");
-            let mut request = vec![0_u8; 4096];
-            let _ = socket.read(&mut request).await.expect("read request");
-            let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                first_chunk.len() + rest.len()
-            );
-            socket
-                .write_all(response.as_bytes())
-                .await
-                .expect("write response headers");
-            socket
-                .write_all(first_chunk.as_bytes())
-                .await
-                .expect("write first chunk");
-            let _ = release_rx.await;
-            socket.write_all(rest.as_bytes()).await.expect("write rest");
-        });
-        (format!("http://{addr}/v1"), release_tx)
+        let model = ScriptedModel::new(vec![ScriptedResponse::Gated {
+            first: parse_sse_body(first_chunk),
+            rest: parse_sse_body(rest),
+            release: release_rx,
+        }]);
+        (model, release_tx)
     }
 
     async fn spawn_recording_sse_server(
         bodies: Vec<&'static str>,
-    ) -> (String, Arc<Mutex<Vec<String>>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind server");
-        let addr = listener.local_addr().expect("server addr");
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let captured_requests = Arc::clone(&requests);
-        tokio::spawn(async move {
-            for body in bodies {
-                let (mut socket, _) = listener.accept().await.expect("accept request");
-                let mut request = vec![0_u8; 8192];
-                let read = socket.read(&mut request).await.expect("read request");
-                captured_requests
-                    .lock()
-                    .expect("requests lock poisoned")
-                    .push(String::from_utf8_lossy(&request[..read]).to_string());
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                socket
-                    .write_all(response.as_bytes())
-                    .await
-                    .expect("write response");
-            }
-        });
-        (format!("http://{addr}/v1"), requests)
+    ) -> (ScriptedModel, Arc<Mutex<Vec<String>>>) {
+        let responses = bodies
+            .into_iter()
+            .map(|body| ScriptedResponse::Events(parse_sse_body(body)))
+            .collect();
+        let model = ScriptedModel::new(responses);
+        let requests = model.recorded_requests();
+        (model, requests)
     }
 
-    fn client(base_url: String) -> OpenAiCompatClient {
-        OpenAiCompatClient::new_without_proxy(OpenAiCompatConfig {
-            base_url,
-            model: "test-model".to_string(),
-            api_key: "test-key".to_string(),
-            timeout: Duration::from_secs(5),
-        })
-        .expect("client")
+    fn client(model: ScriptedModel) -> ScriptedModel {
+        model
+    }
+
+    fn parse_sse_body(body: &str) -> Vec<Result<ModelEvent, String>> {
+        let mut events = Vec::new();
+        let mut tool_calls = Vec::new();
+        for frame in body.replace("\r\n", "\n").split("\n\n") {
+            let Some(data) = frame.strip_prefix("data: ") else {
+                continue;
+            };
+            if data == "[DONE]" {
+                events.push(Ok(ModelEvent::Completed));
+                continue;
+            }
+            let value: Value = match serde_json::from_str(data) {
+                Ok(value) => value,
+                Err(error) => {
+                    events.push(Err(format!("failed to parse model stream JSON: {error}")));
+                    break;
+                }
+            };
+            let Some(choice) = value["choices"]
+                .as_array()
+                .and_then(|choices| choices.first())
+            else {
+                continue;
+            };
+            if let Some(content) = choice["delta"]["content"].as_str()
+                && !content.is_empty()
+            {
+                events.push(Ok(ModelEvent::TextDelta(content.to_string())));
+            }
+            if let Some(calls) = choice["delta"]["tool_calls"].as_array() {
+                for call in calls {
+                    tool_calls.push(ToolCall::function(
+                        call["id"].as_str().unwrap_or_default(),
+                        call["function"]["name"].as_str().unwrap_or_default(),
+                        call["function"]["arguments"].as_str().unwrap_or_default(),
+                    ));
+                }
+            }
+            if choice["finish_reason"].as_str() == Some("tool_calls") {
+                events.push(Ok(ModelEvent::ToolCalls(std::mem::take(&mut tool_calls))));
+            }
+        }
+        events
     }
 
     fn unique_dir(name: &str) -> PathBuf {
@@ -690,29 +1085,291 @@ mod tests {
         Box::leak(body.into_boxed_str())
     }
 
-    fn tools(root: &Path) -> ToolRegistry {
-        ToolRegistry::built_in(
-            root,
-            PermissionProfile::for_mode(PermissionMode::WorkspaceWrite),
-        )
-        .expect("tools")
+    #[derive(Debug, Clone)]
+    struct TestTools {
+        root: PathBuf,
+        mode: PermissionMode,
     }
 
-    fn tools_with_permissions(root: &Path, mode: PermissionMode) -> ToolRegistry {
-        ToolRegistry::built_in(root, PermissionProfile::for_mode(mode)).expect("tools")
+    impl ToolRuntime for TestTools {
+        fn definitions(&self) -> Vec<ToolDefinition> {
+            ["read_file", "list_files", "write_file", "shell_command"]
+                .into_iter()
+                .map(|name| ToolDefinition::function(name, format!("Test tool {name}"), json!({})))
+                .collect()
+        }
+
+        fn execution_mode(&self, call: &ToolCall) -> ToolExecutionMode {
+            match call.function.name.as_str() {
+                "write_file" | "shell_command" => ToolExecutionMode::Serial,
+                _ => ToolExecutionMode::Concurrent,
+            }
+        }
+
+        fn execute(
+            &self,
+            call: ToolCall,
+            approval: Option<ToolApproval>,
+            _context: ToolExecutionContext,
+        ) -> ToolFuture {
+            let tools = self.clone();
+            async move { tools.execute_now(call, approval) }.boxed()
+        }
     }
 
-    async fn collect_events(mut stream: AgentTurnStream<'_>) -> (Vec<AgentEvent>, Turn) {
+    impl TestTools {
+        fn execute_now(&self, call: ToolCall, approval: Option<ToolApproval>) -> ToolExecution {
+            let arguments: Value = match serde_json::from_str(&call.function.arguments) {
+                Ok(arguments) => arguments,
+                Err(error) => return ToolExecution::error(format!("invalid arguments: {error}")),
+            };
+            match call.function.name.as_str() {
+                "read_file" => self.read_file(arguments),
+                "list_files" => self.list_files(arguments),
+                "write_file" => self.write_file(call.id, arguments, approval),
+                "shell_command" => self.shell_command(call.id, arguments, approval),
+                name => ToolExecution::error(format!("unknown tool {name:?}")),
+            }
+        }
+
+        fn read_file(&self, arguments: Value) -> ToolExecution {
+            let path = arguments["path"].as_str().unwrap_or_default();
+            match fs::read_to_string(self.root.join(path)) {
+                Ok(content) => completed_ok(json!({ "path": path, "content": content }), None),
+                Err(error) => ToolExecution::error(format!("failed to read {path}: {error}")),
+            }
+        }
+
+        fn list_files(&self, arguments: Value) -> ToolExecution {
+            let path = arguments["path"].as_str().unwrap_or(".");
+            let entries = fs::read_dir(self.root.join(path))
+                .map(|entries| {
+                    entries
+                        .filter_map(Result::ok)
+                        .map(|entry| entry.file_name().to_string_lossy().to_string())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            completed_ok(json!({ "path": path, "entries": entries }), None)
+        }
+
+        fn write_file(
+            &self,
+            call_id: String,
+            arguments: Value,
+            approval: Option<ToolApproval>,
+        ) -> ToolExecution {
+            let path = arguments["path"].as_str().unwrap_or_default();
+            let content = arguments["content"].as_str().unwrap_or_default();
+            let summary = FileChangeSummary {
+                path: path.to_string(),
+                operation: FileChangeOperation::Add,
+                replacements: 0,
+                created: true,
+                overwritten: false,
+                deleted: false,
+            };
+            let added = content
+                .lines()
+                .map(|line| format!("+{line}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let diff = format!("--- /dev/null\n+++ {path}\n{added}\n");
+
+            if self.mode != PermissionMode::DangerFullAccess && approval.is_none() {
+                return ToolExecution::ApprovalRequired(ApprovalRequest::file_changes(
+                    format!("approval-{call_id}"),
+                    vec![summary],
+                    diff,
+                    "file change requires approval",
+                ));
+            }
+            if let Err(error) = fs::write(self.root.join(path), content) {
+                return ToolExecution::error(format!("failed to write {path}: {error}"));
+            }
+            completed_ok(
+                json!({ "path": path }),
+                Some(ToolExecutionSummary::file_changes(vec![summary], diff)),
+            )
+        }
+
+        fn shell_command(
+            &self,
+            call_id: String,
+            arguments: Value,
+            approval: Option<ToolApproval>,
+        ) -> ToolExecution {
+            let command = arguments["command"].as_str().unwrap_or_default();
+            let timeout_secs = arguments["timeout_secs"].as_u64().unwrap_or(30);
+            if approval.is_none() {
+                return ToolExecution::ApprovalRequired(ApprovalRequest::shell_command(
+                    format!("approval-{call_id}"),
+                    command,
+                    &self.root,
+                    timeout_secs,
+                    "shell command requires approval",
+                ));
+            }
+            completed_ok(json!({ "command": command }), None)
+        }
+    }
+
+    fn completed_ok(data: Value, summary: Option<ToolExecutionSummary>) -> ToolExecution {
+        ToolExecution::Completed(ToolResult {
+            ok: true,
+            content: serde_json::to_string(&json!({ "ok": true, "data": data }))
+                .expect("serialize tool result"),
+            error: None,
+            summary,
+        })
+    }
+
+    fn tools(root: &Path) -> TestTools {
+        tools_with_permissions(root, PermissionMode::WorkspaceWrite)
+    }
+
+    fn tools_with_permissions(root: &Path, mode: PermissionMode) -> TestTools {
+        TestTools {
+            root: root.to_path_buf(),
+            mode,
+        }
+    }
+
+    #[derive(Clone)]
+    struct CancellationProbeTools {
+        observed: Arc<Mutex<Vec<bool>>>,
+    }
+
+    impl ToolRuntime for CancellationProbeTools {
+        fn definitions(&self) -> Vec<ToolDefinition> {
+            vec![ToolDefinition::function(
+                "probe",
+                "Test cancellation",
+                json!({}),
+            )]
+        }
+
+        fn execution_mode(&self, _call: &ToolCall) -> ToolExecutionMode {
+            ToolExecutionMode::Concurrent
+        }
+
+        fn execute(
+            &self,
+            _call: ToolCall,
+            _approval: Option<ToolApproval>,
+            context: ToolExecutionContext,
+        ) -> ToolFuture {
+            self.observed
+                .lock()
+                .expect("observed lock poisoned")
+                .push(context.cancellation.is_cancelled());
+            async { completed_ok(json!({ "observed": true }), None) }.boxed()
+        }
+    }
+
+    #[derive(Clone)]
+    struct DropProbeTools {
+        token: Arc<Mutex<Option<CancellationToken>>>,
+    }
+
+    impl ToolRuntime for DropProbeTools {
+        fn definitions(&self) -> Vec<ToolDefinition> {
+            vec![ToolDefinition::function(
+                "wait",
+                "Never completes",
+                json!({}),
+            )]
+        }
+
+        fn execution_mode(&self, _call: &ToolCall) -> ToolExecutionMode {
+            ToolExecutionMode::Concurrent
+        }
+
+        fn execute(
+            &self,
+            _call: ToolCall,
+            _approval: Option<ToolApproval>,
+            context: ToolExecutionContext,
+        ) -> ToolFuture {
+            *self.token.lock().expect("token lock poisoned") = Some(context.cancellation);
+            futures_util::future::pending().boxed()
+        }
+    }
+
+    #[derive(Clone)]
+    struct OutOfOrderTools;
+
+    impl ToolRuntime for OutOfOrderTools {
+        fn definitions(&self) -> Vec<ToolDefinition> {
+            ["slow", "fast"]
+                .into_iter()
+                .map(|name| ToolDefinition::function(name, "Test ordering", json!({})))
+                .collect()
+        }
+
+        fn execution_mode(&self, _call: &ToolCall) -> ToolExecutionMode {
+            ToolExecutionMode::Concurrent
+        }
+
+        fn execute(
+            &self,
+            call: ToolCall,
+            _approval: Option<ToolApproval>,
+            _context: ToolExecutionContext,
+        ) -> ToolFuture {
+            if call.function.name == "fast" {
+                async { completed_ok(json!({ "completed": true }), None) }.boxed()
+            } else {
+                futures_util::future::pending().boxed()
+            }
+        }
+    }
+
+    fn apply_record(thread: &mut Thread, record: TurnRecord) -> Turn {
+        let TurnRecord { turn, messages } = record;
+        if turn.status == TurnStatus::Completed {
+            thread.messages.extend(messages);
+        }
+        turn
+    }
+
+    async fn collect_events(
+        mut stream: AgentTurnStream<'_>,
+        thread: &mut Thread,
+    ) -> (Vec<AgentEvent>, Turn) {
         let mut events = Vec::new();
         while let Some(event) = stream.next().await {
             events.push(event);
         }
-        let turn = stream.into_turn();
+        let turn = apply_record(thread, stream.into_turn_record());
         (events, turn)
     }
 
     async fn next_event(stream: &mut AgentTurnStream<'_>) -> AgentEvent {
         stream.next().await.expect("next agent event")
+    }
+
+    #[tokio::test]
+    async fn cancellation_token_wakes_all_waiters() {
+        let token = CancellationToken::new();
+        let first = {
+            let token = token.clone();
+            tokio::spawn(async move { token.cancelled().await })
+        };
+        let second = {
+            let token = token.clone();
+            tokio::spawn(async move { token.cancelled().await })
+        };
+
+        tokio::task::yield_now().await;
+        token.cancel();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            first.await.expect("first waiter");
+            second.await.expect("second waiter");
+        })
+        .await
+        .expect("all cancellation waiters must wake");
     }
 
     #[tokio::test]
@@ -723,14 +1380,12 @@ mod tests {
             "data: [DONE]\n\n"
         );
         let base_url = spawn_sse_server(body).await;
-        let agent = Agent::new(client(base_url), "You are helpful.");
+        let model = client(base_url);
+        let agent = Agent::new(&model, "You are helpful.");
         let mut thread = Thread::new();
 
-        let stream = agent
-            .run_turn(&mut thread, "Say hi")
-            .await
-            .expect("run turn");
-        let (events, turn) = collect_events(stream).await;
+        let stream = agent.run_turn(&thread, "Say hi").await.expect("run turn");
+        let (events, turn) = collect_events(stream, &mut thread).await;
 
         assert_eq!(
             events,
@@ -761,12 +1416,10 @@ mod tests {
             "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n";
         let rest = "data: [DONE]\n\n";
         let (base_url, release) = spawn_gated_sse_server(first_chunk, rest).await;
-        let agent = Agent::new(client(base_url), "You are helpful.");
-        let mut thread = Thread::new();
-        let mut stream = agent
-            .run_turn(&mut thread, "Say hi")
-            .await
-            .expect("run turn");
+        let model = client(base_url);
+        let agent = Agent::new(&model, "You are helpful.");
+        let thread = Thread::new();
+        let mut stream = agent.run_turn(&thread, "Say hi").await.expect("run turn");
 
         assert_eq!(next_event(&mut stream).await, AgentEvent::TurnStarted);
         let delta = tokio::time::timeout(Duration::from_secs(1), stream.next())
@@ -786,6 +1439,199 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelling_stream_returns_failed_turn_record() {
+        let first_chunk =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n";
+        let rest = "data: [DONE]\n\n";
+        let (model, _release) = spawn_gated_sse_server(first_chunk, rest).await;
+        let agent = Agent::new(&model, "You are helpful.");
+        let thread = Thread::new();
+        let mut stream = agent.run_turn(&thread, "Say hi").await.expect("run turn");
+
+        assert_eq!(next_event(&mut stream).await, AgentEvent::TurnStarted);
+        assert_eq!(
+            next_event(&mut stream).await,
+            AgentEvent::TextDelta("Hello".to_string())
+        );
+        stream.cancel();
+
+        assert_eq!(
+            next_event(&mut stream).await,
+            AgentEvent::Error("turn cancelled".to_string())
+        );
+        assert_eq!(stream.next().await, None);
+        let record = stream.into_turn_record();
+        assert_eq!(record.turn.status, TurnStatus::Failed);
+        assert_eq!(record.turn.error.as_deref(), Some("turn cancelled"));
+        assert_eq!(record.messages, vec![Message::user("Say hi")]);
+    }
+
+    #[tokio::test]
+    async fn reused_agent_creates_a_fresh_default_cancellation_context_per_turn() {
+        let model = ScriptedModel::new(vec![
+            ScriptedResponse::Events(vec![
+                Ok(ModelEvent::TextDelta("unused".to_string())),
+                Ok(ModelEvent::Completed),
+            ]),
+            ScriptedResponse::Events(vec![Ok(ModelEvent::ToolCalls(vec![ToolCall::function(
+                "call-1", "probe", "{}",
+            )]))]),
+            ScriptedResponse::Events(vec![
+                Ok(ModelEvent::TextDelta("done".to_string())),
+                Ok(ModelEvent::Completed),
+            ]),
+        ]);
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let tools = CancellationProbeTools {
+            observed: observed.clone(),
+        };
+        let agent = Agent::with_tools(&model, "test", &tools);
+
+        let mut first = agent
+            .run_turn(&Thread::new(), "cancel this")
+            .await
+            .expect("first turn");
+        first.cancel();
+        while first.next().await.is_some() {}
+
+        let mut second = agent
+            .run_turn(&Thread::new(), "run the tool")
+            .await
+            .expect("second turn");
+        while second.next().await.is_some() {}
+
+        assert_eq!(second.turn().status, TurnStatus::Completed);
+        assert_eq!(
+            *observed.lock().expect("observed lock poisoned"),
+            vec![false]
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_an_unfinished_stream_cancels_running_tools() {
+        let model = ScriptedModel::new(vec![ScriptedResponse::Events(vec![Ok(
+            ModelEvent::ToolCalls(vec![ToolCall::function("call-1", "wait", "{}")]),
+        )])]);
+        let token = Arc::new(Mutex::new(None));
+        let tools = DropProbeTools {
+            token: token.clone(),
+        };
+        let agent = Agent::with_tools(&model, "test", &tools);
+        let mut stream = agent
+            .run_turn(&Thread::new(), "start waiting")
+            .await
+            .expect("turn");
+
+        assert_eq!(next_event(&mut stream).await, AgentEvent::TurnStarted);
+        assert!(matches!(
+            next_event(&mut stream).await,
+            AgentEvent::ToolCallStarted { .. }
+        ));
+        let cancellation = token
+            .lock()
+            .expect("token lock poisoned")
+            .clone()
+            .expect("tool context token");
+
+        drop(stream);
+
+        assert!(cancellation.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn duplicate_tool_call_ids_fail_before_any_tool_starts() {
+        let model = ScriptedModel::new(vec![ScriptedResponse::Events(vec![Ok(
+            ModelEvent::ToolCalls(vec![
+                ToolCall::function("duplicate", "first", "{}"),
+                ToolCall::function("duplicate", "second", "{}"),
+            ]),
+        )])]);
+        let agent = Agent::new(&model, "test");
+        let mut thread = Thread::new();
+
+        let stream = agent
+            .run_turn(&thread, "invalid tools")
+            .await
+            .expect("turn");
+        let (events, turn) = collect_events(stream, &mut thread).await;
+
+        assert_eq!(turn.status, TurnStatus::Failed);
+        assert!(
+            turn.error
+                .as_deref()
+                .is_some_and(|error| error.contains("duplicate tool call id"))
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, AgentEvent::ToolCallStarted { .. }))
+        );
+        assert!(
+            turn.steps
+                .iter()
+                .all(|step| step.status != TurnStatus::Running)
+        );
+        assert!(thread.messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancellation_preserves_an_out_of_order_completed_tool_step() {
+        let model = ScriptedModel::new(vec![ScriptedResponse::Events(vec![Ok(
+            ModelEvent::ToolCalls(vec![
+                ToolCall::function("slow-call", "slow", "{}"),
+                ToolCall::function("fast-call", "fast", "{}"),
+            ]),
+        )])]);
+        let tools = OutOfOrderTools;
+        let agent = Agent::with_tools(&model, "test", &tools);
+        let mut stream = agent
+            .run_turn(&Thread::new(), "run concurrently")
+            .await
+            .expect("turn");
+
+        assert_eq!(next_event(&mut stream).await, AgentEvent::TurnStarted);
+        assert!(matches!(
+            next_event(&mut stream).await,
+            AgentEvent::ToolCallStarted { .. }
+        ));
+        assert!(matches!(
+            next_event(&mut stream).await,
+            AgentEvent::ToolCallStarted { .. }
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), stream.next())
+                .await
+                .is_err(),
+            "the slow first call keeps ordered result emission pending"
+        );
+
+        let fast_step = stream
+            .turn()
+            .steps
+            .iter()
+            .find(|step| step.tool_call_id.as_deref() == Some("fast-call"))
+            .expect("fast step");
+        assert_eq!(fast_step.status, TurnStatus::Completed);
+
+        stream.cancel();
+
+        let slow_step = stream
+            .turn()
+            .steps
+            .iter()
+            .find(|step| step.tool_call_id.as_deref() == Some("slow-call"))
+            .expect("slow step");
+        let fast_step = stream
+            .turn()
+            .steps
+            .iter()
+            .find(|step| step.tool_call_id.as_deref() == Some("fast-call"))
+            .expect("fast step");
+        assert_eq!(slow_step.status, TurnStatus::Failed);
+        assert_eq!(fast_step.status, TurnStatus::Completed);
+    }
+
+    #[tokio::test]
     async fn run_turn_sends_prior_thread_messages_to_second_model_call() {
         let first_body = concat!(
             "data: {\"choices\":[{\"delta\":{\"content\":\"First answer\"},\"finish_reason\":null}]}\n\n",
@@ -796,19 +1642,20 @@ mod tests {
             "data: [DONE]\n\n"
         );
         let (base_url, requests) = spawn_recording_sse_server(vec![first_body, second_body]).await;
-        let agent = Agent::new(client(base_url), "You are helpful.");
+        let model = client(base_url);
+        let agent = Agent::new(&model, "You are helpful.");
         let mut thread = Thread::new();
 
         let stream = agent
-            .run_turn(&mut thread, "First question")
+            .run_turn(&thread, "First question")
             .await
             .expect("first turn");
-        let _ = collect_events(stream).await;
+        let _ = collect_events(stream, &mut thread).await;
         let stream = agent
-            .run_turn(&mut thread, "Second question")
+            .run_turn(&thread, "Second question")
             .await
             .expect("second turn");
-        let _ = collect_events(stream).await;
+        let _ = collect_events(stream, &mut thread).await;
 
         let requests = requests.lock().expect("requests lock poisoned");
         assert_eq!(requests.len(), 2);
@@ -832,16 +1679,17 @@ mod tests {
     #[tokio::test]
     async fn failed_turn_emits_error_and_does_not_update_thread() {
         let base_url = spawn_sse_server("data: {not-json}\n\n").await;
-        let agent = Agent::new(client(base_url), "You are helpful.");
+        let model = client(base_url);
+        let agent = Agent::new(&model, "You are helpful.");
         let mut thread = Thread::new();
         thread.push(Message::user("Earlier question"));
         thread.push(Message::assistant("Earlier answer"));
 
         let stream = agent
-            .run_turn(&mut thread, "Broken question")
+            .run_turn(&thread, "Broken question")
             .await
             .expect("run turn");
-        let (events, turn) = collect_events(stream).await;
+        let (events, turn) = collect_events(stream, &mut thread).await;
 
         assert_eq!(events.len(), 2);
         assert_eq!(events[0], AgentEvent::TurnStarted);
@@ -872,14 +1720,16 @@ mod tests {
             "data: [DONE]\n\n"
         );
         let (base_url, requests) = spawn_recording_sse_server(vec![first_body, second_body]).await;
-        let agent = Agent::with_tools(client(base_url), "You are helpful.", tools(&root));
+        let model = client(base_url);
+        let tools = tools(&root);
+        let agent = Agent::with_tools(&model, "You are helpful.", &tools);
         let mut thread = Thread::new();
 
         let stream = agent
-            .run_turn(&mut thread, "Read note.txt")
+            .run_turn(&thread, "Read note.txt")
             .await
             .expect("run turn");
-        let (events, turn) = collect_events(stream).await;
+        let (events, turn) = collect_events(stream, &mut thread).await;
 
         assert_eq!(
             events,
@@ -932,14 +1782,16 @@ mod tests {
             "data: [DONE]\n\n"
         );
         let (base_url, requests) = spawn_recording_sse_server(vec![first_body, second_body]).await;
-        let agent = Agent::with_tools(client(base_url), "You are helpful.", tools(&root));
+        let model = client(base_url);
+        let tools = tools(&root);
+        let agent = Agent::with_tools(&model, "You are helpful.", &tools);
         let mut thread = Thread::new();
 
         let stream = agent
-            .run_turn(&mut thread, "Read missing.txt")
+            .run_turn(&thread, "Read missing.txt")
             .await
             .expect("run turn");
-        let (events, turn) = collect_events(stream).await;
+        let (events, turn) = collect_events(stream, &mut thread).await;
 
         assert_eq!(turn.status, TurnStatus::Completed);
         assert!(matches!(
@@ -984,14 +1836,16 @@ mod tests {
             "data: [DONE]\n\n"
         );
         let (base_url, requests) = spawn_recording_sse_server(vec![first_body, second_body]).await;
-        let agent = Agent::with_tools(client(base_url), "You are helpful.", tools(&root));
+        let model = client(base_url);
+        let tools = tools(&root);
+        let agent = Agent::with_tools(&model, "You are helpful.", &tools);
         let mut thread = Thread::new();
 
         let stream = agent
-            .run_turn(&mut thread, "Read a.txt and b.txt")
+            .run_turn(&thread, "Read a.txt and b.txt")
             .await
             .expect("run turn");
-        let (events, turn) = collect_events(stream).await;
+        let (events, turn) = collect_events(stream, &mut thread).await;
 
         assert_eq!(turn.status, TurnStatus::Completed);
         assert_eq!(turn.steps.len(), 4);
@@ -1068,18 +1922,16 @@ mod tests {
             "data: [DONE]\n\n"
         );
         let (base_url, _) = spawn_recording_sse_server(vec![first_body, second_body]).await;
-        let agent = Agent::with_tools(
-            client(base_url),
-            "You are helpful.",
-            tools_with_permissions(&root, PermissionMode::DangerFullAccess),
-        );
+        let model = client(base_url);
+        let tools = tools_with_permissions(&root, PermissionMode::DangerFullAccess);
+        let agent = Agent::with_tools(&model, "You are helpful.", &tools);
         let mut thread = Thread::new();
 
         let stream = agent
-            .run_turn(&mut thread, "Read, write, read")
+            .run_turn(&thread, "Read, write, read")
             .await
             .expect("run turn");
-        let (events, turn) = collect_events(stream).await;
+        let (events, turn) = collect_events(stream, &mut thread).await;
 
         assert_eq!(turn.status, TurnStatus::Completed);
         assert_eq!(
@@ -1149,14 +2001,16 @@ mod tests {
             "data: [DONE]\n\n"
         );
         let (base_url, requests) = spawn_recording_sse_server(vec![first_body, second_body]).await;
-        let agent = Agent::with_tools(client(base_url), "You are helpful.", tools(&root));
+        let model = client(base_url);
+        let tools = tools(&root);
+        let agent = Agent::with_tools(&model, "You are helpful.", &tools);
         let mut thread = Thread::new();
 
         let stream = agent
-            .run_turn(&mut thread, "Read note.txt")
+            .run_turn(&thread, "Read note.txt")
             .await
             .expect("run turn");
-        let (events, turn) = collect_events(stream).await;
+        let (events, turn) = collect_events(stream, &mut thread).await;
 
         assert_eq!(turn.status, TurnStatus::Completed);
         assert!(matches!(
@@ -1203,13 +2057,12 @@ mod tests {
             "data: [DONE]\n\n"
         );
         let (base_url, requests) = spawn_recording_sse_server(vec![first_body, second_body]).await;
-        let agent = Agent::with_tools(client(base_url), "You are helpful.", tools(&root));
+        let model = client(base_url);
+        let tools = tools(&root);
+        let agent = Agent::with_tools(&model, "You are helpful.", &tools);
         let mut thread = Thread::new();
 
-        let mut stream = agent
-            .run_turn(&mut thread, "Run pwd")
-            .await
-            .expect("run turn");
+        let mut stream = agent.run_turn(&thread, "Run pwd").await.expect("run turn");
 
         assert_eq!(next_event(&mut stream).await, AgentEvent::TurnStarted);
         assert_eq!(
@@ -1253,7 +2106,7 @@ mod tests {
         assert_eq!(next_event(&mut stream).await, AgentEvent::TurnCompleted);
         assert_eq!(stream.next().await, None);
 
-        let turn = stream.into_turn();
+        let turn = apply_record(&mut thread, stream.into_turn_record());
         assert_eq!(turn.status, TurnStatus::Completed);
         assert_eq!(turn.steps[1].status, TurnStatus::Failed);
         assert_eq!(thread.messages.len(), 4);
@@ -1276,10 +2129,12 @@ mod tests {
             "data: [DONE]\n\n"
         );
         let (base_url, requests) = spawn_recording_sse_server(vec![first_body, second_body]).await;
-        let agent = Agent::with_tools(client(base_url), "You are helpful.", tools(&root));
-        let mut thread = Thread::new();
+        let model = client(base_url);
+        let tools = tools(&root);
+        let agent = Agent::with_tools(&model, "You are helpful.", &tools);
+        let thread = Thread::new();
         let mut stream = agent
-            .run_turn(&mut thread, "Write note.txt")
+            .run_turn(&thread, "Write note.txt")
             .await
             .expect("run turn");
 
@@ -1335,11 +2190,13 @@ mod tests {
             "data: [DONE]\n\n"
         );
         let (base_url, requests) = spawn_recording_sse_server(vec![first_body, second_body]).await;
-        let agent = Agent::with_tools(client(base_url), "You are helpful.", tools(&root));
-        let mut thread = Thread::new();
+        let model = client(base_url);
+        let tools = tools(&root);
+        let agent = Agent::with_tools(&model, "You are helpful.", &tools);
+        let thread = Thread::new();
 
         let mut stream = agent
-            .run_turn(&mut thread, "Write note.txt")
+            .run_turn(&thread, "Write note.txt")
             .await
             .expect("run turn");
 
@@ -1414,11 +2271,13 @@ mod tests {
             "data: [DONE]\n\n"
         );
         let (base_url, requests) = spawn_recording_sse_server(vec![first_body, second_body]).await;
-        let agent = Agent::with_tools(client(base_url), "You are helpful.", tools(&root));
-        let mut thread = Thread::new();
+        let model = client(base_url);
+        let tools = tools(&root);
+        let agent = Agent::with_tools(&model, "You are helpful.", &tools);
+        let thread = Thread::new();
 
         let mut stream = agent
-            .run_turn(&mut thread, "Write note.txt")
+            .run_turn(&thread, "Write note.txt")
             .await
             .expect("run turn");
 
@@ -1476,11 +2335,13 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let (base_url, requests) = spawn_recording_sse_server(bodies).await;
-        let agent = Agent::with_tools(client(base_url), "You are helpful.", tools(&root));
+        let model = client(base_url);
+        let tools = tools(&root);
+        let agent = Agent::with_tools(&model, "You are helpful.", &tools);
         let mut thread = Thread::new();
 
-        let stream = agent.run_turn(&mut thread, "Loop").await.expect("run turn");
-        let (events, turn) = collect_events(stream).await;
+        let stream = agent.run_turn(&thread, "Loop").await.expect("run turn");
+        let (events, turn) = collect_events(stream, &mut thread).await;
 
         assert_eq!(turn.status, TurnStatus::Failed);
         assert!(

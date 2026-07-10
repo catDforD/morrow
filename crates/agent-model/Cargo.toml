@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+agent-core = { workspace = true }
 agent-protocol = { workspace = true }
 bytes = { workspace = true }
 futures-util = { workspace = true }

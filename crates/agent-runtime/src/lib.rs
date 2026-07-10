@@ -1,11 +1,12 @@
 pub mod session_store;
 
 use agent_config::{ContextConfig, McpServerConfig, ModelContextLimits};
-use agent_core::{Agent, AgentError};
-use agent_model::{ModelError, ModelEvent, OpenAiCompatClient};
+use agent_core::{
+    Agent, AgentError, Model, ModelEvent, ModelFailure, ModelRequest, ToolExecutionContext,
+};
 use agent_protocol::{
     AgentEvent, ApprovalDecision, ApprovalRequest, Conversation, Message, PermissionProfile,
-    Session, TurnRecord, TurnStatus,
+    Session, ToolDefinition, TurnRecord, TurnStatus,
 };
 use agent_tools::{ToolRegistry, ToolRegistryError};
 use futures_util::StreamExt;
@@ -17,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
+pub use agent_core::CancellationToken;
 pub use agent_tools::McpToolCache;
 pub use session_store::{SessionEntry, SessionStore, SessionStoreError};
 
@@ -38,7 +40,7 @@ const REQUIRED_SUMMARY_SECTIONS: [&str; 7] = [
 #[derive(Debug, Error)]
 pub enum RuntimeError {
     #[error(transparent)]
-    Model(#[from] ModelError),
+    Model(#[from] ModelFailure),
     #[error(transparent)]
     Agent(#[from] AgentError),
     #[error(transparent)]
@@ -74,9 +76,9 @@ pub struct AgentEventEnvelope {
     pub event: AgentEvent,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct RunAgentTurnContext<'a> {
-    pub client: &'a OpenAiCompatClient,
+    pub client: &'a dyn Model,
     pub system_prompt: &'a str,
     pub context_config: ContextConfig,
     pub model_limits: ModelContextLimits,
@@ -90,7 +92,10 @@ pub struct RunAgentTurnContext<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunAgentTurnOutcome {
+    /// 表示调用方持有的 Session 已被更新，应执行持久化。
     pub session_changed: bool,
+    /// agent 或事件接收方错误。事件投递可能在 turn 完成后失败，因此这里为 Some
+    /// 不等于 `TurnStatus::Failed`；最终状态应以 Session 中的 TurnRecord 为准。
     pub error: Option<String>,
 }
 
@@ -113,40 +118,76 @@ pub async fn run_agent_turn(
     prompt: &str,
     handler: &mut impl TurnEventHandler,
 ) -> Result<RunAgentTurnOutcome, RuntimeError> {
-    if let Err(error) = maybe_auto_compact(
-        context.client,
-        context.system_prompt,
-        session,
-        context.context_config,
-        context.model_limits,
-        prompt,
-    )
-    .await
-    {
+    run_agent_turn_with_cancellation(context, session, prompt, handler, CancellationToken::new())
+        .await
+}
+
+pub async fn run_agent_turn_with_cancellation(
+    context: RunAgentTurnContext<'_>,
+    session: &mut Session,
+    prompt: &str,
+    handler: &mut impl TurnEventHandler,
+    cancellation: CancellationToken,
+) -> Result<RunAgentTurnOutcome, RuntimeError> {
+    // 所有状态先写入草稿；只有整个用例正常收束后才替换调用方持有的 Session。
+    let mut draft = session.clone();
+    let outcome = run_agent_turn_inner(context, &mut draft, prompt, handler, &cancellation).await?;
+    *session = draft;
+    Ok(outcome)
+}
+
+async fn run_agent_turn_inner(
+    context: RunAgentTurnContext<'_>,
+    session: &mut Session,
+    prompt: &str,
+    handler: &mut impl TurnEventHandler,
+    cancellation: &CancellationToken,
+) -> Result<RunAgentTurnOutcome, RuntimeError> {
+    let build = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => None,
+        result = ToolRegistry::with_mcp_cache_async(
+            context.workspace_root,
+            context.permissions,
+            context.mcp_servers,
+            context.mcp_cache,
+        ) => Some(result),
+    };
+    let Some(build) = build else {
+        return Ok(record_cancelled_turn(session, prompt));
+    };
+    let build = build?;
+    let tools = build.registry;
+    let tool_definitions = tools.definitions();
+
+    let compaction = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => None,
+        result = maybe_auto_compact_with_tools(
+            context.client,
+            context.system_prompt,
+            session,
+            context.context_config,
+            context.model_limits,
+            prompt,
+            &tool_definitions,
+        ) => Some(result),
+    };
+    let Some(compaction) = compaction else {
+        return Ok(record_cancelled_turn(session, prompt));
+    };
+    if let Err(error) = compaction {
         let message = format!("context compaction failed: {error}");
-        session
-            .turns
-            .push(TurnRecord::failed_user_prompt(prompt, message.clone()));
+        session.apply_turn(TurnRecord::failed_user_prompt(prompt, message.clone()));
         return Ok(RunAgentTurnOutcome {
             session_changed: true,
             error: Some(message),
         });
     }
 
-    let build = ToolRegistry::with_mcp_cache_async(
-        context.workspace_root,
-        context.permissions,
-        context.mcp_servers,
-        context.mcp_cache,
-    )
-    .await?;
-    let tools = build.registry;
-    let agent = Agent::with_tools(
-        context.client.clone(),
-        context.system_prompt.to_string(),
-        tools,
-    );
+    let agent = Agent::with_tools(context.client, context.system_prompt.to_string(), &tools);
     let mut agent_error = None;
+    let mut handler_error = None;
     let mut turn_completed = false;
     let mut event_index = 0;
 
@@ -159,15 +200,40 @@ pub async fn run_agent_turn(
             AgentEvent::Warning(diagnostic),
         );
         event_index += 1;
-        handler.on_event(&envelope)?;
+        if let Err(error) = handler.on_event(&envelope) {
+            return Ok(record_failed_turn(session, prompt, error.to_string()));
+        }
     }
 
     {
         let mut stream = agent
-            .run_turn(&mut session.active_thread, prompt.to_string())
+            .run_turn_with_context(
+                &session.active_thread,
+                prompt.to_string(),
+                ToolExecutionContext {
+                    cancellation: cancellation.clone(),
+                },
+            )
             .await?;
 
-        while let Some(event) = stream.next().await {
+        let mut cancellation_observed = false;
+        loop {
+            let event = if cancellation_observed {
+                stream.next().await
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => {
+                        stream.cancel();
+                        cancellation_observed = true;
+                        continue;
+                    },
+                    event = stream.next() => event,
+                }
+            };
+            let Some(event) = event else {
+                break;
+            };
             let envelope = make_event_envelope(
                 context.session_name,
                 context.workspace_root,
@@ -176,18 +242,12 @@ pub async fn run_agent_turn(
                 event.clone(),
             );
             event_index += 1;
-            handler.on_event(&envelope)?;
-
-            match event {
-                AgentEvent::ApprovalRequested(request) => {
-                    let decision = handler.resolve_approval(&request).await?;
-                    stream.resolve_approval(decision)?;
-                }
+            match &event {
                 AgentEvent::TurnCompleted => {
                     turn_completed = true;
                 }
                 AgentEvent::Error(message) => {
-                    agent_error = Some(message);
+                    agent_error = Some(message.clone());
                 }
                 AgentEvent::TurnStarted
                 | AgentEvent::Warning(_)
@@ -195,17 +255,72 @@ pub async fn run_agent_turn(
                 | AgentEvent::AgentMessage(_)
                 | AgentEvent::ToolCallStarted { .. }
                 | AgentEvent::ToolCallFinished { .. }
+                | AgentEvent::ApprovalRequested(_)
                 | AgentEvent::ApprovalResolved(_) => {}
+            }
+
+            if handler_error.is_none()
+                && let Err(error) = handler.on_event(&envelope)
+            {
+                let error = error.to_string();
+                handler_error = Some(error.clone());
+                stream.cancel_with_reason(error);
+                cancellation_observed = true;
+                continue;
+            }
+
+            if let AgentEvent::ApprovalRequested(request) = event {
+                let decision = if cancellation_observed {
+                    ApprovalDecision::deny(request.id.clone())
+                } else {
+                    let result = tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => {
+                            stream.cancel();
+                            cancellation_observed = true;
+                            continue;
+                        },
+                        result = handler.resolve_approval(&request) => result,
+                    };
+                    match result {
+                        Ok(decision) => decision,
+                        Err(error) => {
+                            let error = error.to_string();
+                            handler_error = Some(error.clone());
+                            stream.cancel_with_reason(error);
+                            cancellation_observed = true;
+                            continue;
+                        }
+                    }
+                };
+                stream.resolve_approval(decision)?;
             }
         }
 
-        session.turns.push(stream.into_turn_record());
+        session.apply_turn(stream.into_turn_record());
     }
 
     Ok(RunAgentTurnOutcome {
         session_changed: true,
-        error: agent_error.filter(|_| !turn_completed),
+        error: handler_error.or_else(|| agent_error.filter(|_| !turn_completed)),
     })
+}
+
+fn record_cancelled_turn(session: &mut Session, prompt: &str) -> RunAgentTurnOutcome {
+    record_failed_turn(session, prompt, "turn cancelled")
+}
+
+fn record_failed_turn(
+    session: &mut Session,
+    prompt: &str,
+    message: impl Into<String>,
+) -> RunAgentTurnOutcome {
+    let message = message.into();
+    session.apply_turn(TurnRecord::failed_user_prompt(prompt, message.clone()));
+    RunAgentTurnOutcome {
+        session_changed: true,
+        error: Some(message),
+    }
 }
 
 pub fn make_event_envelope(
@@ -235,26 +350,47 @@ pub fn timestamp_ms() -> u64 {
 }
 
 pub async fn maybe_auto_compact(
-    client: &OpenAiCompatClient,
+    client: &dyn Model,
     system_prompt: &str,
     session: &mut Session,
     context_config: ContextConfig,
     model_limits: ModelContextLimits,
     prompt: &str,
 ) -> Result<(), RuntimeError> {
+    maybe_auto_compact_with_tools(
+        client,
+        system_prompt,
+        session,
+        context_config,
+        model_limits,
+        prompt,
+        &[],
+    )
+    .await
+}
+
+pub async fn maybe_auto_compact_with_tools(
+    client: &dyn Model,
+    system_prompt: &str,
+    session: &mut Session,
+    context_config: ContextConfig,
+    model_limits: ModelContextLimits,
+    prompt: &str,
+    tools: &[ToolDefinition],
+) -> Result<(), RuntimeError> {
     if !context_config.auto_compact {
         return Ok(());
     }
 
     let budget = auto_compact_trigger_tokens(model_limits, context_config);
-    let estimate = estimate_context_tokens(system_prompt, session, prompt);
+    let estimate = estimate_context_tokens(system_prompt, session, prompt, tools);
     if estimate <= budget {
         return Ok(());
     }
 
     compact_session(client, session, context_config).await?;
 
-    let compacted_estimate = estimate_context_tokens(system_prompt, session, prompt);
+    let compacted_estimate = estimate_context_tokens(system_prompt, session, prompt, tools);
     if compacted_estimate > budget {
         return Err(RuntimeError::AgentRun(format!(
             "context is still over token budget after compaction ({compacted_estimate} > {budget})"
@@ -275,7 +411,7 @@ fn auto_compact_trigger_tokens(
 }
 
 pub async fn compact_session(
-    client: &OpenAiCompatClient,
+    client: &dyn Model,
     session: &mut Session,
     context_config: ContextConfig,
 ) -> Result<CompactionOutcome, RuntimeError> {
@@ -352,7 +488,7 @@ fn compactable_prefix_len(session: &Session, retain_recent_turns: usize) -> usiz
 }
 
 async fn request_session_summary(
-    client: &OpenAiCompatClient,
+    client: &dyn Model,
     existing_summary: Option<&str>,
     target_tokens: usize,
     max_attempts: usize,
@@ -399,7 +535,7 @@ async fn request_session_summary(
 }
 
 async fn request_raw_session_summary(
-    client: &OpenAiCompatClient,
+    client: &dyn Model,
     existing_summary: Option<&str>,
     target_tokens: usize,
     repair_feedback: Option<&str>,
@@ -417,7 +553,12 @@ async fn request_raw_session_summary(
         first_turn_index,
     )));
 
-    let mut stream = client.stream_chat(&conversation, &[]).await?;
+    let mut stream = client
+        .stream(ModelRequest {
+            conversation,
+            tools: Vec::new(),
+        })
+        .await?;
     let mut output = String::new();
     while let Some(event) = stream.next().await {
         match event? {
@@ -692,9 +833,18 @@ fn truncate_summary_text(content: &str, max_chars: usize) -> String {
     truncated
 }
 
-fn estimate_context_tokens(system_prompt: &str, session: &Session, prompt: &str) -> usize {
+fn estimate_context_tokens(
+    system_prompt: &str,
+    session: &Session,
+    prompt: &str,
+    tools: &[ToolDefinition],
+) -> usize {
+    let tool_tokens = serde_json::to_string(tools)
+        .map(|definitions| estimate_text_tokens(&definitions))
+        .unwrap_or_default();
     let raw_total = message_text_tokens(agent_protocol::Role::System, system_prompt)
         + message_text_tokens(agent_protocol::Role::User, prompt)
+        + tool_tokens
         + session
             .active_thread
             .messages
@@ -782,7 +932,7 @@ fn manifest_has_workspace_header(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_model::OpenAiCompatConfig;
+    use agent_model::{OpenAiCompatClient, OpenAiCompatConfig};
     use agent_protocol::{FileChangeOperation, SessionContext, Thread, Turn};
     use futures_util::future::BoxFuture;
     use serde_json::json;
@@ -973,6 +1123,57 @@ compact test
         }
     }
 
+    struct FailOnAgentMessage;
+
+    impl TurnEventHandler for FailOnAgentMessage {
+        fn on_event(&mut self, event: &AgentEventEnvelope) -> Result<(), RuntimeError> {
+            if matches!(event.event, AgentEvent::AgentMessage(_)) {
+                return Err(RuntimeError::event_handler("simulated output failure"));
+            }
+            Ok(())
+        }
+    }
+
+    struct FailOnTextDelta;
+
+    impl TurnEventHandler for FailOnTextDelta {
+        fn on_event(&mut self, event: &AgentEventEnvelope) -> Result<(), RuntimeError> {
+            if matches!(event.event, AgentEvent::TextDelta(_)) {
+                return Err(RuntimeError::event_handler("simulated streaming failure"));
+            }
+            Ok(())
+        }
+    }
+
+    struct PendingModel;
+
+    impl Model for PendingModel {
+        fn stream(&self, _request: ModelRequest) -> agent_core::ModelFuture {
+            async move {
+                let stream: agent_core::ModelStream = Box::pin(futures_util::stream::pending::<
+                    Result<ModelEvent, ModelFailure>,
+                >());
+                Ok(stream)
+            }
+            .boxed()
+        }
+    }
+
+    struct CancelOnTurnStarted {
+        cancellation: CancellationToken,
+        events: Vec<AgentEventEnvelope>,
+    }
+
+    impl TurnEventHandler for CancelOnTurnStarted {
+        fn on_event(&mut self, event: &AgentEventEnvelope) -> Result<(), RuntimeError> {
+            self.events.push(event.clone());
+            if matches!(event.event, AgentEvent::TurnStarted) {
+                self.cancellation.cancel();
+            }
+            Ok(())
+        }
+    }
+
     struct ApprovalHandler {
         events: Vec<AgentEventEnvelope>,
         approved: bool,
@@ -1011,6 +1212,21 @@ compact test
         assert_eq!(envelope.turn_index, 7);
         assert_eq!(envelope.event_index, 3);
         assert_eq!(envelope.event, AgentEvent::TurnStarted);
+    }
+
+    #[test]
+    fn context_estimate_includes_tool_definitions() {
+        let session = Session::new();
+        let without_tools = estimate_context_tokens("system", &session, "hello", &[]);
+        let tools = vec![ToolDefinition::function(
+            "large_tool",
+            "x".repeat(4_000),
+            json!({"type": "object", "properties": {}}),
+        )];
+
+        let with_tools = estimate_context_tokens("system", &session, "hello", &tools);
+
+        assert!(with_tools > without_tools + 1_000);
     }
 
     #[tokio::test]
@@ -1140,6 +1356,166 @@ compact test
         assert_eq!(
             handler.events[1].event,
             AgentEvent::TextDelta("ok".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn event_handler_failure_after_completion_commits_turn_and_reports_error() {
+        let root = unique_dir("handler-failure");
+        let (base_url, _) = spawn_recording_sse_server(vec![sse_text_body("ok")]).await;
+        let client = client(base_url);
+        let mut session = Session::from_thread(Thread {
+            messages: vec![Message::user("before"), Message::assistant("context")],
+        });
+        let mut handler = FailOnAgentMessage;
+        let mcp_cache = McpToolCache::new();
+
+        let outcome = run_agent_turn(
+            RunAgentTurnContext {
+                client: &client,
+                system_prompt: "system",
+                context_config: context_config(2),
+                model_limits: model_limits(10_000),
+                workspace_root: &root,
+                permissions: PermissionProfile::for_mode(agent_protocol::PermissionMode::ReadOnly),
+                mcp_servers: &[],
+                mcp_cache: &mcp_cache,
+                session_name: "default",
+                turn_index: 0,
+            },
+            &mut session,
+            "hello",
+            &mut handler,
+        )
+        .await
+        .expect("handler failure is reported after committing the terminal turn");
+
+        assert!(outcome.session_changed);
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("simulated output failure"))
+        );
+        assert_eq!(session.turns.len(), 1);
+        assert_eq!(session.turns[0].turn.status, TurnStatus::Completed);
+        assert_eq!(
+            session.active_thread.messages,
+            vec![
+                Message::user("before"),
+                Message::assistant("context"),
+                Message::user("hello"),
+                Message::assistant("ok"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn event_handler_failure_mid_turn_records_failed_turn() {
+        let root = unique_dir("handler-streaming-failure");
+        let (base_url, _) = spawn_recording_sse_server(vec![sse_text_body("ok")]).await;
+        let client = client(base_url);
+        let original_thread = Thread {
+            messages: vec![Message::user("before"), Message::assistant("context")],
+        };
+        let mut session = Session::from_thread(original_thread.clone());
+        let mut handler = FailOnTextDelta;
+        let mcp_cache = McpToolCache::new();
+
+        let outcome = run_agent_turn(
+            RunAgentTurnContext {
+                client: &client,
+                system_prompt: "system",
+                context_config: context_config(2),
+                model_limits: model_limits(10_000),
+                workspace_root: &root,
+                permissions: PermissionProfile::for_mode(agent_protocol::PermissionMode::ReadOnly),
+                mcp_servers: &[],
+                mcp_cache: &mcp_cache,
+                session_name: "default",
+                turn_index: 0,
+            },
+            &mut session,
+            "hello",
+            &mut handler,
+        )
+        .await
+        .expect("handler failure must still produce an auditable outcome");
+
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("simulated streaming failure"))
+        );
+        assert_eq!(session.active_thread, original_thread);
+        assert_eq!(session.turns.len(), 1);
+        assert_eq!(session.turns[0].turn.status, TurnStatus::Failed);
+        assert!(
+            session.turns[0]
+                .turn
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("simulated streaming failure"))
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_records_failed_turn_without_changing_active_context() {
+        let root = unique_dir("cancelled-turn");
+        let model = PendingModel;
+        let original_thread = Thread {
+            messages: vec![Message::user("before"), Message::assistant("context")],
+        };
+        let mut session = Session::from_thread(original_thread.clone());
+        let cancellation = CancellationToken::new();
+        let mut handler = CancelOnTurnStarted {
+            cancellation: cancellation.clone(),
+            events: Vec::new(),
+        };
+        let mcp_cache = McpToolCache::new();
+
+        let outcome = run_agent_turn_with_cancellation(
+            RunAgentTurnContext {
+                client: &model,
+                system_prompt: "system",
+                context_config: context_config(2),
+                model_limits: model_limits(1_000_000),
+                workspace_root: &root,
+                permissions: PermissionProfile::for_mode(agent_protocol::PermissionMode::ReadOnly),
+                mcp_servers: &[],
+                mcp_cache: &mcp_cache,
+                session_name: "default",
+                turn_index: 0,
+            },
+            &mut session,
+            "cancel me",
+            &mut handler,
+            cancellation,
+        )
+        .await
+        .expect("cancelled turn should close normally");
+
+        assert_eq!(
+            outcome,
+            RunAgentTurnOutcome {
+                session_changed: true,
+                error: Some("turn cancelled".to_string()),
+            }
+        );
+        assert_eq!(session.active_thread, original_thread);
+        assert_eq!(session.turns.len(), 1);
+        assert_eq!(session.turns[0].turn.status, TurnStatus::Failed);
+        assert_eq!(
+            session.turns[0].turn.error.as_deref(),
+            Some("turn cancelled")
+        );
+        assert_eq!(session.turns[0].messages, vec![Message::user("cancel me")]);
+        assert!(
+            handler
+                .events
+                .iter()
+                .any(|event| event.event == AgentEvent::Error("turn cancelled".to_string()))
         );
     }
 

@@ -1,7 +1,9 @@
+pub use agent_core::ModelEvent;
+use agent_core::{Model, ModelFailure, ModelFuture, ModelRequest, ModelStream};
 use agent_protocol::{Conversation, ToolCall, ToolDefinition};
 use bytes::Bytes;
 use futures_util::stream::BoxStream;
-use futures_util::{Stream, StreamExt};
+use futures_util::{FutureExt, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
 use std::pin::Pin;
@@ -9,7 +11,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use thiserror::Error;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OpenAiCompatConfig {
     pub base_url: String,
     pub model: String,
@@ -17,17 +19,31 @@ pub struct OpenAiCompatConfig {
     pub timeout: Duration,
 }
 
-#[derive(Debug, Clone)]
+impl std::fmt::Debug for OpenAiCompatConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OpenAiCompatConfig")
+            .field("base_url", &"<configured>")
+            .field("model", &self.model)
+            .field("api_key", &"<redacted>")
+            .field("timeout", &self.timeout)
+            .finish()
+    }
+}
+
+#[derive(Clone)]
 pub struct OpenAiCompatClient {
     http: reqwest::Client,
     config: OpenAiCompatConfig,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ModelEvent {
-    TextDelta(String),
-    ToolCalls(Vec<ToolCall>),
-    Completed,
+impl std::fmt::Debug for OpenAiCompatClient {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OpenAiCompatClient")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Error)]
@@ -52,6 +68,10 @@ pub enum ModelError {
     UnsupportedToolCall,
     #[error("model returned an invalid tool call: {0}")]
     InvalidToolCall(String),
+    #[error("model response was incomplete: finish_reason={0}")]
+    IncompleteResponse(String),
+    #[error("model returned an unsupported finish_reason: {0}")]
+    UnsupportedFinishReason(String),
 }
 
 #[derive(Debug, Serialize)]
@@ -139,14 +159,13 @@ impl OpenAiCompatClient {
             .json(&request)
             .send()
             .await
-            .map_err(ModelError::Request)?;
+            .map_err(|error| ModelError::Request(error.without_url()))?;
 
         let status = response.status();
         if !status.is_success() {
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|err| format!("failed to read error body: {err}"));
+            let body = response.text().await.unwrap_or_else(|error| {
+                format!("failed to read error body: {}", error.without_url())
+            });
             return Err(ModelError::HttpStatus {
                 status: status.as_u16(),
                 body,
@@ -161,6 +180,21 @@ impl OpenAiCompatClient {
             "{}/chat/completions",
             self.config.base_url.trim_end_matches('/')
         )
+    }
+}
+
+impl Model for OpenAiCompatClient {
+    fn stream(&self, request: ModelRequest) -> ModelFuture {
+        let client = self.clone();
+        async move {
+            let stream =
+                OpenAiCompatClient::stream_chat(&client, &request.conversation, &request.tools)
+                    .await
+                    .map_err(ModelFailure::new)?;
+            let stream: ModelStream = stream.map(|event| event.map_err(ModelFailure::new)).boxed();
+            Ok(stream)
+        }
+        .boxed()
     }
 }
 
@@ -218,12 +252,7 @@ impl ChatCompletionStream {
         }
 
         if data.trim() == "[DONE]" {
-            if self.saw_text {
-                self.pending.push_back(Ok(ModelEvent::Completed));
-            } else {
-                self.pending.push_back(Err(ModelError::EmptyResponse));
-            }
-            self.done = true;
+            self.finish_with_completion();
             return;
         }
 
@@ -259,9 +288,24 @@ impl ChatCompletionStream {
                 self.pending.push_back(Ok(ModelEvent::TextDelta(content)));
             }
 
-            if matches!(choice.finish_reason.as_deref(), Some("tool_calls")) {
-                self.finish_with_tool_calls();
-                return;
+            match choice.finish_reason.as_deref() {
+                Some("tool_calls") => {
+                    self.finish_with_tool_calls();
+                    return;
+                }
+                Some("stop") => {
+                    self.finish_with_completion();
+                    return;
+                }
+                Some(reason @ ("length" | "content_filter")) => {
+                    self.finish_with_error(ModelError::IncompleteResponse(reason.to_string()));
+                    return;
+                }
+                Some(reason) => {
+                    self.finish_with_error(ModelError::UnsupportedFinishReason(reason.to_string()));
+                    return;
+                }
+                None => {}
             }
         }
     }
@@ -327,6 +371,15 @@ impl ChatCompletionStream {
         self.done = true;
     }
 
+    fn finish_with_completion(&mut self) {
+        if self.saw_text {
+            self.pending.push_back(Ok(ModelEvent::Completed));
+        } else {
+            self.pending.push_back(Err(ModelError::EmptyResponse));
+        }
+        self.done = true;
+    }
+
     fn finish_with_error(&mut self, error: ModelError) {
         self.pending.push_back(Err(error));
         self.done = true;
@@ -381,7 +434,9 @@ impl Stream for ChatCompletionStream {
                 }
                 Poll::Ready(Some(Err(err))) => {
                     this.done = true;
-                    return Poll::Ready(Some(Err(ModelError::Stream(err.to_string()))));
+                    return Poll::Ready(Some(Err(ModelError::Stream(
+                        err.without_url().to_string(),
+                    ))));
                 }
                 Poll::Ready(None) => {
                     this.done = true;
@@ -452,6 +507,47 @@ mod tests {
         let mut conversation = Conversation::new();
         conversation.push(Message::user("hello"));
         conversation
+    }
+
+    #[test]
+    fn debug_output_redacts_api_key() {
+        let config = OpenAiCompatConfig {
+            base_url: "https://example.com/v1?token=url-secret".to_string(),
+            model: "test-model".to_string(),
+            api_key: "model-secret".to_string(),
+            timeout: Duration::from_secs(5),
+        };
+        let client = OpenAiCompatClient::new_without_proxy(config.clone()).expect("client");
+
+        assert!(!format!("{config:?}").contains("model-secret"));
+        assert!(!format!("{config:?}").contains("url-secret"));
+        assert!(!format!("{client:?}").contains("model-secret"));
+        assert!(!format!("{client:?}").contains("url-secret"));
+    }
+
+    #[tokio::test]
+    async fn request_errors_redact_url_secrets() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind unused address");
+        let addr = listener.local_addr().expect("unused address");
+        drop(listener);
+        let secret = "model-query-secret";
+        let client = OpenAiCompatClient::new_without_proxy(OpenAiCompatConfig {
+            base_url: format!("http://{addr}/v1?token={secret}"),
+            model: "test-model".to_string(),
+            api_key: "test-key".to_string(),
+            timeout: Duration::from_secs(1),
+        })
+        .expect("client");
+
+        let Err(error) = client.stream_chat(&conversation(), &[]).await else {
+            panic!("closed address must fail");
+        };
+        let message = error.to_string();
+
+        assert!(message.contains("failed to send model request"));
+        assert!(!message.contains(secret));
     }
 
     async fn client_for(body: &'static str) -> OpenAiCompatClient {
@@ -678,6 +774,63 @@ mod tests {
         assert!(requests[0].contains(r#""tool_choice":"auto""#));
         assert!(requests[0].contains(r#""tools":[{"type":"function""#));
         assert!(requests[0].contains(r#""name":"read_file""#));
+    }
+
+    #[tokio::test]
+    async fn stop_finish_reason_completes_without_done_sentinel() {
+        let body =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"finish_reason\":\"stop\"}]}\n\n";
+        let client = client_for(body).await;
+        let stream = client
+            .stream_chat(&conversation(), &[])
+            .await
+            .expect("stream chat");
+
+        let events = collect_events(stream).await;
+
+        assert!(matches!(
+            events.as_slice(),
+            [Ok(ModelEvent::TextDelta(text)), Ok(ModelEvent::Completed)] if text == "Hi"
+        ));
+    }
+
+    #[tokio::test]
+    async fn length_finish_reason_is_reported_as_incomplete() {
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":\"length\"}]}\n\n";
+        let client = client_for(body).await;
+        let stream = client
+            .stream_chat(&conversation(), &[])
+            .await
+            .expect("stream chat");
+
+        let events = collect_events(stream).await;
+
+        assert!(matches!(
+            events.as_slice(),
+            [
+                Ok(ModelEvent::TextDelta(text)),
+                Err(ModelError::IncompleteResponse(reason)),
+            ] if text == "partial" && reason == "length"
+        ));
+    }
+
+    #[tokio::test]
+    async fn unknown_finish_reason_is_reported_explicitly() {
+        let body =
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"provider_specific\"}]}\n\n";
+        let client = client_for(body).await;
+        let stream = client
+            .stream_chat(&conversation(), &[])
+            .await
+            .expect("stream chat");
+
+        let events = collect_events(stream).await;
+
+        assert!(matches!(
+            events.as_slice(),
+            [Err(ModelError::UnsupportedFinishReason(reason))]
+                if reason == "provider_specific"
+        ));
     }
 
     #[tokio::test]

@@ -1,12 +1,17 @@
 pub mod mcp;
 
 use agent_config::McpServerConfig;
+pub use agent_core::{
+    CancellationToken, ToolApproval, ToolExecution, ToolExecutionContext, ToolExecutionMode,
+    ToolFuture, ToolResult, ToolRuntime,
+};
 use agent_protocol::{
     ApprovalDecision, ApprovalRequest, FileChangeOperation, FileChangeSummary, PermissionProfile,
     ShellCommandSummary, ToolCall, ToolDefinition, ToolExecutionSummary,
 };
 use agent_sandbox::{PermissionDecision, PermissionEvaluator, PermissionEvaluatorError};
 use async_trait::async_trait;
+use futures_util::FutureExt;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -14,13 +19,15 @@ use std::borrow::Borrow;
 use std::collections::HashSet;
 use std::env;
 use std::fs;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::Arc;
-use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::process::{Command as StdCommand, Stdio};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::process::{Child, Command as TokioCommand};
+use tokio::task::JoinHandle;
 
 pub use mcp::McpToolCache;
 
@@ -37,6 +44,8 @@ const MAX_SHELL_TIMEOUT_SECS: u64 = 120;
 const MAX_SHELL_OUTPUT_BYTES: usize = 20_000;
 const MAX_FILE_DIFF_LINES: usize = 240;
 const MAX_FILE_DIFF_BYTES: usize = 20_000;
+const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
+const TOOL_CANCELLED_ERROR: &str = "tool execution cancelled";
 const SEARCH_SKIP_NAMES: &[&str] = &[".git", "node_modules", "dist", "build", "target"];
 
 #[derive(Debug, Error)]
@@ -49,18 +58,6 @@ pub enum ToolRegistryError {
     McpServer { server: String, message: String },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToolExecutionMode {
-    Concurrent,
-    Serial,
-}
-
-#[derive(Debug, Clone)]
-pub struct ToolApproval {
-    pub decision: ApprovalDecision,
-    pub request: ApprovalRequest,
-}
-
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn definitions(&self) -> Vec<ToolDefinition>;
@@ -69,7 +66,12 @@ pub trait Tool: Send + Sync {
         ToolExecutionMode::Concurrent
     }
 
-    async fn execute(&self, call: ToolCall, approval: Option<ToolApproval>) -> ToolExecution;
+    async fn execute(
+        &self,
+        call: ToolCall,
+        approval: Option<ToolApproval>,
+        context: ToolExecutionContext,
+    ) -> ToolExecution;
 }
 
 #[derive(Clone)]
@@ -100,32 +102,6 @@ impl std::fmt::Debug for ToolRegistry {
             .debug_struct("ToolRegistry")
             .field("tools", &tools)
             .finish()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ToolExecution {
-    Completed(ToolResult),
-    ApprovalRequired(ApprovalRequest),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolResult {
-    pub ok: bool,
-    pub content: String,
-    pub error: Option<String>,
-    pub summary: Option<ToolExecutionSummary>,
-}
-
-impl ToolExecution {
-    pub fn error(error: impl Into<String>) -> Self {
-        Self::Completed(tool_error(error.into()))
-    }
-}
-
-impl ToolResult {
-    pub fn error(error: impl Into<String>) -> Self {
-        tool_error(error.into())
     }
 }
 
@@ -204,8 +180,20 @@ impl ToolRegistry {
     where
         C: Borrow<ToolCall> + Send,
     {
+        self.execute_with_context(call, ToolExecutionContext::default())
+            .await
+    }
+
+    pub async fn execute_with_context<C>(
+        &self,
+        call: C,
+        context: ToolExecutionContext,
+    ) -> ToolExecution
+    where
+        C: Borrow<ToolCall> + Send,
+    {
         let call = call.borrow().clone();
-        self.execute_inner(call, None).await
+        self.execute_inner(call, None, context).await
     }
 
     pub async fn execute_approved<C, D, R>(&self, call: C, decision: D, request: R) -> ToolExecution
@@ -214,22 +202,63 @@ impl ToolRegistry {
         D: Borrow<ApprovalDecision> + Send,
         R: Borrow<ApprovalRequest> + Send,
     {
-        let call = call.borrow().clone();
-        let decision = decision.borrow().clone();
-        let request = request.borrow().clone();
-        self.execute_inner(call, Some(ToolApproval { decision, request }))
+        self.execute_approved_with_context(call, decision, request, ToolExecutionContext::default())
             .await
     }
 
-    async fn execute_inner(&self, call: ToolCall, approval: Option<ToolApproval>) -> ToolExecution {
+    pub async fn execute_approved_with_context<C, D, R>(
+        &self,
+        call: C,
+        decision: D,
+        request: R,
+        context: ToolExecutionContext,
+    ) -> ToolExecution
+    where
+        C: Borrow<ToolCall> + Send,
+        D: Borrow<ApprovalDecision> + Send,
+        R: Borrow<ApprovalRequest> + Send,
+    {
+        let call = call.borrow().clone();
+        let decision = decision.borrow().clone();
+        let request = request.borrow().clone();
+        self.execute_inner(call, Some(ToolApproval { decision, request }), context)
+            .await
+    }
+
+    async fn execute_inner(
+        &self,
+        call: ToolCall,
+        approval: Option<ToolApproval>,
+        context: ToolExecutionContext,
+    ) -> ToolExecution {
         match self
             .tools
             .iter()
             .find(|registered| registered.definition.function.name == call.function.name)
         {
-            Some(registered) => registered.tool.execute(call, approval).await,
+            Some(registered) => registered.tool.execute(call, approval, context).await,
             None => ToolExecution::error(format!("unknown tool {:?}", call.function.name)),
         }
+    }
+}
+
+impl ToolRuntime for ToolRegistry {
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        ToolRegistry::definitions(self)
+    }
+
+    fn execution_mode(&self, call: &ToolCall) -> ToolExecutionMode {
+        ToolRegistry::execution_mode(self, call)
+    }
+
+    fn execute(
+        &self,
+        call: ToolCall,
+        approval: Option<ToolApproval>,
+        context: ToolExecutionContext,
+    ) -> ToolFuture {
+        let registry = self.clone();
+        async move { registry.execute_inner(call, approval, context).await }.boxed()
     }
 }
 
@@ -254,8 +283,30 @@ impl Tool for BuiltInTools {
         }
     }
 
-    async fn execute(&self, call: ToolCall, approval: Option<ToolApproval>) -> ToolExecution {
+    async fn execute(
+        &self,
+        call: ToolCall,
+        approval: Option<ToolApproval>,
+        context: ToolExecutionContext,
+    ) -> ToolExecution {
+        if context.cancellation.is_cancelled() {
+            return ToolExecution::error(TOOL_CANCELLED_ERROR);
+        }
+
+        if call.function.name == "shell_command" {
+            let approval = approval.as_ref().map(|approval| {
+                (
+                    &approval.decision as &ApprovalDecision,
+                    &approval.request as &ApprovalRequest,
+                )
+            });
+            return self
+                .shell_command(&call, approval, &context.cancellation)
+                .await;
+        }
+
         let tools = self.clone();
+        let cancellation = context.cancellation;
         tokio::task::spawn_blocking(move || {
             let approval = approval.as_ref().map(|approval| {
                 (
@@ -263,7 +314,7 @@ impl Tool for BuiltInTools {
                     &approval.request as &ApprovalRequest,
                 )
             });
-            tools.execute_inner(&call, approval)
+            tools.execute_blocking(&call, approval, &cancellation)
         })
         .await
         .unwrap_or_else(|error| {
@@ -273,19 +324,26 @@ impl Tool for BuiltInTools {
 }
 
 impl BuiltInTools {
-    fn execute_inner(
+    fn execute_blocking(
         &self,
         call: &ToolCall,
         approval: Option<(&ApprovalDecision, &ApprovalRequest)>,
+        cancellation: &CancellationToken,
     ) -> ToolExecution {
+        if cancellation.is_cancelled() {
+            return ToolExecution::error(TOOL_CANCELLED_ERROR);
+        }
+
         let result = match call.function.name.as_str() {
             "read_file" => self.read_file(call).map(tool_ok),
             "list_files" => self.list_files(call).map(tool_ok),
             "search_text" => self.search_text(call).map(tool_ok),
-            "edit_file" => return self.edit_file(call, approval),
-            "write_file" => return self.write_file(call, approval),
-            "apply_patch" => return self.apply_patch(call, approval),
-            "shell_command" => return self.shell_command(call, approval),
+            "edit_file" => return self.edit_file(call, approval, cancellation),
+            "write_file" => return self.write_file(call, approval, cancellation),
+            "apply_patch" => return self.apply_patch(call, approval, cancellation),
+            "shell_command" => {
+                return ToolExecution::error("shell command must use the async execution path");
+            }
             name => Err(format!("unknown tool {name:?}")),
         };
 
@@ -422,7 +480,7 @@ impl BuiltInTools {
             options.case_sensitive,
             options.max_results,
         );
-        let mut command = Command::new(ripgrep);
+        let mut command = StdCommand::new(ripgrep);
         command
             .current_dir(evaluator.root())
             .arg("--json")
@@ -497,8 +555,9 @@ impl BuiltInTools {
         &self,
         call: &ToolCall,
         approval: Option<(&ApprovalDecision, &ApprovalRequest)>,
+        cancellation: &CancellationToken,
     ) -> ToolExecution {
-        self.execute_file_change_plan(call, self.plan_edit_file(call), approval)
+        self.execute_file_change_plan(call, self.plan_edit_file(call), approval, cancellation)
     }
 
     fn plan_edit_file(&self, call: &ToolCall) -> Result<FileChangePlan, String> {
@@ -561,8 +620,9 @@ impl BuiltInTools {
         &self,
         call: &ToolCall,
         approval: Option<(&ApprovalDecision, &ApprovalRequest)>,
+        cancellation: &CancellationToken,
     ) -> ToolExecution {
-        self.execute_file_change_plan(call, self.plan_write_file(call), approval)
+        self.execute_file_change_plan(call, self.plan_write_file(call), approval, cancellation)
     }
 
     fn plan_write_file(&self, call: &ToolCall) -> Result<FileChangePlan, String> {
@@ -646,8 +706,9 @@ impl BuiltInTools {
         &self,
         call: &ToolCall,
         approval: Option<(&ApprovalDecision, &ApprovalRequest)>,
+        cancellation: &CancellationToken,
     ) -> ToolExecution {
-        self.execute_file_change_plan(call, self.plan_apply_patch(call), approval)
+        self.execute_file_change_plan(call, self.plan_apply_patch(call), approval, cancellation)
     }
 
     fn plan_apply_patch(&self, call: &ToolCall) -> Result<FileChangePlan, String> {
@@ -671,18 +732,22 @@ impl BuiltInTools {
         call: &ToolCall,
         plan: Result<FileChangePlan, String>,
         approval: Option<(&ApprovalDecision, &ApprovalRequest)>,
+        cancellation: &CancellationToken,
     ) -> ToolExecution {
         let plan = match plan {
             Ok(plan) => plan,
             Err(error) => return ToolExecution::error(error),
         };
+        if cancellation.is_cancelled() {
+            return ToolExecution::error(TOOL_CANCELLED_ERROR);
+        }
         let evaluator = match self.evaluator() {
             Ok(evaluator) => evaluator,
             Err(error) => return ToolExecution::error(error),
         };
 
         match evaluator.file_changes_decision(&call.id, plan.files.clone(), plan.diff.clone()) {
-            PermissionDecision::Allow => self.commit_file_change_plan(plan),
+            PermissionDecision::Allow => self.commit_file_change_plan(plan, cancellation),
             PermissionDecision::Deny(error) => ToolExecution::error(error),
             PermissionDecision::Prompt(request) => match approval {
                 None => ToolExecution::ApprovalRequired(request),
@@ -707,13 +772,21 @@ impl BuiltInTools {
                     if !decision.approved {
                         return ToolExecution::error("file changes approval denied");
                     }
-                    self.commit_file_change_plan(plan)
+                    self.commit_file_change_plan(plan, cancellation)
                 }
             },
         }
     }
 
-    fn commit_file_change_plan(&self, plan: FileChangePlan) -> ToolExecution {
+    fn commit_file_change_plan(
+        &self,
+        plan: FileChangePlan,
+        cancellation: &CancellationToken,
+    ) -> ToolExecution {
+        // 提交一旦开始就必须完整结束或回滚，因此只在进入事务前响应取消。
+        if cancellation.is_cancelled() {
+            return ToolExecution::error(TOOL_CANCELLED_ERROR);
+        }
         match commit_patch_changes(plan.changes, self) {
             Ok(()) => ToolExecution::Completed(tool_ok_with_summary(plan.data, plan.summary)),
             Err(error) => ToolExecution::error(error),
@@ -741,10 +814,11 @@ impl BuiltInTools {
         })
     }
 
-    fn shell_command(
+    async fn shell_command(
         &self,
         call: &ToolCall,
         approval: Option<(&ApprovalDecision, &ApprovalRequest)>,
+        cancellation: &CancellationToken,
     ) -> ToolExecution {
         let args = match parse_args::<ShellCommandArgs>(call) {
             Ok(args) => args,
@@ -767,11 +841,15 @@ impl BuiltInTools {
         };
 
         match evaluator.shell_command_decision(&call.id, &args.command, timeout_secs) {
-            PermissionDecision::Allow => complete_shell_result(run_shell_command(
-                evaluator.root(),
-                &args.command,
-                Duration::from_secs(timeout_secs),
-            )),
+            PermissionDecision::Allow => complete_shell_result(
+                run_shell_command(
+                    evaluator.root(),
+                    &args.command,
+                    Duration::from_secs(timeout_secs),
+                    cancellation,
+                )
+                .await,
+            ),
             PermissionDecision::Deny(error) => ToolExecution::error(error),
             PermissionDecision::Prompt(request) => match approval {
                 None => ToolExecution::ApprovalRequired(request),
@@ -784,11 +862,15 @@ impl BuiltInTools {
                 Some((decision, _)) if !decision.approved => {
                     ToolExecution::error("shell command approval denied")
                 }
-                Some(_) => complete_shell_result(run_shell_command(
-                    evaluator.root(),
-                    &args.command,
-                    Duration::from_secs(timeout_secs),
-                )),
+                Some(_) => complete_shell_result(
+                    run_shell_command(
+                        evaluator.root(),
+                        &args.command,
+                        Duration::from_secs(timeout_secs),
+                        cancellation,
+                    )
+                    .await,
+                ),
             },
         }
     }
@@ -1491,12 +1573,25 @@ fn write_temp_file(
     permissions: Option<fs::Permissions>,
     tools: &BuiltInTools,
 ) -> Result<(), String> {
-    fs::write(temp_path, content).map_err(|err| {
-        format!(
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(temp_path)
+        .map_err(|err| {
+            format!(
+                "failed to create temporary file for {}: {err}",
+                tools.display_path(display_path)
+            )
+        })?;
+    if let Err(err) = file.write_all(content.as_bytes()) {
+        drop(file);
+        let _ = fs::remove_file(temp_path);
+        return Err(format!(
             "failed to write temporary file for {}: {err}",
             tools.display_path(display_path)
-        )
-    })?;
+        ));
+    }
+    drop(file);
     if let Some(permissions) = permissions {
         fs::set_permissions(temp_path, permissions).map_err(|err| {
             let _ = fs::remove_file(temp_path);
@@ -1547,10 +1642,14 @@ fn commit_patch_changes(
                         tools,
                     );
                 }
-                let temp_path = change
-                    .temp_path
-                    .take()
-                    .ok_or_else(|| "staged add file is missing temporary content".to_string())?;
+                let Some(temp_path) = change.temp_path.take() else {
+                    return fail_patch_commit(
+                        "staged add file is missing temporary content".to_string(),
+                        &changes,
+                        applied,
+                        tools,
+                    );
+                };
                 if let Err(err) = fs::rename(&temp_path, &change.path) {
                     let _ = fs::remove_file(&temp_path);
                     return fail_patch_commit(
@@ -1570,10 +1669,14 @@ fn commit_patch_changes(
                 });
             }
             PatchOperationKind::Update => {
-                let temp_path = change
-                    .temp_path
-                    .take()
-                    .ok_or_else(|| "staged update file is missing temporary content".to_string())?;
+                let Some(temp_path) = change.temp_path.take() else {
+                    return fail_patch_commit(
+                        "staged update file is missing temporary content".to_string(),
+                        &changes,
+                        applied,
+                        tools,
+                    );
+                };
                 let backup_path = backup_path_for(&change.path);
                 if let Err(err) = fs::rename(&change.path, &backup_path) {
                     let _ = fs::remove_file(&temp_path);
@@ -1587,8 +1690,12 @@ fn commit_patch_changes(
                         tools,
                     );
                 }
+                applied.push(AppliedPatchChange {
+                    path: change.path.clone(),
+                    kind: PatchOperationKind::Update,
+                    backup_path: Some(backup_path.clone()),
+                });
                 if let Err(err) = fs::rename(&temp_path, &change.path) {
-                    let _ = fs::rename(&backup_path, &change.path);
                     let _ = fs::remove_file(&temp_path);
                     return fail_patch_commit(
                         format!(
@@ -1600,11 +1707,6 @@ fn commit_patch_changes(
                         tools,
                     );
                 }
-                applied.push(AppliedPatchChange {
-                    path: change.path.clone(),
-                    kind: PatchOperationKind::Update,
-                    backup_path: Some(backup_path),
-                });
             }
             PatchOperationKind::Delete => {
                 let backup_path = backup_path_for(&change.path);
@@ -1679,11 +1781,15 @@ fn rollback_patch_changes(
                 }
             }
             PatchOperationKind::Update => {
-                if let Err(err) = fs::remove_file(&change.path) {
-                    errors.push(format!(
-                        "failed to remove updated {}: {err}",
-                        tools.display_path(&change.path)
-                    ));
+                match fs::remove_file(&change.path) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => {
+                        errors.push(format!(
+                            "failed to remove updated {}: {err}",
+                            tools.display_path(&change.path)
+                        ));
+                    }
                 }
                 if let Some(backup_path) = change.backup_path
                     && let Err(err) = fs::rename(&backup_path, &change.path)
@@ -1990,17 +2096,31 @@ fn complete_shell_result(result: Result<(Value, ShellCommandSummary), String>) -
     }
 }
 
-fn run_shell_command(
+async fn run_shell_command(
     root: &Path,
     command: &str,
     timeout: Duration,
+    cancellation: &CancellationToken,
 ) -> Result<(Value, ShellCommandSummary), String> {
-    let mut child = shell_command(command)
+    if cancellation.is_cancelled() {
+        return Err(TOOL_CANCELLED_ERROR.to_string());
+    }
+
+    let mut process = shell_command(command);
+    process
         .current_dir(root)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    process.process_group(0);
+
+    let mut child = process
         .spawn()
         .map_err(|err| format!("failed to spawn shell command: {err}"))?;
+    let process_id = child.id();
+    let mut process_guard = ShellProcessGuard::new(process_id);
 
     let stdout = child
         .stdout
@@ -2010,34 +2130,80 @@ fn run_shell_command(
         .stderr
         .take()
         .ok_or_else(|| "failed to capture command stderr".to_string())?;
-    let stdout_reader = thread::spawn(move || read_limited(stdout));
-    let stderr_reader = thread::spawn(move || read_limited(stderr));
-    let started = Instant::now();
-    let mut timed_out = false;
+    let (mut stdout_reader, stdout_capture) = spawn_output_capture(stdout);
+    let (mut stderr_reader, stderr_capture) = spawn_output_capture(stderr);
 
-    let status = loop {
-        match child
-            .try_wait()
-            .map_err(|err| format!("failed to wait for command: {err}"))?
-        {
-            Some(status) => break status,
-            None if started.elapsed() >= timeout => {
-                timed_out = true;
-                let _ = child.kill();
-                break child
-                    .wait()
-                    .map_err(|err| format!("failed to wait for killed command: {err}"))?;
-            }
-            None => thread::sleep(Duration::from_millis(20)),
+    enum WaitOutcome {
+        Completed(Result<std::process::ExitStatus, String>),
+        TimedOut,
+        Cancelled,
+    }
+
+    let outcome = {
+        let completion =
+            wait_for_shell_completion(&mut child, &mut stdout_reader, &mut stderr_reader);
+        tokio::pin!(completion);
+        tokio::select! {
+            biased;
+            result = &mut completion => WaitOutcome::Completed(result),
+            _ = cancellation.cancelled() => WaitOutcome::Cancelled,
+            _ = tokio::time::sleep(timeout) => WaitOutcome::TimedOut,
         }
     };
 
-    let (stdout, stdout_truncated) = stdout_reader
-        .join()
-        .map_err(|_| "failed to join stdout reader".to_string())??;
-    let (stderr, stderr_truncated) = stderr_reader
-        .join()
-        .map_err(|_| "failed to join stderr reader".to_string())??;
+    let (status, stdout, stderr, timed_out, cancelled) = match outcome {
+        WaitOutcome::Completed(status) => (
+            status,
+            output_capture_result(&stdout_capture, false, None),
+            output_capture_result(&stderr_capture, false, None),
+            false,
+            false,
+        ),
+        WaitOutcome::TimedOut => {
+            let status = terminate_shell(&mut child, process_id).await;
+            let (stdout, stderr) = tokio::join!(
+                finish_output_capture(stdout_reader, stdout_capture),
+                finish_output_capture(stderr_reader, stderr_capture),
+            );
+            (status, stdout, stderr, true, false)
+        }
+        WaitOutcome::Cancelled => {
+            let status = terminate_shell(&mut child, process_id).await;
+            let (stdout, stderr) = tokio::join!(
+                finish_output_capture(stdout_reader, stdout_capture),
+                finish_output_capture(stderr_reader, stderr_capture),
+            );
+            (status, stdout, stderr, false, true)
+        }
+    };
+
+    let fully_stopped = status.is_ok() && stdout.reached_eof && stderr.reached_eof;
+    if fully_stopped {
+        process_guard.disarm();
+    }
+
+    if cancelled {
+        let cleanup_errors = [
+            status.as_ref().err(),
+            stdout.result.as_ref().err(),
+            stderr.result.as_ref().err(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+        return if cleanup_errors.is_empty() {
+            Err(TOOL_CANCELLED_ERROR.to_string())
+        } else {
+            Err(format!(
+                "{TOOL_CANCELLED_ERROR}; cleanup errors: {}",
+                cleanup_errors.join("; ")
+            ))
+        };
+    }
+    let status = status?;
+    let (stdout, stdout_truncated) = stdout.result?;
+    let (stderr, stderr_truncated) = stderr.result?;
 
     let exit_code = status.code();
     let data = json!({
@@ -2060,42 +2226,222 @@ fn run_shell_command(
     Ok((data, summary))
 }
 
+async fn wait_for_shell_completion(
+    child: &mut Child,
+    stdout_reader: &mut JoinHandle<()>,
+    stderr_reader: &mut JoinHandle<()>,
+) -> Result<std::process::ExitStatus, String> {
+    let (status, stdout, stderr) = tokio::join!(child.wait(), stdout_reader, stderr_reader);
+    let status = status.map_err(|error| format!("failed to wait for command: {error}"))?;
+    stdout.map_err(|error| format!("stdout reader task failed: {error}"))?;
+    stderr.map_err(|error| format!("stderr reader task failed: {error}"))?;
+    Ok(status)
+}
+
 #[cfg(windows)]
-fn shell_command(command: &str) -> Command {
-    let mut builder = Command::new("cmd");
+fn shell_command(command: &str) -> TokioCommand {
+    let mut builder = TokioCommand::new("cmd");
     builder.arg("/C").arg(command);
     builder
 }
 
 #[cfg(not(windows))]
-fn shell_command(command: &str) -> Command {
-    let mut builder = Command::new("sh");
+fn shell_command(command: &str) -> TokioCommand {
+    let mut builder = TokioCommand::new("sh");
     builder.arg("-c").arg(command);
     builder
 }
 
-fn read_limited(mut reader: impl Read) -> Result<(String, bool), String> {
-    let mut buffer = [0_u8; 8192];
-    let mut output = Vec::new();
-    let mut truncated = false;
-
-    loop {
-        let read = reader
-            .read(&mut buffer)
-            .map_err(|err| format!("failed to read process output: {err}"))?;
-        if read == 0 {
-            break;
-        }
-        let remaining = MAX_SHELL_OUTPUT_BYTES.saturating_sub(output.len());
-        if remaining > 0 {
-            output.extend_from_slice(&buffer[..read.min(remaining)]);
-        }
-        if read > remaining {
-            truncated = true;
+async fn terminate_shell(
+    child: &mut Child,
+    process_id: Option<u32>,
+) -> Result<std::process::ExitStatus, String> {
+    #[cfg(unix)]
+    {
+        let group_result = process_id
+            .ok_or_else(|| "shell process id is unavailable".to_string())
+            .and_then(|process_id| {
+                kill_process_group(process_id)
+                    .map_err(|error| format!("failed to kill shell process group: {error}"))
+            });
+        if let Err(group_error) = group_result {
+            let root_error = child
+                .start_kill()
+                .err()
+                .map(|error| format!("failed to kill root shell process: {error}"));
+            let wait_error = child
+                .wait()
+                .await
+                .err()
+                .map(|error| format!("failed to wait for root shell process: {error}"));
+            let mut errors = vec![group_error];
+            errors.extend(root_error);
+            errors.extend(wait_error);
+            return Err(errors.join("; "));
         }
     }
 
-    Ok((String::from_utf8_lossy(&output).to_string(), truncated))
+    #[cfg(not(unix))]
+    child
+        .start_kill()
+        .map_err(|error| format!("failed to kill shell command: {error}"))?;
+
+    child
+        .wait()
+        .await
+        .map_err(|error| format!("failed to wait for killed shell command: {error}"))
+}
+
+struct ShellProcessGuard {
+    process_id: Option<u32>,
+    armed: bool,
+}
+
+impl ShellProcessGuard {
+    fn new(process_id: Option<u32>) -> Self {
+        Self {
+            process_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ShellProcessGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if self.armed
+            && let Some(process_id) = self.process_id
+        {
+            let _ = kill_process_group(process_id);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn kill_process_group(process_id: u32) -> std::io::Result<()> {
+    let process_id = i32::try_from(process_id).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "shell process id exceeds the Unix pid range",
+        )
+    })?;
+
+    unsafe extern "C" {
+        fn kill(process_id: i32, signal: i32) -> i32;
+    }
+
+    // SAFETY: kill 只读取两个整数参数；负 pid 表示向对应进程组发送信号。
+    if unsafe { kill(-process_id, 9) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[derive(Default)]
+struct OutputCapture {
+    bytes: Vec<u8>,
+    truncated: bool,
+    error: Option<String>,
+    reached_eof: bool,
+}
+
+fn spawn_output_capture<R>(reader: R) -> (JoinHandle<()>, Arc<Mutex<OutputCapture>>)
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    let capture = Arc::new(Mutex::new(OutputCapture::default()));
+    let task_capture = capture.clone();
+    let task = tokio::spawn(capture_output(reader, task_capture));
+    (task, capture)
+}
+
+async fn capture_output(mut reader: impl AsyncRead + Unpin, capture: Arc<Mutex<OutputCapture>>) {
+    let mut buffer = [0_u8; 8192];
+
+    loop {
+        let read = match reader.read(&mut buffer).await {
+            Ok(read) => read,
+            Err(error) => {
+                let mut capture = capture
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                capture.error = Some(format!("failed to read process output: {error}"));
+                return;
+            }
+        };
+        if read == 0 {
+            let mut capture = capture
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            capture.reached_eof = true;
+            break;
+        }
+
+        let mut capture = capture
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let remaining = MAX_SHELL_OUTPUT_BYTES.saturating_sub(capture.bytes.len());
+        if remaining > 0 {
+            capture
+                .bytes
+                .extend_from_slice(&buffer[..read.min(remaining)]);
+        }
+        if read > remaining {
+            capture.truncated = true;
+        }
+    }
+}
+
+async fn finish_output_capture(
+    mut task: JoinHandle<()>,
+    capture: Arc<Mutex<OutputCapture>>,
+) -> FinishedOutput {
+    let task_error = match tokio::time::timeout(OUTPUT_DRAIN_TIMEOUT, &mut task).await {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(format!("process output reader task failed: {error}")),
+        Err(_) => {
+            task.abort();
+            let _ = task.await;
+            Some("process output pipe did not close after termination".to_string())
+        }
+    };
+    output_capture_result(&capture, task_error.is_some(), task_error)
+}
+
+struct FinishedOutput {
+    result: Result<(String, bool), String>,
+    reached_eof: bool,
+}
+
+fn output_capture_result(
+    capture: &Arc<Mutex<OutputCapture>>,
+    incomplete: bool,
+    task_error: Option<String>,
+) -> FinishedOutput {
+    let mut capture = capture
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if incomplete {
+        capture.truncated = true;
+    }
+    let reached_eof = capture.reached_eof && !incomplete && capture.error.is_none();
+    let error = task_error.or_else(|| capture.error.take());
+    let result = match error {
+        Some(error) => Err(error),
+        None => Ok((
+            String::from_utf8_lossy(&capture.bytes).to_string(),
+            capture.truncated,
+        )),
+    };
+    FinishedOutput {
+        result,
+        reached_eof,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -2157,7 +2503,7 @@ mod tests {
     use agent_protocol::{ApprovalAction, PermissionMode, ShellPolicy};
     use async_trait::async_trait;
     use std::future::Future;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
     struct TestTool(&'static str);
 
@@ -2171,7 +2517,12 @@ mod tests {
             )]
         }
 
-        async fn execute(&self, _call: ToolCall, _approval: Option<ToolApproval>) -> ToolExecution {
+        async fn execute(
+            &self,
+            _call: ToolCall,
+            _approval: Option<ToolApproval>,
+            _context: ToolExecutionContext,
+        ) -> ToolExecution {
             ToolExecution::Completed(ToolResult {
                 ok: true,
                 content: "{}".to_string(),
@@ -2774,6 +3125,33 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_approved_file_change_does_not_commit() {
+        let root = unique_dir("cancelled-file-change-root");
+        fs::write(root.join("note.txt"), "old\n").expect("write file");
+        let tools = registry(&root);
+        let call = call(
+            "write_file",
+            json!({"path": "note.txt", "content": "new\n", "overwrite": true}),
+        );
+        let request = approval_request(tools.execute(&call));
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let result = completed_result(tools.execute_approved_with_context(
+            &call,
+            &ApprovalDecision::approve(request.id.clone()),
+            &request,
+            ToolExecutionContext { cancellation },
+        ));
+
+        assert_eq!(result.error.as_deref(), Some(TOOL_CANCELLED_ERROR));
+        assert_eq!(
+            fs::read_to_string(root.join("note.txt")).expect("read unchanged file"),
+            "old\n"
+        );
+    }
+
+    #[test]
     fn write_file_rejects_missing_parent_directory() {
         let root = unique_dir("write-missing-parent-root");
         let tools = registry(&root);
@@ -3224,6 +3602,45 @@ mod tests {
     }
 
     #[test]
+    fn failed_update_install_restores_original_file() {
+        let root = unique_dir("patch-rollback-update-root");
+        let path = root.join("note.txt");
+        fs::write(&path, "old\n").expect("write original");
+        let tools = BuiltInTools {
+            evaluator: PermissionEvaluator::new(
+                &root,
+                PermissionProfile::for_mode(PermissionMode::DangerFullAccess),
+            )
+            .expect("permission evaluator"),
+        };
+        let change = StagedPatchChange {
+            path: path.clone(),
+            kind: PatchOperationKind::Update,
+            content: None,
+            permissions: None,
+            summary: FileChangeSummary {
+                path: "note.txt".to_string(),
+                operation: FileChangeOperation::Update,
+                replacements: 1,
+                created: false,
+                overwritten: true,
+                deleted: false,
+            },
+            before: Some("old\n".to_string()),
+            after: Some("new\n".to_string()),
+            temp_path: Some(root.join("missing-staged-content")),
+        };
+
+        let error = commit_patch_changes(vec![change], &tools).expect_err("install must fail");
+
+        assert!(error.contains("failed to replace note.txt"));
+        assert_eq!(
+            fs::read_to_string(path).expect("read restored file"),
+            "old\n"
+        );
+    }
+
+    #[test]
     fn read_only_rejects_apply_patch() {
         let root = unique_dir("patch-read-only-root");
         let tools =
@@ -3331,6 +3748,7 @@ mod tests {
             PermissionProfile::for_mode(PermissionMode::DangerFullAccess),
         );
 
+        let started = Instant::now();
         let value = content(tools.execute(&call(
             "shell_command",
             json!({"command": "sleep 2", "timeout_secs": 1}),
@@ -3338,6 +3756,126 @@ mod tests {
 
         assert_eq!(value["ok"], true);
         assert_eq!(value["data"]["timed_out"], true);
+        assert!(
+            started.elapsed() < Duration::from_millis(1800),
+            "timeout must terminate descendants instead of waiting for inherited pipes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_command_cancellation_kills_process_group() {
+        let root = unique_dir("shell-cancel-root");
+        let tools = registry_with_permissions(
+            &root,
+            PermissionProfile::for_mode(PermissionMode::DangerFullAccess),
+        );
+        let cancellation = CancellationToken::new();
+        let context = ToolExecutionContext {
+            cancellation: cancellation.clone(),
+        };
+        let execution_tools = tools.clone();
+        let execution = tokio::spawn(async move {
+            execution_tools
+                .execute_with_context(
+                    call(
+                        "shell_command",
+                        json!({
+                            "command": "printf started > started.txt; sleep 1; printf late > late.txt",
+                            "timeout_secs": 5
+                        }),
+                    ),
+                    context,
+                )
+                .await
+        });
+
+        for _ in 0..100 {
+            if root.join("started.txt").is_file() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(root.join("started.txt").is_file(), "shell did not start");
+
+        let cancelled_at = Instant::now();
+        cancellation.cancel();
+        let execution = tokio::time::timeout(Duration::from_millis(500), execution)
+            .await
+            .expect("cancelled shell must return promptly")
+            .expect("shell execution task");
+        let ToolExecution::Completed(result) = execution else {
+            panic!("cancelled shell must complete with an error result");
+        };
+        assert_eq!(result.error.as_deref(), Some(TOOL_CANCELLED_ERROR));
+        assert!(cancelled_at.elapsed() < Duration::from_millis(500));
+
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert!(
+            !root.join("late.txt").exists(),
+            "a descendant survived cancellation and wrote after the turn stopped"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_timeout_covers_background_process_pipes() {
+        let root = unique_dir("shell-background-timeout-root");
+        let cancellation = CancellationToken::new();
+        let started = Instant::now();
+
+        let (_, summary) = run_shell_command(
+            &root,
+            "(sleep 1; printf late > late.txt) &",
+            Duration::from_millis(100),
+            &cancellation,
+        )
+        .await
+        .expect("background command must be terminated at the total deadline");
+
+        assert!(summary.timed_out);
+        assert!(started.elapsed() < Duration::from_millis(600));
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert!(
+            !root.join("late.txt").exists(),
+            "background descendant survived the command deadline"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_cancelled_shell_future_kills_process_group() {
+        let root = unique_dir("shell-drop-cancel-root");
+        let task_root = root.clone();
+        let cancellation = CancellationToken::new();
+        let task_cancellation = cancellation.clone();
+        let execution = tokio::spawn(async move {
+            run_shell_command(
+                &task_root,
+                "printf started > started.txt; sleep 1; printf late > late.txt",
+                Duration::from_secs(5),
+                &task_cancellation,
+            )
+            .await
+        });
+
+        for _ in 0..100 {
+            if root.join("started.txt").is_file() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(root.join("started.txt").is_file(), "shell did not start");
+
+        cancellation.cancel();
+        execution.abort();
+        let _ = execution.await;
+
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert!(
+            !root.join("late.txt").exists(),
+            "dropping the tool future left a descendant process running"
+        );
     }
 
     #[test]

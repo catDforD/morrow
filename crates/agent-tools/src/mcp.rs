@@ -1,4 +1,4 @@
-use crate::{Tool, ToolExecution, ToolResult};
+use crate::{TOOL_CANCELLED_ERROR, Tool, ToolExecution, ToolExecutionContext, ToolResult};
 use agent_config::{McpServerConfig, McpTransport};
 use agent_protocol::{ToolCall, ToolDefinition, ToolExecutionSummary};
 use async_trait::async_trait;
@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, Command};
-use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const STDERR_TAIL_BYTES: usize = 8192;
@@ -43,20 +43,15 @@ impl McpToolCache {
                     if entry.runtime.is_healthy().await {
                         return Ok(entry);
                     }
-                    let mut entries = self.entries.lock().await;
-                    entries.remove(&key);
+                    self.evict_ready_if_current(&key, &entry).await;
                 }
-                McpCacheAction::Starting(notify) => {
-                    notify.notified().await;
+                McpCacheAction::Starting(mut wait) => {
+                    self.wait_for_start(&key, &mut wait).await;
                 }
-                McpCacheAction::Start(notify) => {
+                McpCacheAction::Start(signal) => {
                     let result = start_mcp_server(config, cwd.clone()).await;
-                    let mut entries = self.entries.lock().await;
-                    entries.remove(&key);
-                    if let Ok(entry) = result.as_ref() {
-                        entries.insert(key.clone(), McpCacheEntry::Ready(entry.clone()));
-                    }
-                    notify.notify_waiters();
+                    self.finish_start(&key, signal, result.as_ref().ok().cloned())
+                        .await;
                     return result;
                 }
             }
@@ -67,13 +62,77 @@ impl McpToolCache {
         let mut entries = self.entries.lock().await;
         match entries.get(key) {
             Some(McpCacheEntry::Ready(entry)) => McpCacheAction::Ready(entry.clone()),
-            Some(McpCacheEntry::Starting(notify)) => McpCacheAction::Starting(notify.clone()),
+            Some(McpCacheEntry::Starting(wait)) => McpCacheAction::Starting(wait.clone()),
             None => {
-                let notify = Arc::new(Notify::new());
-                entries.insert(key.clone(), McpCacheEntry::Starting(notify.clone()));
-                McpCacheAction::Start(notify)
+                let generation = Arc::new(());
+                let (completed, receiver) = watch::channel(false);
+                entries.insert(
+                    key.clone(),
+                    McpCacheEntry::Starting(McpStartWait {
+                        generation: generation.clone(),
+                        completed: receiver,
+                    }),
+                );
+                McpCacheAction::Start(McpStartSignal {
+                    generation,
+                    completed,
+                })
             }
         }
+    }
+
+    async fn wait_for_start(&self, key: &McpServerKey, wait: &mut McpStartWait) {
+        if wait
+            .completed
+            .wait_for(|completed| *completed)
+            .await
+            .is_ok()
+        {
+            return;
+        }
+
+        // 启动任务可能被取消。只清理同一代启动状态，避免误删后来创建的新任务。
+        let mut entries = self.entries.lock().await;
+        if matches!(
+            entries.get(key),
+            Some(McpCacheEntry::Starting(current))
+                if Arc::ptr_eq(&current.generation, &wait.generation)
+        ) {
+            entries.remove(key);
+        }
+    }
+
+    async fn evict_ready_if_current(&self, key: &McpServerKey, stale: &Arc<CachedMcpServer>) {
+        let mut entries = self.entries.lock().await;
+        if matches!(
+            entries.get(key),
+            Some(McpCacheEntry::Ready(current)) if Arc::ptr_eq(current, stale)
+        ) {
+            entries.remove(key);
+        }
+    }
+
+    async fn finish_start(
+        &self,
+        key: &McpServerKey,
+        signal: McpStartSignal,
+        entry: Option<Arc<CachedMcpServer>>,
+    ) {
+        let mut entries = self.entries.lock().await;
+        if matches!(
+            entries.get(key),
+            Some(McpCacheEntry::Starting(current))
+                if Arc::ptr_eq(&current.generation, &signal.generation)
+        ) {
+            entries.remove(key);
+            if let Some(entry) = entry {
+                entries.insert(key.clone(), McpCacheEntry::Ready(entry));
+            }
+        }
+        drop(entries);
+
+        // watch 会保留最后一个值，完成信号先于 waiter 开始等待也不会丢失。
+        let _ = signal.completed.send(true);
     }
 }
 
@@ -88,13 +147,24 @@ impl std::fmt::Debug for McpToolCache {
 
 enum McpCacheEntry {
     Ready(Arc<CachedMcpServer>),
-    Starting(Arc<Notify>),
+    Starting(McpStartWait),
 }
 
 enum McpCacheAction {
     Ready(Arc<CachedMcpServer>),
-    Starting(Arc<Notify>),
-    Start(Arc<Notify>),
+    Starting(McpStartWait),
+    Start(McpStartSignal),
+}
+
+#[derive(Clone)]
+struct McpStartWait {
+    generation: Arc<()>,
+    completed: watch::Receiver<bool>,
+}
+
+struct McpStartSignal {
+    generation: Arc<()>,
+    completed: watch::Sender<bool>,
 }
 
 pub struct McpDiscovery {
@@ -291,7 +361,11 @@ impl Tool for McpToolProvider {
         &self,
         call: ToolCall,
         _approval: Option<crate::ToolApproval>,
+        context: ToolExecutionContext,
     ) -> ToolExecution {
+        if context.cancellation.is_cancelled() {
+            return ToolExecution::error(TOOL_CANCELLED_ERROR);
+        }
         let Some(original_name) = self.lookup.get(&call.function.name) else {
             return ToolExecution::error(format!("unknown MCP tool {:?}", call.function.name));
         };
@@ -305,7 +379,12 @@ impl Tool for McpToolProvider {
             }
         };
 
-        let result = self.runtime.call_tool(original_name, arguments).await;
+        let result = tokio::select! {
+            _ = context.cancellation.cancelled() => {
+                return ToolExecution::error(TOOL_CANCELLED_ERROR);
+            }
+            result = self.runtime.call_tool(original_name, arguments) => result,
+        };
         ToolExecution::Completed(match result {
             Ok(result) => mcp_call_result(&self.runtime.name, original_name, result),
             Err(error) => tool_error_json(error),
@@ -411,6 +490,10 @@ impl McpServerActor {
                     timeout,
                     reply,
                 } => {
+                    // 调用方可能在排队期间已取消；此时不要再启动远端副作用。
+                    if reply.is_closed() {
+                        continue;
+                    }
                     let result =
                         call_tool(&mut self.transport, &tool_name, arguments, timeout).await;
                     let failed = result.is_err() && !self.transport.is_healthy().await;
@@ -832,9 +915,13 @@ impl HttpTransport {
 
         let response = request.send().await.map_err(|error| {
             if error.is_timeout() {
-                HttpPostError::Failed(format!("MCP HTTP request to {} timed out", self.url))
+                // URL 的 query/userinfo 可能包含 token，错误会进入 Warning/JSONL/WebSocket。
+                HttpPostError::Failed("MCP HTTP request timed out".to_string())
             } else {
-                HttpPostError::Failed(format!("failed to send MCP HTTP request: {error}"))
+                HttpPostError::Failed(format!(
+                    "failed to send MCP HTTP request: {}",
+                    error.without_url()
+                ))
             }
         })?;
         let status = response.status();
@@ -850,7 +937,10 @@ impl HttpTransport {
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
         let body = response.text().await.map_err(|error| {
-            HttpPostError::Failed(format!("failed to read MCP HTTP body: {error}"))
+            HttpPostError::Failed(format!(
+                "failed to read MCP HTTP body: {}",
+                error.without_url()
+            ))
         })?;
 
         if status == StatusCode::NOT_FOUND && had_session {
@@ -1320,6 +1410,144 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn concurrent_cache_waiter_observes_early_completion() {
+        let root = unique_dir("mcp-cache-early-completion");
+        let config = http_config(
+            "remote",
+            "http://127.0.0.1:1/mcp".to_string(),
+            BTreeMap::new(),
+        );
+        let key = McpServerKey::from_config(&config, &root);
+        let cache = Arc::new(McpToolCache::new());
+        let McpCacheAction::Start(signal) = cache.cache_action(&key).await else {
+            panic!("first caller must start the MCP server");
+        };
+
+        let (waiter_ready_tx, waiter_ready_rx) = oneshot::channel();
+        let (release_waiter_tx, release_waiter_rx) = oneshot::channel();
+        let waiter_cache = cache.clone();
+        let waiter_key = key.clone();
+        let waiter = tokio::spawn(async move {
+            let McpCacheAction::Starting(mut wait) = waiter_cache.cache_action(&waiter_key).await
+            else {
+                panic!("concurrent caller must wait for the existing start");
+            };
+            waiter_ready_tx.send(()).expect("signal waiter ready");
+            release_waiter_rx.await.expect("release waiter");
+            waiter_cache.wait_for_start(&waiter_key, &mut wait).await;
+        });
+
+        waiter_ready_rx
+            .await
+            .expect("waiter reached starting state");
+        cache.finish_start(&key, signal, None).await;
+        release_waiter_tx.send(()).expect("release waiter");
+
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("waiter must observe the completion sent before it waited")
+            .expect("waiter task");
+        assert!(!cache.entries.lock().await.contains_key(&key));
+    }
+
+    #[tokio::test]
+    async fn stale_ready_check_does_not_remove_a_new_start_generation() {
+        let root = unique_dir("mcp-cache-ready-generation");
+        let config = http_config(
+            "remote",
+            "http://127.0.0.1:1/mcp".to_string(),
+            BTreeMap::new(),
+        );
+        let key = McpServerKey::from_config(&config, &root);
+        let cache = McpToolCache::new();
+        let (tx, _rx) = mpsc::channel(MCP_ACTOR_QUEUE_CAPACITY);
+        let stale = Arc::new(CachedMcpServer {
+            runtime: McpServerRuntime {
+                name: "stale".to_string(),
+                tx,
+                healthy: Arc::new(AtomicBool::new(false)),
+                tool_timeout: Duration::from_secs(1),
+            },
+            listed_tools: Vec::new(),
+        });
+        let generation = Arc::new(());
+        let (_completed, receiver) = watch::channel(false);
+        cache.entries.lock().await.insert(
+            key.clone(),
+            McpCacheEntry::Starting(McpStartWait {
+                generation: generation.clone(),
+                completed: receiver,
+            }),
+        );
+
+        cache.evict_ready_if_current(&key, &stale).await;
+
+        let entries = cache.entries.lock().await;
+        assert!(matches!(
+            entries.get(&key),
+            Some(McpCacheEntry::Starting(current))
+                if Arc::ptr_eq(&current.generation, &generation)
+        ));
+    }
+
+    #[tokio::test]
+    async fn mcp_provider_returns_promptly_when_context_is_cancelled() {
+        let (tx, mut rx) = mpsc::channel(MCP_ACTOR_QUEUE_CAPACITY);
+        let runtime = McpServerRuntime {
+            name: "slow".to_string(),
+            tx,
+            healthy: Arc::new(AtomicBool::new(true)),
+            tool_timeout: Duration::from_secs(30),
+        };
+        let provider = McpToolProvider {
+            runtime,
+            definitions: Vec::new(),
+            lookup: HashMap::from([("mcp__slow__wait".to_string(), "wait".to_string())]),
+        };
+        let cancellation = crate::CancellationToken::new();
+        let context = ToolExecutionContext {
+            cancellation: cancellation.clone(),
+        };
+        let (call_started_tx, call_started_rx) = oneshot::channel();
+        let actor = tokio::spawn(async move {
+            let Some(McpActorCommand::Health { reply }) = rx.recv().await else {
+                panic!("expected health command");
+            };
+            reply.send(true).expect("health reply");
+
+            let Some(McpActorCommand::CallTool { reply, .. }) = rx.recv().await else {
+                panic!("expected tool call");
+            };
+            call_started_tx.send(()).expect("signal tool call");
+            let _reply = reply;
+            futures_util::future::pending::<()>().await;
+        });
+
+        let execution = tokio::spawn(async move {
+            provider
+                .execute(
+                    ToolCall::function("call_1", "mcp__slow__wait", "{}"),
+                    None,
+                    context,
+                )
+                .await
+        });
+        call_started_rx.await.expect("tool call reached actor");
+        cancellation.cancel();
+
+        let execution = tokio::time::timeout(Duration::from_millis(250), execution)
+            .await
+            .expect("cancelled MCP call must return promptly")
+            .expect("MCP execution task");
+        let ToolExecution::Completed(result) = execution else {
+            panic!("cancelled MCP call must complete with an error result");
+        };
+        assert!(!result.ok);
+        assert_eq!(result.error.as_deref(), Some(TOOL_CANCELLED_ERROR));
+        actor.abort();
+    }
+
     #[async_trait]
     impl JsonRpcTransport for FakeTransport {
         async fn request(
@@ -1602,6 +1830,7 @@ mod tests {
             .execute(
                 ToolCall::function("call_1", "mcp__remote__echo", r#"{"text":"hello"}"#),
                 None,
+                ToolExecutionContext::default(),
             )
             .await;
         let ToolExecution::Completed(result) = execution else {
@@ -1681,6 +1910,79 @@ mod tests {
             discovery.tools[0].definitions()[0].function.name,
             "mcp__remote__search"
         );
+    }
+
+    #[tokio::test]
+    async fn http_timeout_does_not_expose_url_query_secrets() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind hanging server");
+        let addr = listener.local_addr().expect("hanging server addr");
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept hanging request");
+            let _ = read_http_request(&mut stream);
+            thread::sleep(Duration::from_millis(200));
+        });
+        let secret = "query-token-secret";
+        let config = http_config(
+            "remote",
+            format!("http://{addr}/mcp?token={secret}"),
+            BTreeMap::new(),
+        );
+        let mut transport = HttpTransport::start(&config).expect("HTTP transport");
+        transport.client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("HTTP client without proxy");
+
+        let result = transport
+            .post_jsonrpc(
+                &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+                HttpResponseKind::Request { expected_id: 1 },
+                Duration::from_millis(20),
+            )
+            .await;
+        let Err(error) = result else {
+            panic!("hanging server must time out");
+        };
+        let message = error.into_message();
+
+        assert!(message.contains("timed out"));
+        assert!(!message.contains(secret));
+    }
+
+    #[tokio::test]
+    async fn http_connection_errors_do_not_expose_url_query_secrets() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind unused address");
+        let addr = listener.local_addr().expect("unused address");
+        drop(listener);
+        let secret = "connection-query-secret";
+        let config = http_config(
+            "remote",
+            format!("http://{addr}/mcp?token={secret}"),
+            BTreeMap::new(),
+        );
+        let mut transport = HttpTransport::start(&config).expect("HTTP transport");
+        transport.client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("HTTP client without proxy");
+
+        let result = transport
+            .post_jsonrpc(
+                &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+                HttpResponseKind::Request { expected_id: 1 },
+                Duration::from_secs(1),
+            )
+            .await;
+        let Err(error) = result else {
+            panic!("closed address must fail");
+        };
+        let message = error.into_message();
+
+        assert!(
+            message.contains("failed to send MCP HTTP request"),
+            "unexpected error: {message}"
+        );
+        assert!(!message.contains(secret));
     }
 
     #[tokio::test]

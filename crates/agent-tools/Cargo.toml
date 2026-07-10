@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 agent-config = { workspace = true }
+agent-core = { workspace = true }
 agent-protocol = { workspace = true }
 agent-sandbox = { workspace = true }
 async-trait = { workspace = true }
