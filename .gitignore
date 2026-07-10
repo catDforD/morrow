@@ -2,3 +2,8 @@
 morrow.toml
 .codegraph/
 crates/agent-server/web/node_modules/
+.playwright-mcp/
+.zcode/
+
+# 废止文档
+docs/
