@@ -28,7 +28,7 @@ pub struct AppConfig {
     pub mcp_servers: Vec<McpServerConfig>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ModelConfig {
     pub base_url: String,
     pub model: String,
@@ -36,6 +36,20 @@ pub struct ModelConfig {
     pub timeout_secs: u64,
     pub context_window_tokens: usize,
     pub reserved_output_tokens: usize,
+}
+
+impl std::fmt::Debug for ModelConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ModelConfig")
+            .field("base_url", &"<configured>")
+            .field("model", &self.model)
+            .field("api_key_env", &self.api_key_env)
+            .field("timeout_secs", &self.timeout_secs)
+            .field("context_window_tokens", &self.context_window_tokens)
+            .field("reserved_output_tokens", &self.reserved_output_tokens)
+            .finish()
+    }
 }
 
 impl ModelConfig {
@@ -73,7 +87,7 @@ pub enum McpTransport {
     Http,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct McpServerConfig {
     pub name: String,
     pub transport: McpTransport,
@@ -88,11 +102,51 @@ pub struct McpServerConfig {
     pub tool_timeout_sec: u64,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+impl std::fmt::Debug for McpServerConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("McpServerConfig")
+            .field("name", &self.name)
+            .field("transport", &self.transport)
+            .field("command", &self.command)
+            .field("args", &format_args!("<{} entries>", self.args.len()))
+            .field(
+                "env",
+                &self.env.keys().map(String::as_str).collect::<Vec<_>>(),
+            )
+            .field("cwd", &self.cwd)
+            .field("url", &self.url.as_ref().map(|_| "<configured>"))
+            .field(
+                "http_headers",
+                &self
+                    .http_headers
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+            )
+            .field("enabled", &self.enabled)
+            .field("startup_timeout_sec", &self.startup_timeout_sec)
+            .field("tool_timeout_sec", &self.tool_timeout_sec)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq)]
 pub struct LoadedConfig {
     pub config: AppConfig,
     pub path: PathBuf,
     pub api_key: String,
+}
+
+impl std::fmt::Debug for LoadedConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LoadedConfig")
+            .field("config", &self.config)
+            .field("path", &self.path)
+            .field("api_key", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Error)]
@@ -1135,5 +1189,36 @@ max_context_chars = 1024
         let err = load_config_from_locations(Some(&config), &root, None).expect_err("must fail");
 
         assert!(matches!(err, ConfigError::Parse { .. }));
+    }
+
+    #[test]
+    fn debug_output_redacts_model_and_mcp_secrets() {
+        let root = unique_dir("debug-redaction");
+        let config = root.join("morrow.toml");
+        fs::write(
+            &config,
+            r#"
+[model]
+base_url = "https://example.com/v1?token=model-url-secret"
+model = "test-model"
+OPENAI_API_KEY = "model-secret"
+context_window_tokens = 65536
+
+[mcp_servers.remote]
+url = "https://example.com/mcp?token=url-secret"
+http_headers = { Authorization = "Bearer mcp-secret" }
+"#,
+        )
+        .expect("write config");
+
+        let loaded = load_config_from_locations(Some(&config), &root, None).expect("load config");
+        let debug = format!("{loaded:?}");
+
+        assert!(!debug.contains("model-secret"));
+        assert!(!debug.contains("model-url-secret"));
+        assert!(!debug.contains("mcp-secret"));
+        assert!(!debug.contains("url-secret"));
+        assert!(debug.contains("<redacted>"));
+        assert!(debug.contains("Authorization"));
     }
 }

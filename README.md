@@ -2,7 +2,7 @@
 
 Morrow is a local coding agent CLI and web dashboard backed by an OpenAI-compatible Chat Completions API. It streams model output, persists project-scoped sessions, reads and edits files, applies patches, runs shell commands behind explicit permissions, and can emit JSONL events for automation.
 
-![Morrow web dashboard screenshot](Img/dashboard.png)
+![Morrow web dashboard screenshot](web_design/dashboard_v2.png)
 
 ## Highlights
 
@@ -99,9 +99,9 @@ shell = "deny"
 
 The inline `[model].OPENAI_API_KEY` value takes priority when present. Otherwise Morrow reads the environment variable named by `api_key_env`, which defaults to `OPENAI_API_KEY`.
 
-### MCP stdio tools
+### MCP tools
 
-Morrow can register stdio MCP servers from the same config file. Tools are exposed directly to the model as `mcp__server__tool` names after Morrow starts the server and calls `tools/list`. Stdio MCP servers are kept in a process cache for the CLI/server lifetime, so repeated turns reuse the initialized server and cached tool list when the server configuration has not changed.
+Morrow can register stdio and Streamable HTTP MCP servers from the same config file. Tools are exposed directly to the model as `mcp__server__tool` names after discovery. Initialized servers and discovered tools are cached for the CLI/server lifetime when their configuration has not changed.
 
 ```toml
 [mcp_servers.filesystem]
@@ -114,7 +114,7 @@ startup_timeout_sec = 10
 tool_timeout_sec = 60
 ```
 
-MCP support is intentionally narrow in v1: only stdio servers are supported. HTTP, OAuth, deferred search, and per-tool approval policies are not implemented yet. MCP tools are treated as explicitly configured trusted tools, so review server commands before enabling them.
+For a Streamable HTTP example with environment-backed headers, see [`morrow.example.toml`](morrow.example.toml). OAuth, deferred search, and per-tool approval policies are not implemented yet. MCP tools are treated as explicitly configured trusted tools, so review server commands and remote endpoints before enabling them.
 
 ## Run
 
@@ -213,6 +213,8 @@ morrow --jsonl "inspect this crate" > events.jsonl
 JSONL mode requires a prompt and is not available for interactive mode or session subcommands.
 
 ## Development
+
+For the crate boundaries, dependency direction, turn lifecycle, extension points, and cancellation semantics, see [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 Morrow is a Rust workspace:
 

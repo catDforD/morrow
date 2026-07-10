@@ -2,8 +2,8 @@ use agent_config::{ContextConfig, McpServerConfig, ModelContextLimits};
 use agent_model::OpenAiCompatClient;
 use agent_protocol::{ApprovalDecision, PermissionProfile, Session, SessionDocument};
 use agent_runtime::{
-    AgentEventEnvelope, McpToolCache, RunAgentTurnContext, SessionEntry, SessionStore,
-    TurnEventHandler,
+    AgentEventEnvelope, CancellationToken, McpToolCache, RunAgentTurnContext, SessionEntry,
+    SessionStore, TurnEventHandler,
 };
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
@@ -23,7 +23,7 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, broadcast, oneshot};
-use tokio::task::JoinHandle;
+use tokio::task::AbortHandle;
 
 #[derive(Clone)]
 pub struct ServerOptions {
@@ -104,7 +104,8 @@ struct SessionRuntime {
 struct RunningTurn {
     turn_id: String,
     pending_approval: Option<PendingApproval>,
-    handle: Option<JoinHandle<()>>,
+    cancellation: CancellationToken,
+    handle: AbortHandle,
 }
 
 struct PendingApproval {
@@ -453,6 +454,7 @@ async fn start_turn(
     }
 
     let turn_id = format!("turn-{}", agent_runtime::timestamp_ms());
+    let cancellation = CancellationToken::new();
     {
         let mut sessions = state.inner.sessions.lock().await;
         let runtime = sessions
@@ -468,39 +470,44 @@ async fn start_turn(
             );
             return;
         }
+        let state_for_task = state.clone();
+        let session_for_task = session_name.clone();
+        let turn_for_task = turn_id.clone();
+        let cancellation_for_task = cancellation.clone();
+        let tx_for_task = tx.clone();
+        let worker = tokio::spawn(async move {
+            run_turn_task(
+                state_for_task,
+                session_for_task,
+                turn_for_task,
+                prompt,
+                tx_for_task,
+                cancellation_for_task,
+            )
+            .await;
+        });
+        let handle = worker.abort_handle();
+        let state_for_supervisor = state.clone();
+        let session_for_supervisor = session_name.clone();
+        let turn_for_supervisor = turn_id.clone();
+        let tx_for_supervisor = tx.clone();
+        tokio::spawn(supervise_turn_worker(
+            state_for_supervisor,
+            session_for_supervisor,
+            turn_for_supervisor,
+            tx_for_supervisor,
+            worker,
+        ));
         runtime.running = Some(RunningTurn {
             turn_id: turn_id.clone(),
             pending_approval: None,
-            handle: None,
+            cancellation,
+            handle,
         });
     }
 
     if let Ok(snapshot) = snapshot_message(&state, &session_name).await {
         broadcast_message(&tx, snapshot);
-    }
-
-    let state_for_task = state.clone();
-    let session_for_task = session_name.clone();
-    let turn_for_task = turn_id.clone();
-    let prompt_for_task = prompt;
-    let tx_for_task = tx.clone();
-    let handle = tokio::spawn(async move {
-        run_turn_task(
-            state_for_task,
-            session_for_task,
-            turn_for_task,
-            prompt_for_task,
-            tx_for_task,
-        )
-        .await;
-    });
-
-    let mut sessions = state.inner.sessions.lock().await;
-    if let Some(runtime) = sessions.get_mut(&session_name)
-        && let Some(running) = runtime.running.as_mut()
-        && running.turn_id == turn_id
-    {
-        running.handle = Some(handle);
     }
 }
 
@@ -510,6 +517,7 @@ async fn run_turn_task(
     turn_id: String,
     prompt: String,
     tx: broadcast::Sender<ServerMessage>,
+    cancellation: CancellationToken,
 ) {
     let result = run_turn_task_inner(
         state.clone(),
@@ -517,11 +525,25 @@ async fn run_turn_task(
         turn_id.clone(),
         prompt,
         tx.clone(),
+        cancellation,
     )
     .await;
     if let Err(error) = result {
         broadcast_error(&tx, error.to_string());
     }
+}
+
+async fn supervise_turn_worker(
+    state: AppState,
+    session_name: String,
+    turn_id: String,
+    tx: broadcast::Sender<ServerMessage>,
+    worker: tokio::task::JoinHandle<()>,
+) {
+    if worker.await.is_err_and(|error| error.is_panic()) {
+        broadcast_error(&tx, format!("turn {turn_id} worker panicked"));
+    }
+    // 无论正常返回、panic 还是 abort，JoinHandle 完成都表示 worker future 已被 drop。
     clear_running_turn(&state, &session_name, &turn_id).await;
 }
 
@@ -531,6 +553,7 @@ async fn run_turn_task_inner(
     turn_id: String,
     prompt: String,
     tx: broadcast::Sender<ServerMessage>,
+    cancellation: CancellationToken,
 ) -> Result<(), agent_runtime::RuntimeError> {
     let options = state.inner.options.clone();
     let store = SessionStore::for_current_dir(&session_name)?;
@@ -543,7 +566,7 @@ async fn run_turn_task_inner(
         tx: tx.clone(),
     };
 
-    let outcome = agent_runtime::run_agent_turn(
+    let outcome = agent_runtime::run_agent_turn_with_cancellation(
         RunAgentTurnContext {
             client: &options.client,
             system_prompt: &options.system_prompt,
@@ -559,6 +582,7 @@ async fn run_turn_task_inner(
         &mut session,
         &prompt,
         &mut handler,
+        cancellation,
     )
     .await?;
 
@@ -627,9 +651,9 @@ async fn cancel_turn(
     turn_id: String,
     tx: &broadcast::Sender<ServerMessage>,
 ) {
-    let running = {
-        let mut sessions = state.inner.sessions.lock().await;
-        let Some(runtime) = sessions.get_mut(session_name) else {
+    let cancellation = {
+        let sessions = state.inner.sessions.lock().await;
+        let Some(runtime) = sessions.get(session_name) else {
             broadcast_error(tx, "session has no running turn");
             return;
         };
@@ -641,15 +665,36 @@ async fn cancel_turn(
             broadcast_error(tx, format!("turn {turn_id} is not running"));
             return;
         }
-        runtime.running.take()
+        running.cancellation.clone()
     };
 
-    if let Some(running) = running {
-        if let Some(handle) = running.handle {
+    cancellation.cancel();
+
+    // 正常路径由 runtime 收束失败 Turn。只有长期不退出时才使用 abort 兜底。
+    let state = state.clone();
+    let session_name = session_name.to_string();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        let handle = {
+            let sessions = state.inner.sessions.lock().await;
+            sessions
+                .get(&session_name)
+                .and_then(|runtime| runtime.running.as_ref())
+                .filter(|running| running.turn_id == turn_id && running.cancellation.is_cancelled())
+                .map(|running| running.handle.clone())
+        };
+        if let Some(handle) = handle {
             handle.abort();
+            // `abort` 只发送终止请求。等待任务真正结束，确保其 future（以及工具清理
+            // guard）已被 drop 后，才允许同一 Session 接受下一轮请求。
+            while !handle.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            clear_running_turn(&state, &session_name, &turn_id).await;
+            broadcast_error(&tx, format!("turn {turn_id} cancellation timed out"));
         }
-        broadcast_error(tx, format!("turn {turn_id} cancelled"));
-    }
+    });
 }
 
 async fn clear_running_turn(state: &AppState, session_name: &str, turn_id: &str) {
@@ -869,6 +914,7 @@ mod tests {
     #[tokio::test]
     async fn reset_rejects_running_session() {
         let state = test_state();
+        let worker = tokio::spawn(std::future::pending::<()>());
         {
             let mut sessions = state.inner.sessions.lock().await;
             let runtime = sessions
@@ -877,7 +923,8 @@ mod tests {
             runtime.running = Some(RunningTurn {
                 turn_id: "turn-1".to_string(),
                 pending_approval: None,
-                handle: None,
+                cancellation: CancellationToken::new(),
+                handle: worker.abort_handle(),
             });
         }
 
@@ -890,6 +937,88 @@ mod tests {
                 ..
             })
         ));
+        worker.abort();
+        let _ = worker.await;
+    }
+
+    #[tokio::test]
+    async fn cancellation_keeps_session_reserved_until_worker_cleanup() {
+        let state = test_state();
+        let tx = session_sender(&state, "default").await;
+        let worker = tokio::spawn(std::future::pending::<()>());
+        {
+            let mut sessions = state.inner.sessions.lock().await;
+            let runtime = sessions
+                .entry("default".to_string())
+                .or_insert_with(SessionRuntime::new);
+            runtime.running = Some(RunningTurn {
+                turn_id: "turn-1".to_string(),
+                pending_approval: None,
+                cancellation: CancellationToken::new(),
+                handle: worker.abort_handle(),
+            });
+        }
+
+        cancel_turn(&state, "default", "turn-1".to_string(), &tx).await;
+
+        let sessions = state.inner.sessions.lock().await;
+        let running = sessions
+            .get("default")
+            .and_then(|runtime| runtime.running.as_ref())
+            .expect("running turn remains reserved");
+        assert!(running.cancellation.is_cancelled());
+        assert!(
+            !worker.is_finished(),
+            "cooperative cancellation must not abort the worker immediately"
+        );
+        drop(sessions);
+
+        clear_running_turn(&state, "default", "turn-1").await;
+        worker.abort();
+        let _ = worker.await;
+    }
+
+    #[tokio::test]
+    async fn worker_panic_releases_session_slot() {
+        let state = test_state();
+        let tx = session_sender(&state, "default").await;
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let worker = tokio::spawn(async move {
+            let _ = release_rx.await;
+            panic!("test worker panic");
+        });
+        {
+            let mut sessions = state.inner.sessions.lock().await;
+            let runtime = sessions
+                .entry("default".to_string())
+                .or_insert_with(SessionRuntime::new);
+            runtime.running = Some(RunningTurn {
+                turn_id: "turn-panic".to_string(),
+                pending_approval: None,
+                cancellation: CancellationToken::new(),
+                handle: worker.abort_handle(),
+            });
+        }
+
+        let supervisor = tokio::spawn(supervise_turn_worker(
+            state.clone(),
+            "default".to_string(),
+            "turn-panic".to_string(),
+            tx,
+            worker,
+        ));
+        release_tx.send(()).expect("release worker");
+        tokio::time::timeout(std::time::Duration::from_secs(1), supervisor)
+            .await
+            .expect("supervisor must finish")
+            .expect("supervisor task");
+
+        let sessions = state.inner.sessions.lock().await;
+        assert!(
+            sessions
+                .get("default")
+                .is_some_and(|runtime| runtime.running.is_none())
+        );
     }
 
     #[tokio::test]
@@ -968,6 +1097,7 @@ mod tests {
         let state = test_state();
         let tx = session_sender(&state, "default").await;
         let mut rx = tx.subscribe();
+        let worker = tokio::spawn(std::future::pending::<()>());
         {
             let (sender, _receiver) = oneshot::channel();
             let mut sessions = state.inner.sessions.lock().await;
@@ -980,7 +1110,8 @@ mod tests {
                     request_id: "approval-call_1".to_string(),
                     sender,
                 }),
-                handle: None,
+                cancellation: CancellationToken::new(),
+                handle: worker.abort_handle(),
             });
         }
 
@@ -995,5 +1126,8 @@ mod tests {
                 .pending_approval
                 .is_some()
         );
+        clear_running_turn(&state, "default", "turn-1").await;
+        worker.abort();
+        let _ = worker.await;
     }
 }

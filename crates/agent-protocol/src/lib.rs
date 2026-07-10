@@ -227,6 +227,17 @@ pub struct Session {
     pub context: SessionContext,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionApplyError;
+
+impl std::fmt::Display for SessionApplyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("cannot apply a running turn to a session")
+    }
+}
+
+impl std::error::Error for SessionApplyError {}
+
 impl Session {
     pub fn new() -> Self {
         Self::default()
@@ -238,6 +249,25 @@ impl Session {
             turns: Vec::new(),
             context: SessionContext::new(),
         }
+    }
+
+    /// 一次性记录 turn；只有成功完成的消息才进入下一轮模型上下文。
+    pub fn apply_turn(&mut self, record: TurnRecord) {
+        self.try_apply_turn(record)
+            .expect("only terminal turn records may be applied");
+    }
+
+    pub fn try_apply_turn(&mut self, record: TurnRecord) -> Result<(), SessionApplyError> {
+        if record.turn.status == TurnStatus::Running {
+            return Err(SessionApplyError);
+        }
+        if record.turn.status == TurnStatus::Completed {
+            self.active_thread
+                .messages
+                .extend(record.messages.iter().cloned());
+        }
+        self.turns.push(record);
+        Ok(())
     }
 }
 
@@ -569,8 +599,13 @@ impl Turn {
         let error = error.into();
         self.status = TurnStatus::Failed;
         self.error = Some(error.clone());
-        if let Some(step) = self.steps.last_mut() {
-            step.fail(error);
+        // 并发工具可能同时处于 Running；turn 收束后不能留下“仍在运行”的持久化状态。
+        for step in self
+            .steps
+            .iter_mut()
+            .filter(|step| step.status == TurnStatus::Running)
+        {
+            step.fail(error.clone());
         }
     }
 }
@@ -728,6 +763,60 @@ mod tests {
             serde_json::from_value::<SessionDocument>(value).expect("deserialize session document");
         assert_eq!(decoded.schema_version, SESSION_DOCUMENT_SCHEMA_VERSION);
         assert_eq!(decoded.session, session);
+    }
+
+    #[test]
+    fn applying_completed_turn_updates_active_thread_and_history_once() {
+        let mut session = Session::from_thread(Thread {
+            messages: vec![Message::user("Previous"), Message::assistant("Context")],
+        });
+        let user_message = Message::user("Hello");
+        let assistant_message = Message::assistant("Hi");
+        let mut turn = Turn::running(user_message.clone());
+        turn.complete(assistant_message.clone());
+        let record = TurnRecord::new(turn, vec![user_message.clone(), assistant_message.clone()]);
+
+        session.apply_turn(record.clone());
+
+        assert_eq!(
+            session.active_thread.messages,
+            vec![
+                Message::user("Previous"),
+                Message::assistant("Context"),
+                user_message,
+                assistant_message,
+            ]
+        );
+        assert_eq!(session.turns, vec![record]);
+    }
+
+    #[test]
+    fn applying_failed_turn_updates_history_without_changing_active_thread() {
+        let initial_thread = Thread {
+            messages: vec![Message::user("Previous"), Message::assistant("Context")],
+        };
+        let mut session = Session::from_thread(initial_thread.clone());
+        let record = TurnRecord::failed_user_prompt("Broken", "model error");
+
+        session.apply_turn(record.clone());
+
+        assert_eq!(session.active_thread, initial_thread);
+        assert_eq!(session.turns, vec![record]);
+    }
+
+    #[test]
+    fn running_turn_cannot_be_applied_to_session() {
+        let mut session = Session::new();
+        let user_message = Message::user("Still running");
+        let record = TurnRecord::new(Turn::running(user_message.clone()), vec![user_message]);
+
+        let error = session
+            .try_apply_turn(record)
+            .expect_err("running turn must be rejected");
+
+        assert_eq!(error, SessionApplyError);
+        assert!(session.turns.is_empty());
+        assert!(session.active_thread.messages.is_empty());
     }
 
     #[test]
@@ -1005,6 +1094,28 @@ mod tests {
         assert_eq!(failed.steps[0].status, TurnStatus::Failed);
         assert_eq!(failed.steps[0].error, Some("model error".to_string()));
         assert_eq!(failed.error, Some("model error".to_string()));
+    }
+
+    #[test]
+    fn failed_turn_closes_every_running_step() {
+        let mut turn = Turn::running(Message::user("Hello"));
+        turn.steps
+            .push(TurnStep::running_tool_call("read_file", "call-1"));
+        turn.steps
+            .push(TurnStep::running_tool_call("list_files", "call-2"));
+
+        turn.fail("turn cancelled");
+
+        assert!(
+            turn.steps
+                .iter()
+                .all(|step| step.status != TurnStatus::Running)
+        );
+        assert!(
+            turn.steps
+                .iter()
+                .all(|step| step.error.as_deref() == Some("turn cancelled"))
+        );
     }
 
     #[test]

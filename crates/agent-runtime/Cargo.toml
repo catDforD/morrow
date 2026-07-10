@@ -6,7 +6,6 @@ edition.workspace = true
 [dependencies]
 agent-config = { workspace = true }
 agent-core = { workspace = true }
-agent-model = { workspace = true }
 agent-protocol = { workspace = true }
 agent-tools = { workspace = true }
 dirs = { workspace = true }
@@ -14,6 +13,7 @@ futures-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
+agent-model = { workspace = true }

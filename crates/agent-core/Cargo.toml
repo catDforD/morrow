@@ -4,12 +4,10 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-agent-model = { workspace = true }
 agent-protocol = { workspace = true }
-agent-tools = { workspace = true }
 futures-util = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
 
 [dev-dependencies]
-serde_json = { workspace = true }
+tokio = { workspace = true }

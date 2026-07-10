@@ -34,9 +34,7 @@ dependencies = [
 name = "agent-core"
 version = "0.1.2"
 dependencies = [
- "agent-model",
  "agent-protocol",
- "agent-tools",
  "futures-util",
  "serde_json",
  "thiserror",
@@ -47,6 +45,7 @@ dependencies = [
 name = "agent-model"
 version = "0.1.2"
 dependencies = [
+ "agent-core",
  "agent-protocol",
  "bytes",
  "futures-util",
@@ -112,6 +111,7 @@ name = "agent-tools"
 version = "0.1.2"
 dependencies = [
  "agent-config",
+ "agent-core",
  "agent-protocol",
  "agent-sandbox",
  "async-trait",
