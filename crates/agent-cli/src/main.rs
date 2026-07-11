@@ -206,7 +206,7 @@ async fn run() -> Result<(), CliError> {
             model_limits,
             workspace_root,
             config_path: loaded.path,
-            permissions,
+            permissions: PermissionProfile::for_mode(agent_server::DEFAULT_WEB_PERMISSION_MODE),
             mcp_servers: loaded.config.mcp_servers,
             default_session_name: session_name,
         })

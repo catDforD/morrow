@@ -1,8 +1,10 @@
 use agent_config::{ContextConfig, McpServerConfig, ModelContextLimits};
 use agent_model::OpenAiCompatClient;
-use agent_protocol::{ApprovalDecision, PermissionProfile, Session, SessionDocument};
+use agent_protocol::{
+    ApprovalDecision, PermissionMode, PermissionProfile, Session, SessionDocument,
+};
 use agent_runtime::{
-    AgentEventEnvelope, CancellationToken, McpToolCache, RunAgentTurnContext, SessionEntry,
+    AgentEventEnvelope, CancellationToken, McpToolCache, RunAgentTurnContext, SessionListingEntry,
     SessionStore, TurnEventHandler,
 };
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -25,6 +27,8 @@ use tokio::net::TcpListener;
 use tokio::sync::{Mutex, broadcast, oneshot};
 use tokio::task::AbortHandle;
 
+pub const DEFAULT_WEB_PERMISSION_MODE: PermissionMode = PermissionMode::WorkspaceWrite;
+
 #[derive(Clone)]
 pub struct ServerOptions {
     pub host: IpAddr,
@@ -35,6 +39,7 @@ pub struct ServerOptions {
     pub model_limits: ModelContextLimits,
     pub workspace_root: PathBuf,
     pub config_path: PathBuf,
+    /// Default for legacy clients that do not select a permission mode per turn.
     pub permissions: PermissionProfile,
     pub mcp_servers: Vec<McpServerConfig>,
     pub default_session_name: String,
@@ -81,6 +86,8 @@ pub fn router(options: ServerOptions) -> Router {
             get(get_session).post(create_session),
         )
         .route("/api/sessions/{name}/reset", post(reset_session))
+        .route("/api/sessions/{name}/archive", post(archive_session))
+        .route("/api/sessions/{name}/restore", post(restore_session))
         .route("/api/sessions/{name}/ws", get(session_ws))
         .with_state(state)
 }
@@ -129,6 +136,13 @@ struct SessionEntryResponse {
     active_messages: usize,
     summarized_turns: usize,
     has_summary: bool,
+    archived: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SessionArchiveResponse {
+    name: String,
+    archived: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -162,9 +176,19 @@ enum ServerMessage {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 enum ClientMessage {
-    StartTurn { request_id: String, prompt: String },
-    ApprovalDecision { request_id: String, approved: bool },
-    CancelTurn { turn_id: String },
+    StartTurn {
+        request_id: String,
+        prompt: String,
+        #[serde(default)]
+        permission_mode: Option<PermissionMode>,
+    },
+    ApprovalDecision {
+        request_id: String,
+        approved: bool,
+    },
+    CancelTurn {
+        turn_id: String,
+    },
 }
 
 #[derive(Debug)]
@@ -252,7 +276,7 @@ async fn list_sessions(
     let store = SessionStore::for_current_dir(&state.inner.options.default_session_name)
         .map_err(|error| ApiError::internal(error.to_string()))?;
     let entries = store
-        .list_current_scope()
+        .list_current_scope_with_archived()
         .map_err(|error| ApiError::internal(error.to_string()))?
         .into_iter()
         .map(session_entry_response)
@@ -266,6 +290,7 @@ async fn get_session(
     Path(name): Path<String>,
 ) -> Result<Json<SessionDocument>, ApiError> {
     let store = session_store(&name)?;
+    reject_archived_session(&store, &name)?;
     Ok(Json(SessionDocument::new(
         store
             .load()
@@ -282,6 +307,11 @@ async fn create_session(
     }
 
     let store = session_store(&name)?;
+    if store.is_archived() {
+        return Err(ApiError::conflict(format!(
+            "session {name:?} is archived; restore it before creating a session with the same name"
+        )));
+    }
     match store.load_existing() {
         Ok(_) => {
             return Err(ApiError::conflict(format!(
@@ -308,11 +338,44 @@ async fn reset_session(
     }
 
     let store = session_store(&name)?;
+    reject_archived_session(&store, &name)?;
     let session = Session::new();
     store
         .save(&session)
         .map_err(|error| ApiError::internal(error.to_string()))?;
     Ok(Json(SessionDocument::new(session)))
+}
+
+async fn archive_session(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<SessionArchiveResponse>, ApiError> {
+    if running_snapshot(&state, &name).await.is_some() {
+        return Err(ApiError::conflict("session has a running turn"));
+    }
+
+    let store = session_store(&name)?;
+    store.archive().map_err(session_mutation_error)?;
+    Ok(Json(SessionArchiveResponse {
+        name,
+        archived: true,
+    }))
+}
+
+async fn restore_session(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<SessionArchiveResponse>, ApiError> {
+    if running_snapshot(&state, &name).await.is_some() {
+        return Err(ApiError::conflict("session has a running turn"));
+    }
+
+    let store = session_store(&name)?;
+    store.restore().map_err(session_mutation_error)?;
+    Ok(Json(SessionArchiveResponse {
+        name,
+        archived: false,
+    }))
 }
 
 async fn session_ws(
@@ -401,12 +464,17 @@ async fn handle_client_ws_message(
     };
 
     match message {
-        ClientMessage::StartTurn { request_id, prompt } => {
+        ClientMessage::StartTurn {
+            request_id,
+            prompt,
+            permission_mode,
+        } => {
             start_turn(
                 state.clone(),
                 session_name.to_string(),
                 request_id,
                 prompt,
+                permission_mode,
                 tx.clone(),
             )
             .await;
@@ -430,6 +498,7 @@ async fn start_turn(
     session_name: String,
     request_id: String,
     prompt: String,
+    permission_mode: Option<PermissionMode>,
     tx: broadcast::Sender<ServerMessage>,
 ) {
     if prompt.trim().is_empty() {
@@ -442,12 +511,27 @@ async fn start_turn(
         );
         return;
     }
-    if let Err(error) = session_store(&session_name) {
+    let store = match session_store(&session_name) {
+        Ok(store) => store,
+        Err(error) => {
+            broadcast_message(
+                &tx,
+                ServerMessage::TurnRejected {
+                    request_id,
+                    reason: error.message,
+                },
+            );
+            return;
+        }
+    };
+    if store.is_archived() {
         broadcast_message(
             &tx,
             ServerMessage::TurnRejected {
                 request_id,
-                reason: error.message,
+                reason: format!(
+                    "session {session_name:?} is archived; restore it before starting a turn"
+                ),
             },
         );
         return;
@@ -455,6 +539,7 @@ async fn start_turn(
 
     let turn_id = format!("turn-{}", agent_runtime::timestamp_ms());
     let cancellation = CancellationToken::new();
+    let permissions = requested_permissions(state.inner.options.permissions, permission_mode);
     {
         let mut sessions = state.inner.sessions.lock().await;
         let runtime = sessions
@@ -481,6 +566,7 @@ async fn start_turn(
                 session_for_task,
                 turn_for_task,
                 prompt,
+                permissions,
                 tx_for_task,
                 cancellation_for_task,
             )
@@ -516,6 +602,7 @@ async fn run_turn_task(
     session_name: String,
     turn_id: String,
     prompt: String,
+    permissions: PermissionProfile,
     tx: broadcast::Sender<ServerMessage>,
     cancellation: CancellationToken,
 ) {
@@ -524,6 +611,7 @@ async fn run_turn_task(
         session_name.clone(),
         turn_id.clone(),
         prompt,
+        permissions,
         tx.clone(),
         cancellation,
     )
@@ -552,6 +640,7 @@ async fn run_turn_task_inner(
     session_name: String,
     turn_id: String,
     prompt: String,
+    permissions: PermissionProfile,
     tx: broadcast::Sender<ServerMessage>,
     cancellation: CancellationToken,
 ) -> Result<(), agent_runtime::RuntimeError> {
@@ -573,7 +662,7 @@ async fn run_turn_task_inner(
             context_config: options.context_config,
             model_limits: options.model_limits,
             workspace_root: &options.workspace_root,
-            permissions: options.permissions,
+            permissions,
             mcp_servers: &options.mcp_servers,
             mcp_cache: &state.inner.mcp_cache,
             session_name: &session_name,
@@ -782,6 +871,7 @@ async fn session_sender(state: &AppState, session_name: &str) -> broadcast::Send
 
 async fn snapshot_message(state: &AppState, session_name: &str) -> Result<ServerMessage, ApiError> {
     let store = session_store(session_name)?;
+    reject_archived_session(&store, session_name)?;
     let session = store
         .load()
         .map_err(|error| ApiError::internal(error.to_string()))?;
@@ -810,14 +900,44 @@ fn session_store(name: &str) -> Result<SessionStore, ApiError> {
     SessionStore::for_current_dir(name).map_err(|error| ApiError::bad_request(error.to_string()))
 }
 
-fn session_entry_response(entry: SessionEntry) -> SessionEntryResponse {
+fn requested_permissions(
+    default: PermissionProfile,
+    requested_mode: Option<PermissionMode>,
+) -> PermissionProfile {
+    requested_mode
+        .map(PermissionProfile::for_mode)
+        .unwrap_or(default)
+}
+
+fn reject_archived_session(store: &SessionStore, name: &str) -> Result<(), ApiError> {
+    if store.is_archived() {
+        return Err(ApiError::conflict(format!(
+            "session {name:?} is archived; restore it before opening it"
+        )));
+    }
+    Ok(())
+}
+
+fn session_mutation_error(error: agent_runtime::SessionStoreError) -> ApiError {
+    match error {
+        agent_runtime::SessionStoreError::SessionNotFound { .. }
+        | agent_runtime::SessionStoreError::TargetExists { .. } => {
+            ApiError::conflict(error.to_string())
+        }
+        _ => ApiError::internal(error.to_string()),
+    }
+}
+
+fn session_entry_response(entry: SessionListingEntry) -> SessionEntryResponse {
+    let session = entry.session;
     SessionEntryResponse {
-        name: entry.name,
-        path: entry.path.display().to_string(),
-        turns: entry.turns,
-        active_messages: entry.active_messages,
-        summarized_turns: entry.summarized_turns,
-        has_summary: entry.has_summary,
+        name: session.name,
+        path: session.path.display().to_string(),
+        turns: session.turns,
+        active_messages: session.active_messages,
+        summarized_turns: session.summarized_turns,
+        has_summary: session.has_summary,
+        archived: entry.archived,
     }
 }
 
@@ -873,10 +993,7 @@ mod tests {
             },
             workspace_root: root.clone(),
             config_path: root.join("morrow.toml"),
-            permissions: PermissionProfile {
-                mode: PermissionMode::ReadOnly,
-                shell: ShellPolicy::Deny,
-            },
+            permissions: PermissionProfile::for_mode(DEFAULT_WEB_PERMISSION_MODE),
             mcp_servers: Vec::new(),
             default_session_name: "default".to_string(),
         }
@@ -908,6 +1025,7 @@ mod tests {
         let value = serde_json::to_value(response.0).expect("status json");
 
         assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(value["permissions"]["mode"], "workspace_write");
         assert!(!value.to_string().contains("secret-test-key"));
     }
 
@@ -1090,6 +1208,109 @@ mod tests {
             },
         }
         drop(lock);
+    }
+
+    #[tokio::test]
+    async fn archive_and_restore_session_updates_session_listing() {
+        let lock = ENV_LOCK.get_or_init(|| AsyncMutex::new(())).lock().await;
+        let home = unique_test_dir("archive-home");
+        let cwd = unique_test_dir("archive-cwd");
+        let previous_cwd = std::env::current_dir().expect("current dir");
+        let previous_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        std::env::set_current_dir(&cwd).expect("set cwd");
+
+        let state = test_state();
+        let store = SessionStore::for_current_dir("work").expect("store");
+        store.save(&Session::new()).expect("save session");
+
+        let archived = archive_session(State(state.clone()), Path("work".to_string()))
+            .await
+            .expect("archive session");
+        let entries = list_sessions(State(state.clone()))
+            .await
+            .expect("list sessions");
+
+        assert!(archived.0.archived);
+        assert!(store.is_archived());
+        assert_eq!(entries.0.len(), 1);
+        assert!(entries.0[0].archived);
+
+        let restored = restore_session(State(state), Path("work".to_string()))
+            .await
+            .expect("restore session");
+
+        assert!(!restored.0.archived);
+        assert!(!store.is_archived());
+        assert!(store.load_existing().is_ok());
+
+        std::env::set_current_dir(previous_cwd).expect("restore cwd");
+        match previous_home {
+            Some(value) => unsafe {
+                std::env::set_var("HOME", value);
+            },
+            None => unsafe {
+                std::env::remove_var("HOME");
+            },
+        }
+        drop(lock);
+    }
+
+    #[test]
+    fn start_turn_message_accepts_optional_permission_mode() {
+        let selected = serde_json::from_value::<ClientMessage>(json!({
+            "type": "start_turn",
+            "data": {
+                "request_id": "request-1",
+                "prompt": "edit the workspace",
+                "permission_mode": "workspace_write"
+            }
+        }))
+        .expect("parse selected permissions");
+        let legacy = serde_json::from_value::<ClientMessage>(json!({
+            "type": "start_turn",
+            "data": {
+                "request_id": "request-2",
+                "prompt": "inspect the workspace"
+            }
+        }))
+        .expect("parse legacy message");
+
+        assert!(matches!(
+            selected,
+            ClientMessage::StartTurn {
+                permission_mode: Some(PermissionMode::WorkspaceWrite),
+                ..
+            }
+        ));
+        assert!(matches!(
+            legacy,
+            ClientMessage::StartTurn {
+                permission_mode: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn requested_permissions_allow_all_web_modes() {
+        let read_only = PermissionProfile {
+            mode: PermissionMode::ReadOnly,
+            shell: ShellPolicy::Deny,
+        };
+
+        assert_eq!(
+            requested_permissions(read_only, Some(PermissionMode::WorkspaceWrite)),
+            PermissionProfile::for_mode(PermissionMode::WorkspaceWrite)
+        );
+        assert_eq!(
+            requested_permissions(read_only, Some(PermissionMode::DangerFullAccess)),
+            PermissionProfile::for_mode(PermissionMode::DangerFullAccess)
+        );
+        assert_eq!(requested_permissions(read_only, None), read_only);
+        assert_eq!(DEFAULT_WEB_PERMISSION_MODE, PermissionMode::WorkspaceWrite);
     }
 
     #[tokio::test]
