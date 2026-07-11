@@ -25,8 +25,10 @@ import {
   X,
 } from 'lucide-react'
 import type { PermissionMode, StatusResponse } from './types'
+import type { ModelSettingsResponse } from './types'
+import ModelSettingsPanel from './ModelSettingsPanel'
 
-export type SettingsSection = 'general' | 'about'
+export type SettingsSection = 'general' | 'models' | 'about'
 export type ThemePreference = 'system' | 'light' | 'dark'
 
 type SettingsSelectOption<T extends string> = {
@@ -69,7 +71,7 @@ const navigationItems: SettingsNavigationItem[] = [
     icon: <Settings2 size={18} />,
     section: 'general',
   },
-  { label: '模型设置', icon: <Bot size={18} />, section: null },
+  { label: '模型设置', icon: <Bot size={18} />, section: 'models' },
   { label: '技能', icon: <Sparkles size={18} />, section: null },
   { label: '子智能体', icon: <Network size={18} />, section: null },
   { label: 'MCP 服务器', icon: <Server size={18} />, section: null },
@@ -85,6 +87,7 @@ export default function SettingsView({
   status,
   theme,
   permissionMode,
+  modelSettings,
   isSidebarOpen,
   isSidebarHidden,
   onSectionChange,
@@ -93,11 +96,13 @@ export default function SettingsView({
   onCloseSidebar,
   onThemeChange,
   onPermissionModeChange,
+  onModelSettingsChange,
 }: {
   section: SettingsSection
   status: StatusResponse | null
   theme: ThemePreference
   permissionMode: PermissionMode
+  modelSettings: ModelSettingsResponse | null
   isSidebarOpen: boolean
   isSidebarHidden: boolean
   onSectionChange: (section: SettingsSection) => void
@@ -106,8 +111,10 @@ export default function SettingsView({
   onCloseSidebar: () => void
   onThemeChange: (theme: ThemePreference) => void
   onPermissionModeChange: (mode: PermissionMode) => void
+  onModelSettingsChange: () => Promise<void>
 }) {
-  const title = section === 'about' ? '关于' : '常规'
+  const title =
+    section === 'about' ? '关于' : section === 'models' ? '模型设置' : '常规'
 
   return (
     <div
@@ -207,6 +214,11 @@ export default function SettingsView({
         <div className="settings-scroll main-scroll">
           {section === 'about' ? (
             <AboutSettings status={status} />
+          ) : section === 'models' ? (
+            <ModelSettingsPanel
+              settings={modelSettings}
+              onChanged={onModelSettingsChange}
+            />
           ) : (
             <GeneralSettings
               theme={theme}
@@ -330,7 +342,16 @@ function AboutSettings({ status }: { status: StatusResponse | null }) {
           />
           <SettingsInfo
             label="配置文件"
-            value={status?.config_path ?? '加载中…'}
+            value={
+              status
+                ? status.config_path ?? '未加载（Web 可独立配置模型）'
+                : '加载中…'
+            }
+            path
+          />
+          <SettingsInfo
+            label="Web 模型配置"
+            value={status?.model_store_path ?? '加载中…'}
             path
           />
         </dl>
@@ -341,7 +362,7 @@ function AboutSettings({ status }: { status: StatusResponse | null }) {
         <div>
           <strong>Local-first</strong>
           <p>
-            设置页不会展示 API Key，也不会修改配置文件。模型、MCP
+            设置页不会回传已保存的 API Key。Web 模型可即时更新；MCP
             和上下文设置仍需手动编辑配置并重启服务。
           </p>
         </div>

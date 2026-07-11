@@ -138,6 +138,38 @@ pub struct LoadedConfig {
     pub api_key: String,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServerAppConfig {
+    pub agent: AgentConfig,
+    pub context: ContextConfig,
+    pub permissions: PermissionProfile,
+    pub mcp_servers: Vec<McpServerConfig>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct LoadedServerModel {
+    pub config: ModelConfig,
+    pub api_key: String,
+}
+
+impl std::fmt::Debug for LoadedServerModel {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LoadedServerModel")
+            .field("config", &self.config)
+            .field("api_key", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoadedServerConfig {
+    pub config: ServerAppConfig,
+    pub path: Option<PathBuf>,
+    pub model: Option<LoadedServerModel>,
+    pub diagnostics: Vec<String>,
+}
+
 impl std::fmt::Debug for LoadedConfig {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -197,7 +229,7 @@ pub enum ConfigError {
     UnsupportedMcpField { server: String, field: &'static str },
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawAppConfig {
     model: Option<RawModelConfig>,
@@ -269,6 +301,71 @@ struct RawMcpServerConfig {
 pub fn load_config(explicit_path: Option<&Path>) -> Result<LoadedConfig, ConfigError> {
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     load_config_from_locations(explicit_path, &cwd, dirs::home_dir().as_deref())
+}
+
+pub fn load_server_config(explicit_path: Option<&Path>) -> Result<LoadedServerConfig, ConfigError> {
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    load_server_config_from_locations(explicit_path, &cwd, dirs::home_dir().as_deref())
+}
+
+fn load_server_config_from_locations(
+    explicit_path: Option<&Path>,
+    cwd: &Path,
+    home: Option<&Path>,
+) -> Result<LoadedServerConfig, ConfigError> {
+    let path = select_optional_config_path(explicit_path, cwd, home)?;
+    let raw = match path.as_ref() {
+        Some(path) => {
+            let content = fs::read_to_string(path).map_err(|source| ConfigError::Read {
+                path: path.clone(),
+                source,
+            })?;
+            toml::from_str::<RawAppConfig>(&content).map_err(|source| ConfigError::Parse {
+                path: path.clone(),
+                source,
+            })?
+        }
+        None => RawAppConfig::default(),
+    };
+
+    let RawAppConfig {
+        model,
+        agent,
+        context,
+        permissions,
+        mcp_servers,
+    } = raw;
+    let config = parse_server_app_config(agent, context, permissions, mcp_servers)?;
+    let mut diagnostics = Vec::new();
+    let model = model.and_then(|model| match parse_model_config(model) {
+        Ok((config, inline_api_key)) => {
+            let api_key = inline_api_key.or_else(|| env::var(&config.api_key_env).ok());
+            match api_key.filter(|key| !key.trim().is_empty()) {
+                Some(api_key) => Some(LoadedServerModel { config, api_key }),
+                None => {
+                    diagnostics.push(format!(
+                        "configured model is unavailable because API key environment variable {} is not set",
+                        config.api_key_env
+                    ));
+                    None
+                }
+            }
+        }
+        Err(error) => {
+            diagnostics.push(format!("configured model is unavailable: {error}"));
+            None
+        }
+    });
+    if model.is_none() && diagnostics.is_empty() {
+        diagnostics.push("no model is configured; add one in Web settings".to_string());
+    }
+
+    Ok(LoadedServerConfig {
+        config,
+        path,
+        model,
+        diagnostics,
+    })
 }
 
 fn load_config_from_locations(
@@ -343,61 +440,114 @@ fn select_config_path(
     })
 }
 
+fn select_optional_config_path(
+    explicit_path: Option<&Path>,
+    cwd: &Path,
+    home: Option<&Path>,
+) -> Result<Option<PathBuf>, ConfigError> {
+    if explicit_path.is_some() {
+        return select_config_path(explicit_path, cwd, home).map(Some);
+    }
+
+    let local = cwd.join("morrow.toml");
+    if local.is_file() {
+        return Ok(Some(local));
+    }
+    let user = home.map(|home| home.join(".morrow").join("config.toml"));
+    Ok(user.filter(|path| path.is_file()))
+}
+
 impl TryFrom<RawAppConfig> for AppConfig {
     type Error = ConfigError;
 
     fn try_from(value: RawAppConfig) -> Result<Self, Self::Error> {
-        let model = value.model.unwrap_or_default();
-        let model_name = model
-            .model
-            .map(|model| model.trim().to_string())
-            .filter(|model| !model.is_empty())
-            .ok_or(ConfigError::MissingModel)?;
-        let context_window_tokens = positive_config_value(
-            "[model].context_window_tokens",
-            model
-                .context_window_tokens
-                .ok_or(ConfigError::MissingContextWindowTokens)?,
-        )?;
-        let reserved_output_tokens = positive_config_value(
-            "[model].reserved_output_tokens",
-            model
-                .reserved_output_tokens
-                .unwrap_or(DEFAULT_RESERVED_OUTPUT_TOKENS),
-        )?;
-
-        let agent = value.agent.unwrap_or_default();
-        let context = ContextConfig::try_from(value.context.unwrap_or_default())?;
-        let permissions = value.permissions.unwrap_or_default();
-        let mode = permissions.mode.unwrap_or_default();
-        let mut permissions_profile = PermissionProfile::for_mode(mode);
-        if let Some(shell) = permissions.shell {
-            permissions_profile.shell = shell;
-        }
+        let RawAppConfig {
+            model,
+            agent,
+            context,
+            permissions,
+            mcp_servers,
+        } = value;
+        let (model, _) = parse_model_config(model.unwrap_or_default())?;
+        let server = parse_server_app_config(agent, context, permissions, mcp_servers)?;
 
         Ok(Self {
-            model: ModelConfig {
-                base_url: model
-                    .base_url
-                    .unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
-                model: model_name,
-                api_key_env: model
-                    .api_key_env
-                    .unwrap_or_else(|| DEFAULT_API_KEY_ENV.to_string()),
-                timeout_secs: model.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS),
-                context_window_tokens,
-                reserved_output_tokens,
-            },
-            agent: AgentConfig {
-                system_prompt: agent
-                    .system_prompt
-                    .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string()),
-            },
-            context,
-            permissions: permissions_profile,
-            mcp_servers: parse_mcp_servers(value.mcp_servers)?,
+            model,
+            agent: server.agent,
+            context: server.context,
+            permissions: server.permissions,
+            mcp_servers: server.mcp_servers,
         })
     }
+}
+
+fn parse_model_config(model: RawModelConfig) -> Result<(ModelConfig, Option<String>), ConfigError> {
+    let inline_api_key = model
+        .openai_api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(str::to_string);
+    let model_name = model
+        .model
+        .map(|model| model.trim().to_string())
+        .filter(|model| !model.is_empty())
+        .ok_or(ConfigError::MissingModel)?;
+    let context_window_tokens = positive_config_value(
+        "[model].context_window_tokens",
+        model
+            .context_window_tokens
+            .ok_or(ConfigError::MissingContextWindowTokens)?,
+    )?;
+    let reserved_output_tokens = positive_config_value(
+        "[model].reserved_output_tokens",
+        model
+            .reserved_output_tokens
+            .unwrap_or(DEFAULT_RESERVED_OUTPUT_TOKENS),
+    )?;
+
+    Ok((
+        ModelConfig {
+            base_url: model
+                .base_url
+                .unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
+            model: model_name,
+            api_key_env: model
+                .api_key_env
+                .unwrap_or_else(|| DEFAULT_API_KEY_ENV.to_string()),
+            timeout_secs: model.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS),
+            context_window_tokens,
+            reserved_output_tokens,
+        },
+        inline_api_key,
+    ))
+}
+
+fn parse_server_app_config(
+    agent: Option<RawAgentConfig>,
+    context: Option<RawContextConfig>,
+    permissions: Option<RawPermissionsConfig>,
+    mcp_servers: BTreeMap<String, RawMcpServerConfig>,
+) -> Result<ServerAppConfig, ConfigError> {
+    let agent = agent.unwrap_or_default();
+    let context = ContextConfig::try_from(context.unwrap_or_default())?;
+    let permissions = permissions.unwrap_or_default();
+    let mode = permissions.mode.unwrap_or_default();
+    let mut permissions_profile = PermissionProfile::for_mode(mode);
+    if let Some(shell) = permissions.shell {
+        permissions_profile.shell = shell;
+    }
+
+    Ok(ServerAppConfig {
+        agent: AgentConfig {
+            system_prompt: agent
+                .system_prompt
+                .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string()),
+        },
+        context,
+        permissions: permissions_profile,
+        mcp_servers: parse_mcp_servers(mcp_servers)?,
+    })
 }
 
 impl TryFrom<RawContextConfig> for ContextConfig {
@@ -754,6 +904,47 @@ compact_max_retries = 3
         let err = load_config_from_locations(Some(&config), &root, None).expect_err("must fail");
 
         assert!(matches!(err, ConfigError::MissingModel));
+    }
+
+    #[test]
+    fn server_config_allows_missing_file_and_uses_common_defaults() {
+        let cwd = unique_dir("server-no-config-cwd");
+        let home = unique_dir("server-no-config-home");
+
+        let loaded =
+            load_server_config_from_locations(None, &cwd, Some(&home)).expect("server config");
+
+        assert_eq!(loaded.path, None);
+        assert_eq!(loaded.model, None);
+        assert_eq!(loaded.config.agent.system_prompt, DEFAULT_SYSTEM_PROMPT);
+        assert!(loaded.config.mcp_servers.is_empty());
+        assert!(loaded.diagnostics[0].contains("no model"));
+    }
+
+    #[test]
+    fn server_config_keeps_running_when_model_is_incomplete() {
+        let cwd = unique_dir("server-incomplete-cwd");
+        let home = unique_dir("server-incomplete-home");
+        let config = cwd.join("morrow.toml");
+        fs::write(
+            &config,
+            r#"
+[agent]
+system_prompt = "Web bootstrap"
+
+[model]
+model = "deepseek-v4-pro"
+"#,
+        )
+        .expect("write config");
+
+        let loaded =
+            load_server_config_from_locations(None, &cwd, Some(&home)).expect("server config");
+
+        assert_eq!(loaded.path.as_deref(), Some(config.as_path()));
+        assert_eq!(loaded.model, None);
+        assert_eq!(loaded.config.agent.system_prompt, "Web bootstrap");
+        assert!(loaded.diagnostics[0].contains("context_window_tokens"));
     }
 
     #[test]

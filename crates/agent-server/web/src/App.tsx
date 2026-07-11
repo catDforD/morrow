@@ -44,13 +44,18 @@ import type {
   ApprovalRequest,
   ClientMessage,
   Message,
+  ModelSelection,
+  ModelSettingsResponse,
+  ModelProviderResponse,
   PermissionMode,
+  ReasoningLevel,
   RunningTurnSnapshot,
   ServerMessage,
   Session,
   SessionArchiveResponse,
   SessionDocument,
   SessionEntryResponse,
+  SessionModelSelectionResponse,
   StatusResponse,
   TimelineItem,
   TimelineMessageItem,
@@ -147,6 +152,11 @@ export default function App() {
   const [connection, setConnection] =
     useState<ConnectionStatus>('disconnected')
   const [prompt, setPrompt] = useState('')
+  const [modelSettings, setModelSettings] =
+    useState<ModelSettingsResponse | null>(null)
+  const [modelSelection, setModelSelection] = useState<ModelSelection | null>(
+    null,
+  )
   const [themePreference, setThemePreference] = useState<ThemePreference>(
     readSavedThemePreference,
   )
@@ -161,12 +171,15 @@ export default function App() {
 
   const socketRef = useRef<WebSocket | null>(null)
   const selectedRef = useRef(selected)
+  const modelSelectionRef = useRef<ModelSelection | null>(null)
+  const modelSettingsRef = useRef<ModelSettingsResponse | null>(null)
   const appViewRef = useRef(appView)
   const settingsSectionRef = useRef(settingsSection)
   const assistantMessageIdRef = useRef<string | null>(null)
   const runTraceIdRef = useRef<string | null>(null)
   const idRef = useRef(0)
   const selectionRef = useRef(0)
+  const modelSelectionRequestRef = useRef(0)
   const messagesEndRef = useRef<HTMLDivElement | null>(null)
   const sessionSearchRef = useRef<HTMLInputElement | null>(null)
   const resolvedTheme: ResolvedTheme =
@@ -283,6 +296,58 @@ export default function App() {
     [ensureRunTrace, updateRunTrace],
   )
 
+  const ensureLiveModelStep = useCallback(
+    (status: RunStep['status'] = 'running') => {
+      const id = ensureRunTrace('Model call started')
+      updateRunTrace(id, (trace) => {
+        if (
+          trace.steps.some(
+            (step) => step.kind === 'model' && step.status === 'running',
+          )
+        ) {
+          return trace
+        }
+        return {
+          ...trace,
+          steps: [
+            ...trace.steps,
+            {
+              id: nextId('step'),
+              kind: 'model',
+              status,
+              title: 'Model call started',
+              detail: modelSelectionRef.current
+                ? modelSelectionLabel(
+                    modelSettingsRef.current,
+                    modelSelectionRef.current,
+                  )
+                : undefined,
+            },
+          ],
+        }
+      })
+      return id
+    },
+    [ensureRunTrace, nextId, updateRunTrace],
+  )
+
+  const appendReasoningDelta = useCallback(
+    (text: string) => {
+      const id = ensureLiveModelStep()
+      updateRunTrace(id, (trace) => {
+        const index = trace.steps.findIndex(
+          (step) => step.kind === 'model' && step.status === 'running',
+        )
+        if (index === -1) return trace
+        const steps = [...trace.steps]
+        const step = steps[index]
+        steps[index] = { ...step, reasoning: (step.reasoning ?? '') + text }
+        return { ...trace, steps }
+      })
+    },
+    [ensureLiveModelStep, updateRunTrace],
+  )
+
   const upsertRunStep = useCallback(
     (runId: string, nextStep: RunStep) => {
       updateRunTrace(runId, (trace) => {
@@ -306,7 +371,7 @@ export default function App() {
 
   const startToolStep = useCallback(
     (id: string, name: string) => {
-      const runId = ensureRunTrace('Model requested a tool', name)
+      const runId = ensureLiveModelStep('ok')
       updateRunTrace(runId, (trace) => ({
         ...trace,
         steps: trace.steps.map((step) =>
@@ -323,7 +388,7 @@ export default function App() {
         detail: 'Tool call started',
       })
     },
-    [ensureRunTrace, updateRunTrace, upsertRunStep],
+    [ensureLiveModelStep, updateRunTrace, upsertRunStep],
   )
 
   const finishToolStep = useCallback(
@@ -439,6 +504,7 @@ export default function App() {
 
   const appendAssistantDelta = useCallback(
     (text: string) => {
+      ensureLiveModelStep()
       if (!assistantMessageIdRef.current) {
         const id = nextId('assistant')
         assistantMessageIdRef.current = id
@@ -458,7 +524,7 @@ export default function App() {
         ),
       )
     },
-    [nextId],
+    [ensureLiveModelStep, nextId],
   )
 
   const upsertTool = useCallback(
@@ -493,6 +559,20 @@ export default function App() {
     return nextEntries
   }, [])
 
+  const loadModelSettings = useCallback(async () => {
+    const settings = await fetchJson<ModelSettingsResponse>('/api/model-settings')
+    modelSettingsRef.current = settings
+    setModelSettings(settings)
+    return settings
+  }, [])
+
+  const loadSessionModelSelection = useCallback(async (name: string) => {
+    const response = await fetchJson<SessionModelSelectionResponse>(
+      `/api/sessions/${encodeURIComponent(name)}/model-selection`,
+    )
+    return response.selection ?? null
+  }, [])
+
   const sendSocketMessage = useCallback((message: ClientMessage) => {
     const socket = socketRef.current
     if (!socket || socket.readyState !== WebSocket.OPEN) {
@@ -507,11 +587,22 @@ export default function App() {
         case 'turn_started':
           assistantMessageIdRef.current = null
           setTools([])
-          refreshCurrentModelStep('Model call started', selectedRef.current)
+          refreshCurrentModelStep(
+            'Model call started',
+            modelSelectionRef.current
+              ? modelSelectionLabel(
+                  modelSettingsRef.current,
+                  modelSelectionRef.current,
+                )
+              : selectedRef.current,
+          )
           recordActivity('Turn started', selectedRef.current, 'running')
           break
         case 'warning':
           recordActivity('Warning', event.data, 'error')
+          break
+        case 'reasoning_delta':
+          appendReasoningDelta(event.data)
           break
         case 'text_delta':
           appendAssistantDelta(event.data)
@@ -579,6 +670,7 @@ export default function App() {
     },
     [
       addTimelineMessage,
+      appendReasoningDelta,
       appendAssistantDelta,
       completeCurrentRun,
       finishToolStep,
@@ -660,6 +752,7 @@ export default function App() {
     async (name: string) => {
       const selectionId = selectionRef.current + 1
       selectionRef.current = selectionId
+      modelSelectionRequestRef.current += 1
       selectedRef.current = name
       setSelected(name)
       setIsSidebarOpen(false)
@@ -670,6 +763,8 @@ export default function App() {
       assistantMessageIdRef.current = null
       runTraceIdRef.current = null
       setTimeline([])
+      modelSelectionRef.current = null
+      setModelSelection(null)
       closeSocket()
       writeAppLocation(
         name,
@@ -680,10 +775,15 @@ export default function App() {
       )
 
       try {
-        const document = await fetchJson<SessionDocument>(
-          `/api/sessions/${encodeURIComponent(name)}`,
-        )
+        const [document, selection] = await Promise.all([
+          fetchJson<SessionDocument>(
+            `/api/sessions/${encodeURIComponent(name)}`,
+          ),
+          loadSessionModelSelection(name),
+        ])
         if (selectionRef.current !== selectionId) return
+        modelSelectionRef.current = selection
+        setModelSelection(selection)
         setTimeline(sessionTimeline(document.session))
         recordActivity(
           'Session loaded',
@@ -698,7 +798,14 @@ export default function App() {
         }
       }
     },
-    [closeSocket, loadSessions, openSocket, recordActivity, showError],
+    [
+      closeSocket,
+      loadSessionModelSelection,
+      loadSessions,
+      openSocket,
+      recordActivity,
+      showError,
+    ],
   )
 
   useEffect(() => {
@@ -811,6 +918,7 @@ export default function App() {
         setStatus(loadedStatus)
         const savedMode = savedPermissionModeRef.current
         setPermissionMode(savedMode ?? loadedStatus.permissions.mode)
+        await loadModelSettings()
         const requestedName = initialLocationRef.current.session
         const entries = await loadSessions()
         const requestedEntry = entries.find(
@@ -832,7 +940,7 @@ export default function App() {
       mounted = false
       closeSocket()
     }
-  }, [closeSocket, loadSessions, selectSession, showError])
+  }, [closeSocket, loadModelSettings, loadSessions, selectSession, showError])
 
   const selectedEntry = useMemo(
     () => sessions.find((session) => session.name === selected),
@@ -855,7 +963,15 @@ export default function App() {
   )
 
   const isRunning = Boolean(runningTurn)
-  const canSend = connection === 'connected' && !isRunning && prompt.trim().length > 0
+  const selectedModel = useMemo(
+    () => findSelectedModel(modelSettings, modelSelection),
+    [modelSelection, modelSettings],
+  )
+  const canSend =
+    connection === 'connected' &&
+    !isRunning &&
+    prompt.trim().length > 0 &&
+    Boolean(selectedModel)
   const canCancel = Boolean(runningTurn?.turn_id && runningTurn.turn_id !== 'pending')
 
   const openInspector = (panel: InspectorPanel) => {
@@ -869,17 +985,17 @@ export default function App() {
     setIsSidebarOpen(true)
   }
 
-  const openSettings = () => {
+  const openSettings = (section: SettingsSection = 'general') => {
     appViewRef.current = 'settings'
-    settingsSectionRef.current = 'general'
+    settingsSectionRef.current = section
     setAppView('settings')
-    setSettingsSection('general')
+    setSettingsSection(section)
     setIsSidebarOpen(false)
     setIsInspectorOpen(false)
     writeAppLocation(
       selectedRef.current,
       'settings',
-      'general',
+      section,
       'push',
       true,
     )
@@ -930,13 +1046,19 @@ export default function App() {
     if (!trimmed || !canSend) return
     try {
       addTimelineMessage('user', trimmed)
-      createRunTrace('Request queued', compactText(trimmed, 90))
+      createRunTrace(
+        'Request queued',
+        selectedModel
+          ? `${selectedModel.provider.name} · ${selectedModel.model.name} · ${reasoningLabel(modelSelection?.reasoning ?? 'off')}`
+          : compactText(trimmed, 90),
+      )
       sendSocketMessage({
         type: 'start_turn',
         data: {
           request_id: `request-${Date.now()}`,
           prompt: trimmed,
           permission_mode: permissionMode,
+          model_selection: modelSelection,
         },
       })
       setPrompt('')
@@ -997,6 +1119,41 @@ export default function App() {
   const changePermissionMode = (mode: PermissionMode) => {
     setPermissionMode(mode)
     writeLocalPreference('morrow-permission-mode', mode)
+  }
+
+  const changeModelSelection = async (selection: ModelSelection) => {
+    if (isRunning) return
+    const session = selectedRef.current
+    const requestId = modelSelectionRequestRef.current + 1
+    modelSelectionRequestRef.current = requestId
+    const previous = modelSelectionRef.current
+    modelSelectionRef.current = selection
+    setModelSelection(selection)
+    try {
+      const response = await fetchJson<SessionModelSelectionResponse>(
+        `/api/sessions/${encodeURIComponent(session)}/model-selection`,
+        {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(selection),
+        },
+      )
+      if (
+        selectedRef.current !== session ||
+        modelSelectionRequestRef.current !== requestId
+      ) return
+      const saved = response.selection ?? null
+      modelSelectionRef.current = saved
+      setModelSelection(saved)
+    } catch (error) {
+      if (
+        selectedRef.current !== session ||
+        modelSelectionRequestRef.current !== requestId
+      ) return
+      modelSelectionRef.current = previous
+      setModelSelection(previous)
+      showError(error)
+    }
   }
 
   const archiveSession = async (name: string) => {
@@ -1081,6 +1238,7 @@ export default function App() {
           status={status}
           theme={themePreference}
           permissionMode={permissionMode}
+          modelSettings={modelSettings}
           isSidebarOpen={isSidebarOpen}
           isSidebarHidden={isNarrowViewport && !isSidebarOpen}
           onSectionChange={changeSettingsSection}
@@ -1089,6 +1247,13 @@ export default function App() {
           onCloseSidebar={() => setIsSidebarOpen(false)}
           onThemeChange={setThemePreference}
           onPermissionModeChange={changePermissionMode}
+          onModelSettingsChange={async () => {
+            modelSelectionRequestRef.current += 1
+            await loadModelSettings()
+            const selection = await loadSessionModelSelection(selectedRef.current)
+            modelSelectionRef.current = selection
+            setModelSelection(selection)
+          }}
         />
       ) : (
         <div className={`app-frame${isSidebarOpen ? ' sidebar-open' : ''}`}>
@@ -1144,12 +1309,18 @@ export default function App() {
               canCancel={canCancel}
               isRunning={isRunning}
               permissionMode={permissionMode}
+              modelSettings={modelSettings}
+              modelSelection={modelSelection}
               isSidebarOpen={isSidebarOpen}
               onPromptChange={setPrompt}
               onPromptKeyDown={handlePromptKeyDown}
               onSubmit={handleSubmit}
               onCancel={cancelTurn}
               onPermissionModeChange={changePermissionMode}
+              onModelSelectionChange={(selection) =>
+                void changeModelSelection(selection)
+              }
+              onManageModels={() => openSettings('models')}
               onOpenSidebar={openSidebar}
               onOpenInspector={openInspector}
               onToggleRun={(id) => {
@@ -1434,7 +1605,7 @@ function AppSidebar({
             className="sidebar-settings"
             type="button"
             title="Open settings"
-            onClick={onOpenSettings}
+            onClick={() => onOpenSettings()}
           >
             <Settings size={17} />
             <span>Settings</span>
@@ -1493,12 +1664,16 @@ function ChatView({
   canCancel,
   isRunning,
   permissionMode,
+  modelSettings,
+  modelSelection,
   isSidebarOpen,
   onPromptChange,
   onPromptKeyDown,
   onSubmit,
   onCancel,
   onPermissionModeChange,
+  onModelSelectionChange,
+  onManageModels,
   onOpenSidebar,
   onOpenInspector,
   onToggleRun,
@@ -1515,12 +1690,16 @@ function ChatView({
   canCancel: boolean
   isRunning: boolean
   permissionMode: PermissionMode
+  modelSettings: ModelSettingsResponse | null
+  modelSelection: ModelSelection | null
   isSidebarOpen: boolean
   onPromptChange: (value: string) => void
   onPromptKeyDown: (event: KeyboardEvent<HTMLTextAreaElement>) => void
   onSubmit: (event: FormEvent) => void
   onCancel: () => void
   onPermissionModeChange: (mode: PermissionMode) => void
+  onModelSelectionChange: (selection: ModelSelection) => void
+  onManageModels: () => void
   onOpenSidebar: () => void
   onOpenInspector: (panel: InspectorPanel) => void
   onToggleRun: (id: string) => void
@@ -1535,12 +1714,16 @@ function ChatView({
       isRunning={isRunning}
       status={status}
       permissionMode={permissionMode}
+      modelSettings={modelSettings}
+      modelSelection={modelSelection}
       variant={isEmpty ? 'home' : 'dock'}
       onPromptChange={onPromptChange}
       onPromptKeyDown={onPromptKeyDown}
       onSubmit={onSubmit}
       onCancel={onCancel}
       onPermissionModeChange={onPermissionModeChange}
+      onModelSelectionChange={onModelSelectionChange}
+      onManageModels={onManageModels}
     />
   )
 
@@ -1813,12 +1996,20 @@ function RunStepRow({ step }: { step: RunStep }) {
 
 function RunStepDetails({ step }: { step: RunStep }) {
   const summary = step.summary
-  if (!summary) return null
+  if (!summary && !step.reasoning) return null
 
   return (
-    <details className="run-step-details">
-      <summary>Details</summary>
-      {summary.shell ? (
+    <>
+      {step.reasoning ? (
+        <details className="run-step-details reasoning-details">
+          <summary>思考过程</summary>
+          <pre>{step.reasoning}</pre>
+        </details>
+      ) : null}
+      {summary ? (
+        <details className="run-step-details">
+          <summary>Details</summary>
+          {summary.shell ? (
         <pre>
           {[
             `command: ${summary.shell.command}`,
@@ -1830,8 +2021,8 @@ function RunStepDetails({ step }: { step: RunStep }) {
             `stderr truncated: ${summary.shell.stderr_truncated ? 'yes' : 'no'}`,
           ].join('\n')}
         </pre>
-      ) : null}
-      {summary.files?.length ? (
+          ) : null}
+          {summary.files?.length ? (
         <div className="run-file-list">
           {summary.files.map((file) => (
             <span key={`${file.operation}-${file.path}`}>
@@ -1839,10 +2030,12 @@ function RunStepDetails({ step }: { step: RunStep }) {
             </span>
           ))}
         </div>
+          ) : null}
+          {summary.diff ? <pre>{summary.diff}</pre> : null}
+          {summary.error ? <pre>{summary.error}</pre> : null}
+        </details>
       ) : null}
-      {summary.diff ? <pre>{summary.diff}</pre> : null}
-      {summary.error ? <pre>{summary.error}</pre> : null}
-    </details>
+    </>
   )
 }
 
@@ -1853,12 +2046,16 @@ function Composer({
   isRunning,
   status,
   permissionMode,
+  modelSettings,
+  modelSelection,
   variant = 'dock',
   onPromptChange,
   onPromptKeyDown,
   onSubmit,
   onCancel,
   onPermissionModeChange,
+  onModelSelectionChange,
+  onManageModels,
 }: {
   prompt: string
   canSend: boolean
@@ -1866,12 +2063,16 @@ function Composer({
   isRunning: boolean
   status: StatusResponse | null
   permissionMode: PermissionMode
+  modelSettings: ModelSettingsResponse | null
+  modelSelection: ModelSelection | null
   variant?: 'home' | 'dock'
   onPromptChange: (value: string) => void
   onPromptKeyDown: (event: KeyboardEvent<HTMLTextAreaElement>) => void
   onSubmit: (event: FormEvent) => void
   onCancel: () => void
   onPermissionModeChange: (mode: PermissionMode) => void
+  onModelSelectionChange: (selection: ModelSelection) => void
+  onManageModels: () => void
 }) {
   const primaryLabel = isRunning ? 'Stop turn' : 'Send'
   const primaryDisabled = isRunning ? !canCancel : !canSend
@@ -1920,15 +2121,13 @@ function Composer({
               />
             </div>
             <div className="composer-primary">
-              <button
-                className="composer-chip labeled"
-                type="button"
-                title="Model selection coming soon"
-                disabled
-              >
-                <Bot size={15} />
-                <span>Model</span>
-              </button>
+              <ModelPicker
+                settings={modelSettings}
+                selection={modelSelection}
+                disabled={isRunning}
+                onChange={onModelSelectionChange}
+                onManage={onManageModels}
+              />
               <button
                 aria-label={primaryLabel}
                 className={`send-button composer-primary-button${isRunning ? ' stop-button' : ''}`}
@@ -2031,6 +2230,185 @@ function PermissionPicker({
               </button>
             )
           })}
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+function ModelPicker({
+  settings,
+  selection,
+  disabled,
+  onChange,
+  onManage,
+}: {
+  settings: ModelSettingsResponse | null
+  selection: ModelSelection | null
+  disabled: boolean
+  onChange: (selection: ModelSelection) => void
+  onManage: () => void
+}) {
+  const [open, setOpen] = useState(false)
+  const [modelListOpen, setModelListOpen] = useState(false)
+  const pickerRef = useRef<HTMLDivElement | null>(null)
+  const selected = findSelectedModel(settings, selection)
+  const providers =
+    settings?.providers.filter(
+      (provider) => provider.enabled && provider.models.length > 0,
+    ) ?? []
+
+  useEffect(() => {
+    if (!open) return
+    const handlePointerDown = (event: globalThis.PointerEvent) => {
+      if (!pickerRef.current?.contains(event.target as Node)) {
+        setOpen(false)
+        setModelListOpen(false)
+      }
+    }
+    const handleKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setOpen(false)
+        setModelListOpen(false)
+      }
+    }
+    document.addEventListener('pointerdown', handlePointerDown)
+    document.addEventListener('keydown', handleKeyDown)
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown)
+      document.removeEventListener('keydown', handleKeyDown)
+    }
+  }, [open])
+
+  useEffect(() => {
+    if (disabled) {
+      setOpen(false)
+      setModelListOpen(false)
+    }
+  }, [disabled])
+
+  const openOrManage = () => {
+    if (providers.length === 0) {
+      onManage()
+      return
+    }
+    if (open) {
+      setOpen(false)
+      setModelListOpen(false)
+    } else {
+      setOpen(true)
+    }
+  }
+
+  return (
+    <div className={`model-picker${open ? ' open' : ''}`} ref={pickerRef}>
+      <button
+        className="composer-chip labeled model-trigger"
+        type="button"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        disabled={disabled}
+        title={selected ? modelSelectionLabel(settings, selection) : '配置模型'}
+        onClick={openOrManage}
+      >
+        <Bot size={15} />
+        <span>
+          {selected
+            ? `${selected.model.name} · ${reasoningLabel(selection?.reasoning ?? 'off')}`
+            : '配置模型'}
+        </span>
+        <ChevronDown size={14} />
+      </button>
+
+      {open ? (
+        <div className="model-menu" role="menu" aria-label="模型与思考设置">
+          {selected?.model.reasoning_profile === 'deepseek' && selection ? (
+            <section className="model-menu-section">
+              {(['off', 'high', 'max'] as ReasoningLevel[]).map((reasoning) => (
+                <button
+                  key={reasoning}
+                  type="button"
+                  role="menuitemradio"
+                  aria-checked={selection.reasoning === reasoning}
+                  className={selection.reasoning === reasoning ? 'selected' : ''}
+                  onClick={() =>
+                    onChange({ ...selection, reasoning })
+                  }
+                >
+                  <span>{reasoningLabel(reasoning)}</span>
+                  {selection.reasoning === reasoning ? <Check size={15} /> : null}
+                </button>
+              ))}
+            </section>
+          ) : null}
+
+          <section className="model-menu-section model-list-section">
+            <button
+              className={`model-current-toggle${modelListOpen ? ' expanded' : ''}`}
+              type="button"
+              aria-haspopup="menu"
+              aria-expanded={modelListOpen}
+              onClick={() => setModelListOpen((current) => !current)}
+            >
+              <span>{selected?.model.name ?? '选择模型'}</span>
+              <ChevronRight size={15} />
+            </button>
+            {modelListOpen ? (
+              <div className="model-list-expanded">
+                {providers.map((provider) => (
+                  <div className="model-provider-group" key={provider.id}>
+                    <small>{provider.name}</small>
+                    {provider.models.map((model) => {
+                      const isSelected =
+                        selection?.provider_id === provider.id &&
+                        selection.model_id === model.id
+                      return (
+                        <button
+                          key={model.id}
+                          type="button"
+                          role="menuitemradio"
+                          aria-checked={isSelected}
+                          className={isSelected ? 'selected' : ''}
+                          onClick={() => {
+                            onChange({
+                              provider_id: provider.id,
+                              model_id: model.id,
+                              reasoning:
+                                model.reasoning_profile === 'deepseek'
+                                  ? isSelected
+                                    ? selection?.reasoning ?? 'high'
+                                    : 'high'
+                                  : 'off',
+                            })
+                            setModelListOpen(false)
+                          }}
+                        >
+                          <span>
+                            <strong>{model.name}</strong>
+                            <small>{compactTokenCount(model.context_window_tokens)}</small>
+                          </span>
+                          {isSelected ? <Check size={15} /> : null}
+                        </button>
+                      )
+                    })}
+                  </div>
+                ))}
+              </div>
+            ) : null}
+          </section>
+
+          <button
+            className="model-manage-link"
+            type="button"
+            onClick={() => {
+              setOpen(false)
+              setModelListOpen(false)
+              onManage()
+            }}
+          >
+            <Settings size={15} />
+            <span>管理模型</span>
+          </button>
         </div>
       ) : null}
     </div>
@@ -2473,7 +2851,7 @@ function turnRecordTimeline(
   }
 
   if (record.turn.steps.length > 0 || record.turn.error) {
-    const trace = historyRunTrace(record.turn, turnIndex)
+    const trace = historyRunTrace(record, turnIndex)
     items.push({
       kind: 'run',
       id: trace.id,
@@ -2495,24 +2873,41 @@ function turnRecordTimeline(
 }
 
 function historyRunTrace(
-  turn: Session['turns'][number]['turn'],
+  record: Session['turns'][number],
   turnIndex: number,
 ): RunTrace {
-  const steps: RunStep[] = turn.steps.map((step, stepIndex) => ({
-    id: `history-${turnIndex}-step-${stepIndex}`,
-    kind: step.kind === 'tool_call' ? 'tool' : 'model',
-    status:
-      step.status === 'completed'
-        ? 'ok'
-        : step.status === 'failed'
-          ? 'error'
-          : 'running',
-    title:
-      step.kind === 'tool_call'
-        ? step.tool_name || 'Tool call'
-        : 'Model call',
-    detail: step.error || step.tool_call_id || undefined,
-  }))
+  const turn = record.turn
+  const modelMessages = record.messages.filter(
+    (message) => message.role === 'assistant',
+  )
+  let modelMessageIndex = 0
+  const steps: RunStep[] = turn.steps.map((step, stepIndex) => {
+    const modelMessage =
+      step.kind === 'model_call'
+        ? modelMessages[modelMessageIndex++]
+        : undefined
+    return {
+      id: `history-${turnIndex}-step-${stepIndex}`,
+      kind: step.kind === 'tool_call' ? 'tool' : 'model',
+      status:
+        step.status === 'completed'
+          ? 'ok'
+          : step.status === 'failed'
+            ? 'error'
+            : 'running',
+      title:
+        step.kind === 'tool_call'
+          ? step.tool_name || 'Tool call'
+          : turn.model?.model_name || 'Model call',
+      detail:
+        step.error ||
+        step.tool_call_id ||
+        (turn.model
+          ? `${turn.model.provider_name} · ${reasoningLabel(turn.model.reasoning)}`
+          : undefined),
+      reasoning: modelMessage?.reasoning_content || undefined,
+    }
+  })
 
   if (turn.error && !steps.some((step) => step.status === 'error')) {
     steps.push({
@@ -2715,6 +3110,46 @@ function compactText(text: string, length: number): string {
   return `${text.slice(0, length - 1)}...`
 }
 
+function findSelectedModel(
+  settings: ModelSettingsResponse | null,
+  selection: ModelSelection | null,
+): { provider: ModelProviderResponse; model: ModelProviderResponse['models'][number] } | null {
+  if (!settings || !selection) return null
+  const provider = settings.providers.find(
+    (candidate) => candidate.id === selection.provider_id && candidate.enabled,
+  )
+  const model = provider?.models.find(
+    (candidate) => candidate.id === selection.model_id,
+  )
+  return provider && model ? { provider, model } : null
+}
+
+function modelSelectionLabel(
+  settings: ModelSettingsResponse | null,
+  selection: ModelSelection | null,
+): string {
+  const selected = findSelectedModel(settings, selection)
+  if (!selected || !selection) return '未配置模型'
+  return `${selected.provider.name} · ${selected.model.name} · ${reasoningLabel(selection.reasoning)}`
+}
+
+function reasoningLabel(reasoning: ReasoningLevel): string {
+  switch (reasoning) {
+    case 'off':
+      return '关闭思考'
+    case 'high':
+      return '高'
+    case 'max':
+      return '最高'
+  }
+}
+
+function compactTokenCount(tokens: number): string {
+  if (tokens >= 1_000_000) return `${tokens / 1_000_000}M`
+  if (tokens >= 1_000) return `${Math.round(tokens / 1_000)}K`
+  return String(tokens)
+}
+
 function workspaceName(path: string): string {
   const parts = path.split(/[\\/]/).filter(Boolean)
   return parts.at(-1) || path
@@ -2737,7 +3172,10 @@ function readAppLocation(): AppLocation {
     params.get('view') === 'settings' ? 'settings' : 'workspace'
   const requestedSection = params.get('section')
   const section: SettingsSection =
-    view === 'settings' && requestedSection === 'about' ? 'about' : 'general'
+    view === 'settings' &&
+    (requestedSection === 'about' || requestedSection === 'models')
+      ? requestedSection
+      : 'general'
 
   return {
     session: params.get('session') || 'default',

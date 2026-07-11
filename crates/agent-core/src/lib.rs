@@ -24,6 +24,7 @@ pub struct ModelRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelEvent {
+    ReasoningDelta(String),
     TextDelta(String),
     ToolCalls(Vec<ToolCall>),
     Completed,
@@ -326,6 +327,7 @@ impl<'a> Agent<'a> {
             pending_approval: None,
             turn: Turn::running(user_message.clone()),
             turn_messages: vec![user_message.clone()],
+            assistant_reasoning: String::new(),
             assistant_text: String::new(),
             pending: VecDeque::from([AgentEvent::TurnStarted]),
             finished: false,
@@ -369,6 +371,7 @@ pub struct AgentTurnStream<'a> {
     pending_approval: Option<PendingApproval>,
     turn: Turn,
     turn_messages: Vec<Message>,
+    assistant_reasoning: String,
     assistant_text: String,
     pending: VecDeque<AgentEvent>,
     finished: bool,
@@ -456,7 +459,8 @@ impl AgentTurnStream<'_> {
 
     fn complete_turn(&mut self) {
         let assistant_text = self.assistant_text.clone();
-        let assistant_message = Message::assistant(assistant_text.clone());
+        let assistant_message = Message::assistant(assistant_text.clone())
+            .with_reasoning_content(self.assistant_reasoning.clone());
         self.turn_messages.push(assistant_message.clone());
         self.turn.complete(assistant_message);
         self.pending
@@ -515,7 +519,9 @@ impl AgentTurnStream<'_> {
                 self.assistant_text.clone(),
                 tool_calls.clone(),
             )
-        };
+        }
+        .with_reasoning_content(self.assistant_reasoning.clone());
+        self.assistant_reasoning.clear();
         self.assistant_text.clear();
         self.conversation.push(assistant_message.clone());
         self.turn_messages.push(assistant_message);
@@ -783,6 +789,10 @@ impl Stream for AgentTurnStream<'_> {
 
             if let Some(model_stream) = this.model_stream.as_mut() {
                 match model_stream.as_mut().poll_next(cx) {
+                    Poll::Ready(Some(Ok(ModelEvent::ReasoningDelta(text)))) => {
+                        this.assistant_reasoning.push_str(&text);
+                        return Poll::Ready(Some(AgentEvent::ReasoningDelta(text)));
+                    }
                     Poll::Ready(Some(Ok(ModelEvent::TextDelta(text)))) => {
                         this.assistant_text.push_str(&text);
                         return Poll::Ready(Some(AgentEvent::TextDelta(text)));
@@ -1771,6 +1781,56 @@ mod tests {
         assert!(requests[1].contains(r#""role":"tool""#));
         assert!(requests[1].contains(r#""tool_call_id":"call_1""#));
         assert!(requests[1].contains("tool result"));
+    }
+
+    #[tokio::test]
+    async fn reasoning_content_is_preserved_across_tool_rounds() {
+        let root = unique_dir("reasoning-tool-round");
+        fs::write(root.join("note.txt"), "tool result\n").expect("write note");
+        let model = ScriptedModel::new(vec![
+            ScriptedResponse::Events(vec![
+                Ok(ModelEvent::ReasoningDelta("inspect first".to_string())),
+                Ok(ModelEvent::ToolCalls(vec![ToolCall::function(
+                    "call_1",
+                    "read_file",
+                    r#"{"path":"note.txt","max_lines":5}"#,
+                )])),
+            ]),
+            ScriptedResponse::Events(vec![
+                Ok(ModelEvent::ReasoningDelta("use result".to_string())),
+                Ok(ModelEvent::TextDelta("Read it".to_string())),
+                Ok(ModelEvent::Completed),
+            ]),
+        ]);
+        let requests = model.recorded_requests();
+        let tools = tools(&root);
+        let agent = Agent::with_tools(&model, "You are helpful.", &tools);
+        let mut thread = Thread::new();
+
+        let stream = agent
+            .run_turn(&thread, "Read note.txt")
+            .await
+            .expect("run turn");
+        let (events, turn) = collect_events(stream, &mut thread).await;
+
+        assert!(events.contains(&AgentEvent::ReasoningDelta("inspect first".to_string())));
+        assert!(events.contains(&AgentEvent::ReasoningDelta("use result".to_string())));
+        assert_eq!(
+            thread.messages[1].reasoning_content.as_deref(),
+            Some("inspect first")
+        );
+        assert_eq!(
+            thread.messages[3].reasoning_content.as_deref(),
+            Some("use result")
+        );
+        assert_eq!(
+            turn.assistant_message
+                .as_ref()
+                .and_then(|message| message.reasoning_content.as_deref()),
+            Some("use result")
+        );
+        let requests = requests.lock().expect("requests lock poisoned");
+        assert!(requests[1].contains(r#""reasoning_content":"inspect first""#));
     }
 
     #[tokio::test]

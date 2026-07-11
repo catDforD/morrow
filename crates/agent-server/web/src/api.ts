@@ -8,6 +8,7 @@ export async function fetchJson<T>(url: string, options?: RequestInit): Promise<
         : `${response.status} ${response.statusText}`
     throw new Error(message)
   }
+  if (response.status === 204) return undefined as T
   return response.json() as Promise<T>
 }
 

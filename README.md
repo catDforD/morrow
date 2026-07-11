@@ -8,6 +8,7 @@ Morrow is a local coding agent CLI and web dashboard backed by an OpenAI-compati
 
 - CLI, interactive REPL, and local browser dashboard.
 - OpenAI-compatible model configuration through `--config`, local `morrow.toml`, or `~/.morrow/config.toml`.
+- Web-only model provider management with per-session model and reasoning selection.
 - Persistent named sessions scoped to the current project.
 - Built-in tools for file reads, file edits, patch application, text search, directory listing, and shell commands.
 - Read-only, workspace-write, and full-access permission profiles, with shell execution controlled separately.
@@ -98,6 +99,12 @@ shell = "deny"
 ```
 
 The inline `[model].OPENAI_API_KEY` value takes priority when present. Otherwise Morrow reads the environment variable named by `api_key_env`, which defaults to `OPENAI_API_KEY`.
+
+CLI commands continue to require a valid model and API key in the resolved TOML config. `morrow server` is more permissive when `--config` is omitted: it can start without a config file, `[model]` section, or model API key so that the first provider can be configured in the browser. An explicitly requested missing config and invalid TOML still stop startup.
+
+The dashboard's **Settings → Models** page manages Web-only OpenAI Chat Completions compatible providers. These settings do not change the CLI model. Provider data is stored in `~/.morrow/web-models.json`; API keys are kept as local plaintext, never returned by the API, and the file is written with mode `0600` on Unix. A valid TOML model appears as a read-only provider and becomes the initial Web default until another default is selected.
+
+The built-in DeepSeek template adds `deepseek-v4-flash` and `deepseek-v4-pro` with 1,000,000-token context windows, tool support, and **Off / High / Max** reasoning choices. New browser sessions inherit the global default, while each existing session remembers its own model and reasoning level.
 
 ### MCP tools
 

@@ -22,7 +22,7 @@ pub use agent_core::CancellationToken;
 pub use agent_tools::McpToolCache;
 pub use session_store::{SessionEntry, SessionListingEntry, SessionStore, SessionStoreError};
 
-pub const EVENT_SCHEMA_VERSION: u32 = 1;
+pub const EVENT_SCHEMA_VERSION: u32 = 2;
 const MESSAGE_BASE_TOKENS: usize = 6;
 const TOOL_CALL_BASE_TOKENS: usize = 12;
 const REQUEST_PADDING_NUMERATOR: usize = 4;
@@ -251,6 +251,7 @@ async fn run_agent_turn_inner(
                 }
                 AgentEvent::TurnStarted
                 | AgentEvent::Warning(_)
+                | AgentEvent::ReasoningDelta(_)
                 | AgentEvent::TextDelta(_)
                 | AgentEvent::AgentMessage(_)
                 | AgentEvent::ToolCallStarted { .. }
@@ -562,6 +563,7 @@ async fn request_raw_session_summary(
     let mut output = String::new();
     while let Some(event) = stream.next().await {
         match event? {
+            ModelEvent::ReasoningDelta(_) => {}
             ModelEvent::TextDelta(text) => output.push_str(&text),
             ModelEvent::Completed => {
                 let output = output.trim().to_string();
@@ -860,6 +862,9 @@ fn message_context_tokens(message: &Message) -> usize {
     let mut total = MESSAGE_BASE_TOKENS + estimate_text_tokens(message_role_label(message));
     if let Some(content) = message.content.as_ref() {
         total += estimate_text_tokens(content);
+    }
+    if let Some(reasoning_content) = message.reasoning_content.as_ref() {
+        total += estimate_text_tokens(reasoning_content);
     }
     if let Some(tool_call_id) = message.tool_call_id.as_ref() {
         total += estimate_text_tokens(tool_call_id);
@@ -1227,6 +1232,36 @@ compact test
         let with_tools = estimate_context_tokens("system", &session, "hello", &tools);
 
         assert!(with_tools > without_tools + 1_000);
+    }
+
+    #[test]
+    fn context_estimate_includes_reasoning_content() {
+        let mut without_reasoning = Session::new();
+        without_reasoning
+            .active_thread
+            .push(Message::assistant("answer"));
+        let mut with_reasoning = without_reasoning.clone();
+        with_reasoning.active_thread.messages[0].reasoning_content = Some("r".repeat(4_000));
+
+        let without = estimate_context_tokens("system", &without_reasoning, "hello", &[]);
+        let with = estimate_context_tokens("system", &with_reasoning, "hello", &[]);
+
+        assert!(with > without + 1_000);
+    }
+
+    #[test]
+    fn summary_prompt_omits_reasoning_content() {
+        let user = Message::user("question");
+        let assistant =
+            Message::assistant("answer").with_reasoning_content("private reasoning chain");
+        let mut turn = Turn::running(user.clone());
+        turn.complete(assistant.clone());
+        let record = TurnRecord::new(turn, vec![user, assistant]);
+
+        let prompt = build_summary_prompt(None, 256, None, &[record], 0);
+
+        assert!(prompt.contains("answer"));
+        assert!(!prompt.contains("private reasoning chain"));
     }
 
     #[tokio::test]

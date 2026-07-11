@@ -14,9 +14,84 @@ export interface PermissionProfile {
 
 export interface StatusResponse {
   workspace_root: string
-  config_path: string
+  config_path: string | null
   permissions: PermissionProfile
   version: string
+  model_ready: boolean
+  model_store_path: string
+  config_diagnostics: string[]
+}
+
+export type ReasoningLevel = 'off' | 'high' | 'max'
+export type ReasoningProfile = 'none' | 'deepseek'
+
+export interface ModelSelection {
+  provider_id: string
+  model_id: string
+  reasoning: ReasoningLevel
+}
+
+export interface ModelInvocation {
+  provider_id: string
+  provider_name: string
+  model_id: string
+  model_name: string
+  reasoning: ReasoningLevel
+}
+
+export interface ManagedModel {
+  id: string
+  name: string
+  context_window_tokens: number
+  reserved_output_tokens: number
+  supports_tools: boolean
+  reasoning_profile: ReasoningProfile
+}
+
+export interface ModelProviderResponse {
+  id: string
+  name: string
+  base_url: string
+  api_format: 'openai_chat_completions'
+  enabled: boolean
+  read_only: boolean
+  api_key_configured: boolean
+  timeout_secs: number
+  models: ManagedModel[]
+}
+
+export interface ModelSettingsResponse {
+  providers: ModelProviderResponse[]
+  default_selection?: ModelSelection | null
+  model_ready: boolean
+  store_path: string
+}
+
+export interface SessionModelSelectionResponse {
+  selection?: ModelSelection | null
+  inherited: boolean
+}
+
+export interface ProviderWriteRequest {
+  name: string
+  base_url: string
+  api_key?: string
+  enabled: boolean
+  timeout_secs: number
+  models: ManagedModel[]
+  default_model?: {
+    model_id: string
+    reasoning: ReasoningLevel
+  }
+}
+
+export interface DiscoveredModel {
+  id: string
+  suggested?: ManagedModel
+}
+
+export interface DiscoverModelsResponse {
+  models: DiscoveredModel[]
 }
 
 export interface SessionEntryResponse {
@@ -48,6 +123,7 @@ export interface ToolCall {
 export interface Message {
   role: Role
   content?: string | null
+  reasoning_content?: string | null
   tool_calls?: ToolCall[]
   tool_call_id?: string
 }
@@ -75,6 +151,7 @@ export interface Turn {
   status: TurnStatus
   user_message: Message
   assistant_message?: Message | null
+  model?: ModelInvocation | null
   steps: TurnStep[]
   error?: string | null
 }
@@ -148,6 +225,7 @@ export interface ApprovalDecision {
 export type AgentEvent =
   | { type: 'turn_started' }
   | { type: 'warning'; data: string }
+  | { type: 'reasoning_delta'; data: string }
   | { type: 'text_delta'; data: string }
   | { type: 'agent_message'; data: string }
   | { type: 'tool_call_started'; data: { id: string; name: string } }
@@ -201,6 +279,7 @@ export type ClientMessage =
         request_id: string
         prompt: string
         permission_mode: PermissionMode
+        model_selection?: ModelSelection | null
       }
     }
   | {
@@ -251,6 +330,7 @@ export interface RunStep {
   status: RunStepStatus
   title: string
   detail?: string
+  reasoning?: string
   summary?: ToolExecutionSummary
 }
 
