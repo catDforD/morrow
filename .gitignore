@@ -3,6 +3,7 @@ morrow.toml
 .codegraph/
 crates/agent-server/web/node_modules/
 .playwright-mcp/
+.playwright-cli/
 .zcode/
 
 # 废止文档
