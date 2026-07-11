@@ -20,7 +20,7 @@ use thiserror::Error;
 
 pub use agent_core::CancellationToken;
 pub use agent_tools::McpToolCache;
-pub use session_store::{SessionEntry, SessionStore, SessionStoreError};
+pub use session_store::{SessionEntry, SessionListingEntry, SessionStore, SessionStoreError};
 
 pub const EVENT_SCHEMA_VERSION: u32 = 1;
 const MESSAGE_BASE_TOKENS: usize = 6;

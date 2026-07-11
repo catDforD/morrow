@@ -26,6 +26,12 @@ export interface SessionEntryResponse {
   active_messages: number
   summarized_turns: number
   has_summary: boolean
+  archived: boolean
+}
+
+export interface SessionArchiveResponse {
+  name: string
+  archived: boolean
 }
 
 export interface ToolFunctionCall {
@@ -189,7 +195,14 @@ export type ServerMessage =
   | { type: 'error'; data: { message: string } }
 
 export type ClientMessage =
-  | { type: 'start_turn'; data: { request_id: string; prompt: string } }
+  | {
+      type: 'start_turn'
+      data: {
+        request_id: string
+        prompt: string
+        permission_mode: PermissionMode
+      }
+    }
   | {
       type: 'approval_decision'
       data: { request_id: string; approved: boolean }

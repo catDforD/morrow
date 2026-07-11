@@ -144,11 +144,11 @@ Customize the dashboard bind address:
 morrow server --host 127.0.0.1 --port 3000
 ```
 
-The browser UI can approve or deny prompted shell and file actions, but it cannot raise permissions beyond the mode used when the server started.
+The dashboard selects permissions independently for each turn and remembers the latest browser choice. It defaults to `workspace_write`; `[permissions]` in `morrow.toml` applies to CLI runs only. The sidebar also supports archiving and restoring project-scoped task sessions.
 
 ## Permissions
 
-File access is controlled by `permissions.mode`:
+CLI file access is controlled by `permissions.mode`:
 
 - `read_only`: write tools are denied.
 - `workspace_write`: file changes require approval and are limited to the workspace.

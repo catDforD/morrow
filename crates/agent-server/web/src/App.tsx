@@ -2,6 +2,8 @@ import type { FormEvent, KeyboardEvent, ReactNode } from 'react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Activity,
+  Archive,
+  ArchiveRestore,
   Bot,
   CalendarClock,
   Check,
@@ -12,9 +14,11 @@ import {
   Clock3,
   FileText,
   Folder,
+  Eye,
   ListTree,
   Moon,
   PanelLeft,
+  PencilLine,
   Plug,
   Plus,
   RefreshCw,
@@ -22,6 +26,7 @@ import {
   Send,
   Settings,
   Shield,
+  ShieldCheck,
   Square,
   Sun,
   Terminal,
@@ -37,9 +42,11 @@ import type {
   ApprovalRequest,
   ClientMessage,
   Message,
+  PermissionMode,
   RunningTurnSnapshot,
   ServerMessage,
   Session,
+  SessionArchiveResponse,
   SessionDocument,
   SessionEntryResponse,
   StatusResponse,
@@ -57,6 +64,40 @@ type ConnectionStatus = 'connecting' | 'connected' | 'disconnected'
 
 const markdownPlugins = [remarkGfm]
 
+const permissionOptions: Array<{
+  id: PermissionMode | 'plan'
+  mode: PermissionMode | null
+  label: string
+  description: string
+  disabled?: boolean
+}> = [
+  {
+    id: 'read_only',
+    mode: 'read_only',
+    label: '只读模式',
+    description: '仅检查和解释，不修改文件。',
+  },
+  {
+    id: 'workspace_write',
+    mode: 'workspace_write',
+    label: '自动编辑',
+    description: '可编辑工作区，敏感操作仍需确认。',
+  },
+  {
+    id: 'plan',
+    mode: null,
+    label: '计划模式',
+    description: '先制定实施计划，再开始修改。',
+    disabled: true,
+  },
+  {
+    id: 'danger_full_access',
+    mode: 'danger_full_access',
+    label: '完全访问',
+    description: '允许工作区外操作并减少确认。',
+  },
+]
+
 const emptySessionEntry = (name: string): SessionEntryResponse => ({
   name,
   path: '',
@@ -64,6 +105,7 @@ const emptySessionEntry = (name: string): SessionEntryResponse => ({
   active_messages: 0,
   summarized_turns: 0,
   has_summary: false,
+  archived: false,
 })
 
 export default function App() {
@@ -97,6 +139,11 @@ export default function App() {
   const [theme, setTheme] = useState<'light' | 'dark'>(() =>
     localStorage.getItem('morrow-theme') === 'dark' ? 'dark' : 'light',
   )
+  const savedPermissionModeRef = useRef(readSavedPermissionMode())
+  const [permissionMode, setPermissionMode] = useState<PermissionMode>(
+    savedPermissionModeRef.current ?? 'read_only',
+  )
+  const [sessionAction, setSessionAction] = useState<string | null>(null)
 
   const socketRef = useRef<WebSocket | null>(null)
   const selectedRef = useRef(selected)
@@ -421,11 +468,11 @@ export default function App() {
   const loadSessions = useCallback(async () => {
     const entries = await fetchJson<SessionEntryResponse[]>('/api/sessions')
     const current = selectedRef.current
-    setSessions(
-      entries.some((session) => session.name === current)
-        ? entries
-        : [emptySessionEntry(current), ...entries],
-    )
+    const nextEntries = entries.some((session) => session.name === current)
+      ? entries
+      : [emptySessionEntry(current), ...entries]
+    setSessions(nextEntries)
+    return nextEntries
   }, [])
 
   const sendSocketMessage = useCallback((message: ClientMessage) => {
@@ -684,9 +731,19 @@ export default function App() {
         const loadedStatus = await fetchJson<StatusResponse>('/api/status')
         if (!mounted) return
         setStatus(loadedStatus)
-        const name = new URLSearchParams(location.search).get('session') || 'default'
+        const savedMode = savedPermissionModeRef.current
+        setPermissionMode(savedMode ?? loadedStatus.permissions.mode)
+        const requestedName =
+          new URLSearchParams(location.search).get('session') || 'default'
+        const entries = await loadSessions()
+        const requestedEntry = entries.find(
+          (session) => session.name === requestedName,
+        )
+        const name = requestedEntry?.archived
+          ? entries.find((session) => !session.archived)?.name ||
+            nextAvailableSessionName(entries)
+          : requestedName
         selectedRef.current = name
-        await loadSessions()
         await selectSession(name)
       } catch (error) {
         if (mounted) showError(error)
@@ -711,6 +768,14 @@ export default function App() {
       session.name.toLowerCase().includes(query),
     )
   }, [sessionFilter, sessions])
+  const activeSessions = useMemo(
+    () => filteredSessions.filter((session) => !session.archived),
+    [filteredSessions],
+  )
+  const archivedSessions = useMemo(
+    () => filteredSessions.filter((session) => session.archived),
+    [filteredSessions],
+  )
 
   const isRunning = Boolean(runningTurn)
   const canSend = connection === 'connected' && !isRunning && prompt.trim().length > 0
@@ -744,6 +809,7 @@ export default function App() {
         data: {
           request_id: `request-${Date.now()}`,
           prompt: trimmed,
+          permission_mode: permissionMode,
         },
       })
       setPrompt('')
@@ -801,6 +867,56 @@ export default function App() {
     }
   }
 
+  const changePermissionMode = (mode: PermissionMode) => {
+    setPermissionMode(mode)
+    localStorage.setItem('morrow-permission-mode', mode)
+  }
+
+  const archiveSession = async (name: string) => {
+    if (sessionAction) return
+    setSessionAction(`archive:${name}`)
+    try {
+      await fetchJson<SessionArchiveResponse>(
+        `/api/sessions/${encodeURIComponent(name)}/archive`,
+        { method: 'POST' },
+      )
+      if (name === selectedRef.current) {
+        const latestSessions = await loadSessions()
+        let nextName = latestSessions.find((session) => !session.archived)?.name
+        if (!nextName) {
+          nextName = nextAvailableSessionName(latestSessions)
+          await fetchJson<SessionDocument>(
+            `/api/sessions/${encodeURIComponent(nextName)}`,
+            { method: 'POST' },
+          )
+        }
+        await selectSession(nextName)
+      } else {
+        await loadSessions()
+      }
+    } catch (error) {
+      showError(error)
+    } finally {
+      setSessionAction(null)
+    }
+  }
+
+  const restoreSession = async (name: string) => {
+    if (sessionAction) return
+    setSessionAction(`restore:${name}`)
+    try {
+      await fetchJson<SessionArchiveResponse>(
+        `/api/sessions/${encodeURIComponent(name)}/restore`,
+        { method: 'POST' },
+      )
+      await selectSession(name)
+    } catch (error) {
+      showError(error)
+    } finally {
+      setSessionAction(null)
+    }
+  }
+
   const cancelTurn = () => {
     if (!runningTurn || !canCancel) return
     try {
@@ -842,12 +958,12 @@ export default function App() {
           onClick={() => setIsSidebarOpen(false)}
         />
         <AppSidebar
-          sessions={filteredSessions}
-          sessionCount={sessions.length}
-          status={status}
-          connection={connection}
+          sessions={activeSessions}
+          archivedSessions={archivedSessions}
+          sessionCount={sessions.filter((session) => !session.archived).length}
           runningTurn={runningTurn}
           selected={selected}
+          sessionAction={sessionAction}
           isCreatingSession={isCreatingSession}
           newSessionName={newSessionName}
           createSessionError={createSessionError}
@@ -863,6 +979,8 @@ export default function App() {
           onCreateSession={() => void createSession()}
           onToggleSearch={toggleSearch}
           onSessionFilterChange={setSessionFilter}
+          onArchiveSession={(name) => void archiveSession(name)}
+          onRestoreSession={(name) => void restoreSession(name)}
           onRefresh={() => void refresh()}
           onClose={() => setIsSidebarOpen(false)}
           onThemeToggle={() =>
@@ -881,11 +999,13 @@ export default function App() {
             canSend={canSend}
             canCancel={canCancel}
             isRunning={isRunning}
+            permissionMode={permissionMode}
             isSidebarOpen={isSidebarOpen}
             onPromptChange={setPrompt}
             onPromptKeyDown={handlePromptKeyDown}
             onSubmit={handleSubmit}
             onCancel={cancelTurn}
+            onPermissionModeChange={changePermissionMode}
             onOpenSidebar={openSidebar}
             onOpenInspector={openInspector}
             onToggleRun={(id) => {
@@ -929,11 +1049,11 @@ export default function App() {
 
 function AppSidebar({
   sessions,
+  archivedSessions,
   sessionCount,
-  status,
-  connection,
   runningTurn,
   selected,
+  sessionAction,
   isCreatingSession,
   newSessionName,
   createSessionError,
@@ -949,16 +1069,18 @@ function AppSidebar({
   onCreateSession,
   onToggleSearch,
   onSessionFilterChange,
+  onArchiveSession,
+  onRestoreSession,
   onRefresh,
   onClose,
   onThemeToggle,
 }: {
   sessions: SessionEntryResponse[]
+  archivedSessions: SessionEntryResponse[]
   sessionCount: number
-  status: StatusResponse | null
-  connection: ConnectionStatus
   runningTurn: RunningTurnSnapshot | null
   selected: string
+  sessionAction: string | null
   isCreatingSession: boolean
   newSessionName: string
   createSessionError: string | null
@@ -974,16 +1096,15 @@ function AppSidebar({
   onCreateSession: () => void
   onToggleSearch: () => void
   onSessionFilterChange: (value: string) => void
+  onArchiveSession: (name: string) => void
+  onRestoreSession: (name: string) => void
   onRefresh: () => void
   onClose: () => void
   onThemeToggle: () => void
 }) {
-  const workspace = status ? workspaceName(status.workspace_root) : 'loading'
-  const permission = status
-    ? formatPermissionMode(status.permissions.mode)
-    : 'unknown mode'
-  const connectionState = runningTurn ? 'running' : connection
-  const selectedSessionRef = useRef<HTMLButtonElement | null>(null)
+  const [isArchiveOpen, setIsArchiveOpen] = useState(false)
+  const selectedSessionRef = useRef<HTMLDivElement | null>(null)
+  const showArchivedSessions = isArchiveOpen || sessionFilter.trim().length > 0
 
   useEffect(() => {
     selectedSessionRef.current?.scrollIntoView({ block: 'nearest' })
@@ -1074,40 +1195,93 @@ function AppSidebar({
           ) : null}
           {sessions.length === 0 ? (
             <p className="muted-line">
-              {sessionFilter.trim() ? 'No matching sessions.' : 'No sessions.'}
+              {sessionFilter.trim() ? 'No matching active tasks.' : 'No active tasks.'}
             </p>
           ) : (
             sessions.map((session) => (
-              <button
+              <div
                 key={session.name}
-                type="button"
-                className={`sidebar-session${session.name === selected ? ' active' : ''}`}
+                className={`sidebar-session-row${session.name === selected ? ' active' : ''}`}
                 ref={session.name === selected ? selectedSessionRef : undefined}
-                onClick={() => onSelectSession(session.name)}
               >
-                <span className="session-name">{session.name}</span>
-                <span>
-                  {session.turns} turns
-                  {session.has_summary ? ' / summary' : ''}
-                </span>
-              </button>
+                <button
+                  type="button"
+                  className="sidebar-session"
+                  onClick={() => onSelectSession(session.name)}
+                >
+                  <span className="session-name">{session.name}</span>
+                  <span>
+                    {session.turns} turns
+                    {session.has_summary ? ' / summary' : ''}
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  className="session-row-action archive-action"
+                  title={
+                    session.path
+                      ? `归档任务 ${session.name}`
+                      : '空任务无需归档'
+                  }
+                  aria-label={`归档任务 ${session.name}`}
+                  disabled={
+                    !session.path ||
+                    Boolean(sessionAction) ||
+                    (session.name === selected && Boolean(runningTurn))
+                  }
+                  onClick={() => onArchiveSession(session.name)}
+                >
+                  <Archive size={15} />
+                </button>
+              </div>
             ))
           )}
+
+          {archivedSessions.length > 0 ? (
+            <section className="archived-session-section" aria-label="Archived tasks">
+              <button
+                type="button"
+                className="archive-section-toggle"
+                aria-expanded={showArchivedSessions}
+                onClick={() => setIsArchiveOpen((open) => !open)}
+              >
+                <Archive size={14} />
+                <span>已归档</span>
+                <small>{archivedSessions.length}</small>
+                {showArchivedSessions ? (
+                  <ChevronDown size={14} />
+                ) : (
+                  <ChevronRight size={14} />
+                )}
+              </button>
+              {showArchivedSessions ? (
+                <div className="archived-session-list">
+                  {archivedSessions.map((session) => (
+                    <div className="sidebar-session-row archived" key={session.name}>
+                      <div className="archived-session-copy">
+                        <span className="session-name">{session.name}</span>
+                        <span>{session.turns} turns</span>
+                      </div>
+                      <button
+                        type="button"
+                        className="session-row-action restore-action"
+                        title={`恢复任务 ${session.name}`}
+                        aria-label={`恢复任务 ${session.name}`}
+                        disabled={Boolean(sessionAction)}
+                        onClick={() => onRestoreSession(session.name)}
+                      >
+                        <ArchiveRestore size={15} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+            </section>
+          ) : null}
         </div>
       </section>
 
       <div className="sidebar-footer">
-        <div className="workspace-summary">
-          <Folder size={17} />
-          <div title={status?.workspace_root || ''}>
-            <strong>{workspace}</strong>
-            <span>{permission}</span>
-          </div>
-          <span
-            className={`workspace-connection ${connectionState}`}
-            title={connectionState}
-          />
-        </div>
         <div className="sidebar-footer-row">
           <button
             className="sidebar-settings"
@@ -1172,11 +1346,13 @@ function ChatView({
   canSend,
   canCancel,
   isRunning,
+  permissionMode,
   isSidebarOpen,
   onPromptChange,
   onPromptKeyDown,
   onSubmit,
   onCancel,
+  onPermissionModeChange,
   onOpenSidebar,
   onOpenInspector,
   onToggleRun,
@@ -1192,11 +1368,13 @@ function ChatView({
   canSend: boolean
   canCancel: boolean
   isRunning: boolean
+  permissionMode: PermissionMode
   isSidebarOpen: boolean
   onPromptChange: (value: string) => void
   onPromptKeyDown: (event: KeyboardEvent<HTMLTextAreaElement>) => void
   onSubmit: (event: FormEvent) => void
   onCancel: () => void
+  onPermissionModeChange: (mode: PermissionMode) => void
   onOpenSidebar: () => void
   onOpenInspector: (panel: InspectorPanel) => void
   onToggleRun: (id: string) => void
@@ -1209,12 +1387,13 @@ function ChatView({
       canSend={canSend}
       canCancel={canCancel}
       isRunning={isRunning}
-      status={status}
+      permissionMode={permissionMode}
       variant={isEmpty ? 'home' : 'dock'}
       onPromptChange={onPromptChange}
       onPromptKeyDown={onPromptKeyDown}
       onSubmit={onSubmit}
       onCancel={onCancel}
+      onPermissionModeChange={onPermissionModeChange}
     />
   )
 
@@ -1525,48 +1704,32 @@ function Composer({
   canSend,
   canCancel,
   isRunning,
-  status,
+  permissionMode,
   variant = 'dock',
   onPromptChange,
   onPromptKeyDown,
   onSubmit,
   onCancel,
+  onPermissionModeChange,
 }: {
   prompt: string
   canSend: boolean
   canCancel: boolean
   isRunning: boolean
-  status: StatusResponse | null
+  permissionMode: PermissionMode
   variant?: 'home' | 'dock'
   onPromptChange: (value: string) => void
   onPromptKeyDown: (event: KeyboardEvent<HTMLTextAreaElement>) => void
   onSubmit: (event: FormEvent) => void
   onCancel: () => void
+  onPermissionModeChange: (mode: PermissionMode) => void
 }) {
   const primaryLabel = isRunning ? 'Stop turn' : 'Send'
   const primaryDisabled = isRunning ? !canCancel : !canSend
-  const workspace = status ? workspaceName(status.workspace_root) : 'loading'
-  const permission = status
-    ? formatPermissionMode(status.permissions.mode)
-    : 'unknown mode'
 
   return (
     <form className={`composer ${variant}`} onSubmit={onSubmit}>
       <div className="composer-shell">
-        <div className="composer-context" aria-label="Workspace context">
-          <span title={status?.workspace_root || ''}>
-            <Folder size={14} />
-            {workspace}
-          </span>
-          <span>
-            <Terminal size={14} />
-            Local
-          </span>
-          <span>
-            <Shield size={14} />
-            {permission}
-          </span>
-        </div>
         <div className="composer-card">
           <textarea
             value={prompt}
@@ -1586,15 +1749,11 @@ function Composer({
               >
                 <Plus size={16} />
               </button>
-              <button
-                className="composer-chip labeled"
-                type="button"
-                title="Plan mode coming soon"
-                disabled
-              >
-                <ListTree size={15} />
-                <span>Plan mode</span>
-              </button>
+              <PermissionPicker
+                mode={permissionMode}
+                disabled={isRunning}
+                onChange={onPermissionModeChange}
+              />
             </div>
             <div className="composer-primary">
               <button
@@ -1621,6 +1780,117 @@ function Composer({
       </div>
     </form>
   )
+}
+
+function PermissionPicker({
+  mode,
+  disabled,
+  onChange,
+}: {
+  mode: PermissionMode
+  disabled: boolean
+  onChange: (mode: PermissionMode) => void
+}) {
+  const [open, setOpen] = useState(false)
+  const pickerRef = useRef<HTMLDivElement | null>(null)
+  const selectedOption = permissionOptions.find((option) => option.mode === mode)
+
+  useEffect(() => {
+    if (!open) return
+    const handlePointerDown = (event: globalThis.PointerEvent) => {
+      if (!pickerRef.current?.contains(event.target as Node)) setOpen(false)
+    }
+    const handleKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === 'Escape') setOpen(false)
+    }
+    document.addEventListener('pointerdown', handlePointerDown)
+    document.addEventListener('keydown', handleKeyDown)
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown)
+      document.removeEventListener('keydown', handleKeyDown)
+    }
+  }, [open])
+
+  useEffect(() => {
+    if (disabled) setOpen(false)
+  }, [disabled])
+
+  return (
+    <div className={`permission-picker${open ? ' open' : ''}`} ref={pickerRef}>
+      <button
+        className="permission-trigger"
+        type="button"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        disabled={disabled}
+        onClick={() => setOpen((current) => !current)}
+      >
+        {permissionModeIcon(mode, 15)}
+        <span className="permission-trigger-label">
+          {selectedOption?.label || '只读模式'}
+        </span>
+        <ChevronDown size={14} />
+      </button>
+      {open ? (
+        <div className="permission-menu" role="menu" aria-label="权限模式">
+          {permissionOptions.map((option) => {
+            const isSelected = option.mode === mode
+            return (
+              <button
+                key={option.id}
+                type="button"
+                role="menuitemradio"
+                aria-checked={isSelected}
+                className={`permission-option ${option.id}${isSelected ? ' selected' : ''}`}
+                disabled={option.disabled}
+                title={
+                  option.disabled ? '计划模式将在后续版本开放' : option.label
+                }
+                onClick={() => {
+                  if (!option.mode) return
+                  onChange(option.mode)
+                  setOpen(false)
+                }}
+              >
+                <span className="permission-option-icon">
+                  {permissionOptionIcon(option.id)}
+                </span>
+                <span className="permission-option-copy">
+                  <strong>{option.label}</strong>
+                  <small>{option.description}</small>
+                </span>
+                {option.disabled ? (
+                  <span className="permission-option-badge">即将推出</span>
+                ) : isSelected ? (
+                  <Check size={16} />
+                ) : null}
+              </button>
+            )
+          })}
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+function permissionOptionIcon(
+  id: PermissionMode | 'plan',
+  size = 17,
+): ReactNode {
+  switch (id) {
+    case 'read_only':
+      return <Eye size={size} />
+    case 'workspace_write':
+      return <PencilLine size={size} />
+    case 'plan':
+      return <ListTree size={size} />
+    case 'danger_full_access':
+      return <ShieldCheck size={size} />
+  }
+}
+
+function permissionModeIcon(mode: PermissionMode, size: number): ReactNode {
+  return permissionOptionIcon(mode, size)
 }
 
 function InspectorDrawer({
@@ -2286,6 +2556,20 @@ function workspaceName(path: string): string {
   return parts.at(-1) || path
 }
 
-function formatPermissionMode(mode: string): string {
-  return mode.replaceAll('_', ' ')
+function readSavedPermissionMode(): PermissionMode | null {
+  const saved = localStorage.getItem('morrow-permission-mode')
+  return saved === 'read_only' ||
+    saved === 'workspace_write' ||
+    saved === 'danger_full_access'
+    ? saved
+    : null
+}
+
+function nextAvailableSessionName(sessions: SessionEntryResponse[]): string {
+  const names = new Set(sessions.map((session) => session.name))
+  if (!names.has('default')) return 'default'
+
+  let index = 1
+  while (names.has(`task-${index}`)) index += 1
+  return `task-${index}`
 }
