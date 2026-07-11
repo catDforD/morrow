@@ -36,6 +36,8 @@ import {
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { fetchJson, sessionSocketUrl } from './api'
+import SettingsView from './SettingsView'
+import type { SettingsSection, ThemePreference } from './SettingsView'
 import type {
   ActivityItem,
   AgentEvent,
@@ -61,6 +63,8 @@ import type {
 
 type InspectorPanel = 'run' | 'tools' | 'recent'
 type ConnectionStatus = 'connecting' | 'connected' | 'disconnected'
+type AppView = 'workspace' | 'settings'
+type ResolvedTheme = Exclude<ThemePreference, 'system'>
 
 const markdownPlugins = [remarkGfm]
 
@@ -109,9 +113,16 @@ const emptySessionEntry = (name: string): SessionEntryResponse => ({
 })
 
 export default function App() {
+  const initialLocationRef = useRef(readAppLocation())
   const [status, setStatus] = useState<StatusResponse | null>(null)
   const [sessions, setSessions] = useState<SessionEntryResponse[]>([])
-  const [selected, setSelected] = useState('default')
+  const [selected, setSelected] = useState(initialLocationRef.current.session)
+  const [appView, setAppView] = useState<AppView>(
+    initialLocationRef.current.view,
+  )
+  const [settingsSection, setSettingsSection] = useState<SettingsSection>(
+    initialLocationRef.current.section,
+  )
   const [timeline, setTimeline] = useState<TimelineItem[]>([])
   const [tools, setTools] = useState<ToolRun[]>([])
   const [activity, setActivity] = useState<ActivityItem[]>([])
@@ -136,8 +147,11 @@ export default function App() {
   const [connection, setConnection] =
     useState<ConnectionStatus>('disconnected')
   const [prompt, setPrompt] = useState('')
-  const [theme, setTheme] = useState<'light' | 'dark'>(() =>
-    localStorage.getItem('morrow-theme') === 'dark' ? 'dark' : 'light',
+  const [themePreference, setThemePreference] = useState<ThemePreference>(
+    readSavedThemePreference,
+  )
+  const [systemTheme, setSystemTheme] = useState<ResolvedTheme>(
+    readSystemTheme,
   )
   const savedPermissionModeRef = useRef(readSavedPermissionMode())
   const [permissionMode, setPermissionMode] = useState<PermissionMode>(
@@ -147,12 +161,16 @@ export default function App() {
 
   const socketRef = useRef<WebSocket | null>(null)
   const selectedRef = useRef(selected)
+  const appViewRef = useRef(appView)
+  const settingsSectionRef = useRef(settingsSection)
   const assistantMessageIdRef = useRef<string | null>(null)
   const runTraceIdRef = useRef<string | null>(null)
   const idRef = useRef(0)
   const selectionRef = useRef(0)
   const messagesEndRef = useRef<HTMLDivElement | null>(null)
   const sessionSearchRef = useRef<HTMLInputElement | null>(null)
+  const resolvedTheme: ResolvedTheme =
+    themePreference === 'system' ? systemTheme : themePreference
 
   const nextId = useCallback((prefix: string) => {
     idRef.current += 1
@@ -653,7 +671,13 @@ export default function App() {
       runTraceIdRef.current = null
       setTimeline([])
       closeSocket()
-      history.replaceState(null, '', `?session=${encodeURIComponent(name)}`)
+      writeAppLocation(
+        name,
+        appViewRef.current,
+        settingsSectionRef.current,
+        'replace',
+        readHistoryState().fromWorkspace,
+      )
 
       try {
         const document = await fetchJson<SessionDocument>(
@@ -682,6 +706,42 @@ export default function App() {
   }, [selected])
 
   useEffect(() => {
+    appViewRef.current = appView
+  }, [appView])
+
+  useEffect(() => {
+    settingsSectionRef.current = settingsSection
+  }, [settingsSection])
+
+  useEffect(() => {
+    const initial = initialLocationRef.current
+    writeAppLocation(
+      initial.session,
+      initial.view,
+      initial.section,
+      'replace',
+      false,
+    )
+
+    const handlePopState = () => {
+      const next = readAppLocation()
+      appViewRef.current = next.view
+      settingsSectionRef.current = next.section
+      setAppView(next.view)
+      setSettingsSection(next.section)
+      setIsSidebarOpen(false)
+      setIsInspectorOpen(false)
+
+      if (next.session !== selectedRef.current) {
+        void selectSession(next.session)
+      }
+    }
+
+    window.addEventListener('popstate', handlePopState)
+    return () => window.removeEventListener('popstate', handlePopState)
+  }, [selectSession])
+
+  useEffect(() => {
     if (isSearchOpen) {
       sessionSearchRef.current?.focus()
     }
@@ -705,9 +765,23 @@ export default function App() {
   }, [isInspectorOpen, isSidebarOpen])
 
   useEffect(() => {
-    document.documentElement.classList.toggle('dark', theme === 'dark')
-    localStorage.setItem('morrow-theme', theme)
-  }, [theme])
+    const media = window.matchMedia('(prefers-color-scheme: dark)')
+    const handleChange = (event: MediaQueryListEvent) => {
+      setSystemTheme(event.matches ? 'dark' : 'light')
+    }
+
+    setSystemTheme(media.matches ? 'dark' : 'light')
+    media.addEventListener('change', handleChange)
+    return () => media.removeEventListener('change', handleChange)
+  }, [])
+
+  useEffect(() => {
+    document.documentElement.classList.toggle('dark', resolvedTheme === 'dark')
+  }, [resolvedTheme])
+
+  useEffect(() => {
+    writeLocalPreference('morrow-theme', themePreference)
+  }, [themePreference])
 
   useEffect(() => {
     const media = window.matchMedia('(max-width: 900px)')
@@ -721,8 +795,12 @@ export default function App() {
   }, [])
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ block: 'end' })
-  }, [timeline])
+    if (appView !== 'workspace') return
+    const frame = requestAnimationFrame(() => {
+      messagesEndRef.current?.scrollIntoView({ block: 'end' })
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [appView, timeline])
 
   useEffect(() => {
     let mounted = true
@@ -733,8 +811,7 @@ export default function App() {
         setStatus(loadedStatus)
         const savedMode = savedPermissionModeRef.current
         setPermissionMode(savedMode ?? loadedStatus.permissions.mode)
-        const requestedName =
-          new URLSearchParams(location.search).get('session') || 'default'
+        const requestedName = initialLocationRef.current.session
         const entries = await loadSessions()
         const requestedEntry = entries.find(
           (session) => session.name === requestedName,
@@ -790,6 +867,56 @@ export default function App() {
   const openSidebar = () => {
     setIsInspectorOpen(false)
     setIsSidebarOpen(true)
+  }
+
+  const openSettings = () => {
+    appViewRef.current = 'settings'
+    settingsSectionRef.current = 'general'
+    setAppView('settings')
+    setSettingsSection('general')
+    setIsSidebarOpen(false)
+    setIsInspectorOpen(false)
+    writeAppLocation(
+      selectedRef.current,
+      'settings',
+      'general',
+      'push',
+      true,
+    )
+  }
+
+  const closeSettings = () => {
+    setIsSidebarOpen(false)
+    const historyState = readHistoryState()
+    if (historyState.morrowView === 'settings' && historyState.fromWorkspace) {
+      history.back()
+      return
+    }
+
+    appViewRef.current = 'workspace'
+    settingsSectionRef.current = 'general'
+    setAppView('workspace')
+    setSettingsSection('general')
+    writeAppLocation(
+      selectedRef.current,
+      'workspace',
+      'general',
+      'replace',
+      false,
+    )
+  }
+
+  const changeSettingsSection = (section: SettingsSection) => {
+    settingsSectionRef.current = section
+    setSettingsSection(section)
+    setIsSidebarOpen(false)
+    writeAppLocation(
+      selectedRef.current,
+      'settings',
+      section,
+      'replace',
+      readHistoryState().fromWorkspace,
+    )
   }
 
   const toggleSearch = () => {
@@ -869,7 +996,7 @@ export default function App() {
 
   const changePermissionMode = (mode: PermissionMode) => {
     setPermissionMode(mode)
-    localStorage.setItem('morrow-permission-mode', mode)
+    writeLocalPreference('morrow-permission-mode', mode)
   }
 
   const archiveSession = async (name: string) => {
@@ -948,96 +1075,114 @@ export default function App() {
 
   return (
     <>
-      <div className={`app-frame${isSidebarOpen ? ' sidebar-open' : ''}`}>
-        <button
-          className="mobile-sidebar-backdrop"
-          type="button"
-          aria-label="Close task navigation"
-          aria-hidden={!isSidebarOpen}
-          tabIndex={isSidebarOpen ? 0 : -1}
-          onClick={() => setIsSidebarOpen(false)}
+      {appView === 'settings' ? (
+        <SettingsView
+          section={settingsSection}
+          status={status}
+          theme={themePreference}
+          permissionMode={permissionMode}
+          isSidebarOpen={isSidebarOpen}
+          isSidebarHidden={isNarrowViewport && !isSidebarOpen}
+          onSectionChange={changeSettingsSection}
+          onBack={closeSettings}
+          onOpenSidebar={() => setIsSidebarOpen(true)}
+          onCloseSidebar={() => setIsSidebarOpen(false)}
+          onThemeChange={setThemePreference}
+          onPermissionModeChange={changePermissionMode}
         />
-        <AppSidebar
-          sessions={activeSessions}
-          archivedSessions={archivedSessions}
-          sessionCount={sessions.filter((session) => !session.archived).length}
-          runningTurn={runningTurn}
-          selected={selected}
-          sessionAction={sessionAction}
-          isCreatingSession={isCreatingSession}
-          newSessionName={newSessionName}
-          createSessionError={createSessionError}
-          isSearchOpen={isSearchOpen}
-          sessionFilter={sessionFilter}
-          theme={theme}
-          searchInputRef={sessionSearchRef}
-          isHidden={isNarrowViewport && !isSidebarOpen}
-          onSelectSession={(name) => void selectSession(name)}
-          onStartCreateSession={startCreateSession}
-          onCancelCreateSession={cancelCreateSession}
-          onNewSessionNameChange={setNewSessionName}
-          onCreateSession={() => void createSession()}
-          onToggleSearch={toggleSearch}
-          onSessionFilterChange={setSessionFilter}
-          onArchiveSession={(name) => void archiveSession(name)}
-          onRestoreSession={(name) => void restoreSession(name)}
-          onRefresh={() => void refresh()}
-          onClose={() => setIsSidebarOpen(false)}
-          onThemeToggle={() =>
-            setTheme((current) => (current === 'dark' ? 'light' : 'dark'))
-          }
-        />
-        <main className="window-main">
-          <ChatView
+      ) : (
+        <div className={`app-frame${isSidebarOpen ? ' sidebar-open' : ''}`}>
+          <button
+            className="mobile-sidebar-backdrop"
+            type="button"
+            aria-label="Close task navigation"
+            aria-hidden={!isSidebarOpen}
+            tabIndex={isSidebarOpen ? 0 : -1}
+            onClick={() => setIsSidebarOpen(false)}
+          />
+          <AppSidebar
+            sessions={activeSessions}
+            archivedSessions={archivedSessions}
+            sessionCount={sessions.filter((session) => !session.archived).length}
+            runningTurn={runningTurn}
             selected={selected}
-            status={status}
-            connection={connection}
-            timeline={timeline}
+            sessionAction={sessionAction}
+            isCreatingSession={isCreatingSession}
+            newSessionName={newSessionName}
+            createSessionError={createSessionError}
+            isSearchOpen={isSearchOpen}
+            sessionFilter={sessionFilter}
+            theme={resolvedTheme}
+            searchInputRef={sessionSearchRef}
+            isHidden={isNarrowViewport && !isSidebarOpen}
+            onSelectSession={(name) => void selectSession(name)}
+            onStartCreateSession={startCreateSession}
+            onCancelCreateSession={cancelCreateSession}
+            onNewSessionNameChange={setNewSessionName}
+            onCreateSession={() => void createSession()}
+            onToggleSearch={toggleSearch}
+            onSessionFilterChange={setSessionFilter}
+            onArchiveSession={(name) => void archiveSession(name)}
+            onRestoreSession={(name) => void restoreSession(name)}
+            onRefresh={() => void refresh()}
+            onClose={() => setIsSidebarOpen(false)}
+            onOpenSettings={openSettings}
+            onThemeToggle={() =>
+              setThemePreference(resolvedTheme === 'dark' ? 'light' : 'dark')
+            }
+          />
+          <main className="window-main">
+            <ChatView
+              selected={selected}
+              status={status}
+              connection={connection}
+              timeline={timeline}
+              runningTurn={runningTurn}
+              pendingApproval={pendingApproval}
+              prompt={prompt}
+              canSend={canSend}
+              canCancel={canCancel}
+              isRunning={isRunning}
+              permissionMode={permissionMode}
+              isSidebarOpen={isSidebarOpen}
+              onPromptChange={setPrompt}
+              onPromptKeyDown={handlePromptKeyDown}
+              onSubmit={handleSubmit}
+              onCancel={cancelTurn}
+              onPermissionModeChange={changePermissionMode}
+              onOpenSidebar={openSidebar}
+              onOpenInspector={openInspector}
+              onToggleRun={(id) => {
+                setTimeline((items) =>
+                  items.map((item) =>
+                    item.kind === 'run' && item.id === id
+                      ? {
+                          ...item,
+                          trace: {
+                            ...item.trace,
+                            collapsed: !item.trace.collapsed,
+                          },
+                        }
+                      : item,
+                  ),
+                )
+              }}
+              messagesEndRef={messagesEndRef}
+            />
+          </main>
+          <InspectorDrawer
+            open={isInspectorOpen}
+            panel={inspectorPanel}
+            tools={tools}
+            activity={activity}
+            selectedEntry={selectedEntry}
             runningTurn={runningTurn}
             pendingApproval={pendingApproval}
-            prompt={prompt}
-            canSend={canSend}
-            canCancel={canCancel}
-            isRunning={isRunning}
-            permissionMode={permissionMode}
-            isSidebarOpen={isSidebarOpen}
-            onPromptChange={setPrompt}
-            onPromptKeyDown={handlePromptKeyDown}
-            onSubmit={handleSubmit}
-            onCancel={cancelTurn}
-            onPermissionModeChange={changePermissionMode}
-            onOpenSidebar={openSidebar}
-            onOpenInspector={openInspector}
-            onToggleRun={(id) => {
-              setTimeline((items) =>
-                items.map((item) =>
-                  item.kind === 'run' && item.id === id
-                    ? {
-                        ...item,
-                        trace: {
-                          ...item.trace,
-                          collapsed: !item.trace.collapsed,
-                        },
-                      }
-                    : item,
-                ),
-              )
-            }}
-            messagesEndRef={messagesEndRef}
+            onClose={() => setIsInspectorOpen(false)}
+            onPanelChange={setInspectorPanel}
           />
-        </main>
-        <InspectorDrawer
-          open={isInspectorOpen}
-          panel={inspectorPanel}
-          tools={tools}
-          activity={activity}
-          selectedEntry={selectedEntry}
-          runningTurn={runningTurn}
-          pendingApproval={pendingApproval}
-          onClose={() => setIsInspectorOpen(false)}
-          onPanelChange={setInspectorPanel}
-        />
-      </div>
+        </div>
+      )}
       <ApprovalDialog
         request={pendingApproval}
         onApprove={() => sendApproval(true)}
@@ -1073,6 +1218,7 @@ function AppSidebar({
   onRestoreSession,
   onRefresh,
   onClose,
+  onOpenSettings,
   onThemeToggle,
 }: {
   sessions: SessionEntryResponse[]
@@ -1100,6 +1246,7 @@ function AppSidebar({
   onRestoreSession: (name: string) => void
   onRefresh: () => void
   onClose: () => void
+  onOpenSettings: () => void
   onThemeToggle: () => void
 }) {
   const [isArchiveOpen, setIsArchiveOpen] = useState(false)
@@ -1286,12 +1433,11 @@ function AppSidebar({
           <button
             className="sidebar-settings"
             type="button"
-            title="Settings coming soon"
-            disabled
+            title="Open settings"
+            onClick={onOpenSettings}
           >
             <Settings size={17} />
             <span>Settings</span>
-            <small>Soon</small>
           </button>
           <div className="sidebar-footer-actions">
             <MiniIconButton title="Refresh sessions" onClick={onRefresh}>
@@ -1387,6 +1533,7 @@ function ChatView({
       canSend={canSend}
       canCancel={canCancel}
       isRunning={isRunning}
+      status={status}
       permissionMode={permissionMode}
       variant={isEmpty ? 'home' : 'dock'}
       onPromptChange={onPromptChange}
@@ -1704,6 +1851,7 @@ function Composer({
   canSend,
   canCancel,
   isRunning,
+  status,
   permissionMode,
   variant = 'dock',
   onPromptChange,
@@ -1716,6 +1864,7 @@ function Composer({
   canSend: boolean
   canCancel: boolean
   isRunning: boolean
+  status: StatusResponse | null
   permissionMode: PermissionMode
   variant?: 'home' | 'dock'
   onPromptChange: (value: string) => void
@@ -1726,10 +1875,25 @@ function Composer({
 }) {
   const primaryLabel = isRunning ? 'Stop turn' : 'Send'
   const primaryDisabled = isRunning ? !canCancel : !canSend
+  const workspace = status ? workspaceName(status.workspace_root) : 'loading'
 
   return (
     <form className={`composer ${variant}`} onSubmit={onSubmit}>
       <div className="composer-shell">
+        <div className="composer-context" aria-label="Project context">
+          <span title={status?.workspace_root || ''}>
+            <Folder size={14} />
+            {workspace}
+          </span>
+          <span>
+            <Terminal size={14} />
+            Local
+          </span>
+          <span>
+            <Shield size={14} />
+            {permissionMode.replaceAll('_', ' ')}
+          </span>
+        </div>
         <div className="composer-card">
           <textarea
             value={prompt}
@@ -2556,8 +2720,101 @@ function workspaceName(path: string): string {
   return parts.at(-1) || path
 }
 
+type AppLocation = {
+  session: string
+  view: AppView
+  section: SettingsSection
+}
+
+type MorrowHistoryState = {
+  morrowView?: AppView
+  fromWorkspace: boolean
+}
+
+function readAppLocation(): AppLocation {
+  const params = new URLSearchParams(location.search)
+  const view: AppView =
+    params.get('view') === 'settings' ? 'settings' : 'workspace'
+  const requestedSection = params.get('section')
+  const section: SettingsSection =
+    view === 'settings' && requestedSection === 'about' ? 'about' : 'general'
+
+  return {
+    session: params.get('session') || 'default',
+    view,
+    section,
+  }
+}
+
+function readHistoryState(): MorrowHistoryState {
+  const state = history.state
+  if (!state || typeof state !== 'object') {
+    return { fromWorkspace: false }
+  }
+
+  return {
+    morrowView:
+      state.morrowView === 'workspace' || state.morrowView === 'settings'
+        ? state.morrowView
+        : undefined,
+    fromWorkspace: state.fromWorkspace === true,
+  }
+}
+
+function writeAppLocation(
+  session: string,
+  view: AppView,
+  section: SettingsSection,
+  method: 'push' | 'replace',
+  fromWorkspace: boolean,
+): void {
+  const params = new URLSearchParams()
+  params.set('session', session)
+  if (view === 'settings') {
+    params.set('view', 'settings')
+    params.set('section', section)
+  }
+
+  const url = `${location.pathname}?${params.toString()}`
+  const state: MorrowHistoryState = { morrowView: view, fromWorkspace }
+  if (method === 'push') {
+    history.pushState(state, '', url)
+  } else {
+    history.replaceState(state, '', url)
+  }
+}
+
+function readSavedThemePreference(): ThemePreference {
+  const saved = readLocalPreference('morrow-theme')
+  return saved === 'dark' || saved === 'light' || saved === 'system'
+    ? saved
+    : 'light'
+}
+
+function readSystemTheme(): ResolvedTheme {
+  return window.matchMedia('(prefers-color-scheme: dark)').matches
+    ? 'dark'
+    : 'light'
+}
+
+function readLocalPreference(key: string): string | null {
+  try {
+    return localStorage.getItem(key)
+  } catch {
+    return null
+  }
+}
+
+function writeLocalPreference(key: string, value: string): void {
+  try {
+    localStorage.setItem(key, value)
+  } catch {
+    // Keep the in-memory preference when browser storage is unavailable.
+  }
+}
+
 function readSavedPermissionMode(): PermissionMode | null {
-  const saved = localStorage.getItem('morrow-permission-mode')
+  const saved = readLocalPreference('morrow-permission-mode')
   return saved === 'read_only' ||
     saved === 'workspace_write' ||
     saved === 'danger_full_access'
