@@ -1,21 +1,40 @@
-use agent_config::{ContextConfig, McpServerConfig, ModelContextLimits};
-use agent_model::OpenAiCompatClient;
+mod commands;
+mod mcp_settings;
+mod models;
+
+pub use models::FallbackModel;
+
+use agent_config::{ContextConfig, McpServerConfig};
+use agent_model::ModelError;
 use agent_protocol::{
-    ApprovalDecision, PermissionMode, PermissionProfile, Session, SessionDocument,
+    ApprovalDecision, ModelSelection, PermissionMode, PermissionProfile, Session, SessionDocument,
 };
 use agent_runtime::{
-    AgentEventEnvelope, CancellationToken, McpToolCache, RunAgentTurnContext, SessionListingEntry,
-    SessionStore, TurnEventHandler,
+    AgentEventEnvelope, CancellationToken, McpInspection, McpToolCache, RunAgentTurnContext,
+    SessionListingEntry, SessionStore, TurnEventHandler, inspect_mcp_servers,
 };
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::http::{StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
+use commands::{
+    CommandRegistry, CommandRegistryError, CommandResponse, CommandSettingsResponse,
+    CommandWriteRequest, ResolveCommandRequest, ResolveCommandResponse,
+};
 use futures_util::future::{BoxFuture, FutureExt};
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
+use mcp_settings::{
+    McpRegistry, McpRegistryError, McpServerResponse, McpServerTestRequest, McpServerWriteRequest,
+    McpSettingsResponse,
+};
+use models::{
+    DiscoverModelsRequest, DiscoverModelsResponse, ModelProviderResponse, ModelRegistry,
+    ModelRegistryError, ModelSettingsResponse, ProviderWriteRequest, ResolvedModel,
+    SessionModelSelectionResponse,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
@@ -24,7 +43,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, broadcast, oneshot};
+use tokio::sync::{Mutex, RwLock, broadcast, oneshot};
 use tokio::task::AbortHandle;
 
 pub const DEFAULT_WEB_PERMISSION_MODE: PermissionMode = PermissionMode::WorkspaceWrite;
@@ -33,12 +52,15 @@ pub const DEFAULT_WEB_PERMISSION_MODE: PermissionMode = PermissionMode::Workspac
 pub struct ServerOptions {
     pub host: IpAddr,
     pub port: u16,
-    pub client: OpenAiCompatClient,
+    pub fallback_model: Option<FallbackModel>,
+    pub model_store_path: PathBuf,
+    pub mcp_store_path: PathBuf,
+    pub command_store_path: PathBuf,
     pub system_prompt: String,
     pub context_config: ContextConfig,
-    pub model_limits: ModelContextLimits,
     pub workspace_root: PathBuf,
-    pub config_path: PathBuf,
+    pub config_path: Option<PathBuf>,
+    pub config_diagnostics: Vec<String>,
     /// Default for legacy clients that do not select a permission mode per turn.
     pub permissions: PermissionProfile,
     pub mcp_servers: Vec<McpServerConfig>,
@@ -47,6 +69,8 @@ pub struct ServerOptions {
 
 #[derive(Debug, Error)]
 pub enum ServerError {
+    #[error(transparent)]
+    ModelSettings(#[from] ModelRegistryError),
     #[error("failed to bind server at {addr}: {source}")]
     Bind {
         addr: SocketAddr,
@@ -62,24 +86,61 @@ pub async fn serve(options: ServerOptions) -> Result<(), ServerError> {
     let listener = TcpListener::bind(addr)
         .await
         .map_err(|source| ServerError::Bind { addr, source })?;
-    axum::serve(listener, router(options))
+    axum::serve(listener, router(options)?)
         .await
         .map_err(ServerError::Serve)
 }
 
-pub fn router(options: ServerOptions) -> Router {
+pub fn router(options: ServerOptions) -> Result<Router, ModelRegistryError> {
+    let model_registry = ModelRegistry::load(
+        options.model_store_path.clone(),
+        &options.workspace_root,
+        options.fallback_model.clone(),
+    )?;
+    let mcp_registry =
+        McpRegistry::load(options.mcp_store_path.clone(), options.mcp_servers.clone())
+            .map_err(|error| ModelRegistryError::Validation(error.to_string()))?;
+    let command_registry = CommandRegistry::new(options.command_store_path.clone());
     let state = AppState {
         inner: Arc::new(ServerState {
             options,
+            model_registry,
+            mcp_registry,
+            command_registry,
             sessions: Mutex::new(HashMap::new()),
-            mcp_cache: McpToolCache::new(),
+            mcp_cache: RwLock::new(Arc::new(McpToolCache::new())),
         }),
     };
 
-    Router::new()
+    Ok(Router::new()
         .route("/", get(index))
         .route("/assets/{*path}", get(asset))
         .route("/api/status", get(status))
+        .route("/api/model-settings", get(model_settings))
+        .route("/api/model-providers", post(create_model_provider))
+        .route(
+            "/api/model-providers/{provider_id}",
+            put(update_model_provider).delete(delete_model_provider),
+        )
+        .route(
+            "/api/model-providers/discover",
+            post(discover_model_provider),
+        )
+        .route("/api/model-default", put(set_default_model))
+        .route("/api/mcp-settings", get(mcp_settings))
+        .route("/api/mcp-servers", post(create_mcp_server))
+        .route("/api/mcp-servers/import", post(import_mcp_servers))
+        .route("/api/mcp-servers/test", post(test_mcp_server))
+        .route(
+            "/api/mcp-servers/{name}",
+            put(update_mcp_server).delete(delete_mcp_server),
+        )
+        .route("/api/commands", get(command_settings).post(create_command))
+        .route("/api/commands/resolve", post(resolve_command))
+        .route(
+            "/api/commands/{name}",
+            put(update_command).delete(delete_command),
+        )
         .route("/api/sessions", get(list_sessions))
         .route(
             "/api/sessions/{name}",
@@ -88,8 +149,12 @@ pub fn router(options: ServerOptions) -> Router {
         .route("/api/sessions/{name}/reset", post(reset_session))
         .route("/api/sessions/{name}/archive", post(archive_session))
         .route("/api/sessions/{name}/restore", post(restore_session))
+        .route(
+            "/api/sessions/{name}/model-selection",
+            get(get_session_model_selection).put(set_session_model_selection),
+        )
         .route("/api/sessions/{name}/ws", get(session_ws))
-        .with_state(state)
+        .with_state(state))
 }
 
 #[derive(Clone)]
@@ -99,8 +164,11 @@ struct AppState {
 
 struct ServerState {
     options: ServerOptions,
+    model_registry: ModelRegistry,
+    mcp_registry: McpRegistry,
+    command_registry: CommandRegistry,
     sessions: Mutex<HashMap<String, SessionRuntime>>,
-    mcp_cache: McpToolCache,
+    mcp_cache: RwLock<Arc<McpToolCache>>,
 }
 
 struct SessionRuntime {
@@ -123,9 +191,14 @@ struct PendingApproval {
 #[derive(Debug, Clone, Serialize)]
 struct StatusResponse {
     workspace_root: String,
-    config_path: String,
+    config_path: Option<String>,
     permissions: PermissionProfile,
     version: &'static str,
+    model_ready: bool,
+    model_store_path: String,
+    mcp_store_path: String,
+    command_store_path: String,
+    config_diagnostics: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -180,7 +253,11 @@ enum ClientMessage {
         request_id: String,
         prompt: String,
         #[serde(default)]
+        prompt_resolved: bool,
+        #[serde(default)]
         permission_mode: Option<PermissionMode>,
+        #[serde(default)]
+        model_selection: Option<ModelSelection>,
     },
     ApprovalDecision {
         request_id: String,
@@ -208,6 +285,13 @@ impl ApiError {
     fn conflict(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::CONFLICT,
+            message: message.into(),
+        }
+    }
+
+    fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
             message: message.into(),
         }
     }
@@ -262,12 +346,257 @@ async fn asset(Path(path): Path<String>) -> Response {
 }
 
 async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
+    let settings = state.inner.model_registry.settings().await;
     Json(StatusResponse {
         workspace_root: state.inner.options.workspace_root.display().to_string(),
-        config_path: state.inner.options.config_path.display().to_string(),
+        config_path: state
+            .inner
+            .options
+            .config_path
+            .as_ref()
+            .map(|path| path.display().to_string()),
         permissions: state.inner.options.permissions,
         version: env!("CARGO_PKG_VERSION"),
+        model_ready: settings.model_ready,
+        model_store_path: settings.store_path,
+        mcp_store_path: state.inner.options.mcp_store_path.display().to_string(),
+        command_store_path: state.inner.command_registry.root().display().to_string(),
+        config_diagnostics: state.inner.options.config_diagnostics.clone(),
     })
+}
+
+async fn model_settings(State(state): State<AppState>) -> Json<ModelSettingsResponse> {
+    Json(state.inner.model_registry.settings().await)
+}
+
+async fn create_model_provider(
+    State(state): State<AppState>,
+    Json(request): Json<ProviderWriteRequest>,
+) -> Result<Json<ModelProviderResponse>, ApiError> {
+    state
+        .inner
+        .model_registry
+        .create_provider(request)
+        .await
+        .map(Json)
+        .map_err(model_registry_error)
+}
+
+async fn update_model_provider(
+    State(state): State<AppState>,
+    Path(provider_id): Path<String>,
+    Json(request): Json<ProviderWriteRequest>,
+) -> Result<Json<ModelProviderResponse>, ApiError> {
+    state
+        .inner
+        .model_registry
+        .update_provider(&provider_id, request)
+        .await
+        .map(Json)
+        .map_err(model_registry_error)
+}
+
+async fn delete_model_provider(
+    State(state): State<AppState>,
+    Path(provider_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .inner
+        .model_registry
+        .delete_provider(&provider_id)
+        .await
+        .map_err(model_registry_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn discover_model_provider(
+    State(state): State<AppState>,
+    Json(request): Json<DiscoverModelsRequest>,
+) -> Result<Json<DiscoverModelsResponse>, ApiError> {
+    state
+        .inner
+        .model_registry
+        .discover(request)
+        .await
+        .map(Json)
+        .map_err(model_registry_error)
+}
+
+async fn set_default_model(
+    State(state): State<AppState>,
+    Json(selection): Json<ModelSelection>,
+) -> Result<Json<ModelSelection>, ApiError> {
+    state
+        .inner
+        .model_registry
+        .set_default(selection)
+        .await
+        .map(Json)
+        .map_err(model_registry_error)
+}
+
+async fn mcp_settings(State(state): State<AppState>) -> Json<McpSettingsResponse> {
+    Json(state.inner.mcp_registry.settings().await)
+}
+
+async fn create_mcp_server(
+    State(state): State<AppState>,
+    Json(request): Json<McpServerWriteRequest>,
+) -> Result<Json<McpServerResponse>, ApiError> {
+    let response = state
+        .inner
+        .mcp_registry
+        .create(request)
+        .await
+        .map_err(mcp_registry_error)?;
+    reset_mcp_cache(&state).await;
+    Ok(Json(response))
+}
+
+async fn update_mcp_server(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(request): Json<McpServerWriteRequest>,
+) -> Result<Json<McpServerResponse>, ApiError> {
+    let response = state
+        .inner
+        .mcp_registry
+        .update(&name, request)
+        .await
+        .map_err(mcp_registry_error)?;
+    reset_mcp_cache(&state).await;
+    Ok(Json(response))
+}
+
+async fn delete_mcp_server(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .inner
+        .mcp_registry
+        .delete(&name)
+        .await
+        .map_err(mcp_registry_error)?;
+    reset_mcp_cache(&state).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn import_mcp_servers(
+    State(state): State<AppState>,
+    Json(value): Json<serde_json::Value>,
+) -> Result<Json<Vec<McpServerResponse>>, ApiError> {
+    let response = state
+        .inner
+        .mcp_registry
+        .import(value)
+        .await
+        .map_err(mcp_registry_error)?;
+    reset_mcp_cache(&state).await;
+    Ok(Json(response))
+}
+
+async fn test_mcp_server(
+    State(state): State<AppState>,
+    Json(request): Json<McpServerTestRequest>,
+) -> Result<Json<McpInspection>, ApiError> {
+    let server = state
+        .inner
+        .mcp_registry
+        .config_for_test(request)
+        .await
+        .map_err(mcp_registry_error)?;
+    Ok(Json(
+        inspect_mcp_servers(&state.inner.options.workspace_root, &[server]).await,
+    ))
+}
+
+async fn command_settings(
+    State(state): State<AppState>,
+) -> Result<Json<CommandSettingsResponse>, ApiError> {
+    state
+        .inner
+        .command_registry
+        .settings()
+        .map(Json)
+        .map_err(command_registry_error)
+}
+
+async fn create_command(
+    State(state): State<AppState>,
+    Json(request): Json<CommandWriteRequest>,
+) -> Result<Json<CommandResponse>, ApiError> {
+    state
+        .inner
+        .command_registry
+        .create(request)
+        .await
+        .map(Json)
+        .map_err(command_registry_error)
+}
+
+async fn update_command(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(request): Json<CommandWriteRequest>,
+) -> Result<Json<CommandResponse>, ApiError> {
+    state
+        .inner
+        .command_registry
+        .update(&name, request)
+        .await
+        .map(Json)
+        .map_err(command_registry_error)
+}
+
+async fn delete_command(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .inner
+        .command_registry
+        .delete(&name)
+        .await
+        .map_err(command_registry_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn resolve_command(
+    State(state): State<AppState>,
+    Json(request): Json<ResolveCommandRequest>,
+) -> Result<Json<ResolveCommandResponse>, ApiError> {
+    state
+        .inner
+        .command_registry
+        .resolve(request)
+        .map(Json)
+        .map_err(command_registry_error)
+}
+
+async fn get_session_model_selection(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<SessionModelSelectionResponse>, ApiError> {
+    session_store(&name)?;
+    Ok(Json(
+        state.inner.model_registry.session_selection(&name).await,
+    ))
+}
+
+async fn set_session_model_selection(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(selection): Json<ModelSelection>,
+) -> Result<Json<SessionModelSelectionResponse>, ApiError> {
+    session_store(&name)?;
+    state
+        .inner
+        .model_registry
+        .set_session_selection(&name, selection)
+        .await
+        .map(Json)
+        .map_err(model_registry_error)
 }
 
 async fn list_sessions(
@@ -467,14 +796,20 @@ async fn handle_client_ws_message(
         ClientMessage::StartTurn {
             request_id,
             prompt,
+            prompt_resolved,
             permission_mode,
+            model_selection,
         } => {
             start_turn(
                 state.clone(),
                 session_name.to_string(),
-                request_id,
-                prompt,
-                permission_mode,
+                StartTurnRequest {
+                    request_id,
+                    prompt,
+                    prompt_resolved,
+                    permission_mode,
+                    model_selection,
+                },
                 tx.clone(),
             )
             .await;
@@ -493,14 +828,48 @@ async fn handle_client_ws_message(
     true
 }
 
+struct StartTurnRequest {
+    request_id: String,
+    prompt: String,
+    prompt_resolved: bool,
+    permission_mode: Option<PermissionMode>,
+    model_selection: Option<ModelSelection>,
+}
+
 async fn start_turn(
     state: AppState,
     session_name: String,
-    request_id: String,
-    prompt: String,
-    permission_mode: Option<PermissionMode>,
+    request: StartTurnRequest,
     tx: broadcast::Sender<ServerMessage>,
 ) {
+    let StartTurnRequest {
+        request_id,
+        prompt,
+        prompt_resolved,
+        permission_mode,
+        model_selection,
+    } = request;
+    let prompt = if prompt_resolved {
+        prompt
+    } else {
+        match state
+            .inner
+            .command_registry
+            .resolve(ResolveCommandRequest { input: prompt })
+        {
+            Ok(resolved) => resolved.prompt,
+            Err(error) => {
+                broadcast_message(
+                    &tx,
+                    ServerMessage::TurnRejected {
+                        request_id,
+                        reason: error.to_string(),
+                    },
+                );
+                return;
+            }
+        }
+    };
     if prompt.trim().is_empty() {
         broadcast_message(
             &tx,
@@ -540,6 +909,49 @@ async fn start_turn(
     let turn_id = format!("turn-{}", agent_runtime::timestamp_ms());
     let cancellation = CancellationToken::new();
     let permissions = requested_permissions(state.inner.options.permissions, permission_mode);
+    if running_snapshot(&state, &session_name).await.is_some() {
+        broadcast_message(
+            &tx,
+            ServerMessage::TurnRejected {
+                request_id,
+                reason: "session already has a running turn".to_string(),
+            },
+        );
+        return;
+    }
+    let resolved_model = match state
+        .inner
+        .model_registry
+        .resolve_for_turn(&session_name, model_selection)
+        .await
+    {
+        Ok(model) => model,
+        Err(error) => {
+            broadcast_message(
+                &tx,
+                ServerMessage::TurnRejected {
+                    request_id,
+                    reason: error.to_string(),
+                },
+            );
+            return;
+        }
+    };
+    if let Err(error) = state
+        .inner
+        .model_registry
+        .set_session_selection(&session_name, resolved_model.selection.clone())
+        .await
+    {
+        broadcast_message(
+            &tx,
+            ServerMessage::TurnRejected {
+                request_id,
+                reason: error.to_string(),
+            },
+        );
+        return;
+    }
     {
         let mut sessions = state.inner.sessions.lock().await;
         let runtime = sessions
@@ -561,15 +973,16 @@ async fn start_turn(
         let cancellation_for_task = cancellation.clone();
         let tx_for_task = tx.clone();
         let worker = tokio::spawn(async move {
-            run_turn_task(
-                state_for_task,
-                session_for_task,
-                turn_for_task,
+            run_turn_task(TurnTaskContext {
+                state: state_for_task,
+                session_name: session_for_task,
+                turn_id: turn_for_task,
                 prompt,
                 permissions,
-                tx_for_task,
-                cancellation_for_task,
-            )
+                resolved_model,
+                tx: tx_for_task,
+                cancellation: cancellation_for_task,
+            })
             .await;
         });
         let handle = worker.abort_handle();
@@ -597,25 +1010,20 @@ async fn start_turn(
     }
 }
 
-async fn run_turn_task(
+struct TurnTaskContext {
     state: AppState,
     session_name: String,
     turn_id: String,
     prompt: String,
     permissions: PermissionProfile,
+    resolved_model: ResolvedModel,
     tx: broadcast::Sender<ServerMessage>,
     cancellation: CancellationToken,
-) {
-    let result = run_turn_task_inner(
-        state.clone(),
-        session_name.clone(),
-        turn_id.clone(),
-        prompt,
-        permissions,
-        tx.clone(),
-        cancellation,
-    )
-    .await;
+}
+
+async fn run_turn_task(context: TurnTaskContext) {
+    let tx = context.tx.clone();
+    let result = run_turn_task_inner(context).await;
     if let Err(error) = result {
         broadcast_error(&tx, error.to_string());
     }
@@ -635,16 +1043,20 @@ async fn supervise_turn_worker(
     clear_running_turn(&state, &session_name, &turn_id).await;
 }
 
-async fn run_turn_task_inner(
-    state: AppState,
-    session_name: String,
-    turn_id: String,
-    prompt: String,
-    permissions: PermissionProfile,
-    tx: broadcast::Sender<ServerMessage>,
-    cancellation: CancellationToken,
-) -> Result<(), agent_runtime::RuntimeError> {
+async fn run_turn_task_inner(context: TurnTaskContext) -> Result<(), agent_runtime::RuntimeError> {
+    let TurnTaskContext {
+        state,
+        session_name,
+        turn_id,
+        prompt,
+        permissions,
+        resolved_model,
+        tx,
+        cancellation,
+    } = context;
     let options = state.inner.options.clone();
+    let mcp_cache = state.inner.mcp_cache.read().await.clone();
+    let mcp_servers = state.inner.mcp_registry.effective_servers().await;
     let store = SessionStore::for_current_dir(&session_name)?;
     let mut session = store.load()?;
     let turn_index = session.turns.len();
@@ -657,14 +1069,14 @@ async fn run_turn_task_inner(
 
     let outcome = agent_runtime::run_agent_turn_with_cancellation(
         RunAgentTurnContext {
-            client: &options.client,
+            client: &resolved_model.client,
             system_prompt: &options.system_prompt,
             context_config: options.context_config,
-            model_limits: options.model_limits,
+            model_limits: resolved_model.limits,
             workspace_root: &options.workspace_root,
             permissions,
-            mcp_servers: &options.mcp_servers,
-            mcp_cache: &state.inner.mcp_cache,
+            mcp_servers: &mcp_servers,
+            mcp_cache: mcp_cache.as_ref(),
             session_name: &session_name,
             turn_index,
         },
@@ -674,6 +1086,10 @@ async fn run_turn_task_inner(
         cancellation,
     )
     .await?;
+
+    if let Some(record) = session.turns.get_mut(turn_index) {
+        record.turn.model = Some(resolved_model.invocation);
+    }
 
     if outcome.session_changed {
         store.save(&session)?;
@@ -796,6 +1212,14 @@ async fn clear_running_turn(state: &AppState, session_name: &str, turn_id: &str)
     {
         runtime.running = None;
     }
+}
+
+async fn reset_mcp_cache(state: &AppState) {
+    let previous = {
+        let mut current = state.inner.mcp_cache.write().await;
+        std::mem::replace(&mut *current, Arc::new(McpToolCache::new()))
+    };
+    previous.clear().await;
 }
 
 struct ServerTurnHandler {
@@ -928,6 +1352,40 @@ fn session_mutation_error(error: agent_runtime::SessionStoreError) -> ApiError {
     }
 }
 
+fn model_registry_error(error: ModelRegistryError) -> ApiError {
+    match error {
+        ModelRegistryError::Conflict(_) | ModelRegistryError::SelectionUnavailable(_) => {
+            ApiError::conflict(error.to_string())
+        }
+        ModelRegistryError::Validation(_) | ModelRegistryError::ProviderNotFound(_) => {
+            ApiError::bad_request(error.to_string())
+        }
+        ModelRegistryError::Model(ModelError::HttpStatus { .. })
+        | ModelRegistryError::Model(ModelError::Request(_)) => {
+            ApiError::bad_request(error.to_string())
+        }
+        _ => ApiError::internal(error.to_string()),
+    }
+}
+
+fn mcp_registry_error(error: McpRegistryError) -> ApiError {
+    match error {
+        McpRegistryError::Validation(_) => ApiError::bad_request(error.to_string()),
+        McpRegistryError::Conflict(_) => ApiError::conflict(error.to_string()),
+        McpRegistryError::NotFound(_) => ApiError::not_found(error.to_string()),
+        _ => ApiError::internal(error.to_string()),
+    }
+}
+
+fn command_registry_error(error: CommandRegistryError) -> ApiError {
+    match error {
+        CommandRegistryError::Validation(_) => ApiError::bad_request(error.to_string()),
+        CommandRegistryError::Conflict(_) => ApiError::conflict(error.to_string()),
+        CommandRegistryError::NotFound(_) => ApiError::not_found(error.to_string()),
+        _ => ApiError::internal(error.to_string()),
+    }
+}
+
 fn session_entry_response(entry: SessionListingEntry) -> SessionEntryResponse {
     let session = entry.session;
     SessionEntryResponse {
@@ -957,8 +1415,9 @@ fn broadcast_error(tx: &broadcast::Sender<ServerMessage>, message: impl ToString
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_model::OpenAiCompatConfig;
-    use agent_protocol::{PermissionMode, ShellPolicy};
+    use agent_config::ModelContextLimits;
+    use agent_model::{OpenAiCompatClient, OpenAiCompatConfig};
+    use agent_protocol::{PermissionMode, ReasoningProfile, ShellPolicy};
     use std::fs;
     use std::path::PathBuf;
     use std::sync::OnceLock;
@@ -968,17 +1427,31 @@ mod tests {
     static ENV_LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
 
     fn test_options() -> ServerOptions {
-        let root = std::env::temp_dir();
+        let root = unique_test_dir("options");
+        let client = OpenAiCompatClient::new_without_proxy(OpenAiCompatConfig {
+            base_url: "http://127.0.0.1:1/v1".to_string(),
+            model: "test-model".to_string(),
+            api_key: "secret-test-key".to_string(),
+            timeout: Duration::from_secs(1),
+        })
+        .expect("client");
         ServerOptions {
             host: "127.0.0.1".parse().expect("host"),
             port: 0,
-            client: OpenAiCompatClient::new_without_proxy(OpenAiCompatConfig {
-                base_url: "http://127.0.0.1:1/v1".to_string(),
-                model: "test-model".to_string(),
-                api_key: "secret-test-key".to_string(),
-                timeout: Duration::from_secs(1),
-            })
-            .expect("client"),
+            fallback_model: Some(FallbackModel {
+                provider_name: "Current config".to_string(),
+                model_id: "test-model".to_string(),
+                model_name: "test-model".to_string(),
+                client,
+                limits: ModelContextLimits {
+                    context_window_tokens: 65_536,
+                    reserved_output_tokens: 8_192,
+                },
+                reasoning_profile: ReasoningProfile::None,
+            }),
+            model_store_path: root.join("web-models.json"),
+            mcp_store_path: root.join("web-mcp.json"),
+            command_store_path: root.join("commands"),
             system_prompt: "system".to_string(),
             context_config: ContextConfig {
                 auto_compact: false,
@@ -987,12 +1460,9 @@ mod tests {
                 summary_target_tokens: 256,
                 compact_max_retries: 2,
             },
-            model_limits: ModelContextLimits {
-                context_window_tokens: 65_536,
-                reserved_output_tokens: 8_192,
-            },
             workspace_root: root.clone(),
-            config_path: root.join("morrow.toml"),
+            config_path: Some(root.join("morrow.toml")),
+            config_diagnostics: Vec::new(),
             permissions: PermissionProfile::for_mode(DEFAULT_WEB_PERMISSION_MODE),
             mcp_servers: Vec::new(),
             default_session_name: "default".to_string(),
@@ -1000,11 +1470,25 @@ mod tests {
     }
 
     fn test_state() -> AppState {
+        let options = test_options();
+        let model_registry = ModelRegistry::load(
+            options.model_store_path.clone(),
+            &options.workspace_root,
+            options.fallback_model.clone(),
+        )
+        .expect("model registry");
+        let mcp_registry =
+            McpRegistry::load(options.mcp_store_path.clone(), options.mcp_servers.clone())
+                .expect("MCP registry");
+        let command_registry = CommandRegistry::new(options.command_store_path.clone());
         AppState {
             inner: Arc::new(ServerState {
-                options: test_options(),
+                options,
+                model_registry,
+                mcp_registry,
+                command_registry,
                 sessions: Mutex::new(HashMap::new()),
-                mcp_cache: McpToolCache::new(),
+                mcp_cache: RwLock::new(Arc::new(McpToolCache::new())),
             }),
         }
     }
@@ -1027,6 +1511,11 @@ mod tests {
         assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(value["permissions"]["mode"], "workspace_write");
         assert!(!value.to_string().contains("secret-test-key"));
+    }
+
+    #[test]
+    fn router_registers_model_routes_without_conflicts() {
+        let _ = router(test_options()).expect("router");
     }
 
     #[tokio::test]
@@ -1265,7 +1754,13 @@ mod tests {
             "data": {
                 "request_id": "request-1",
                 "prompt": "edit the workspace",
-                "permission_mode": "workspace_write"
+                "prompt_resolved": true,
+                "permission_mode": "workspace_write",
+                "model_selection": {
+                    "provider_id": "deepseek",
+                    "model_id": "deepseek-v4-pro",
+                    "reasoning": "max"
+                }
             }
         }))
         .expect("parse selected permissions");
@@ -1281,13 +1776,19 @@ mod tests {
         assert!(matches!(
             selected,
             ClientMessage::StartTurn {
+                prompt_resolved: true,
                 permission_mode: Some(PermissionMode::WorkspaceWrite),
+                model_selection: Some(ModelSelection {
+                    reasoning: agent_protocol::ReasoningLevel::Max,
+                    ..
+                }),
                 ..
             }
         ));
         assert!(matches!(
             legacy,
             ClientMessage::StartTurn {
+                prompt_resolved: false,
                 permission_mode: None,
                 ..
             }

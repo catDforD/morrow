@@ -30,6 +30,10 @@ impl McpToolCache {
         Self::default()
     }
 
+    pub async fn clear(&self) {
+        self.entries.lock().await.clear();
+    }
+
     async fn get_or_start(
         &self,
         config: &McpServerConfig,
@@ -1449,6 +1453,25 @@ mod tests {
             .expect("waiter must observe the completion sent before it waited")
             .expect("waiter task");
         assert!(!cache.entries.lock().await.contains_key(&key));
+    }
+
+    #[tokio::test]
+    async fn clearing_cache_removes_in_progress_entries() {
+        let root = unique_dir("mcp-cache-clear");
+        let config = http_config(
+            "remote",
+            "http://127.0.0.1:1/mcp".to_string(),
+            BTreeMap::new(),
+        );
+        let key = McpServerKey::from_config(&config, &root);
+        let cache = McpToolCache::new();
+        let McpCacheAction::Start(_signal) = cache.cache_action(&key).await else {
+            panic!("first caller must start the MCP server");
+        };
+
+        cache.clear().await;
+
+        assert!(cache.entries.lock().await.is_empty());
     }
 
     #[tokio::test]

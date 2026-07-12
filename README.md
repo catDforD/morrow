@@ -8,6 +8,7 @@ Morrow is a local coding agent CLI and web dashboard backed by an OpenAI-compati
 
 - CLI, interactive REPL, and local browser dashboard.
 - OpenAI-compatible model configuration through `--config`, local `morrow.toml`, or `~/.morrow/config.toml`.
+- Web-only model provider management with per-session model and reasoning selection.
 - Persistent named sessions scoped to the current project.
 - Built-in tools for file reads, file edits, patch application, text search, directory listing, and shell commands.
 - Read-only, workspace-write, and full-access permission profiles, with shell execution controlled separately.
@@ -99,6 +100,12 @@ shell = "deny"
 
 The inline `[model].OPENAI_API_KEY` value takes priority when present. Otherwise Morrow reads the environment variable named by `api_key_env`, which defaults to `OPENAI_API_KEY`.
 
+CLI commands continue to require a valid model and API key in the resolved TOML config. `morrow server` is more permissive when `--config` is omitted: it can start without a config file, `[model]` section, or model API key so that the first provider can be configured in the browser. An explicitly requested missing config and invalid TOML still stop startup.
+
+The dashboard's **Settings → Models** page manages Web-only OpenAI Chat Completions compatible providers. These settings do not change the CLI model. Provider data is stored in `~/.morrow/web-models.json`; API keys are kept as local plaintext, never returned by the API, and the file is written with mode `0600` on Unix. A valid TOML model appears as a read-only provider and becomes the initial Web default until another default is selected.
+
+The built-in DeepSeek template adds `deepseek-v4-flash` and `deepseek-v4-pro` with 1,000,000-token context windows, tool support, and **Off / High / Max** reasoning choices. New browser sessions inherit the global default, while each existing session remembers its own model and reasoning level.
+
 ### MCP tools
 
 Morrow can register stdio and Streamable HTTP MCP servers from the same config file. Tools are exposed directly to the model as `mcp__server__tool` names after discovery. Initialized servers and discovered tools are cached for the CLI/server lifetime when their configuration has not changed.
@@ -115,6 +122,24 @@ tool_timeout_sec = 60
 ```
 
 For a Streamable HTTP example with environment-backed headers, see [`morrow.example.toml`](morrow.example.toml). OAuth, deferred search, and per-tool approval policies are not implemented yet. MCP tools are treated as explicitly configured trusted tools, so review server commands and remote endpoints before enabling them.
+
+The dashboard's **Settings → MCP Servers** page adds Web-only stdio and HTTP servers without changing the CLI configuration. Web entries are stored in `~/.morrow/web-mcp.json` and merged with read-only servers loaded from `morrow.toml`; duplicate names are rejected. Changes apply from the next Web turn, while a turn that is already running keeps its original server snapshot. The page can import direct JSON server maps or an `mcpServers` wrapper and can test a draft configuration without saving it.
+
+Web MCP environment variables and HTTP header values are stored as local plaintext with mode `0600` on Unix. Their values are never returned by the settings API: leaving an existing value blank preserves it, while removing its row deletes it. Testing or using a configured MCP server may execute local programs or contact remote services.
+
+### Web custom commands
+
+The dashboard's **Settings → Commands** page manages user commands in `~/.morrow/commands/*.md`. These commands are available only in Web chat; CLI and JSONL inputs keep their existing behavior. A command filename is its slash name and may contain lowercase ASCII letters, digits, `-`, and `_`.
+
+```md
+---
+description: "Review a target file"
+argument-hint: "<file-path>"
+---
+Review $ARGUMENTS carefully.
+```
+
+Type `/` in the Web composer to search commands. When `/review src/lib.rs` is sent, every `$ARGUMENTS` placeholder is replaced with `src/lib.rs`; if the template has no placeholder, the arguments are appended to the prompt. Unknown slash names are sent unchanged, and `//review` sends the literal text `/review`. The expanded prompt is what the model receives and what the session history stores.
 
 ## Run
 

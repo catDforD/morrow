@@ -1,6 +1,8 @@
 pub use agent_core::ModelEvent;
 use agent_core::{Model, ModelFailure, ModelFuture, ModelRequest, ModelStream};
-use agent_protocol::{Conversation, ToolCall, ToolDefinition};
+use agent_protocol::{
+    Conversation, Message, ReasoningLevel, ReasoningProfile, ToolCall, ToolDefinition,
+};
 use bytes::Bytes;
 use futures_util::stream::BoxStream;
 use futures_util::{FutureExt, Stream, StreamExt};
@@ -35,6 +37,24 @@ impl std::fmt::Debug for OpenAiCompatConfig {
 pub struct OpenAiCompatClient {
     http: reqwest::Client,
     config: OpenAiCompatConfig,
+    request_options: OpenAiCompatRequestOptions,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenAiCompatRequestOptions {
+    pub reasoning_profile: ReasoningProfile,
+    pub reasoning: ReasoningLevel,
+    pub supports_tools: bool,
+}
+
+impl Default for OpenAiCompatRequestOptions {
+    fn default() -> Self {
+        Self {
+            reasoning_profile: ReasoningProfile::None,
+            reasoning: ReasoningLevel::Off,
+            supports_tools: true,
+        }
+    }
 }
 
 impl std::fmt::Debug for OpenAiCompatClient {
@@ -77,12 +97,22 @@ pub enum ModelError {
 #[derive(Debug, Serialize)]
 struct ChatCompletionRequest<'a> {
     model: &'a str,
-    messages: &'a [agent_protocol::Message],
+    messages: &'a [Message],
     stream: bool,
     #[serde(skip_serializing_if = "is_empty_tools")]
     tools: &'a [ToolDefinition],
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<ThinkingRequest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+struct ThinkingRequest {
+    #[serde(rename = "type")]
+    kind: &'static str,
 }
 
 fn is_empty_tools(tools: &[ToolDefinition]) -> bool {
@@ -102,6 +132,7 @@ struct ChatCompletionChoice {
 
 #[derive(Debug, Default, Deserialize)]
 struct ChatCompletionDelta {
+    reasoning_content: Option<String>,
     content: Option<String>,
     tool_calls: Option<Vec<ChatCompletionToolCallDelta>>,
     function_call: Option<serde_json::Value>,
@@ -122,6 +153,16 @@ struct ChatCompletionFunctionCallDelta {
     arguments: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ModelsResponse {
+    data: Vec<ModelDescription>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelDescription {
+    id: String,
+}
+
 impl OpenAiCompatClient {
     pub fn new(config: OpenAiCompatConfig) -> Result<Self, ModelError> {
         Self::build(config, false)
@@ -137,7 +178,16 @@ impl OpenAiCompatClient {
             builder = builder.no_proxy();
         }
         let http = builder.build().map_err(ModelError::ClientBuild)?;
-        Ok(Self { http, config })
+        Ok(Self {
+            http,
+            config,
+            request_options: OpenAiCompatRequestOptions::default(),
+        })
+    }
+
+    pub fn with_request_options(mut self, request_options: OpenAiCompatRequestOptions) -> Self {
+        self.request_options = request_options;
+        self
     }
 
     pub async fn stream_chat(
@@ -145,12 +195,21 @@ impl OpenAiCompatClient {
         conversation: &Conversation,
         tools: &[ToolDefinition],
     ) -> Result<ChatCompletionStream, ModelError> {
+        let messages = request_messages(conversation, self.request_options.reasoning_profile);
+        let tools = if self.request_options.supports_tools {
+            tools
+        } else {
+            &[]
+        };
+        let (thinking, reasoning_effort) = reasoning_request_options(self.request_options);
         let request = ChatCompletionRequest {
             model: &self.config.model,
-            messages: &conversation.messages,
+            messages: &messages,
             stream: true,
             tools,
             tool_choice: (!tools.is_empty()).then_some("auto"),
+            thinking,
+            reasoning_effort,
         };
         let response = self
             .http
@@ -175,11 +234,75 @@ impl OpenAiCompatClient {
         Ok(ChatCompletionStream::new(response.bytes_stream().boxed()))
     }
 
+    pub async fn list_models(&self) -> Result<Vec<String>, ModelError> {
+        let response = self
+            .http
+            .get(self.models_url())
+            .bearer_auth(&self.config.api_key)
+            .send()
+            .await
+            .map_err(|error| ModelError::Request(error.without_url()))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_else(|error| {
+                format!("failed to read error body: {}", error.without_url())
+            });
+            return Err(ModelError::HttpStatus {
+                status: status.as_u16(),
+                body,
+            });
+        }
+
+        let mut models = response
+            .json::<ModelsResponse>()
+            .await
+            .map_err(|error| ModelError::Request(error.without_url()))?
+            .data
+            .into_iter()
+            .map(|model| model.id)
+            .filter(|id| !id.trim().is_empty())
+            .collect::<Vec<_>>();
+        models.sort();
+        models.dedup();
+        Ok(models)
+    }
+
     fn chat_completions_url(&self) -> String {
         format!(
             "{}/chat/completions",
             self.config.base_url.trim_end_matches('/')
         )
+    }
+
+    fn models_url(&self) -> String {
+        format!("{}/models", self.config.base_url.trim_end_matches('/'))
+    }
+}
+
+fn request_messages(
+    conversation: &Conversation,
+    reasoning_profile: ReasoningProfile,
+) -> Vec<Message> {
+    let mut messages = conversation.messages.clone();
+    if reasoning_profile == ReasoningProfile::None {
+        for message in &mut messages {
+            message.reasoning_content = None;
+        }
+    }
+    messages
+}
+
+fn reasoning_request_options(
+    options: OpenAiCompatRequestOptions,
+) -> (Option<ThinkingRequest>, Option<&'static str>) {
+    if options.reasoning_profile != ReasoningProfile::Deepseek {
+        return (None, None);
+    }
+
+    match options.reasoning {
+        ReasoningLevel::Off => (Some(ThinkingRequest { kind: "disabled" }), None),
+        ReasoningLevel::High => (Some(ThinkingRequest { kind: "enabled" }), Some("high")),
+        ReasoningLevel::Max => (Some(ThinkingRequest { kind: "enabled" }), Some("max")),
     }
 }
 
@@ -279,6 +402,13 @@ impl ChatCompletionStream {
                         return;
                     }
                 }
+            }
+
+            if let Some(reasoning_content) = choice.delta.reasoning_content
+                && !reasoning_content.is_empty()
+            {
+                self.pending
+                    .push_back(Ok(ModelEvent::ReasoningDelta(reasoning_content)));
             }
 
             if let Some(content) = choice.delta.content
@@ -684,12 +814,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parses_fragmented_tool_calls() {
+    async fn parses_interleaved_reasoning_content_and_fragmented_tool_calls() {
         let body = format!(
             "data: {}\n\ndata: {}\n\ndata: {}\n\n",
             json!({
                 "choices": [{
                     "delta": {
+                        "reasoning_content": "inspect first",
                         "tool_calls": [{
                             "index": 0,
                             "id": "call_1",
@@ -706,6 +837,7 @@ mod tests {
             json!({
                 "choices": [{
                     "delta": {
+                        "content": "checking",
                         "tool_calls": [{
                             "index": 0,
                             "function": {
@@ -732,9 +864,17 @@ mod tests {
 
         let events = collect_events(stream).await;
 
-        assert_eq!(events.len(), 1);
+        assert_eq!(events.len(), 3);
         assert_eq!(
-            events[0].as_ref().expect("tool calls"),
+            events[0].as_ref().expect("reasoning"),
+            &ModelEvent::ReasoningDelta("inspect first".to_string())
+        );
+        assert_eq!(
+            events[1].as_ref().expect("content"),
+            &ModelEvent::TextDelta("checking".to_string())
+        );
+        assert_eq!(
+            events[2].as_ref().expect("tool calls"),
             &ModelEvent::ToolCalls(vec![ToolCall::function(
                 "call_1",
                 "read_file",
@@ -774,6 +914,102 @@ mod tests {
         assert!(requests[0].contains(r#""tool_choice":"auto""#));
         assert!(requests[0].contains(r#""tools":[{"type":"function""#));
         assert!(requests[0].contains(r#""name":"read_file""#));
+    }
+
+    #[tokio::test]
+    async fn sends_deepseek_reasoning_controls_for_all_supported_levels() {
+        for (reasoning, expected_type, expected_effort) in [
+            (ReasoningLevel::Off, "disabled", None),
+            (ReasoningLevel::High, "enabled", Some("high")),
+            (ReasoningLevel::Max, "enabled", Some("max")),
+        ] {
+            let body = concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n",
+                "data: [DONE]\n\n"
+            );
+            let (base_url, requests) = spawn_recording_server(body).await;
+            let client = OpenAiCompatClient::new_without_proxy(OpenAiCompatConfig {
+                base_url,
+                model: "deepseek-v4-pro".to_string(),
+                api_key: "test-key".to_string(),
+                timeout: Duration::from_secs(5),
+            })
+            .expect("client")
+            .with_request_options(OpenAiCompatRequestOptions {
+                reasoning_profile: ReasoningProfile::Deepseek,
+                reasoning,
+                supports_tools: true,
+            });
+
+            let stream = client
+                .stream_chat(&conversation(), &[])
+                .await
+                .expect("stream chat");
+            let _ = collect_events(stream).await;
+
+            let requests = requests.lock().expect("requests lock poisoned");
+            assert!(requests[0].contains(&format!(r#""thinking":{{"type":"{expected_type}"}}"#)));
+            match expected_effort {
+                Some(effort) => {
+                    assert!(requests[0].contains(&format!(r#""reasoning_effort":"{effort}""#)))
+                }
+                None => assert!(!requests[0].contains("reasoning_effort")),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn generic_provider_strips_reasoning_content_from_history() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (base_url, requests) = spawn_recording_server(body).await;
+        let client = OpenAiCompatClient::new_without_proxy(OpenAiCompatConfig {
+            base_url,
+            model: "generic-model".to_string(),
+            api_key: "test-key".to_string(),
+            timeout: Duration::from_secs(5),
+        })
+        .expect("client");
+        let mut conversation = Conversation::new();
+        conversation.push(Message::assistant("answer").with_reasoning_content("private reasoning"));
+
+        let stream = client
+            .stream_chat(&conversation, &[])
+            .await
+            .expect("stream chat");
+        let _ = collect_events(stream).await;
+
+        let requests = requests.lock().expect("requests lock poisoned");
+        assert!(!requests[0].contains("reasoning_content"));
+        assert!(!requests[0].contains("private reasoning"));
+    }
+
+    #[tokio::test]
+    async fn parses_reasoning_delta_before_answer_text() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":null}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let client = client_for(body).await;
+        let events = collect_events(
+            client
+                .stream_chat(&conversation(), &[])
+                .await
+                .expect("stream chat"),
+        )
+        .await;
+
+        assert!(matches!(
+            events.as_slice(),
+            [
+                Ok(ModelEvent::ReasoningDelta(reasoning)),
+                Ok(ModelEvent::TextDelta(text)),
+                Ok(ModelEvent::Completed),
+            ] if reasoning == "think" && text == "answer"
+        ));
     }
 
     #[tokio::test]

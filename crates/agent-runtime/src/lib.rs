@@ -22,7 +22,7 @@ pub use agent_core::CancellationToken;
 pub use agent_tools::McpToolCache;
 pub use session_store::{SessionEntry, SessionListingEntry, SessionStore, SessionStoreError};
 
-pub const EVENT_SCHEMA_VERSION: u32 = 1;
+pub const EVENT_SCHEMA_VERSION: u32 = 2;
 const MESSAGE_BASE_TOKENS: usize = 6;
 const TOOL_CALL_BASE_TOKENS: usize = 12;
 const REQUEST_PADDING_NUMERATOR: usize = 4;
@@ -97,6 +97,42 @@ pub struct RunAgentTurnOutcome {
     /// agent 或事件接收方错误。事件投递可能在 turn 完成后失败，因此这里为 Some
     /// 不等于 `TurnStatus::Failed`；最终状态应以 Session 中的 TurnRecord 为准。
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct McpInspectionTool {
+    pub name: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct McpInspection {
+    pub tools: Vec<McpInspectionTool>,
+    pub diagnostics: Vec<String>,
+}
+
+pub async fn inspect_mcp_servers(
+    workspace_root: &Path,
+    servers: &[McpServerConfig],
+) -> McpInspection {
+    let cache = McpToolCache::new();
+    let discovery = agent_tools::mcp::discover_tools(workspace_root, servers, &cache).await;
+    let mut tools = discovery
+        .tools
+        .into_iter()
+        .flat_map(|provider| provider.definitions())
+        .map(|definition| McpInspectionTool {
+            name: definition.function.name,
+            description: definition.function.description,
+        })
+        .collect::<Vec<_>>();
+    tools.sort_by(|left, right| left.name.cmp(&right.name));
+    cache.clear().await;
+
+    McpInspection {
+        tools,
+        diagnostics: discovery.diagnostics,
+    }
 }
 
 pub trait TurnEventHandler {
@@ -251,6 +287,7 @@ async fn run_agent_turn_inner(
                 }
                 AgentEvent::TurnStarted
                 | AgentEvent::Warning(_)
+                | AgentEvent::ReasoningDelta(_)
                 | AgentEvent::TextDelta(_)
                 | AgentEvent::AgentMessage(_)
                 | AgentEvent::ToolCallStarted { .. }
@@ -562,6 +599,7 @@ async fn request_raw_session_summary(
     let mut output = String::new();
     while let Some(event) = stream.next().await {
         match event? {
+            ModelEvent::ReasoningDelta(_) => {}
             ModelEvent::TextDelta(text) => output.push_str(&text),
             ModelEvent::Completed => {
                 let output = output.trim().to_string();
@@ -860,6 +898,9 @@ fn message_context_tokens(message: &Message) -> usize {
     let mut total = MESSAGE_BASE_TOKENS + estimate_text_tokens(message_role_label(message));
     if let Some(content) = message.content.as_ref() {
         total += estimate_text_tokens(content);
+    }
+    if let Some(reasoning_content) = message.reasoning_content.as_ref() {
+        total += estimate_text_tokens(reasoning_content);
     }
     if let Some(tool_call_id) = message.tool_call_id.as_ref() {
         total += estimate_text_tokens(tool_call_id);
@@ -1229,6 +1270,36 @@ compact test
         assert!(with_tools > without_tools + 1_000);
     }
 
+    #[test]
+    fn context_estimate_includes_reasoning_content() {
+        let mut without_reasoning = Session::new();
+        without_reasoning
+            .active_thread
+            .push(Message::assistant("answer"));
+        let mut with_reasoning = without_reasoning.clone();
+        with_reasoning.active_thread.messages[0].reasoning_content = Some("r".repeat(4_000));
+
+        let without = estimate_context_tokens("system", &without_reasoning, "hello", &[]);
+        let with = estimate_context_tokens("system", &with_reasoning, "hello", &[]);
+
+        assert!(with > without + 1_000);
+    }
+
+    #[test]
+    fn summary_prompt_omits_reasoning_content() {
+        let user = Message::user("question");
+        let assistant =
+            Message::assistant("answer").with_reasoning_content("private reasoning chain");
+        let mut turn = Turn::running(user.clone());
+        turn.complete(assistant.clone());
+        let record = TurnRecord::new(turn, vec![user, assistant]);
+
+        let prompt = build_summary_prompt(None, 256, None, &[record], 0);
+
+        assert!(prompt.contains("answer"));
+        assert!(!prompt.contains("private reasoning chain"));
+    }
+
     #[tokio::test]
     async fn manual_compaction_summarizes_old_turns_and_rebuilds_active_context() {
         let summary = valid_compact_summary("new summary");
@@ -1517,6 +1588,48 @@ compact test
                 .iter()
                 .any(|event| event.event == AgentEvent::Error("turn cancelled".to_string()))
         );
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn inspect_mcp_servers_returns_discovered_tools() {
+        let root = unique_dir("inspect-mcp-tools");
+        let server_script = root.join("fake-inspection-mcp.sh");
+        fs::write(
+            &server_script,
+            r#"#!/bin/sh
+count=0
+while IFS= read -r line; do
+  count=$((count + 1))
+  if [ "$count" -eq 1 ]; then
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"fake","version":"1"}}}'
+  elif [ "$count" -eq 3 ]; then
+    printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"Search Docs","description":"Search docs","inputSchema":{"type":"object"}}]}}'
+  fi
+done
+"#,
+        )
+        .expect("write fake MCP server");
+        let server = McpServerConfig {
+            name: "Docs".to_string(),
+            transport: agent_config::McpTransport::Stdio,
+            command: "sh".to_string(),
+            args: vec![server_script.display().to_string()],
+            env: Default::default(),
+            cwd: None,
+            url: None,
+            http_headers: Default::default(),
+            enabled: true,
+            startup_timeout_sec: 5,
+            tool_timeout_sec: 5,
+        };
+
+        let inspection = inspect_mcp_servers(&root, &[server]).await;
+
+        assert!(inspection.diagnostics.is_empty());
+        assert_eq!(inspection.tools.len(), 1);
+        assert_eq!(inspection.tools[0].name, "mcp__docs__search_docs");
+        assert!(inspection.tools[0].description.contains("Search docs"));
     }
 
     #[cfg(not(windows))]

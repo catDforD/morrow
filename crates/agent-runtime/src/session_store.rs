@@ -481,7 +481,7 @@ fn parse_session_document(path: &Path, content: &str) -> Result<Session, Session
         })? as u32;
 
     match version {
-        SESSION_DOCUMENT_SCHEMA_VERSION => {
+        3 | SESSION_DOCUMENT_SCHEMA_VERSION => {
             let document = serde_json::from_value::<SessionDocument>(value).map_err(|source| {
                 SessionStoreError::Parse {
                     path: path.to_path_buf(),
@@ -615,6 +615,36 @@ mod tests {
     }
 
     #[test]
+    fn loads_v3_session_documents_and_upgrades_on_save() {
+        let root = unique_dir("v3-root");
+        let legacy_root = unique_dir("v3-legacy-root");
+        let cwd = unique_dir("v3-cwd");
+        let store = make_store(&root, &legacy_root, &cwd, "default");
+        let path = store.path().to_path_buf();
+        fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
+        fs::write(
+            &path,
+            json!({
+                "schema_version": 3,
+                "session": {
+                    "active_thread": {"messages": [{"role": "user", "content": "Hello"}]},
+                    "turns": [],
+                    "context": {"summarized_turns": 0}
+                }
+            })
+            .to_string(),
+        )
+        .expect("write v3 session");
+
+        let session = store.load().expect("load v3");
+        store.save(&session).expect("save v4");
+
+        assert_eq!(session.active_thread.messages, vec![Message::user("Hello")]);
+        let saved = fs::read_to_string(path).expect("read upgraded session");
+        assert!(saved.contains(r#""schema_version": 4"#));
+    }
+
+    #[test]
     fn rejects_invalid_session_names() {
         let root = unique_dir("invalid-root");
         let legacy_root = unique_dir("invalid-legacy-root");
@@ -711,7 +741,7 @@ mod tests {
         assert!(store.path().is_file());
         assert!(store.legacy_path().is_file());
         let saved = fs::read_to_string(store.path()).expect("read saved session");
-        assert!(saved.contains(r#""schema_version": 3"#));
+        assert!(saved.contains(r#""schema_version": 4"#));
     }
 
     #[test]
@@ -852,7 +882,7 @@ mod tests {
     }
 
     #[test]
-    fn export_document_bytes_outputs_schema_v3_document() {
+    fn export_document_bytes_outputs_current_schema_document() {
         let root = unique_dir("export-root");
         let legacy_root = unique_dir("export-legacy-root");
         let cwd = unique_dir("export-cwd");

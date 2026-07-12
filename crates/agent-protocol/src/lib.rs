@@ -15,6 +15,8 @@ pub struct Message {
     pub role: Role,
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
@@ -25,6 +27,7 @@ impl Message {
         Self {
             role: Role::System,
             content: Some(content.into()),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
         }
@@ -34,6 +37,7 @@ impl Message {
         Self {
             role: Role::User,
             content: Some(content.into()),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
         }
@@ -43,6 +47,7 @@ impl Message {
         Self {
             role: Role::Assistant,
             content: Some(content.into()),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
         }
@@ -52,6 +57,7 @@ impl Message {
         Self {
             role: Role::Assistant,
             content: None,
+            reasoning_content: None,
             tool_calls: Some(tool_calls),
             tool_call_id: None,
         }
@@ -64,6 +70,7 @@ impl Message {
         Self {
             role: Role::Assistant,
             content: Some(content.into()),
+            reasoning_content: None,
             tool_calls: Some(tool_calls),
             tool_call_id: None,
         }
@@ -73,9 +80,16 @@ impl Message {
         Self {
             role: Role::Tool,
             content: Some(content.into()),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: Some(tool_call_id.into()),
         }
+    }
+
+    pub fn with_reasoning_content(mut self, reasoning_content: impl Into<String>) -> Self {
+        let reasoning_content = reasoning_content.into();
+        self.reasoning_content = (!reasoning_content.is_empty()).then_some(reasoning_content);
+        self
     }
 }
 
@@ -190,7 +204,7 @@ impl Thread {
 }
 
 pub const THREAD_DOCUMENT_SCHEMA_VERSION: u32 = 2;
-pub const SESSION_DOCUMENT_SCHEMA_VERSION: u32 = 3;
+pub const SESSION_DOCUMENT_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ThreadDocument {
@@ -293,6 +307,49 @@ pub enum PermissionMode {
     ReadOnly,
     WorkspaceWrite,
     DangerFullAccess,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningLevel {
+    #[default]
+    Off,
+    High,
+    Max,
+}
+
+impl ReasoningLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::High => "high",
+            Self::Max => "max",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningProfile {
+    #[default]
+    None,
+    Deepseek,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ModelSelection {
+    pub provider_id: String,
+    pub model_id: String,
+    pub reasoning: ReasoningLevel,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ModelInvocation {
+    pub provider_id: String,
+    pub provider_name: String,
+    pub model_id: String,
+    pub model_name: String,
+    pub reasoning: ReasoningLevel,
 }
 
 impl PermissionMode {
@@ -571,6 +628,8 @@ pub struct Turn {
     pub status: TurnStatus,
     pub user_message: Message,
     pub assistant_message: Option<Message>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<ModelInvocation>,
     pub steps: Vec<TurnStep>,
     pub error: Option<String>,
 }
@@ -581,6 +640,7 @@ impl Turn {
             status: TurnStatus::Running,
             user_message,
             assistant_message: None,
+            model: None,
             steps: vec![TurnStep::running_model_call()],
             error: None,
         }
@@ -637,6 +697,7 @@ impl TurnRecord {
 pub enum AgentEvent {
     TurnStarted,
     Warning(String),
+    ReasoningDelta(String),
     TextDelta(String),
     AgentMessage(String),
     ToolCallStarted {
@@ -749,7 +810,7 @@ mod tests {
         let document = SessionDocument::new(session.clone());
         let value = serde_json::to_value(&document).expect("serialize session document");
 
-        assert_eq!(value["schema_version"], json!(3));
+        assert_eq!(value["schema_version"], json!(4));
         assert_eq!(
             value["session"]["context"],
             json!({"summary": "Known facts", "summarized_turns": 1})

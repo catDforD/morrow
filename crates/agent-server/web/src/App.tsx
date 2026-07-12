@@ -36,19 +36,28 @@ import {
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { fetchJson, sessionSocketUrl } from './api'
+import SettingsView from './SettingsView'
+import type { SettingsSection, ThemePreference } from './SettingsView'
 import type {
   ActivityItem,
   AgentEvent,
   ApprovalRequest,
   ClientMessage,
+  CommandSettingsResponse,
   Message,
+  ModelSelection,
+  ModelSettingsResponse,
+  ModelProviderResponse,
   PermissionMode,
+  ReasoningLevel,
+  ResolveCommandResponse,
   RunningTurnSnapshot,
   ServerMessage,
   Session,
   SessionArchiveResponse,
   SessionDocument,
   SessionEntryResponse,
+  SessionModelSelectionResponse,
   StatusResponse,
   TimelineItem,
   TimelineMessageItem,
@@ -61,6 +70,8 @@ import type {
 
 type InspectorPanel = 'run' | 'tools' | 'recent'
 type ConnectionStatus = 'connecting' | 'connected' | 'disconnected'
+type AppView = 'workspace' | 'settings'
+type ResolvedTheme = Exclude<ThemePreference, 'system'>
 
 const markdownPlugins = [remarkGfm]
 
@@ -109,9 +120,16 @@ const emptySessionEntry = (name: string): SessionEntryResponse => ({
 })
 
 export default function App() {
+  const initialLocationRef = useRef(readAppLocation())
   const [status, setStatus] = useState<StatusResponse | null>(null)
   const [sessions, setSessions] = useState<SessionEntryResponse[]>([])
-  const [selected, setSelected] = useState('default')
+  const [selected, setSelected] = useState(initialLocationRef.current.session)
+  const [appView, setAppView] = useState<AppView>(
+    initialLocationRef.current.view,
+  )
+  const [settingsSection, setSettingsSection] = useState<SettingsSection>(
+    initialLocationRef.current.section,
+  )
   const [timeline, setTimeline] = useState<TimelineItem[]>([])
   const [tools, setTools] = useState<ToolRun[]>([])
   const [activity, setActivity] = useState<ActivityItem[]>([])
@@ -136,8 +154,19 @@ export default function App() {
   const [connection, setConnection] =
     useState<ConnectionStatus>('disconnected')
   const [prompt, setPrompt] = useState('')
-  const [theme, setTheme] = useState<'light' | 'dark'>(() =>
-    localStorage.getItem('morrow-theme') === 'dark' ? 'dark' : 'light',
+  const [modelSettings, setModelSettings] =
+    useState<ModelSettingsResponse | null>(null)
+  const [commandSettings, setCommandSettings] =
+    useState<CommandSettingsResponse | null>(null)
+  const [isResolvingCommand, setIsResolvingCommand] = useState(false)
+  const [modelSelection, setModelSelection] = useState<ModelSelection | null>(
+    null,
+  )
+  const [themePreference, setThemePreference] = useState<ThemePreference>(
+    readSavedThemePreference,
+  )
+  const [systemTheme, setSystemTheme] = useState<ResolvedTheme>(
+    readSystemTheme,
   )
   const savedPermissionModeRef = useRef(readSavedPermissionMode())
   const [permissionMode, setPermissionMode] = useState<PermissionMode>(
@@ -147,12 +176,19 @@ export default function App() {
 
   const socketRef = useRef<WebSocket | null>(null)
   const selectedRef = useRef(selected)
+  const modelSelectionRef = useRef<ModelSelection | null>(null)
+  const modelSettingsRef = useRef<ModelSettingsResponse | null>(null)
+  const appViewRef = useRef(appView)
+  const settingsSectionRef = useRef(settingsSection)
   const assistantMessageIdRef = useRef<string | null>(null)
   const runTraceIdRef = useRef<string | null>(null)
   const idRef = useRef(0)
   const selectionRef = useRef(0)
+  const modelSelectionRequestRef = useRef(0)
   const messagesEndRef = useRef<HTMLDivElement | null>(null)
   const sessionSearchRef = useRef<HTMLInputElement | null>(null)
+  const resolvedTheme: ResolvedTheme =
+    themePreference === 'system' ? systemTheme : themePreference
 
   const nextId = useCallback((prefix: string) => {
     idRef.current += 1
@@ -265,6 +301,58 @@ export default function App() {
     [ensureRunTrace, updateRunTrace],
   )
 
+  const ensureLiveModelStep = useCallback(
+    (status: RunStep['status'] = 'running') => {
+      const id = ensureRunTrace('Model call started')
+      updateRunTrace(id, (trace) => {
+        if (
+          trace.steps.some(
+            (step) => step.kind === 'model' && step.status === 'running',
+          )
+        ) {
+          return trace
+        }
+        return {
+          ...trace,
+          steps: [
+            ...trace.steps,
+            {
+              id: nextId('step'),
+              kind: 'model',
+              status,
+              title: 'Model call started',
+              detail: modelSelectionRef.current
+                ? modelSelectionLabel(
+                    modelSettingsRef.current,
+                    modelSelectionRef.current,
+                  )
+                : undefined,
+            },
+          ],
+        }
+      })
+      return id
+    },
+    [ensureRunTrace, nextId, updateRunTrace],
+  )
+
+  const appendReasoningDelta = useCallback(
+    (text: string) => {
+      const id = ensureLiveModelStep()
+      updateRunTrace(id, (trace) => {
+        const index = trace.steps.findIndex(
+          (step) => step.kind === 'model' && step.status === 'running',
+        )
+        if (index === -1) return trace
+        const steps = [...trace.steps]
+        const step = steps[index]
+        steps[index] = { ...step, reasoning: (step.reasoning ?? '') + text }
+        return { ...trace, steps }
+      })
+    },
+    [ensureLiveModelStep, updateRunTrace],
+  )
+
   const upsertRunStep = useCallback(
     (runId: string, nextStep: RunStep) => {
       updateRunTrace(runId, (trace) => {
@@ -288,7 +376,7 @@ export default function App() {
 
   const startToolStep = useCallback(
     (id: string, name: string) => {
-      const runId = ensureRunTrace('Model requested a tool', name)
+      const runId = ensureLiveModelStep('ok')
       updateRunTrace(runId, (trace) => ({
         ...trace,
         steps: trace.steps.map((step) =>
@@ -305,7 +393,7 @@ export default function App() {
         detail: 'Tool call started',
       })
     },
-    [ensureRunTrace, updateRunTrace, upsertRunStep],
+    [ensureLiveModelStep, updateRunTrace, upsertRunStep],
   )
 
   const finishToolStep = useCallback(
@@ -421,6 +509,7 @@ export default function App() {
 
   const appendAssistantDelta = useCallback(
     (text: string) => {
+      ensureLiveModelStep()
       if (!assistantMessageIdRef.current) {
         const id = nextId('assistant')
         assistantMessageIdRef.current = id
@@ -440,7 +529,7 @@ export default function App() {
         ),
       )
     },
-    [nextId],
+    [ensureLiveModelStep, nextId],
   )
 
   const upsertTool = useCallback(
@@ -475,6 +564,26 @@ export default function App() {
     return nextEntries
   }, [])
 
+  const loadModelSettings = useCallback(async () => {
+    const settings = await fetchJson<ModelSettingsResponse>('/api/model-settings')
+    modelSettingsRef.current = settings
+    setModelSettings(settings)
+    return settings
+  }, [])
+
+  const loadCommandSettings = useCallback(async () => {
+    const settings = await fetchJson<CommandSettingsResponse>('/api/commands')
+    setCommandSettings(settings)
+    return settings
+  }, [])
+
+  const loadSessionModelSelection = useCallback(async (name: string) => {
+    const response = await fetchJson<SessionModelSelectionResponse>(
+      `/api/sessions/${encodeURIComponent(name)}/model-selection`,
+    )
+    return response.selection ?? null
+  }, [])
+
   const sendSocketMessage = useCallback((message: ClientMessage) => {
     const socket = socketRef.current
     if (!socket || socket.readyState !== WebSocket.OPEN) {
@@ -489,11 +598,22 @@ export default function App() {
         case 'turn_started':
           assistantMessageIdRef.current = null
           setTools([])
-          refreshCurrentModelStep('Model call started', selectedRef.current)
+          refreshCurrentModelStep(
+            'Model call started',
+            modelSelectionRef.current
+              ? modelSelectionLabel(
+                  modelSettingsRef.current,
+                  modelSelectionRef.current,
+                )
+              : selectedRef.current,
+          )
           recordActivity('Turn started', selectedRef.current, 'running')
           break
         case 'warning':
           recordActivity('Warning', event.data, 'error')
+          break
+        case 'reasoning_delta':
+          appendReasoningDelta(event.data)
           break
         case 'text_delta':
           appendAssistantDelta(event.data)
@@ -561,6 +681,7 @@ export default function App() {
     },
     [
       addTimelineMessage,
+      appendReasoningDelta,
       appendAssistantDelta,
       completeCurrentRun,
       finishToolStep,
@@ -642,6 +763,7 @@ export default function App() {
     async (name: string) => {
       const selectionId = selectionRef.current + 1
       selectionRef.current = selectionId
+      modelSelectionRequestRef.current += 1
       selectedRef.current = name
       setSelected(name)
       setIsSidebarOpen(false)
@@ -652,14 +774,27 @@ export default function App() {
       assistantMessageIdRef.current = null
       runTraceIdRef.current = null
       setTimeline([])
+      modelSelectionRef.current = null
+      setModelSelection(null)
       closeSocket()
-      history.replaceState(null, '', `?session=${encodeURIComponent(name)}`)
+      writeAppLocation(
+        name,
+        appViewRef.current,
+        settingsSectionRef.current,
+        'replace',
+        readHistoryState().fromWorkspace,
+      )
 
       try {
-        const document = await fetchJson<SessionDocument>(
-          `/api/sessions/${encodeURIComponent(name)}`,
-        )
+        const [document, selection] = await Promise.all([
+          fetchJson<SessionDocument>(
+            `/api/sessions/${encodeURIComponent(name)}`,
+          ),
+          loadSessionModelSelection(name),
+        ])
         if (selectionRef.current !== selectionId) return
+        modelSelectionRef.current = selection
+        setModelSelection(selection)
         setTimeline(sessionTimeline(document.session))
         recordActivity(
           'Session loaded',
@@ -674,12 +809,55 @@ export default function App() {
         }
       }
     },
-    [closeSocket, loadSessions, openSocket, recordActivity, showError],
+    [
+      closeSocket,
+      loadSessionModelSelection,
+      loadSessions,
+      openSocket,
+      recordActivity,
+      showError,
+    ],
   )
 
   useEffect(() => {
     selectedRef.current = selected
   }, [selected])
+
+  useEffect(() => {
+    appViewRef.current = appView
+  }, [appView])
+
+  useEffect(() => {
+    settingsSectionRef.current = settingsSection
+  }, [settingsSection])
+
+  useEffect(() => {
+    const initial = initialLocationRef.current
+    writeAppLocation(
+      initial.session,
+      initial.view,
+      initial.section,
+      'replace',
+      false,
+    )
+
+    const handlePopState = () => {
+      const next = readAppLocation()
+      appViewRef.current = next.view
+      settingsSectionRef.current = next.section
+      setAppView(next.view)
+      setSettingsSection(next.section)
+      setIsSidebarOpen(false)
+      setIsInspectorOpen(false)
+
+      if (next.session !== selectedRef.current) {
+        void selectSession(next.session)
+      }
+    }
+
+    window.addEventListener('popstate', handlePopState)
+    return () => window.removeEventListener('popstate', handlePopState)
+  }, [selectSession])
 
   useEffect(() => {
     if (isSearchOpen) {
@@ -705,9 +883,23 @@ export default function App() {
   }, [isInspectorOpen, isSidebarOpen])
 
   useEffect(() => {
-    document.documentElement.classList.toggle('dark', theme === 'dark')
-    localStorage.setItem('morrow-theme', theme)
-  }, [theme])
+    const media = window.matchMedia('(prefers-color-scheme: dark)')
+    const handleChange = (event: MediaQueryListEvent) => {
+      setSystemTheme(event.matches ? 'dark' : 'light')
+    }
+
+    setSystemTheme(media.matches ? 'dark' : 'light')
+    media.addEventListener('change', handleChange)
+    return () => media.removeEventListener('change', handleChange)
+  }, [])
+
+  useEffect(() => {
+    document.documentElement.classList.toggle('dark', resolvedTheme === 'dark')
+  }, [resolvedTheme])
+
+  useEffect(() => {
+    writeLocalPreference('morrow-theme', themePreference)
+  }, [themePreference])
 
   useEffect(() => {
     const media = window.matchMedia('(max-width: 900px)')
@@ -721,8 +913,12 @@ export default function App() {
   }, [])
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ block: 'end' })
-  }, [timeline])
+    if (appView !== 'workspace') return
+    const frame = requestAnimationFrame(() => {
+      messagesEndRef.current?.scrollIntoView({ block: 'end' })
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [appView, timeline])
 
   useEffect(() => {
     let mounted = true
@@ -733,8 +929,8 @@ export default function App() {
         setStatus(loadedStatus)
         const savedMode = savedPermissionModeRef.current
         setPermissionMode(savedMode ?? loadedStatus.permissions.mode)
-        const requestedName =
-          new URLSearchParams(location.search).get('session') || 'default'
+        await Promise.all([loadModelSettings(), loadCommandSettings()])
+        const requestedName = initialLocationRef.current.session
         const entries = await loadSessions()
         const requestedEntry = entries.find(
           (session) => session.name === requestedName,
@@ -755,7 +951,14 @@ export default function App() {
       mounted = false
       closeSocket()
     }
-  }, [closeSocket, loadSessions, selectSession, showError])
+  }, [
+    closeSocket,
+    loadCommandSettings,
+    loadModelSettings,
+    loadSessions,
+    selectSession,
+    showError,
+  ])
 
   const selectedEntry = useMemo(
     () => sessions.find((session) => session.name === selected),
@@ -778,7 +981,16 @@ export default function App() {
   )
 
   const isRunning = Boolean(runningTurn)
-  const canSend = connection === 'connected' && !isRunning && prompt.trim().length > 0
+  const selectedModel = useMemo(
+    () => findSelectedModel(modelSettings, modelSelection),
+    [modelSelection, modelSettings],
+  )
+  const canSend =
+    connection === 'connected' &&
+    !isRunning &&
+    !isResolvingCommand &&
+    prompt.trim().length > 0 &&
+    Boolean(selectedModel)
   const canCancel = Boolean(runningTurn?.turn_id && runningTurn.turn_id !== 'pending')
 
   const openInspector = (panel: InspectorPanel) => {
@@ -792,31 +1004,111 @@ export default function App() {
     setIsSidebarOpen(true)
   }
 
+  const openSettings = (section: SettingsSection = 'general') => {
+    appViewRef.current = 'settings'
+    settingsSectionRef.current = section
+    setAppView('settings')
+    setSettingsSection(section)
+    setIsSidebarOpen(false)
+    setIsInspectorOpen(false)
+    writeAppLocation(
+      selectedRef.current,
+      'settings',
+      section,
+      'push',
+      true,
+    )
+  }
+
+  const closeSettings = () => {
+    setIsSidebarOpen(false)
+    const historyState = readHistoryState()
+    if (historyState.morrowView === 'settings' && historyState.fromWorkspace) {
+      history.back()
+      return
+    }
+
+    appViewRef.current = 'workspace'
+    settingsSectionRef.current = 'general'
+    setAppView('workspace')
+    setSettingsSection('general')
+    writeAppLocation(
+      selectedRef.current,
+      'workspace',
+      'general',
+      'replace',
+      false,
+    )
+  }
+
+  const changeSettingsSection = (section: SettingsSection) => {
+    settingsSectionRef.current = section
+    setSettingsSection(section)
+    setIsSidebarOpen(false)
+    writeAppLocation(
+      selectedRef.current,
+      'settings',
+      section,
+      'replace',
+      readHistoryState().fromWorkspace,
+    )
+  }
+
   const toggleSearch = () => {
     if (isSearchOpen) setSessionFilter('')
     setIsSearchOpen((open) => !open)
   }
 
-  const handleSubmit = (event: FormEvent) => {
+  const handleSubmit = async (event: FormEvent) => {
     event.preventDefault()
     const trimmed = prompt.trim()
     if (!trimmed || !canSend) return
+    setIsResolvingCommand(trimmed.startsWith('/'))
     try {
-      addTimelineMessage('user', trimmed)
-      createRunTrace('Request queued', compactText(trimmed, 90))
+      const resolved = trimmed.startsWith('/')
+        ? await fetchJson<ResolveCommandResponse>('/api/commands/resolve', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ input: trimmed }),
+          })
+        : { matched: false, prompt: trimmed }
+      const resolvedPrompt = resolved.prompt.trim()
+      if (!resolvedPrompt) throw new Error('resolved prompt must not be empty')
+      addTimelineMessage('user', resolvedPrompt)
+      createRunTrace(
+        'Request queued',
+        selectedModel
+          ? `${selectedModel.provider.name} · ${selectedModel.model.name} · ${reasoningLabel(modelSelection?.reasoning ?? 'off')}`
+          : compactText(resolvedPrompt, 90),
+      )
       sendSocketMessage({
         type: 'start_turn',
         data: {
           request_id: `request-${Date.now()}`,
-          prompt: trimmed,
+          prompt: resolvedPrompt,
+          prompt_resolved: true,
           permission_mode: permissionMode,
+          model_selection: modelSelection,
         },
       })
       setPrompt('')
       setRunningTurn({ turn_id: 'pending' })
-      recordActivity('Turn requested', compactText(trimmed, 90), 'running')
+      if (resolved.matched && resolved.command_name) {
+        recordActivity(
+          'Command expanded',
+          `/${resolved.command_name}`,
+          'neutral',
+        )
+      }
+      recordActivity(
+        'Turn requested',
+        compactText(resolvedPrompt, 90),
+        'running',
+      )
     } catch (error) {
       showError(error)
+    } finally {
+      setIsResolvingCommand(false)
     }
   }
 
@@ -869,7 +1161,42 @@ export default function App() {
 
   const changePermissionMode = (mode: PermissionMode) => {
     setPermissionMode(mode)
-    localStorage.setItem('morrow-permission-mode', mode)
+    writeLocalPreference('morrow-permission-mode', mode)
+  }
+
+  const changeModelSelection = async (selection: ModelSelection) => {
+    if (isRunning) return
+    const session = selectedRef.current
+    const requestId = modelSelectionRequestRef.current + 1
+    modelSelectionRequestRef.current = requestId
+    const previous = modelSelectionRef.current
+    modelSelectionRef.current = selection
+    setModelSelection(selection)
+    try {
+      const response = await fetchJson<SessionModelSelectionResponse>(
+        `/api/sessions/${encodeURIComponent(session)}/model-selection`,
+        {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(selection),
+        },
+      )
+      if (
+        selectedRef.current !== session ||
+        modelSelectionRequestRef.current !== requestId
+      ) return
+      const saved = response.selection ?? null
+      modelSelectionRef.current = saved
+      setModelSelection(saved)
+    } catch (error) {
+      if (
+        selectedRef.current !== session ||
+        modelSelectionRequestRef.current !== requestId
+      ) return
+      modelSelectionRef.current = previous
+      setModelSelection(previous)
+      showError(error)
+    }
   }
 
   const archiveSession = async (name: string) => {
@@ -948,96 +1275,134 @@ export default function App() {
 
   return (
     <>
-      <div className={`app-frame${isSidebarOpen ? ' sidebar-open' : ''}`}>
-        <button
-          className="mobile-sidebar-backdrop"
-          type="button"
-          aria-label="Close task navigation"
-          aria-hidden={!isSidebarOpen}
-          tabIndex={isSidebarOpen ? 0 : -1}
-          onClick={() => setIsSidebarOpen(false)}
+      {appView === 'settings' ? (
+        <SettingsView
+          section={settingsSection}
+          status={status}
+          theme={themePreference}
+          permissionMode={permissionMode}
+          modelSettings={modelSettings}
+          commandSettings={commandSettings}
+          isSidebarOpen={isSidebarOpen}
+          isSidebarHidden={isNarrowViewport && !isSidebarOpen}
+          onSectionChange={changeSettingsSection}
+          onBack={closeSettings}
+          onOpenSidebar={() => setIsSidebarOpen(true)}
+          onCloseSidebar={() => setIsSidebarOpen(false)}
+          onThemeChange={setThemePreference}
+          onPermissionModeChange={changePermissionMode}
+          onModelSettingsChange={async () => {
+            modelSelectionRequestRef.current += 1
+            await loadModelSettings()
+            const selection = await loadSessionModelSelection(selectedRef.current)
+            modelSelectionRef.current = selection
+            setModelSelection(selection)
+          }}
+          onCommandSettingsChange={async () => {
+            await loadCommandSettings()
+          }}
         />
-        <AppSidebar
-          sessions={activeSessions}
-          archivedSessions={archivedSessions}
-          sessionCount={sessions.filter((session) => !session.archived).length}
-          runningTurn={runningTurn}
-          selected={selected}
-          sessionAction={sessionAction}
-          isCreatingSession={isCreatingSession}
-          newSessionName={newSessionName}
-          createSessionError={createSessionError}
-          isSearchOpen={isSearchOpen}
-          sessionFilter={sessionFilter}
-          theme={theme}
-          searchInputRef={sessionSearchRef}
-          isHidden={isNarrowViewport && !isSidebarOpen}
-          onSelectSession={(name) => void selectSession(name)}
-          onStartCreateSession={startCreateSession}
-          onCancelCreateSession={cancelCreateSession}
-          onNewSessionNameChange={setNewSessionName}
-          onCreateSession={() => void createSession()}
-          onToggleSearch={toggleSearch}
-          onSessionFilterChange={setSessionFilter}
-          onArchiveSession={(name) => void archiveSession(name)}
-          onRestoreSession={(name) => void restoreSession(name)}
-          onRefresh={() => void refresh()}
-          onClose={() => setIsSidebarOpen(false)}
-          onThemeToggle={() =>
-            setTheme((current) => (current === 'dark' ? 'light' : 'dark'))
-          }
-        />
-        <main className="window-main">
-          <ChatView
+      ) : (
+        <div className={`app-frame${isSidebarOpen ? ' sidebar-open' : ''}`}>
+          <button
+            className="mobile-sidebar-backdrop"
+            type="button"
+            aria-label="Close task navigation"
+            aria-hidden={!isSidebarOpen}
+            tabIndex={isSidebarOpen ? 0 : -1}
+            onClick={() => setIsSidebarOpen(false)}
+          />
+          <AppSidebar
+            sessions={activeSessions}
+            archivedSessions={archivedSessions}
+            sessionCount={sessions.filter((session) => !session.archived).length}
+            runningTurn={runningTurn}
             selected={selected}
-            status={status}
-            connection={connection}
-            timeline={timeline}
+            sessionAction={sessionAction}
+            isCreatingSession={isCreatingSession}
+            newSessionName={newSessionName}
+            createSessionError={createSessionError}
+            isSearchOpen={isSearchOpen}
+            sessionFilter={sessionFilter}
+            theme={resolvedTheme}
+            searchInputRef={sessionSearchRef}
+            isHidden={isNarrowViewport && !isSidebarOpen}
+            onSelectSession={(name) => void selectSession(name)}
+            onStartCreateSession={startCreateSession}
+            onCancelCreateSession={cancelCreateSession}
+            onNewSessionNameChange={setNewSessionName}
+            onCreateSession={() => void createSession()}
+            onToggleSearch={toggleSearch}
+            onSessionFilterChange={setSessionFilter}
+            onArchiveSession={(name) => void archiveSession(name)}
+            onRestoreSession={(name) => void restoreSession(name)}
+            onRefresh={() => void refresh()}
+            onClose={() => setIsSidebarOpen(false)}
+            onOpenSettings={openSettings}
+            onThemeToggle={() =>
+              setThemePreference(resolvedTheme === 'dark' ? 'light' : 'dark')
+            }
+          />
+          <main className="window-main">
+            <ChatView
+              selected={selected}
+              status={status}
+              connection={connection}
+              timeline={timeline}
+              runningTurn={runningTurn}
+              pendingApproval={pendingApproval}
+              prompt={prompt}
+              canSend={canSend}
+              canCancel={canCancel}
+              isRunning={isRunning}
+              permissionMode={permissionMode}
+              modelSettings={modelSettings}
+              commandSettings={commandSettings}
+              modelSelection={modelSelection}
+              isResolvingCommand={isResolvingCommand}
+              isSidebarOpen={isSidebarOpen}
+              onPromptChange={setPrompt}
+              onPromptKeyDown={handlePromptKeyDown}
+              onSubmit={handleSubmit}
+              onCancel={cancelTurn}
+              onPermissionModeChange={changePermissionMode}
+              onModelSelectionChange={(selection) =>
+                void changeModelSelection(selection)
+              }
+              onManageModels={() => openSettings('models')}
+              onOpenSidebar={openSidebar}
+              onOpenInspector={openInspector}
+              onToggleRun={(id) => {
+                setTimeline((items) =>
+                  items.map((item) =>
+                    item.kind === 'run' && item.id === id
+                      ? {
+                          ...item,
+                          trace: {
+                            ...item.trace,
+                            collapsed: !item.trace.collapsed,
+                          },
+                        }
+                      : item,
+                  ),
+                )
+              }}
+              messagesEndRef={messagesEndRef}
+            />
+          </main>
+          <InspectorDrawer
+            open={isInspectorOpen}
+            panel={inspectorPanel}
+            tools={tools}
+            activity={activity}
+            selectedEntry={selectedEntry}
             runningTurn={runningTurn}
             pendingApproval={pendingApproval}
-            prompt={prompt}
-            canSend={canSend}
-            canCancel={canCancel}
-            isRunning={isRunning}
-            permissionMode={permissionMode}
-            isSidebarOpen={isSidebarOpen}
-            onPromptChange={setPrompt}
-            onPromptKeyDown={handlePromptKeyDown}
-            onSubmit={handleSubmit}
-            onCancel={cancelTurn}
-            onPermissionModeChange={changePermissionMode}
-            onOpenSidebar={openSidebar}
-            onOpenInspector={openInspector}
-            onToggleRun={(id) => {
-              setTimeline((items) =>
-                items.map((item) =>
-                  item.kind === 'run' && item.id === id
-                    ? {
-                        ...item,
-                        trace: {
-                          ...item.trace,
-                          collapsed: !item.trace.collapsed,
-                        },
-                      }
-                    : item,
-                ),
-              )
-            }}
-            messagesEndRef={messagesEndRef}
+            onClose={() => setIsInspectorOpen(false)}
+            onPanelChange={setInspectorPanel}
           />
-        </main>
-        <InspectorDrawer
-          open={isInspectorOpen}
-          panel={inspectorPanel}
-          tools={tools}
-          activity={activity}
-          selectedEntry={selectedEntry}
-          runningTurn={runningTurn}
-          pendingApproval={pendingApproval}
-          onClose={() => setIsInspectorOpen(false)}
-          onPanelChange={setInspectorPanel}
-        />
-      </div>
+        </div>
+      )}
       <ApprovalDialog
         request={pendingApproval}
         onApprove={() => sendApproval(true)}
@@ -1073,6 +1438,7 @@ function AppSidebar({
   onRestoreSession,
   onRefresh,
   onClose,
+  onOpenSettings,
   onThemeToggle,
 }: {
   sessions: SessionEntryResponse[]
@@ -1100,6 +1466,7 @@ function AppSidebar({
   onRestoreSession: (name: string) => void
   onRefresh: () => void
   onClose: () => void
+  onOpenSettings: () => void
   onThemeToggle: () => void
 }) {
   const [isArchiveOpen, setIsArchiveOpen] = useState(false)
@@ -1286,12 +1653,11 @@ function AppSidebar({
           <button
             className="sidebar-settings"
             type="button"
-            title="Settings coming soon"
-            disabled
+            title="Open settings"
+            onClick={() => onOpenSettings()}
           >
             <Settings size={17} />
             <span>Settings</span>
-            <small>Soon</small>
           </button>
           <div className="sidebar-footer-actions">
             <MiniIconButton title="Refresh sessions" onClick={onRefresh}>
@@ -1347,12 +1713,18 @@ function ChatView({
   canCancel,
   isRunning,
   permissionMode,
+  modelSettings,
+  commandSettings,
+  modelSelection,
+  isResolvingCommand,
   isSidebarOpen,
   onPromptChange,
   onPromptKeyDown,
   onSubmit,
   onCancel,
   onPermissionModeChange,
+  onModelSelectionChange,
+  onManageModels,
   onOpenSidebar,
   onOpenInspector,
   onToggleRun,
@@ -1369,12 +1741,18 @@ function ChatView({
   canCancel: boolean
   isRunning: boolean
   permissionMode: PermissionMode
+  modelSettings: ModelSettingsResponse | null
+  commandSettings: CommandSettingsResponse | null
+  modelSelection: ModelSelection | null
+  isResolvingCommand: boolean
   isSidebarOpen: boolean
   onPromptChange: (value: string) => void
   onPromptKeyDown: (event: KeyboardEvent<HTMLTextAreaElement>) => void
   onSubmit: (event: FormEvent) => void
   onCancel: () => void
   onPermissionModeChange: (mode: PermissionMode) => void
+  onModelSelectionChange: (selection: ModelSelection) => void
+  onManageModels: () => void
   onOpenSidebar: () => void
   onOpenInspector: (panel: InspectorPanel) => void
   onToggleRun: (id: string) => void
@@ -1387,13 +1765,20 @@ function ChatView({
       canSend={canSend}
       canCancel={canCancel}
       isRunning={isRunning}
+      status={status}
       permissionMode={permissionMode}
+      modelSettings={modelSettings}
+      commandSettings={commandSettings}
+      modelSelection={modelSelection}
+      isResolvingCommand={isResolvingCommand}
       variant={isEmpty ? 'home' : 'dock'}
       onPromptChange={onPromptChange}
       onPromptKeyDown={onPromptKeyDown}
       onSubmit={onSubmit}
       onCancel={onCancel}
       onPermissionModeChange={onPermissionModeChange}
+      onModelSelectionChange={onModelSelectionChange}
+      onManageModels={onManageModels}
     />
   )
 
@@ -1666,12 +2051,20 @@ function RunStepRow({ step }: { step: RunStep }) {
 
 function RunStepDetails({ step }: { step: RunStep }) {
   const summary = step.summary
-  if (!summary) return null
+  if (!summary && !step.reasoning) return null
 
   return (
-    <details className="run-step-details">
-      <summary>Details</summary>
-      {summary.shell ? (
+    <>
+      {step.reasoning ? (
+        <details className="run-step-details reasoning-details">
+          <summary>思考过程</summary>
+          <pre>{step.reasoning}</pre>
+        </details>
+      ) : null}
+      {summary ? (
+        <details className="run-step-details">
+          <summary>Details</summary>
+          {summary.shell ? (
         <pre>
           {[
             `command: ${summary.shell.command}`,
@@ -1683,8 +2076,8 @@ function RunStepDetails({ step }: { step: RunStep }) {
             `stderr truncated: ${summary.shell.stderr_truncated ? 'yes' : 'no'}`,
           ].join('\n')}
         </pre>
-      ) : null}
-      {summary.files?.length ? (
+          ) : null}
+          {summary.files?.length ? (
         <div className="run-file-list">
           {summary.files.map((file) => (
             <span key={`${file.operation}-${file.path}`}>
@@ -1692,10 +2085,12 @@ function RunStepDetails({ step }: { step: RunStep }) {
             </span>
           ))}
         </div>
+          ) : null}
+          {summary.diff ? <pre>{summary.diff}</pre> : null}
+          {summary.error ? <pre>{summary.error}</pre> : null}
+        </details>
       ) : null}
-      {summary.diff ? <pre>{summary.diff}</pre> : null}
-      {summary.error ? <pre>{summary.error}</pre> : null}
-    </details>
+    </>
   )
 }
 
@@ -1704,40 +2099,173 @@ function Composer({
   canSend,
   canCancel,
   isRunning,
+  status,
   permissionMode,
+  modelSettings,
+  commandSettings,
+  modelSelection,
+  isResolvingCommand,
   variant = 'dock',
   onPromptChange,
   onPromptKeyDown,
   onSubmit,
   onCancel,
   onPermissionModeChange,
+  onModelSelectionChange,
+  onManageModels,
 }: {
   prompt: string
   canSend: boolean
   canCancel: boolean
   isRunning: boolean
+  status: StatusResponse | null
   permissionMode: PermissionMode
+  modelSettings: ModelSettingsResponse | null
+  commandSettings: CommandSettingsResponse | null
+  modelSelection: ModelSelection | null
+  isResolvingCommand: boolean
   variant?: 'home' | 'dock'
   onPromptChange: (value: string) => void
   onPromptKeyDown: (event: KeyboardEvent<HTMLTextAreaElement>) => void
   onSubmit: (event: FormEvent) => void
   onCancel: () => void
   onPermissionModeChange: (mode: PermissionMode) => void
+  onModelSelectionChange: (selection: ModelSelection) => void
+  onManageModels: () => void
 }) {
-  const primaryLabel = isRunning ? 'Stop turn' : 'Send'
+  const [commandIndex, setCommandIndex] = useState(0)
+  const [dismissedCommandPrompt, setDismissedCommandPrompt] = useState('')
+  const commandQuery = slashCommandQuery(prompt)
+  const commandSuggestions = useMemo(() => {
+    if (commandQuery == null) return []
+    const normalized = commandQuery.toLowerCase()
+    return (commandSettings?.commands ?? [])
+      .filter((command) =>
+        `${command.name} ${command.description}`
+          .toLowerCase()
+          .includes(normalized),
+      )
+      .slice(0, 8)
+  }, [commandQuery, commandSettings])
+  const commandMenuOpen =
+    commandQuery != null &&
+    commandSuggestions.length > 0 &&
+    dismissedCommandPrompt !== prompt &&
+    !isRunning &&
+    !isResolvingCommand
+
+  useEffect(() => {
+    setCommandIndex((current) =>
+      Math.min(current, Math.max(commandSuggestions.length - 1, 0)),
+    )
+  }, [commandSuggestions.length])
+
+  const selectCommand = (index: number) => {
+    const command = commandSuggestions[index]
+    if (!command) return
+    onPromptChange(`/${command.name} `)
+    setDismissedCommandPrompt('')
+    setCommandIndex(0)
+  }
+
+  const handleComposerKeyDown = (
+    event: KeyboardEvent<HTMLTextAreaElement>,
+  ) => {
+    if (commandMenuOpen) {
+      if (event.key === 'ArrowDown') {
+        event.preventDefault()
+        setCommandIndex((current) =>
+          (current + 1) % commandSuggestions.length,
+        )
+        return
+      }
+      if (event.key === 'ArrowUp') {
+        event.preventDefault()
+        setCommandIndex((current) =>
+          (current - 1 + commandSuggestions.length) % commandSuggestions.length,
+        )
+        return
+      }
+      if (
+        (event.key === 'Enter' && !event.metaKey && !event.ctrlKey) ||
+        event.key === 'Tab'
+      ) {
+        event.preventDefault()
+        selectCommand(commandIndex)
+        return
+      }
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        setDismissedCommandPrompt(prompt)
+        return
+      }
+    }
+    onPromptKeyDown(event)
+  }
+
+  const primaryLabel = isRunning
+    ? 'Stop turn'
+    : isResolvingCommand
+      ? 'Resolving command'
+      : 'Send'
   const primaryDisabled = isRunning ? !canCancel : !canSend
+  const workspace = status ? workspaceName(status.workspace_root) : 'loading'
 
   return (
     <form className={`composer ${variant}`} onSubmit={onSubmit}>
       <div className="composer-shell">
+        <div className="composer-context" aria-label="Project context">
+          <span title={status?.workspace_root || ''}>
+            <Folder size={14} />
+            {workspace}
+          </span>
+          <span>
+            <Terminal size={14} />
+            Local
+          </span>
+          <span>
+            <Shield size={14} />
+            {permissionMode.replaceAll('_', ' ')}
+          </span>
+        </div>
         <div className="composer-card">
+          {commandMenuOpen ? (
+            <div className="command-suggestion-menu" role="listbox" aria-label="命令建议">
+              <div className="command-suggestion-heading">
+                <span>命令</span>
+                <small>Enter 选择 · Esc 关闭</small>
+              </div>
+              {commandSuggestions.map((command, index) => (
+                <button
+                  className={index === commandIndex ? 'active' : undefined}
+                  type="button"
+                  role="option"
+                  aria-selected={index === commandIndex}
+                  key={command.name}
+                  onMouseEnter={() => setCommandIndex(index)}
+                  onClick={() => selectCommand(index)}
+                >
+                  <span className="command-suggestion-icon"><Terminal size={16} /></span>
+                  <span>
+                    <strong>/{command.name}</strong>
+                    <small>{command.description || '自定义 Markdown 命令'}</small>
+                  </span>
+                  {command.argument_hint ? <em>{command.argument_hint}</em> : null}
+                </button>
+              ))}
+            </div>
+          ) : null}
           <textarea
             value={prompt}
             rows={variant === 'home' ? 3 : 2}
-            disabled={isRunning}
+            disabled={isRunning || isResolvingCommand}
             placeholder="Ask Morrow to edit, inspect, or explain this workspace"
-            onChange={(event) => onPromptChange(event.target.value)}
-            onKeyDown={onPromptKeyDown}
+            onChange={(event) => {
+              setDismissedCommandPrompt('')
+              setCommandIndex(0)
+              onPromptChange(event.target.value)
+            }}
+            onKeyDown={handleComposerKeyDown}
           />
           <div className="composer-bar">
             <div className="composer-left">
@@ -1751,20 +2279,18 @@ function Composer({
               </button>
               <PermissionPicker
                 mode={permissionMode}
-                disabled={isRunning}
+                disabled={isRunning || isResolvingCommand}
                 onChange={onPermissionModeChange}
               />
             </div>
             <div className="composer-primary">
-              <button
-                className="composer-chip labeled"
-                type="button"
-                title="Model selection coming soon"
-                disabled
-              >
-                <Bot size={15} />
-                <span>Model</span>
-              </button>
+              <ModelPicker
+                settings={modelSettings}
+                selection={modelSelection}
+                disabled={isRunning || isResolvingCommand}
+                onChange={onModelSelectionChange}
+                onManage={onManageModels}
+              />
               <button
                 aria-label={primaryLabel}
                 className={`send-button composer-primary-button${isRunning ? ' stop-button' : ''}`}
@@ -1772,7 +2298,13 @@ function Composer({
                 disabled={primaryDisabled}
                 onClick={isRunning ? onCancel : undefined}
               >
-                {isRunning ? <Square size={17} /> : <Send size={17} />}
+                {isRunning ? (
+                  <Square size={17} />
+                ) : isResolvingCommand ? (
+                  <RefreshCw size={17} className="spinning" />
+                ) : (
+                  <Send size={17} />
+                )}
               </button>
             </div>
           </div>
@@ -1867,6 +2399,185 @@ function PermissionPicker({
               </button>
             )
           })}
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+function ModelPicker({
+  settings,
+  selection,
+  disabled,
+  onChange,
+  onManage,
+}: {
+  settings: ModelSettingsResponse | null
+  selection: ModelSelection | null
+  disabled: boolean
+  onChange: (selection: ModelSelection) => void
+  onManage: () => void
+}) {
+  const [open, setOpen] = useState(false)
+  const [modelListOpen, setModelListOpen] = useState(false)
+  const pickerRef = useRef<HTMLDivElement | null>(null)
+  const selected = findSelectedModel(settings, selection)
+  const providers =
+    settings?.providers.filter(
+      (provider) => provider.enabled && provider.models.length > 0,
+    ) ?? []
+
+  useEffect(() => {
+    if (!open) return
+    const handlePointerDown = (event: globalThis.PointerEvent) => {
+      if (!pickerRef.current?.contains(event.target as Node)) {
+        setOpen(false)
+        setModelListOpen(false)
+      }
+    }
+    const handleKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setOpen(false)
+        setModelListOpen(false)
+      }
+    }
+    document.addEventListener('pointerdown', handlePointerDown)
+    document.addEventListener('keydown', handleKeyDown)
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown)
+      document.removeEventListener('keydown', handleKeyDown)
+    }
+  }, [open])
+
+  useEffect(() => {
+    if (disabled) {
+      setOpen(false)
+      setModelListOpen(false)
+    }
+  }, [disabled])
+
+  const openOrManage = () => {
+    if (providers.length === 0) {
+      onManage()
+      return
+    }
+    if (open) {
+      setOpen(false)
+      setModelListOpen(false)
+    } else {
+      setOpen(true)
+    }
+  }
+
+  return (
+    <div className={`model-picker${open ? ' open' : ''}`} ref={pickerRef}>
+      <button
+        className="composer-chip labeled model-trigger"
+        type="button"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        disabled={disabled}
+        title={selected ? modelSelectionLabel(settings, selection) : '配置模型'}
+        onClick={openOrManage}
+      >
+        <Bot size={15} />
+        <span>
+          {selected
+            ? `${selected.model.name} · ${reasoningLabel(selection?.reasoning ?? 'off')}`
+            : '配置模型'}
+        </span>
+        <ChevronDown size={14} />
+      </button>
+
+      {open ? (
+        <div className="model-menu" role="menu" aria-label="模型与思考设置">
+          {selected?.model.reasoning_profile === 'deepseek' && selection ? (
+            <section className="model-menu-section">
+              {(['off', 'high', 'max'] as ReasoningLevel[]).map((reasoning) => (
+                <button
+                  key={reasoning}
+                  type="button"
+                  role="menuitemradio"
+                  aria-checked={selection.reasoning === reasoning}
+                  className={selection.reasoning === reasoning ? 'selected' : ''}
+                  onClick={() =>
+                    onChange({ ...selection, reasoning })
+                  }
+                >
+                  <span>{reasoningLabel(reasoning)}</span>
+                  {selection.reasoning === reasoning ? <Check size={15} /> : null}
+                </button>
+              ))}
+            </section>
+          ) : null}
+
+          <section className="model-menu-section model-list-section">
+            <button
+              className={`model-current-toggle${modelListOpen ? ' expanded' : ''}`}
+              type="button"
+              aria-haspopup="menu"
+              aria-expanded={modelListOpen}
+              onClick={() => setModelListOpen((current) => !current)}
+            >
+              <span>{selected?.model.name ?? '选择模型'}</span>
+              <ChevronRight size={15} />
+            </button>
+            {modelListOpen ? (
+              <div className="model-list-expanded">
+                {providers.map((provider) => (
+                  <div className="model-provider-group" key={provider.id}>
+                    <small>{provider.name}</small>
+                    {provider.models.map((model) => {
+                      const isSelected =
+                        selection?.provider_id === provider.id &&
+                        selection.model_id === model.id
+                      return (
+                        <button
+                          key={model.id}
+                          type="button"
+                          role="menuitemradio"
+                          aria-checked={isSelected}
+                          className={isSelected ? 'selected' : ''}
+                          onClick={() => {
+                            onChange({
+                              provider_id: provider.id,
+                              model_id: model.id,
+                              reasoning:
+                                model.reasoning_profile === 'deepseek'
+                                  ? isSelected
+                                    ? selection?.reasoning ?? 'high'
+                                    : 'high'
+                                  : 'off',
+                            })
+                            setModelListOpen(false)
+                          }}
+                        >
+                          <span>
+                            <strong>{model.name}</strong>
+                            <small>{compactTokenCount(model.context_window_tokens)}</small>
+                          </span>
+                          {isSelected ? <Check size={15} /> : null}
+                        </button>
+                      )
+                    })}
+                  </div>
+                ))}
+              </div>
+            ) : null}
+          </section>
+
+          <button
+            className="model-manage-link"
+            type="button"
+            onClick={() => {
+              setOpen(false)
+              setModelListOpen(false)
+              onManage()
+            }}
+          >
+            <Settings size={15} />
+            <span>管理模型</span>
+          </button>
         </div>
       ) : null}
     </div>
@@ -2309,7 +3020,7 @@ function turnRecordTimeline(
   }
 
   if (record.turn.steps.length > 0 || record.turn.error) {
-    const trace = historyRunTrace(record.turn, turnIndex)
+    const trace = historyRunTrace(record, turnIndex)
     items.push({
       kind: 'run',
       id: trace.id,
@@ -2331,24 +3042,41 @@ function turnRecordTimeline(
 }
 
 function historyRunTrace(
-  turn: Session['turns'][number]['turn'],
+  record: Session['turns'][number],
   turnIndex: number,
 ): RunTrace {
-  const steps: RunStep[] = turn.steps.map((step, stepIndex) => ({
-    id: `history-${turnIndex}-step-${stepIndex}`,
-    kind: step.kind === 'tool_call' ? 'tool' : 'model',
-    status:
-      step.status === 'completed'
-        ? 'ok'
-        : step.status === 'failed'
-          ? 'error'
-          : 'running',
-    title:
-      step.kind === 'tool_call'
-        ? step.tool_name || 'Tool call'
-        : 'Model call',
-    detail: step.error || step.tool_call_id || undefined,
-  }))
+  const turn = record.turn
+  const modelMessages = record.messages.filter(
+    (message) => message.role === 'assistant',
+  )
+  let modelMessageIndex = 0
+  const steps: RunStep[] = turn.steps.map((step, stepIndex) => {
+    const modelMessage =
+      step.kind === 'model_call'
+        ? modelMessages[modelMessageIndex++]
+        : undefined
+    return {
+      id: `history-${turnIndex}-step-${stepIndex}`,
+      kind: step.kind === 'tool_call' ? 'tool' : 'model',
+      status:
+        step.status === 'completed'
+          ? 'ok'
+          : step.status === 'failed'
+            ? 'error'
+            : 'running',
+      title:
+        step.kind === 'tool_call'
+          ? step.tool_name || 'Tool call'
+          : turn.model?.model_name || 'Model call',
+      detail:
+        step.error ||
+        step.tool_call_id ||
+        (turn.model
+          ? `${turn.model.provider_name} · ${reasoningLabel(turn.model.reasoning)}`
+          : undefined),
+      reasoning: modelMessage?.reasoning_content || undefined,
+    }
+  })
 
   if (turn.error && !steps.some((step) => step.status === 'error')) {
     steps.push({
@@ -2551,13 +3279,159 @@ function compactText(text: string, length: number): string {
   return `${text.slice(0, length - 1)}...`
 }
 
+function findSelectedModel(
+  settings: ModelSettingsResponse | null,
+  selection: ModelSelection | null,
+): { provider: ModelProviderResponse; model: ModelProviderResponse['models'][number] } | null {
+  if (!settings || !selection) return null
+  const provider = settings.providers.find(
+    (candidate) => candidate.id === selection.provider_id && candidate.enabled,
+  )
+  const model = provider?.models.find(
+    (candidate) => candidate.id === selection.model_id,
+  )
+  return provider && model ? { provider, model } : null
+}
+
+function modelSelectionLabel(
+  settings: ModelSettingsResponse | null,
+  selection: ModelSelection | null,
+): string {
+  const selected = findSelectedModel(settings, selection)
+  if (!selected || !selection) return '未配置模型'
+  return `${selected.provider.name} · ${selected.model.name} · ${reasoningLabel(selection.reasoning)}`
+}
+
+function slashCommandQuery(prompt: string): string | null {
+  if (!prompt.startsWith('/') || prompt.startsWith('//')) return null
+  const firstLine = prompt.split(/\r?\n/, 1)[0]
+  if (/\s/.test(firstLine)) return null
+  return firstLine.slice(1)
+}
+
+function reasoningLabel(reasoning: ReasoningLevel): string {
+  switch (reasoning) {
+    case 'off':
+      return '关闭思考'
+    case 'high':
+      return '高'
+    case 'max':
+      return '最高'
+  }
+}
+
+function compactTokenCount(tokens: number): string {
+  if (tokens >= 1_000_000) return `${tokens / 1_000_000}M`
+  if (tokens >= 1_000) return `${Math.round(tokens / 1_000)}K`
+  return String(tokens)
+}
+
 function workspaceName(path: string): string {
   const parts = path.split(/[\\/]/).filter(Boolean)
   return parts.at(-1) || path
 }
 
+type AppLocation = {
+  session: string
+  view: AppView
+  section: SettingsSection
+}
+
+type MorrowHistoryState = {
+  morrowView?: AppView
+  fromWorkspace: boolean
+}
+
+function readAppLocation(): AppLocation {
+  const params = new URLSearchParams(location.search)
+  const view: AppView =
+    params.get('view') === 'settings' ? 'settings' : 'workspace'
+  const requestedSection = params.get('section')
+  const section: SettingsSection =
+    view === 'settings' &&
+    (requestedSection === 'about' ||
+      requestedSection === 'models' ||
+      requestedSection === 'mcp' ||
+      requestedSection === 'commands')
+      ? requestedSection
+      : 'general'
+
+  return {
+    session: params.get('session') || 'default',
+    view,
+    section,
+  }
+}
+
+function readHistoryState(): MorrowHistoryState {
+  const state = history.state
+  if (!state || typeof state !== 'object') {
+    return { fromWorkspace: false }
+  }
+
+  return {
+    morrowView:
+      state.morrowView === 'workspace' || state.morrowView === 'settings'
+        ? state.morrowView
+        : undefined,
+    fromWorkspace: state.fromWorkspace === true,
+  }
+}
+
+function writeAppLocation(
+  session: string,
+  view: AppView,
+  section: SettingsSection,
+  method: 'push' | 'replace',
+  fromWorkspace: boolean,
+): void {
+  const params = new URLSearchParams()
+  params.set('session', session)
+  if (view === 'settings') {
+    params.set('view', 'settings')
+    params.set('section', section)
+  }
+
+  const url = `${location.pathname}?${params.toString()}`
+  const state: MorrowHistoryState = { morrowView: view, fromWorkspace }
+  if (method === 'push') {
+    history.pushState(state, '', url)
+  } else {
+    history.replaceState(state, '', url)
+  }
+}
+
+function readSavedThemePreference(): ThemePreference {
+  const saved = readLocalPreference('morrow-theme')
+  return saved === 'dark' || saved === 'light' || saved === 'system'
+    ? saved
+    : 'light'
+}
+
+function readSystemTheme(): ResolvedTheme {
+  return window.matchMedia('(prefers-color-scheme: dark)').matches
+    ? 'dark'
+    : 'light'
+}
+
+function readLocalPreference(key: string): string | null {
+  try {
+    return localStorage.getItem(key)
+  } catch {
+    return null
+  }
+}
+
+function writeLocalPreference(key: string, value: string): void {
+  try {
+    localStorage.setItem(key, value)
+  } catch {
+    // Keep the in-memory preference when browser storage is unavailable.
+  }
+}
+
 function readSavedPermissionMode(): PermissionMode | null {
-  const saved = localStorage.getItem('morrow-permission-mode')
+  const saved = readLocalPreference('morrow-permission-mode')
   return saved === 'read_only' ||
     saved === 'workspace_write' ||
     saved === 'danger_full_access'

@@ -14,9 +14,159 @@ export interface PermissionProfile {
 
 export interface StatusResponse {
   workspace_root: string
-  config_path: string
+  config_path: string | null
   permissions: PermissionProfile
   version: string
+  model_ready: boolean
+  model_store_path: string
+  mcp_store_path: string
+  command_store_path: string
+  config_diagnostics: string[]
+}
+
+export type ReasoningLevel = 'off' | 'high' | 'max'
+export type ReasoningProfile = 'none' | 'deepseek'
+
+export interface ModelSelection {
+  provider_id: string
+  model_id: string
+  reasoning: ReasoningLevel
+}
+
+export interface ModelInvocation {
+  provider_id: string
+  provider_name: string
+  model_id: string
+  model_name: string
+  reasoning: ReasoningLevel
+}
+
+export interface ManagedModel {
+  id: string
+  name: string
+  context_window_tokens: number
+  reserved_output_tokens: number
+  supports_tools: boolean
+  reasoning_profile: ReasoningProfile
+}
+
+export interface ModelProviderResponse {
+  id: string
+  name: string
+  base_url: string
+  api_format: 'openai_chat_completions'
+  enabled: boolean
+  read_only: boolean
+  api_key_configured: boolean
+  timeout_secs: number
+  models: ManagedModel[]
+}
+
+export interface ModelSettingsResponse {
+  providers: ModelProviderResponse[]
+  default_selection?: ModelSelection | null
+  model_ready: boolean
+  store_path: string
+}
+
+export interface SessionModelSelectionResponse {
+  selection?: ModelSelection | null
+  inherited: boolean
+}
+
+export interface ProviderWriteRequest {
+  name: string
+  base_url: string
+  api_key?: string
+  enabled: boolean
+  timeout_secs: number
+  models: ManagedModel[]
+  default_model?: {
+    model_id: string
+    reasoning: ReasoningLevel
+  }
+}
+
+export interface DiscoveredModel {
+  id: string
+  suggested?: ManagedModel
+}
+
+export interface DiscoverModelsResponse {
+  models: DiscoveredModel[]
+}
+
+export type McpTransport = 'stdio' | 'http'
+
+export interface McpServerResponse {
+  name: string
+  transport: McpTransport
+  enabled: boolean
+  read_only: boolean
+  source: 'runtime_config' | 'web'
+  command?: string
+  args: string[]
+  env_keys: string[]
+  cwd?: string
+  url?: string
+  http_header_keys: string[]
+  startup_timeout_sec: number
+  tool_timeout_sec: number
+}
+
+export interface McpSettingsResponse {
+  servers: McpServerResponse[]
+  store_path: string
+}
+
+export interface McpServerWriteRequest {
+  name: string
+  transport: McpTransport
+  command?: string
+  args: string[]
+  env: Record<string, string | null>
+  cwd?: string
+  url?: string
+  http_headers: Record<string, string | null>
+  enabled: boolean
+  startup_timeout_sec: number
+  tool_timeout_sec: number
+}
+
+export interface McpInspectionTool {
+  name: string
+  description: string
+}
+
+export interface McpInspection {
+  tools: McpInspectionTool[]
+  diagnostics: string[]
+}
+
+export interface CommandDefinition {
+  name: string
+  description: string
+  argument_hint: string
+  prompt: string
+}
+
+export interface CommandSettingsResponse {
+  commands: CommandDefinition[]
+  store_path: string
+  diagnostics: string[]
+}
+
+export interface CommandWriteRequest {
+  name: string
+  description: string
+  argument_hint: string
+  prompt: string
+}
+
+export interface ResolveCommandResponse {
+  matched: boolean
+  command_name?: string
+  prompt: string
 }
 
 export interface SessionEntryResponse {
@@ -48,6 +198,7 @@ export interface ToolCall {
 export interface Message {
   role: Role
   content?: string | null
+  reasoning_content?: string | null
   tool_calls?: ToolCall[]
   tool_call_id?: string
 }
@@ -75,6 +226,7 @@ export interface Turn {
   status: TurnStatus
   user_message: Message
   assistant_message?: Message | null
+  model?: ModelInvocation | null
   steps: TurnStep[]
   error?: string | null
 }
@@ -148,6 +300,7 @@ export interface ApprovalDecision {
 export type AgentEvent =
   | { type: 'turn_started' }
   | { type: 'warning'; data: string }
+  | { type: 'reasoning_delta'; data: string }
   | { type: 'text_delta'; data: string }
   | { type: 'agent_message'; data: string }
   | { type: 'tool_call_started'; data: { id: string; name: string } }
@@ -200,7 +353,9 @@ export type ClientMessage =
       data: {
         request_id: string
         prompt: string
+        prompt_resolved?: boolean
         permission_mode: PermissionMode
+        model_selection?: ModelSelection | null
       }
     }
   | {
@@ -251,6 +406,7 @@ export interface RunStep {
   status: RunStepStatus
   title: string
   detail?: string
+  reasoning?: string
   summary?: ToolExecutionSummary
 }
 
