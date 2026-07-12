@@ -123,6 +123,24 @@ tool_timeout_sec = 60
 
 For a Streamable HTTP example with environment-backed headers, see [`morrow.example.toml`](morrow.example.toml). OAuth, deferred search, and per-tool approval policies are not implemented yet. MCP tools are treated as explicitly configured trusted tools, so review server commands and remote endpoints before enabling them.
 
+The dashboard's **Settings → MCP Servers** page adds Web-only stdio and HTTP servers without changing the CLI configuration. Web entries are stored in `~/.morrow/web-mcp.json` and merged with read-only servers loaded from `morrow.toml`; duplicate names are rejected. Changes apply from the next Web turn, while a turn that is already running keeps its original server snapshot. The page can import direct JSON server maps or an `mcpServers` wrapper and can test a draft configuration without saving it.
+
+Web MCP environment variables and HTTP header values are stored as local plaintext with mode `0600` on Unix. Their values are never returned by the settings API: leaving an existing value blank preserves it, while removing its row deletes it. Testing or using a configured MCP server may execute local programs or contact remote services.
+
+### Web custom commands
+
+The dashboard's **Settings → Commands** page manages user commands in `~/.morrow/commands/*.md`. These commands are available only in Web chat; CLI and JSONL inputs keep their existing behavior. A command filename is its slash name and may contain lowercase ASCII letters, digits, `-`, and `_`.
+
+```md
+---
+description: "Review a target file"
+argument-hint: "<file-path>"
+---
+Review $ARGUMENTS carefully.
+```
+
+Type `/` in the Web composer to search commands. When `/review src/lib.rs` is sent, every `$ARGUMENTS` placeholder is replaced with `src/lib.rs`; if the template has no placeholder, the arguments are appended to the prompt. Unknown slash names are sent unchanged, and `//review` sends the literal text `/review`. The expanded prompt is what the model receives and what the session history stores.
+
 ## Run
 
 Run one prompt in the current project:

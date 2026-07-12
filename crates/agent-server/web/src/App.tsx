@@ -43,12 +43,14 @@ import type {
   AgentEvent,
   ApprovalRequest,
   ClientMessage,
+  CommandSettingsResponse,
   Message,
   ModelSelection,
   ModelSettingsResponse,
   ModelProviderResponse,
   PermissionMode,
   ReasoningLevel,
+  ResolveCommandResponse,
   RunningTurnSnapshot,
   ServerMessage,
   Session,
@@ -154,6 +156,9 @@ export default function App() {
   const [prompt, setPrompt] = useState('')
   const [modelSettings, setModelSettings] =
     useState<ModelSettingsResponse | null>(null)
+  const [commandSettings, setCommandSettings] =
+    useState<CommandSettingsResponse | null>(null)
+  const [isResolvingCommand, setIsResolvingCommand] = useState(false)
   const [modelSelection, setModelSelection] = useState<ModelSelection | null>(
     null,
   )
@@ -566,6 +571,12 @@ export default function App() {
     return settings
   }, [])
 
+  const loadCommandSettings = useCallback(async () => {
+    const settings = await fetchJson<CommandSettingsResponse>('/api/commands')
+    setCommandSettings(settings)
+    return settings
+  }, [])
+
   const loadSessionModelSelection = useCallback(async (name: string) => {
     const response = await fetchJson<SessionModelSelectionResponse>(
       `/api/sessions/${encodeURIComponent(name)}/model-selection`,
@@ -918,7 +929,7 @@ export default function App() {
         setStatus(loadedStatus)
         const savedMode = savedPermissionModeRef.current
         setPermissionMode(savedMode ?? loadedStatus.permissions.mode)
-        await loadModelSettings()
+        await Promise.all([loadModelSettings(), loadCommandSettings()])
         const requestedName = initialLocationRef.current.session
         const entries = await loadSessions()
         const requestedEntry = entries.find(
@@ -940,7 +951,14 @@ export default function App() {
       mounted = false
       closeSocket()
     }
-  }, [closeSocket, loadModelSettings, loadSessions, selectSession, showError])
+  }, [
+    closeSocket,
+    loadCommandSettings,
+    loadModelSettings,
+    loadSessions,
+    selectSession,
+    showError,
+  ])
 
   const selectedEntry = useMemo(
     () => sessions.find((session) => session.name === selected),
@@ -970,6 +988,7 @@ export default function App() {
   const canSend =
     connection === 'connected' &&
     !isRunning &&
+    !isResolvingCommand &&
     prompt.trim().length > 0 &&
     Boolean(selectedModel)
   const canCancel = Boolean(runningTurn?.turn_id && runningTurn.turn_id !== 'pending')
@@ -1040,32 +1059,56 @@ export default function App() {
     setIsSearchOpen((open) => !open)
   }
 
-  const handleSubmit = (event: FormEvent) => {
+  const handleSubmit = async (event: FormEvent) => {
     event.preventDefault()
     const trimmed = prompt.trim()
     if (!trimmed || !canSend) return
+    setIsResolvingCommand(trimmed.startsWith('/'))
     try {
-      addTimelineMessage('user', trimmed)
+      const resolved = trimmed.startsWith('/')
+        ? await fetchJson<ResolveCommandResponse>('/api/commands/resolve', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ input: trimmed }),
+          })
+        : { matched: false, prompt: trimmed }
+      const resolvedPrompt = resolved.prompt.trim()
+      if (!resolvedPrompt) throw new Error('resolved prompt must not be empty')
+      addTimelineMessage('user', resolvedPrompt)
       createRunTrace(
         'Request queued',
         selectedModel
           ? `${selectedModel.provider.name} · ${selectedModel.model.name} · ${reasoningLabel(modelSelection?.reasoning ?? 'off')}`
-          : compactText(trimmed, 90),
+          : compactText(resolvedPrompt, 90),
       )
       sendSocketMessage({
         type: 'start_turn',
         data: {
           request_id: `request-${Date.now()}`,
-          prompt: trimmed,
+          prompt: resolvedPrompt,
+          prompt_resolved: true,
           permission_mode: permissionMode,
           model_selection: modelSelection,
         },
       })
       setPrompt('')
       setRunningTurn({ turn_id: 'pending' })
-      recordActivity('Turn requested', compactText(trimmed, 90), 'running')
+      if (resolved.matched && resolved.command_name) {
+        recordActivity(
+          'Command expanded',
+          `/${resolved.command_name}`,
+          'neutral',
+        )
+      }
+      recordActivity(
+        'Turn requested',
+        compactText(resolvedPrompt, 90),
+        'running',
+      )
     } catch (error) {
       showError(error)
+    } finally {
+      setIsResolvingCommand(false)
     }
   }
 
@@ -1239,6 +1282,7 @@ export default function App() {
           theme={themePreference}
           permissionMode={permissionMode}
           modelSettings={modelSettings}
+          commandSettings={commandSettings}
           isSidebarOpen={isSidebarOpen}
           isSidebarHidden={isNarrowViewport && !isSidebarOpen}
           onSectionChange={changeSettingsSection}
@@ -1253,6 +1297,9 @@ export default function App() {
             const selection = await loadSessionModelSelection(selectedRef.current)
             modelSelectionRef.current = selection
             setModelSelection(selection)
+          }}
+          onCommandSettingsChange={async () => {
+            await loadCommandSettings()
           }}
         />
       ) : (
@@ -1310,7 +1357,9 @@ export default function App() {
               isRunning={isRunning}
               permissionMode={permissionMode}
               modelSettings={modelSettings}
+              commandSettings={commandSettings}
               modelSelection={modelSelection}
+              isResolvingCommand={isResolvingCommand}
               isSidebarOpen={isSidebarOpen}
               onPromptChange={setPrompt}
               onPromptKeyDown={handlePromptKeyDown}
@@ -1665,7 +1714,9 @@ function ChatView({
   isRunning,
   permissionMode,
   modelSettings,
+  commandSettings,
   modelSelection,
+  isResolvingCommand,
   isSidebarOpen,
   onPromptChange,
   onPromptKeyDown,
@@ -1691,7 +1742,9 @@ function ChatView({
   isRunning: boolean
   permissionMode: PermissionMode
   modelSettings: ModelSettingsResponse | null
+  commandSettings: CommandSettingsResponse | null
   modelSelection: ModelSelection | null
+  isResolvingCommand: boolean
   isSidebarOpen: boolean
   onPromptChange: (value: string) => void
   onPromptKeyDown: (event: KeyboardEvent<HTMLTextAreaElement>) => void
@@ -1715,7 +1768,9 @@ function ChatView({
       status={status}
       permissionMode={permissionMode}
       modelSettings={modelSettings}
+      commandSettings={commandSettings}
       modelSelection={modelSelection}
+      isResolvingCommand={isResolvingCommand}
       variant={isEmpty ? 'home' : 'dock'}
       onPromptChange={onPromptChange}
       onPromptKeyDown={onPromptKeyDown}
@@ -2047,7 +2102,9 @@ function Composer({
   status,
   permissionMode,
   modelSettings,
+  commandSettings,
   modelSelection,
+  isResolvingCommand,
   variant = 'dock',
   onPromptChange,
   onPromptKeyDown,
@@ -2064,7 +2121,9 @@ function Composer({
   status: StatusResponse | null
   permissionMode: PermissionMode
   modelSettings: ModelSettingsResponse | null
+  commandSettings: CommandSettingsResponse | null
   modelSelection: ModelSelection | null
+  isResolvingCommand: boolean
   variant?: 'home' | 'dock'
   onPromptChange: (value: string) => void
   onPromptKeyDown: (event: KeyboardEvent<HTMLTextAreaElement>) => void
@@ -2074,7 +2133,81 @@ function Composer({
   onModelSelectionChange: (selection: ModelSelection) => void
   onManageModels: () => void
 }) {
-  const primaryLabel = isRunning ? 'Stop turn' : 'Send'
+  const [commandIndex, setCommandIndex] = useState(0)
+  const [dismissedCommandPrompt, setDismissedCommandPrompt] = useState('')
+  const commandQuery = slashCommandQuery(prompt)
+  const commandSuggestions = useMemo(() => {
+    if (commandQuery == null) return []
+    const normalized = commandQuery.toLowerCase()
+    return (commandSettings?.commands ?? [])
+      .filter((command) =>
+        `${command.name} ${command.description}`
+          .toLowerCase()
+          .includes(normalized),
+      )
+      .slice(0, 8)
+  }, [commandQuery, commandSettings])
+  const commandMenuOpen =
+    commandQuery != null &&
+    commandSuggestions.length > 0 &&
+    dismissedCommandPrompt !== prompt &&
+    !isRunning &&
+    !isResolvingCommand
+
+  useEffect(() => {
+    setCommandIndex((current) =>
+      Math.min(current, Math.max(commandSuggestions.length - 1, 0)),
+    )
+  }, [commandSuggestions.length])
+
+  const selectCommand = (index: number) => {
+    const command = commandSuggestions[index]
+    if (!command) return
+    onPromptChange(`/${command.name} `)
+    setDismissedCommandPrompt('')
+    setCommandIndex(0)
+  }
+
+  const handleComposerKeyDown = (
+    event: KeyboardEvent<HTMLTextAreaElement>,
+  ) => {
+    if (commandMenuOpen) {
+      if (event.key === 'ArrowDown') {
+        event.preventDefault()
+        setCommandIndex((current) =>
+          (current + 1) % commandSuggestions.length,
+        )
+        return
+      }
+      if (event.key === 'ArrowUp') {
+        event.preventDefault()
+        setCommandIndex((current) =>
+          (current - 1 + commandSuggestions.length) % commandSuggestions.length,
+        )
+        return
+      }
+      if (
+        (event.key === 'Enter' && !event.metaKey && !event.ctrlKey) ||
+        event.key === 'Tab'
+      ) {
+        event.preventDefault()
+        selectCommand(commandIndex)
+        return
+      }
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        setDismissedCommandPrompt(prompt)
+        return
+      }
+    }
+    onPromptKeyDown(event)
+  }
+
+  const primaryLabel = isRunning
+    ? 'Stop turn'
+    : isResolvingCommand
+      ? 'Resolving command'
+      : 'Send'
   const primaryDisabled = isRunning ? !canCancel : !canSend
   const workspace = status ? workspaceName(status.workspace_root) : 'loading'
 
@@ -2096,13 +2229,43 @@ function Composer({
           </span>
         </div>
         <div className="composer-card">
+          {commandMenuOpen ? (
+            <div className="command-suggestion-menu" role="listbox" aria-label="命令建议">
+              <div className="command-suggestion-heading">
+                <span>命令</span>
+                <small>Enter 选择 · Esc 关闭</small>
+              </div>
+              {commandSuggestions.map((command, index) => (
+                <button
+                  className={index === commandIndex ? 'active' : undefined}
+                  type="button"
+                  role="option"
+                  aria-selected={index === commandIndex}
+                  key={command.name}
+                  onMouseEnter={() => setCommandIndex(index)}
+                  onClick={() => selectCommand(index)}
+                >
+                  <span className="command-suggestion-icon"><Terminal size={16} /></span>
+                  <span>
+                    <strong>/{command.name}</strong>
+                    <small>{command.description || '自定义 Markdown 命令'}</small>
+                  </span>
+                  {command.argument_hint ? <em>{command.argument_hint}</em> : null}
+                </button>
+              ))}
+            </div>
+          ) : null}
           <textarea
             value={prompt}
             rows={variant === 'home' ? 3 : 2}
-            disabled={isRunning}
+            disabled={isRunning || isResolvingCommand}
             placeholder="Ask Morrow to edit, inspect, or explain this workspace"
-            onChange={(event) => onPromptChange(event.target.value)}
-            onKeyDown={onPromptKeyDown}
+            onChange={(event) => {
+              setDismissedCommandPrompt('')
+              setCommandIndex(0)
+              onPromptChange(event.target.value)
+            }}
+            onKeyDown={handleComposerKeyDown}
           />
           <div className="composer-bar">
             <div className="composer-left">
@@ -2116,7 +2279,7 @@ function Composer({
               </button>
               <PermissionPicker
                 mode={permissionMode}
-                disabled={isRunning}
+                disabled={isRunning || isResolvingCommand}
                 onChange={onPermissionModeChange}
               />
             </div>
@@ -2124,7 +2287,7 @@ function Composer({
               <ModelPicker
                 settings={modelSettings}
                 selection={modelSelection}
-                disabled={isRunning}
+                disabled={isRunning || isResolvingCommand}
                 onChange={onModelSelectionChange}
                 onManage={onManageModels}
               />
@@ -2135,7 +2298,13 @@ function Composer({
                 disabled={primaryDisabled}
                 onClick={isRunning ? onCancel : undefined}
               >
-                {isRunning ? <Square size={17} /> : <Send size={17} />}
+                {isRunning ? (
+                  <Square size={17} />
+                ) : isResolvingCommand ? (
+                  <RefreshCw size={17} className="spinning" />
+                ) : (
+                  <Send size={17} />
+                )}
               </button>
             </div>
           </div>
@@ -3133,6 +3302,13 @@ function modelSelectionLabel(
   return `${selected.provider.name} · ${selected.model.name} · ${reasoningLabel(selection.reasoning)}`
 }
 
+function slashCommandQuery(prompt: string): string | null {
+  if (!prompt.startsWith('/') || prompt.startsWith('//')) return null
+  const firstLine = prompt.split(/\r?\n/, 1)[0]
+  if (/\s/.test(firstLine)) return null
+  return firstLine.slice(1)
+}
+
 function reasoningLabel(reasoning: ReasoningLevel): string {
   switch (reasoning) {
     case 'off':
@@ -3173,7 +3349,10 @@ function readAppLocation(): AppLocation {
   const requestedSection = params.get('section')
   const section: SettingsSection =
     view === 'settings' &&
-    (requestedSection === 'about' || requestedSection === 'models')
+    (requestedSection === 'about' ||
+      requestedSection === 'models' ||
+      requestedSection === 'mcp' ||
+      requestedSection === 'commands')
       ? requestedSection
       : 'general'
 

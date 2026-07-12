@@ -216,6 +216,8 @@ async fn run() -> Result<(), CliError> {
             port: *port,
             fallback_model,
             model_store_path: home.join(".morrow").join("web-models.json"),
+            mcp_store_path: home.join(".morrow").join("web-mcp.json"),
+            command_store_path: home.join(".morrow").join("commands"),
             system_prompt: loaded.config.agent.system_prompt,
             context_config: loaded.config.context,
             workspace_root,

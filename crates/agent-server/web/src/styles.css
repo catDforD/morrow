@@ -783,7 +783,7 @@ a:focus-visible {
 
 .settings-page-header h1 {
   margin: 0;
-  font-size: clamp(32px, 4vw, 42px);
+  font-size: clamp(28px, 3.2vw, 36px);
   font-weight: 850;
   line-height: 1;
   letter-spacing: -0.035em;
@@ -1743,6 +1743,7 @@ a:focus-visible {
 }
 
 .composer-card {
+  position: relative;
   min-width: 0;
   display: grid;
   gap: 9px;
@@ -1751,6 +1752,97 @@ a:focus-visible {
   box-shadow: 5px 5px 0 0 var(--border);
   background: var(--surface-panel);
   padding: 11px 12px 10px;
+}
+
+.command-suggestion-menu {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 10px);
+  left: 0;
+  z-index: 90;
+  display: grid;
+  gap: 4px;
+  overflow: hidden;
+  border: 2px solid var(--border);
+  border-radius: calc(var(--radius) + 2px);
+  box-shadow: 5px 5px 0 0 var(--border);
+  background: var(--surface-panel);
+  padding: 7px;
+}
+
+.command-suggestion-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 4px 6px 7px;
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 850;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.command-suggestion-menu > button {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  border: 1.5px solid transparent;
+  border-radius: var(--radius);
+  background: transparent;
+  padding: 7px;
+  color: var(--foreground);
+  cursor: pointer;
+  text-align: left;
+}
+
+.command-suggestion-menu > button:hover,
+.command-suggestion-menu > button.active {
+  border-color: var(--border);
+  background: var(--surface-panel-muted);
+}
+
+.command-suggestion-icon {
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  border: 1.5px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-panel);
+}
+
+.command-suggestion-menu > button > span:nth-child(2) {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.command-suggestion-menu strong,
+.command-suggestion-menu small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.command-suggestion-menu strong {
+  font-size: 11px;
+}
+
+.command-suggestion-menu small,
+.command-suggestion-menu em {
+  color: var(--muted);
+  font-size: 9px;
+  font-style: normal;
+}
+
+.command-suggestion-menu em {
+  border: 1px solid color-mix(in srgb, var(--border), transparent 52%);
+  border-radius: 999px;
+  padding: 3px 6px;
+  white-space: nowrap;
 }
 
 .composer textarea {
@@ -3033,6 +3125,516 @@ a:focus-visible {
   margin-top: -8px;
 }
 
+.resource-settings-page {
+  width: min(1040px, 100%);
+}
+
+.resource-settings-header {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+}
+
+.resource-settings-header > div:first-child {
+  display: grid;
+  gap: 8px;
+}
+
+.resource-settings-header > div:first-child > p:last-child {
+  margin: 0;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.resource-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.resource-settings-page .resource-header-actions > button,
+.resource-settings-page .resource-settings-header > button,
+.resource-settings-page .resource-form-actions > button {
+  min-height: 36px;
+  padding: 0 11px;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.resource-list-view,
+.resource-editor-view {
+  display: grid;
+  gap: 16px;
+}
+
+.resource-search {
+  min-width: 0;
+  height: 42px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  border: 1.5px solid color-mix(in srgb, var(--border), transparent 54%);
+  border-radius: var(--radius);
+  background: var(--surface-panel);
+  padding: 0 12px;
+}
+
+.resource-search input {
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--foreground);
+  font-size: 12px;
+}
+
+.resource-search > button {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: var(--radius);
+  background: transparent;
+  cursor: pointer;
+}
+
+.resource-search > button:hover {
+  background: var(--surface-panel-muted);
+}
+
+.resource-list-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: -7px;
+  padding: 0 3px;
+  font-size: 11px;
+}
+
+.resource-list-heading span {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.resource-list-card {
+  overflow: hidden;
+  border: 1.5px solid color-mix(in srgb, var(--border), transparent 42%);
+  border-radius: calc(var(--radius) + 2px);
+  background: var(--surface-panel);
+}
+
+.resource-list-row {
+  width: 100%;
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  border: 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--border), transparent 78%);
+  background: transparent;
+  padding: 12px 14px;
+  color: var(--foreground);
+  cursor: pointer;
+  text-align: left;
+}
+
+.resource-list-row:last-child {
+  border-bottom: 0;
+}
+
+.resource-list-row:hover {
+  background: var(--surface-panel-muted);
+}
+
+.resource-list-icon {
+  width: 36px;
+  height: 36px;
+  display: grid;
+  place-items: center;
+  border: 1.5px solid color-mix(in srgb, var(--border), transparent 40%);
+  border-radius: 50%;
+  background: var(--surface-panel);
+}
+
+.resource-list-copy {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.resource-list-copy > span {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.resource-list-copy strong,
+.resource-list-copy small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.resource-list-copy strong {
+  font-size: 12px;
+}
+
+.resource-list-copy small {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.resource-list-copy > span small {
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: var(--surface-panel-muted);
+  padding: 3px 6px;
+  font-size: 8px;
+  font-weight: 850;
+}
+
+.resource-status,
+.scope-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1.5px solid color-mix(in srgb, var(--border), transparent 30%);
+  border-radius: 999px;
+  background: var(--surface-panel-muted);
+  padding: 5px 8px;
+  font-size: 9px;
+  font-weight: 850;
+  white-space: nowrap;
+}
+
+.resource-status.ready {
+  background: var(--surface-ok);
+  color: #000;
+}
+
+.resource-empty {
+  min-height: 230px;
+  display: grid;
+  place-items: center;
+  align-content: center;
+  gap: 8px;
+  padding: 28px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.resource-empty strong {
+  color: var(--foreground);
+  font-size: 14px;
+}
+
+.resource-empty span {
+  max-width: 420px;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.resource-back-link {
+  width: max-content;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 0;
+  background: transparent;
+  padding: 2px;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.resource-back-link:hover {
+  color: var(--foreground);
+}
+
+.resource-form-card {
+  display: grid;
+  gap: 20px;
+  border: 1.5px solid color-mix(in srgb, var(--border), transparent 45%);
+  border-radius: calc(var(--radius) + 2px);
+  background: var(--surface-panel);
+  padding: 22px;
+}
+
+.resource-form-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.resource-form-heading h2,
+.resource-form-heading p {
+  margin: 0;
+}
+
+.resource-form-heading h2 {
+  margin-top: 3px;
+  font-size: 23px;
+}
+
+.resource-form-heading > div > p:last-child {
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.resource-field-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 13px;
+}
+
+.resource-field,
+.resource-secret-section {
+  min-width: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.resource-field.full,
+.resource-secret-section {
+  grid-column: 1 / -1;
+}
+
+.resource-field > span,
+.resource-secret-heading > span {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 850;
+}
+
+.resource-field input,
+.resource-field select,
+.resource-field textarea,
+.resource-secret-row input,
+.command-name-input {
+  min-width: 0;
+  width: 100%;
+  border: 1.5px solid color-mix(in srgb, var(--border), transparent 32%);
+  border-radius: var(--radius);
+  background: var(--surface-panel);
+  color: var(--foreground);
+  font-size: 11px;
+}
+
+.resource-field input,
+.resource-field select {
+  height: 39px;
+  padding: 0 10px;
+}
+
+.resource-field textarea {
+  min-height: 90px;
+  padding: 10px;
+  line-height: 1.5;
+  resize: vertical;
+}
+
+.resource-field textarea.resource-code-editor {
+  min-height: 330px;
+  background: var(--surface-code);
+  color: #f5f5f7;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.resource-secret-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.resource-secret-heading button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 800;
+}
+
+.resource-secret-heading button:hover {
+  color: var(--foreground);
+}
+
+.resource-secret-row {
+  display: grid;
+  grid-template-columns: minmax(130px, 0.55fr) minmax(180px, 1fr) 34px;
+  gap: 8px;
+}
+
+.resource-secret-row input {
+  height: 37px;
+  padding: 0 9px;
+}
+
+.resource-secret-row > button {
+  width: 34px;
+  height: 37px;
+  display: grid;
+  place-items: center;
+  border: 1.5px solid transparent;
+  border-radius: var(--radius);
+  background: transparent;
+  cursor: pointer;
+}
+
+.resource-secret-row > button:hover {
+  border-color: var(--border);
+  background: var(--surface-danger);
+}
+
+.resource-secret-empty,
+.resource-form-note,
+.resource-test-block > p {
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.resource-toggle-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  border: 1.5px solid color-mix(in srgb, var(--border), transparent 58%);
+  border-radius: var(--radius);
+  background: var(--surface-panel-muted);
+  padding: 11px 12px;
+}
+
+.resource-toggle-row > span {
+  display: grid;
+  gap: 3px;
+}
+
+.resource-toggle-row strong {
+  font-size: 11px;
+}
+
+.resource-toggle-row small {
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.resource-test-block {
+  display: grid;
+  justify-items: start;
+  gap: 7px;
+  border-top: 1px solid color-mix(in srgb, var(--border), transparent 74%);
+  padding-top: 16px;
+}
+
+.resource-test-block > p,
+.resource-form-note {
+  margin: 0;
+}
+
+.resource-test-result {
+  width: 100%;
+  display: grid;
+  gap: 4px;
+  border: 1.5px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-ok);
+  padding: 10px;
+  color: #000;
+  font-size: 10px;
+  overflow-wrap: anywhere;
+}
+
+.resource-test-result.warning {
+  background: var(--surface-warn);
+}
+
+.resource-form-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 9px;
+}
+
+.resource-form-actions.split {
+  justify-content: space-between;
+}
+
+.resource-error {
+  position: static;
+  margin-top: 0;
+  white-space: pre-wrap;
+}
+
+.resource-diagnostics {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  border: 1.5px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-warn);
+  padding: 10px 12px;
+  color: #000;
+  font-size: 10px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+.readonly-resource .settings-card {
+  box-shadow: none;
+}
+
+.command-name-input {
+  height: 39px;
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr);
+  align-items: center;
+  gap: 5px;
+  padding: 0 9px;
+}
+
+.command-name-input input {
+  height: auto;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  padding: 0;
+}
+
+.resource-field textarea.command-prompt-editor {
+  min-height: 250px;
+}
+
+.command-template-help {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  border: 1.5px dashed color-mix(in srgb, var(--border), transparent 44%);
+  border-radius: var(--radius);
+  background: var(--surface-panel-muted);
+  padding: 10px 12px;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.command-template-help code {
+  color: var(--foreground);
+}
+
 .main-scroll,
 .drawer-run,
 .drawer-panel > .tool-list,
@@ -3210,6 +3812,10 @@ a:focus-visible {
     padding: 18px;
   }
 
+  .resource-settings-page {
+    width: 100%;
+  }
+
   .model-row-primary {
     grid-template-columns: 20px minmax(100px, 1fr) minmax(130px, 1fr) 32px;
   }
@@ -3234,6 +3840,19 @@ a:focus-visible {
     padding: 20px 12px;
   }
 
+  .command-suggestion-menu {
+    max-height: min(360px, 55vh);
+    overflow-y: auto;
+  }
+
+  .command-suggestion-menu > button {
+    grid-template-columns: 32px minmax(0, 1fr);
+  }
+
+  .command-suggestion-menu em {
+    display: none;
+  }
+
   .settings-scroll {
     padding: 22px 12px 38px;
   }
@@ -3243,7 +3862,7 @@ a:focus-visible {
   }
 
   .settings-page-header h1 {
-    font-size: 30px;
+    font-size: 27px;
   }
 
   .settings-row {
@@ -3294,6 +3913,69 @@ a:focus-visible {
   .model-settings-header {
     grid-template-columns: minmax(0, 1fr);
     align-items: start;
+  }
+
+  .resource-settings-header {
+    grid-template-columns: minmax(0, 1fr);
+    align-items: start;
+  }
+
+  .resource-header-actions {
+    flex-wrap: wrap;
+  }
+
+  .resource-form-card {
+    padding: 16px 13px;
+  }
+
+  .resource-field-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .resource-field.full,
+  .resource-secret-section {
+    grid-column: auto;
+  }
+
+  .resource-form-heading {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .scope-badge {
+    width: max-content;
+  }
+
+  .resource-list-row {
+    grid-template-columns: 36px minmax(0, 1fr);
+  }
+
+  .resource-list-row > .resource-status {
+    grid-column: 2;
+    width: max-content;
+  }
+
+  .resource-secret-row {
+    grid-template-columns: minmax(0, 1fr) 34px;
+  }
+
+  .resource-secret-row input:nth-child(2) {
+    grid-column: 1;
+  }
+
+  .resource-secret-row > button {
+    grid-column: 2;
+    grid-row: 1 / span 2;
+    height: 100%;
+  }
+
+  .resource-form-actions.split {
+    align-items: stretch;
+    flex-direction: column-reverse;
+  }
+
+  .resource-form-actions.split > button {
+    justify-content: center;
   }
 
   .model-settings-header .secondary-button {

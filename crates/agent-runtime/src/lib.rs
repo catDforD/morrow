@@ -99,6 +99,42 @@ pub struct RunAgentTurnOutcome {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct McpInspectionTool {
+    pub name: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct McpInspection {
+    pub tools: Vec<McpInspectionTool>,
+    pub diagnostics: Vec<String>,
+}
+
+pub async fn inspect_mcp_servers(
+    workspace_root: &Path,
+    servers: &[McpServerConfig],
+) -> McpInspection {
+    let cache = McpToolCache::new();
+    let discovery = agent_tools::mcp::discover_tools(workspace_root, servers, &cache).await;
+    let mut tools = discovery
+        .tools
+        .into_iter()
+        .flat_map(|provider| provider.definitions())
+        .map(|definition| McpInspectionTool {
+            name: definition.function.name,
+            description: definition.function.description,
+        })
+        .collect::<Vec<_>>();
+    tools.sort_by(|left, right| left.name.cmp(&right.name));
+    cache.clear().await;
+
+    McpInspection {
+        tools,
+        diagnostics: discovery.diagnostics,
+    }
+}
+
 pub trait TurnEventHandler {
     fn on_event(&mut self, _event: &AgentEventEnvelope) -> Result<(), RuntimeError> {
         Ok(())
@@ -1552,6 +1588,48 @@ compact test
                 .iter()
                 .any(|event| event.event == AgentEvent::Error("turn cancelled".to_string()))
         );
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn inspect_mcp_servers_returns_discovered_tools() {
+        let root = unique_dir("inspect-mcp-tools");
+        let server_script = root.join("fake-inspection-mcp.sh");
+        fs::write(
+            &server_script,
+            r#"#!/bin/sh
+count=0
+while IFS= read -r line; do
+  count=$((count + 1))
+  if [ "$count" -eq 1 ]; then
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"fake","version":"1"}}}'
+  elif [ "$count" -eq 3 ]; then
+    printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"Search Docs","description":"Search docs","inputSchema":{"type":"object"}}]}}'
+  fi
+done
+"#,
+        )
+        .expect("write fake MCP server");
+        let server = McpServerConfig {
+            name: "Docs".to_string(),
+            transport: agent_config::McpTransport::Stdio,
+            command: "sh".to_string(),
+            args: vec![server_script.display().to_string()],
+            env: Default::default(),
+            cwd: None,
+            url: None,
+            http_headers: Default::default(),
+            enabled: true,
+            startup_timeout_sec: 5,
+            tool_timeout_sec: 5,
+        };
+
+        let inspection = inspect_mcp_servers(&root, &[server]).await;
+
+        assert!(inspection.diagnostics.is_empty());
+        assert_eq!(inspection.tools.len(), 1);
+        assert_eq!(inspection.tools[0].name, "mcp__docs__search_docs");
+        assert!(inspection.tools[0].description.contains("Search docs"));
     }
 
     #[cfg(not(windows))]

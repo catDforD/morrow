@@ -19,6 +19,8 @@ export interface StatusResponse {
   version: string
   model_ready: boolean
   model_store_path: string
+  mcp_store_path: string
+  command_store_path: string
   config_diagnostics: string[]
 }
 
@@ -92,6 +94,79 @@ export interface DiscoveredModel {
 
 export interface DiscoverModelsResponse {
   models: DiscoveredModel[]
+}
+
+export type McpTransport = 'stdio' | 'http'
+
+export interface McpServerResponse {
+  name: string
+  transport: McpTransport
+  enabled: boolean
+  read_only: boolean
+  source: 'runtime_config' | 'web'
+  command?: string
+  args: string[]
+  env_keys: string[]
+  cwd?: string
+  url?: string
+  http_header_keys: string[]
+  startup_timeout_sec: number
+  tool_timeout_sec: number
+}
+
+export interface McpSettingsResponse {
+  servers: McpServerResponse[]
+  store_path: string
+}
+
+export interface McpServerWriteRequest {
+  name: string
+  transport: McpTransport
+  command?: string
+  args: string[]
+  env: Record<string, string | null>
+  cwd?: string
+  url?: string
+  http_headers: Record<string, string | null>
+  enabled: boolean
+  startup_timeout_sec: number
+  tool_timeout_sec: number
+}
+
+export interface McpInspectionTool {
+  name: string
+  description: string
+}
+
+export interface McpInspection {
+  tools: McpInspectionTool[]
+  diagnostics: string[]
+}
+
+export interface CommandDefinition {
+  name: string
+  description: string
+  argument_hint: string
+  prompt: string
+}
+
+export interface CommandSettingsResponse {
+  commands: CommandDefinition[]
+  store_path: string
+  diagnostics: string[]
+}
+
+export interface CommandWriteRequest {
+  name: string
+  description: string
+  argument_hint: string
+  prompt: string
+}
+
+export interface ResolveCommandResponse {
+  matched: boolean
+  command_name?: string
+  prompt: string
 }
 
 export interface SessionEntryResponse {
@@ -278,6 +353,7 @@ export type ClientMessage =
       data: {
         request_id: string
         prompt: string
+        prompt_resolved?: boolean
         permission_mode: PermissionMode
         model_selection?: ModelSelection | null
       }

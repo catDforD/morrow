@@ -25,10 +25,12 @@ import {
   X,
 } from 'lucide-react'
 import type { PermissionMode, StatusResponse } from './types'
-import type { ModelSettingsResponse } from './types'
+import type { CommandSettingsResponse, ModelSettingsResponse } from './types'
+import CommandSettingsPanel from './CommandSettingsPanel'
+import McpSettingsPanel from './McpSettingsPanel'
 import ModelSettingsPanel from './ModelSettingsPanel'
 
-export type SettingsSection = 'general' | 'models' | 'about'
+export type SettingsSection = 'general' | 'models' | 'mcp' | 'commands' | 'about'
 export type ThemePreference = 'system' | 'light' | 'dark'
 
 type SettingsSelectOption<T extends string> = {
@@ -74,9 +76,9 @@ const navigationItems: SettingsNavigationItem[] = [
   { label: '模型设置', icon: <Bot size={18} />, section: 'models' },
   { label: '技能', icon: <Sparkles size={18} />, section: null },
   { label: '子智能体', icon: <Network size={18} />, section: null },
-  { label: 'MCP 服务器', icon: <Server size={18} />, section: null },
+  { label: 'MCP 服务器', icon: <Server size={18} />, section: 'mcp' },
   { label: '插件管理', icon: <Plug size={18} />, section: null },
-  { label: '命令', icon: <Terminal size={18} />, section: null },
+  { label: '命令', icon: <Terminal size={18} />, section: 'commands' },
   { label: '索引库', icon: <Database size={18} />, section: null },
   { label: '使用统计', icon: <BarChart3 size={18} />, section: null },
   { label: '关于', icon: <Info size={18} />, section: 'about' },
@@ -88,6 +90,7 @@ export default function SettingsView({
   theme,
   permissionMode,
   modelSettings,
+  commandSettings,
   isSidebarOpen,
   isSidebarHidden,
   onSectionChange,
@@ -97,12 +100,14 @@ export default function SettingsView({
   onThemeChange,
   onPermissionModeChange,
   onModelSettingsChange,
+  onCommandSettingsChange,
 }: {
   section: SettingsSection
   status: StatusResponse | null
   theme: ThemePreference
   permissionMode: PermissionMode
   modelSettings: ModelSettingsResponse | null
+  commandSettings: CommandSettingsResponse | null
   isSidebarOpen: boolean
   isSidebarHidden: boolean
   onSectionChange: (section: SettingsSection) => void
@@ -112,9 +117,18 @@ export default function SettingsView({
   onThemeChange: (theme: ThemePreference) => void
   onPermissionModeChange: (mode: PermissionMode) => void
   onModelSettingsChange: () => Promise<void>
+  onCommandSettingsChange: () => Promise<void>
 }) {
   const title =
-    section === 'about' ? '关于' : section === 'models' ? '模型设置' : '常规'
+    section === 'about'
+      ? '关于'
+      : section === 'models'
+        ? '模型设置'
+        : section === 'mcp'
+          ? 'MCP 服务器'
+          : section === 'commands'
+            ? '命令'
+            : '常规'
 
   return (
     <div
@@ -218,6 +232,13 @@ export default function SettingsView({
             <ModelSettingsPanel
               settings={modelSettings}
               onChanged={onModelSettingsChange}
+            />
+          ) : section === 'mcp' ? (
+            <McpSettingsPanel />
+          ) : section === 'commands' ? (
+            <CommandSettingsPanel
+              settings={commandSettings}
+              onChanged={onCommandSettingsChange}
             />
           ) : (
             <GeneralSettings
@@ -352,6 +373,16 @@ function AboutSettings({ status }: { status: StatusResponse | null }) {
           <SettingsInfo
             label="Web 模型配置"
             value={status?.model_store_path ?? '加载中…'}
+            path
+          />
+          <SettingsInfo
+            label="Web MCP 配置"
+            value={status?.mcp_store_path ?? '加载中…'}
+            path
+          />
+          <SettingsInfo
+            label="用户命令目录"
+            value={status?.command_store_path ?? '加载中…'}
             path
           />
         </dl>
