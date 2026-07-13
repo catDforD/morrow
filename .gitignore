@@ -2,6 +2,7 @@
 morrow.toml
 .codegraph/
 crates/agent-server/web/node_modules/
+crates/agent-desktop/node_modules/
 .playwright-mcp/
 .playwright-cli/
 .zcode/

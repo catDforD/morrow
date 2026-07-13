@@ -17,6 +17,28 @@ Morrow is a local coding agent CLI and web dashboard backed by an OpenAI-compati
 
 ## Install
 
+### Desktop app (early access)
+
+The Tauri 2 desktop app uses the same dashboard and local agent runtime as `morrow server`. It is a separate distribution and does not install the `morrow` CLI.
+
+Download the installer for your machine from [GitHub Releases](https://github.com/catDforD/morrow/releases):
+
+- Windows 10 22H2/Windows 11 x64: `Morrow_<version>_x64-setup.exe`.
+- macOS 14+ on Apple Silicon: `Morrow_<version>_aarch64.dmg`.
+- macOS 14+ on Intel: `Morrow_<version>_x64.dmg`.
+
+These early builds are not formally code-signed or notarized. Download them only from the project GitHub Release page.
+
+On Windows, run the NSIS installer. If SmartScreen blocks it, select **More info**, verify that the installer came from this repository’s Release page, then select **Run anyway**.
+
+On macOS, drag Morrow into Applications. For the first launch, right-click Morrow in Finder and choose **Open**. If it is still blocked, go to **System Settings → Privacy & Security** and choose **Open Anyway**.
+
+The app restores the last valid workspace and offers **File → Open Folder** and **File → Open Recent**. Closing the window exits on Windows; on macOS it hides Morrow until it is reopened, while `Cmd+Q` exits.
+
+Desktop updates are manual; the app does not check for updates in the background. Use **Help → Download Latest Version** or visit GitHub Releases, then run the newer Windows installer or replace the macOS app in Applications. Model settings, MCP settings, commands, and project sessions remain in `~/.morrow` across upgrades and normal uninstall operations. To downgrade, manually install an older GitHub Release; there is no in-app rollback.
+
+### CLI
+
 macOS and Linux:
 
 ```bash
@@ -244,6 +266,7 @@ For the crate boundaries, dependency direction, turn lifecycle, extension points
 Morrow is a Rust workspace:
 
 - `crates/agent-cli`: CLI entry point, REPL, JSONL output, server command, and config wiring.
+- `crates/agent-desktop/src-tauri`: Tauri 2 desktop shell, native menus, project switching, and local server lifecycle.
 - `crates/agent-config`: `morrow.toml` and `~/.morrow/config.toml` loading.
 - `crates/agent-core`: agent turn execution and event stream orchestration.
 - `crates/agent-model`: OpenAI-compatible HTTP client and streaming response parsing.
@@ -288,11 +311,36 @@ pnpm build
 pnpm typecheck
 ```
 
-Release builds are created by tagging `v*` and letting GitHub Actions publish the platform archives plus `SHA256SUMS`.
+Develop the desktop app:
+
+```bash
+pnpm --dir crates/agent-server/web install
+pnpm --dir crates/agent-desktop install
+pnpm --dir crates/agent-desktop dev
+```
+
+Desktop development starts Vite at `127.0.0.1:5173`; the native shell starts its browser-mode Axum backend at `127.0.0.1:3000`. Keep port 3000 free. Release builds instead start an authenticated backend on a random loopback port and serve the embedded dashboard assets.
+
+Native bundles must be built on their target operating system. Before native desktop development or a Windows/macOS bundle build, place the matching ripgrep binary in `crates/agent-desktop/src-tauri/binaries/` using Tauri’s target-suffixed names:
+
+```text
+morrow-rg-x86_64-pc-windows-msvc.exe
+morrow-rg-aarch64-apple-darwin
+morrow-rg-x86_64-apple-darwin
+```
+
+Then build the target installer:
+
+```bash
+pnpm --dir crates/agent-desktop build:windows
+pnpm --dir crates/agent-desktop build:macos
+```
+
+Release builds are created by tagging the exact workspace version, for example `v0.3.0`. GitHub Actions publishes the CLI archives, Windows NSIS installer, two architecture-specific macOS DMGs, and `SHA256SUMS` to one Release. No signing or updater secrets are required for this early-access workflow.
 
 ## Uninstall
 
-Remove the binary and, if desired, local private state:
+Remove the CLI binary or uninstall/delete the desktop app. Local private state is intentionally retained; remove it separately only if desired:
 
 ```bash
 rm -f ~/.local/bin/morrow

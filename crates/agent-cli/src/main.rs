@@ -4,7 +4,7 @@ use agent_config::{
 use agent_model::{ModelError, OpenAiCompatClient, OpenAiCompatConfig};
 use agent_protocol::{
     AgentEvent, ApprovalAction, ApprovalDecision, ApprovalRequest, FileChangeSummary,
-    PermissionMode, PermissionProfile, ReasoningProfile, Session, ShellCommandSummary, ShellPolicy,
+    PermissionMode, PermissionProfile, Session, ShellCommandSummary, ShellPolicy,
     ToolExecutionSummary,
 };
 use agent_runtime::{
@@ -187,47 +187,17 @@ async fn run() -> Result<(), CliError> {
     let workspace_root = agent_runtime::detect_workspace_root()?;
     if let Some(CliCommand::Server { host, port }) = args.command.as_ref() {
         let loaded = load_server_config(args.config.as_deref())?;
-        let fallback_model = loaded
-            .model
-            .map(|model| -> Result<agent_server::FallbackModel, ModelError> {
-                let model_name = model.config.model.clone();
-                let reasoning_profile = deepseek_reasoning_profile(&model_name);
-                let limits = model.config.context_limits();
-                let client = OpenAiCompatClient::new(OpenAiCompatConfig {
-                    base_url: model.config.base_url,
-                    model: model_name.clone(),
-                    api_key: model.api_key,
-                    timeout: Duration::from_secs(model.config.timeout_secs),
-                })?;
-                Ok(agent_server::FallbackModel {
-                    provider_name: "默认配置".to_string(),
-                    model_id: model_name.clone(),
-                    model_name,
-                    client,
-                    limits,
-                    reasoning_profile,
-                })
-            })
-            .transpose()?;
         let home = dirs::home_dir().ok_or(CliError::HomeDirNotFound)?;
         eprintln!("morrow server listening on http://{host}:{port}");
-        agent_server::serve(agent_server::ServerOptions {
-            host: *host,
-            port: *port,
-            fallback_model,
-            model_store_path: home.join(".morrow").join("web-models.json"),
-            mcp_store_path: home.join(".morrow").join("web-mcp.json"),
-            command_store_path: home.join(".morrow").join("commands"),
-            system_prompt: loaded.config.agent.system_prompt,
-            context_config: loaded.config.context,
+        let options = agent_server::server_options_from_loaded_config(
+            *host,
+            *port,
             workspace_root,
-            config_path: loaded.path,
-            config_diagnostics: loaded.diagnostics,
-            permissions: PermissionProfile::for_mode(agent_server::DEFAULT_WEB_PERMISSION_MODE),
-            mcp_servers: loaded.config.mcp_servers,
-            default_session_name: session_name,
-        })
-        .await?;
+            &home,
+            loaded,
+            session_name,
+        )?;
+        agent_server::serve(options).await?;
         return Ok(());
     }
 
@@ -1069,13 +1039,6 @@ fn parse_permission_mode(value: &str) -> Result<PermissionMode, String> {
         _ => Err(format!(
             "invalid permission mode {value:?}; expected read-only, workspace-write, or danger-full-access"
         )),
-    }
-}
-
-fn deepseek_reasoning_profile(model: &str) -> ReasoningProfile {
-    match model {
-        "deepseek-v4-flash" | "deepseek-v4-pro" => ReasoningProfile::Deepseek,
-        _ => ReasoningProfile::None,
     }
 }
 

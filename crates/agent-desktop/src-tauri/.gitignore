@@ -1,0 +1,7 @@
+/gen/schemas/
+/binaries/*
+!/binaries/.gitkeep
+/icons/android/
+/icons/ios/
+/icons/Square*.png
+/icons/StoreLogo.png
