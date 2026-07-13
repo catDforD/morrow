@@ -208,12 +208,22 @@ jobs:
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          app="target/${{ matrix.target }}/release/bundle/macos/Morrow.app"
+          dmg="$(find "target/${{ matrix.target }}/release/bundle/dmg" -maxdepth 1 -name '*.dmg' -print -quit)"
+          test -n "${dmg}"
+
+          mount_dir="$(mktemp -d)"
+          hdiutil attach "${dmg}" -nobrowse -readonly -mountpoint "${mount_dir}"
+          trap 'hdiutil detach "${mount_dir}" || true; rm -rf "${mount_dir}"' EXIT
+
+          app="${mount_dir}/Morrow.app"
           sidecar="${app}/Contents/MacOS/morrow-rg"
           test -x "${sidecar}"
           codesign --verify --deep --strict "${app}"
-          dmg="$(find "target/${{ matrix.target }}/release/bundle/dmg" -maxdepth 1 -name '*.dmg' -print -quit)"
-          test -n "${dmg}"
+
+          hdiutil detach "${mount_dir}"
+          rm -rf "${mount_dir}"
+          trap - EXIT
+
           mkdir -p dist/desktop
           cp "${dmg}" "dist/desktop/Morrow_${{ needs.verify-version.outputs.version }}_${{ matrix.asset_arch }}.dmg"
 

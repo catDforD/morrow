@@ -445,6 +445,7 @@ fn open_external_url(app: &AppHandle, url: &Url) {
 fn install_close_handler(window: &WebviewWindow) {
     #[cfg(target_os = "macos")]
     let window_handle = window.clone();
+    #[cfg(not(target_os = "macos"))]
     let app = window.app_handle().clone();
     window.on_window_event(move |event| {
         if let WindowEvent::CloseRequested { api, .. } = event {
