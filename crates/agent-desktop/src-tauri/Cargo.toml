@@ -1,0 +1,32 @@
+[package]
+name = "agent-desktop"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "morrow-desktop"
+path = "src/main.rs"
+
+[lib]
+name = "agent_desktop"
+path = "src/lib.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+agent-config = { workspace = true }
+agent-server = { workspace = true }
+dirs = { workspace = true }
+getrandom = "0.3"
+log = "0.4"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-log = "2"
+tauri-plugin-opener = "2"
+tauri-plugin-single-instance = "2"
+tauri-plugin-window-state = "2"
+thiserror = { workspace = true }
+tokio = { workspace = true }

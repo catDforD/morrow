@@ -12,8 +12,32 @@ env:
   RIPGREP_VERSION: 15.1.0
 
 jobs:
+  verify-version:
+    name: Verify release version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Match tag and workspace version
+        id: version
+        shell: bash
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "agent-desktop") | .version')"
+          if [[ "${GITHUB_REF_NAME}" != "v${version}" ]]; then
+            echo "release tag ${GITHUB_REF_NAME} does not match workspace version v${version}" >&2
+            exit 1
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
   build:
     name: Build ${{ matrix.target }}
+    needs: verify-version
     strategy:
       fail-fast: false
       matrix:
@@ -100,11 +124,124 @@ jobs:
           name: morrow-${{ matrix.target }}
           path: dist/morrow-*
 
+  desktop:
+    name: Desktop ${{ matrix.target }}
+    needs: verify-version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            bundle: nsis
+            asset_arch: x64
+          - target: aarch64-apple-darwin
+            os: macos-15
+            bundle: dmg
+            asset_arch: aarch64
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            bundle: dmg
+            asset_arch: x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.30.3
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: |
+            crates/agent-desktop/pnpm-lock.yaml
+            crates/agent-server/web/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        run: |
+          pnpm --dir crates/agent-server/web install --frozen-lockfile
+          pnpm --dir crates/agent-desktop install --frozen-lockfile
+
+      - name: Build dashboard assets
+        run: pnpm --dir crates/agent-server/web build
+
+      - name: Download ripgrep sidecar
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p crates/agent-desktop/src-tauri/binaries dist/rg
+          asset="ripgrep-${RIPGREP_VERSION}-${{ matrix.target }}.tar.gz"
+          curl -fsSL "https://github.com/BurntSushi/ripgrep/releases/download/${RIPGREP_VERSION}/${asset}" -o "dist/${asset}"
+          tar -xzf "dist/${asset}" -C dist/rg --strip-components=1 "ripgrep-${RIPGREP_VERSION}-${{ matrix.target }}/rg"
+          cp dist/rg/rg "crates/agent-desktop/src-tauri/binaries/morrow-rg-${{ matrix.target }}"
+          chmod +x "crates/agent-desktop/src-tauri/binaries/morrow-rg-${{ matrix.target }}"
+          test -x "crates/agent-desktop/src-tauri/binaries/morrow-rg-${{ matrix.target }}"
+
+      - name: Download ripgrep sidecar
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path crates/agent-desktop/src-tauri/binaries,dist/rg | Out-Null
+          $asset = "ripgrep-${env:RIPGREP_VERSION}-${{ matrix.target }}.zip"
+          $url = "https://github.com/BurntSushi/ripgrep/releases/download/${env:RIPGREP_VERSION}/$asset"
+          Invoke-WebRequest -Uri $url -OutFile "dist/$asset"
+          Expand-Archive -Path "dist/$asset" -DestinationPath dist/rg
+          $source = "dist/rg/ripgrep-${env:RIPGREP_VERSION}-${{ matrix.target }}/rg.exe"
+          $destination = "crates/agent-desktop/src-tauri/binaries/morrow-rg-${{ matrix.target }}.exe"
+          Copy-Item $source $destination
+          if (-not (Test-Path $destination)) { throw "ripgrep sidecar was not prepared" }
+
+      - name: Build desktop installer
+        run: pnpm --dir crates/agent-desktop exec tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundle }}
+
+      - name: Verify and stage macOS bundle
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          app="target/${{ matrix.target }}/release/bundle/macos/Morrow.app"
+          sidecar="${app}/Contents/MacOS/morrow-rg"
+          test -x "${sidecar}"
+          codesign --verify --deep --strict "${app}"
+          dmg="$(find "target/${{ matrix.target }}/release/bundle/dmg" -maxdepth 1 -name '*.dmg' -print -quit)"
+          test -n "${dmg}"
+          mkdir -p dist/desktop
+          cp "${dmg}" "dist/desktop/Morrow_${{ needs.verify-version.outputs.version }}_${{ matrix.asset_arch }}.dmg"
+
+      - name: Verify and stage Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem "target/${{ matrix.target }}/release/bundle/nsis/*.exe" | Select-Object -First 1
+          if ($null -eq $installer) { throw "NSIS installer was not produced" }
+          $listing = (& 7z l $installer.FullName | Out-String)
+          if ($listing -notmatch "morrow-rg.exe") { throw "NSIS installer does not contain morrow-rg.exe" }
+          New-Item -ItemType Directory -Force -Path dist/desktop | Out-Null
+          Copy-Item $installer.FullName "dist/desktop/Morrow_${{ needs.verify-version.outputs.version }}_x64-setup.exe"
+
+      - name: Upload desktop artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Morrow-desktop-${{ matrix.target }}
+          path: dist/desktop/Morrow_*
+
   publish:
     name: Publish GitHub Release
-    needs: build
+    needs: [build, desktop]
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
@@ -113,11 +250,13 @@ jobs:
 
       - name: Generate checksums
         working-directory: dist
-        run: sha256sum morrow-* > SHA256SUMS
+        run: sha256sum morrow-* Morrow_* > SHA256SUMS
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/morrow-*
+            dist/Morrow_*
             dist/SHA256SUMS
+          body_path: .github/release-notes.md

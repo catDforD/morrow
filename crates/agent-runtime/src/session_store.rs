@@ -116,12 +116,16 @@ pub struct SessionListingEntry {
 
 impl SessionStore {
     pub fn for_current_dir(session_name: &str) -> Result<Self, SessionStoreError> {
-        let home = dirs::home_dir().ok_or(SessionStoreError::HomeDirNotFound)?;
         let cwd = env::current_dir().map_err(SessionStoreError::CurrentDir)?;
+        Self::for_workspace(&cwd, session_name)
+    }
+
+    pub fn for_workspace(workspace: &Path, session_name: &str) -> Result<Self, SessionStoreError> {
+        let home = dirs::home_dir().ok_or(SessionStoreError::HomeDirNotFound)?;
         Self::new(
             home.join(".morrow").join("sessions"),
             home.join(".morrow").join("threads"),
-            &cwd,
+            workspace,
             session_name,
         )
     }
@@ -587,6 +591,42 @@ mod tests {
             .expect("load saved session");
 
         assert_eq!(loaded, session);
+    }
+
+    #[test]
+    fn explicit_workspace_scope_is_canonicalized() {
+        let workspace = unique_dir("explicit-workspace");
+        let direct = SessionStore::for_workspace(&workspace, "default").expect("explicit store");
+        let dotted =
+            SessionStore::for_workspace(&workspace.join("."), "default").expect("canonical store");
+
+        assert_eq!(direct.path(), dotted.path());
+    }
+
+    #[test]
+    fn identical_session_names_are_isolated_between_workspaces() {
+        let root = unique_dir("workspace-isolation-root");
+        let legacy = unique_dir("workspace-isolation-legacy");
+        let first_workspace = unique_dir("workspace-isolation-a");
+        let second_workspace = unique_dir("workspace-isolation-b");
+        let first = SessionStore::new(&root, &legacy, &first_workspace, "work")
+            .expect("first workspace store");
+        let second = SessionStore::new(&root, &legacy, &second_workspace, "work")
+            .expect("second workspace store");
+
+        let mut first_session = Session::new();
+        first_session
+            .active_thread
+            .messages
+            .push(Message::user("first workspace"));
+        first.save(&first_session).expect("save first session");
+
+        assert_ne!(first.path(), second.path());
+        assert_eq!(first.load_existing().expect("load first"), first_session);
+        assert!(matches!(
+            second.load_existing(),
+            Err(SessionStoreError::SessionNotFound { .. })
+        ));
     }
 
     #[test]

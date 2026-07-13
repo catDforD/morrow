@@ -4,18 +4,21 @@ mod models;
 
 pub use models::FallbackModel;
 
-use agent_config::{ContextConfig, McpServerConfig};
-use agent_model::ModelError;
+use agent_config::{ContextConfig, LoadedServerConfig, McpServerConfig};
+use agent_model::{ModelError, OpenAiCompatClient, OpenAiCompatConfig};
 use agent_protocol::{
-    ApprovalDecision, ModelSelection, PermissionMode, PermissionProfile, Session, SessionDocument,
+    ApprovalDecision, ModelSelection, PermissionMode, PermissionProfile, ReasoningProfile, Session,
+    SessionDocument,
 };
 use agent_runtime::{
     AgentEventEnvelope, CancellationToken, McpInspection, McpToolCache, RunAgentTurnContext,
     SessionListingEntry, SessionStore, TurnEventHandler, inspect_mcp_servers,
 };
+use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderValue, Method, Request, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
@@ -41,10 +44,12 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, RwLock, broadcast, oneshot};
-use tokio::task::AbortHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 
 pub const DEFAULT_WEB_PERMISSION_MODE: PermissionMode = PermissionMode::WorkspaceWrite;
 
@@ -67,6 +72,176 @@ pub struct ServerOptions {
     pub default_session_name: String,
 }
 
+pub fn server_options_from_loaded_config(
+    host: IpAddr,
+    port: u16,
+    workspace_root: PathBuf,
+    home: &std::path::Path,
+    loaded: LoadedServerConfig,
+    default_session_name: String,
+) -> Result<ServerOptions, ModelError> {
+    let fallback_model = loaded
+        .model
+        .map(|model| {
+            let model_name = model.config.model.clone();
+            let limits = model.config.context_limits();
+            let client = OpenAiCompatClient::new(OpenAiCompatConfig {
+                base_url: model.config.base_url,
+                model: model_name.clone(),
+                api_key: model.api_key,
+                timeout: Duration::from_secs(model.config.timeout_secs),
+            })?;
+            Ok(FallbackModel {
+                provider_name: "默认配置".to_string(),
+                model_id: model_name.clone(),
+                model_name: model_name.clone(),
+                client,
+                limits,
+                reasoning_profile: reasoning_profile(&model_name),
+            })
+        })
+        .transpose()?;
+
+    Ok(ServerOptions {
+        host,
+        port,
+        fallback_model,
+        model_store_path: home.join(".morrow").join("web-models.json"),
+        mcp_store_path: home.join(".morrow").join("web-mcp.json"),
+        command_store_path: home.join(".morrow").join("commands"),
+        system_prompt: loaded.config.agent.system_prompt,
+        context_config: loaded.config.context,
+        workspace_root,
+        config_path: loaded.path,
+        config_diagnostics: loaded.diagnostics,
+        permissions: PermissionProfile::for_mode(DEFAULT_WEB_PERMISSION_MODE),
+        mcp_servers: loaded.config.mcp_servers,
+        default_session_name,
+    })
+}
+
+fn reasoning_profile(model: &str) -> ReasoningProfile {
+    match model {
+        "deepseek-v4-flash" | "deepseek-v4-pro" => ReasoningProfile::Deepseek,
+        _ => ReasoningProfile::None,
+    }
+}
+
+#[derive(Clone, Default)]
+pub enum ServerAccessPolicy {
+    #[default]
+    Browser,
+    Desktop {
+        token: Arc<str>,
+    },
+}
+
+impl ServerAccessPolicy {
+    pub fn desktop(token: impl Into<String>) -> Self {
+        Self::Desktop {
+            token: Arc::from(token.into()),
+        }
+    }
+}
+
+impl std::fmt::Debug for ServerAccessPolicy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Browser => formatter.write_str("Browser"),
+            Self::Desktop { .. } => formatter
+                .debug_struct("Desktop")
+                .field("token", &"<redacted>")
+                .finish(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerActivity {
+    pub running_turns: usize,
+    pub pending_approvals: usize,
+}
+
+impl ServerActivity {
+    pub fn is_idle(self) -> bool {
+        self.running_turns == 0
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ShutdownPolicy {
+    RequireIdle,
+    CancelRunning { timeout: Duration },
+}
+
+pub struct RunningServer {
+    addr: SocketAddr,
+    state: AppState,
+    shutdown: Option<oneshot::Sender<()>>,
+    task: Option<JoinHandle<Result<(), ServerError>>>,
+}
+
+impl RunningServer {
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    pub fn base_url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    pub async fn activity(&self) -> ServerActivity {
+        server_activity(&self.state).await
+    }
+
+    pub async fn shutdown(&mut self, policy: ShutdownPolicy) -> Result<(), ServerError> {
+        self.state
+            .inner
+            .shutting_down
+            .store(true, Ordering::Release);
+        let activity = server_activity(&self.state).await;
+        match policy {
+            ShutdownPolicy::RequireIdle if !activity.is_idle() => {
+                self.state
+                    .inner
+                    .shutting_down
+                    .store(false, Ordering::Release);
+                return Err(ServerError::RunningTurns(activity.running_turns));
+            }
+            ShutdownPolicy::RequireIdle => {}
+            ShutdownPolicy::CancelRunning { timeout } => {
+                cancel_all_turns(&self.state, timeout).await;
+            }
+        }
+
+        reset_mcp_cache(&self.state).await;
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(mut task) = self.task.take() {
+            match tokio::time::timeout(Duration::from_secs(2), &mut task).await {
+                Ok(result) => return result.map_err(ServerError::Task)?,
+                Err(_) => {
+                    task.abort();
+                    let _ = task.await;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for RunningServer {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ServerError {
     #[error(transparent)]
@@ -79,19 +254,66 @@ pub enum ServerError {
     },
     #[error("server failed: {0}")]
     Serve(#[source] std::io::Error),
+    #[error("server task failed: {0}")]
+    Task(#[source] tokio::task::JoinError),
+    #[error("server has {0} running turn(s)")]
+    RunningTurns(usize),
 }
 
-pub async fn serve(options: ServerOptions) -> Result<(), ServerError> {
+pub async fn serve(mut options: ServerOptions) -> Result<(), ServerError> {
     let addr = SocketAddr::new(options.host, options.port);
     let listener = TcpListener::bind(addr)
         .await
         .map_err(|source| ServerError::Bind { addr, source })?;
+    let bound_addr = listener
+        .local_addr()
+        .map_err(|source| ServerError::Bind { addr, source })?;
+    options.host = bound_addr.ip();
+    options.port = bound_addr.port();
     axum::serve(listener, router(options)?)
         .await
         .map_err(ServerError::Serve)
 }
 
 pub fn router(options: ServerOptions) -> Result<Router, ModelRegistryError> {
+    build_router(options, ServerAccessPolicy::Browser).map(|(router, _)| router)
+}
+
+pub async fn spawn_local(
+    mut options: ServerOptions,
+    access_policy: ServerAccessPolicy,
+) -> Result<RunningServer, ServerError> {
+    let addr = SocketAddr::new(options.host, options.port);
+    let listener = TcpListener::bind(addr)
+        .await
+        .map_err(|source| ServerError::Bind { addr, source })?;
+    let bound_addr = listener
+        .local_addr()
+        .map_err(|source| ServerError::Bind { addr, source })?;
+    options.host = bound_addr.ip();
+    options.port = bound_addr.port();
+    let (router, state) = build_router(options, access_policy)?;
+    let (shutdown, receiver) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .with_graceful_shutdown(async {
+                let _ = receiver.await;
+            })
+            .await
+            .map_err(ServerError::Serve)
+    });
+    Ok(RunningServer {
+        addr: bound_addr,
+        state,
+        shutdown: Some(shutdown),
+        task: Some(task),
+    })
+}
+
+fn build_router(
+    options: ServerOptions,
+    access_policy: ServerAccessPolicy,
+) -> Result<(Router, AppState), ModelRegistryError> {
     let model_registry = ModelRegistry::load(
         options.model_store_path.clone(),
         &options.workspace_root,
@@ -109,10 +331,12 @@ pub fn router(options: ServerOptions) -> Result<Router, ModelRegistryError> {
             command_registry,
             sessions: Mutex::new(HashMap::new()),
             mcp_cache: RwLock::new(Arc::new(McpToolCache::new())),
+            access_policy,
+            shutting_down: AtomicBool::new(false),
         }),
     };
 
-    Ok(Router::new()
+    let router = Router::new()
         .route("/", get(index))
         .route("/assets/{*path}", get(asset))
         .route("/api/status", get(status))
@@ -154,7 +378,12 @@ pub fn router(options: ServerOptions) -> Result<Router, ModelRegistryError> {
             get(get_session_model_selection).put(set_session_model_selection),
         )
         .route("/api/sessions/{name}/ws", get(session_ws))
-        .with_state(state))
+        .with_state(state.clone())
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            access_middleware,
+        ));
+    Ok((router, state))
 }
 
 #[derive(Clone)]
@@ -169,6 +398,176 @@ struct ServerState {
     command_registry: CommandRegistry,
     sessions: Mutex<HashMap<String, SessionRuntime>>,
     mcp_cache: RwLock<Arc<McpToolCache>>,
+    access_policy: ServerAccessPolicy,
+    shutting_down: AtomicBool,
+}
+
+async fn access_middleware(
+    State(state): State<AppState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let response = match &state.inner.access_policy {
+        ServerAccessPolicy::Browser => next.run(request).await,
+        ServerAccessPolicy::Desktop { token } => {
+            let expected_host =
+                format!("{}:{}", state.inner.options.host, state.inner.options.port);
+            let host_matches = request
+                .headers()
+                .get(header::HOST)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|host| host == expected_host);
+            if !host_matches {
+                StatusCode::UNAUTHORIZED.into_response()
+            } else if is_bootstrap_request(&request, token) {
+                let mut response = StatusCode::SEE_OTHER.into_response();
+                response
+                    .headers_mut()
+                    .insert(header::LOCATION, HeaderValue::from_static("/"));
+                let cookie =
+                    format!("morrow_desktop_session={token}; HttpOnly; SameSite=Strict; Path=/");
+                if let Ok(value) = HeaderValue::from_str(&cookie) {
+                    response.headers_mut().insert(header::SET_COOKIE, value);
+                }
+                response
+            } else if !has_desktop_cookie(&request, token)
+                || !origin_is_allowed(&request, &expected_host)
+            {
+                StatusCode::UNAUTHORIZED.into_response()
+            } else {
+                next.run(request).await
+            }
+        }
+    };
+
+    with_security_headers(response)
+}
+
+fn is_bootstrap_request(request: &Request<Body>, token: &str) -> bool {
+    request.method() == Method::GET
+        && request.uri().path() == "/"
+        && request
+            .uri()
+            .query()
+            .and_then(|query| {
+                query.split('&').find_map(|pair| {
+                    pair.strip_prefix("desktop_bootstrap=")
+                        .filter(|value| !value.contains('='))
+                })
+            })
+            .is_some_and(|provided| constant_time_eq(provided.as_bytes(), token.as_bytes()))
+}
+
+fn has_desktop_cookie(request: &Request<Body>, token: &str) -> bool {
+    request
+        .headers()
+        .get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|cookies| {
+            cookies.split(';').any(|cookie| {
+                cookie
+                    .trim()
+                    .strip_prefix("morrow_desktop_session=")
+                    .is_some_and(|provided| constant_time_eq(provided.as_bytes(), token.as_bytes()))
+            })
+        })
+}
+
+fn origin_is_allowed(request: &Request<Body>, expected_host: &str) -> bool {
+    let requires_origin = request.uri().path().ends_with("/ws")
+        || !matches!(*request.method(), Method::GET | Method::HEAD);
+    if !requires_origin {
+        return true;
+    }
+    let expected_origin = format!("http://{expected_host}");
+    request
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|origin| origin == expected_origin)
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
+        == 0
+}
+
+fn with_security_headers(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' ws: wss:; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+        ),
+    );
+    response.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    response.headers_mut().insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    response
+        .headers_mut()
+        .insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    response
+}
+
+async fn server_activity(state: &AppState) -> ServerActivity {
+    let sessions = state.inner.sessions.lock().await;
+    let mut running_turns = 0;
+    let mut pending_approvals = 0;
+    for runtime in sessions.values() {
+        if let Some(running) = runtime.running.as_ref() {
+            running_turns += 1;
+            pending_approvals += usize::from(running.pending_approval.is_some());
+        }
+    }
+    ServerActivity {
+        running_turns,
+        pending_approvals,
+    }
+}
+
+async fn cancel_all_turns(state: &AppState, timeout: Duration) {
+    let handles = {
+        let sessions = state.inner.sessions.lock().await;
+        sessions
+            .values()
+            .filter_map(|runtime| runtime.running.as_ref())
+            .map(|running| {
+                running.cancellation.cancel();
+                running.handle.clone()
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    while handles.iter().any(|handle| !handle.is_finished())
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    for handle in handles.iter().filter(|handle| !handle.is_finished()) {
+        handle.abort();
+    }
+    while handles.iter().any(|handle| !handle.is_finished()) {
+        tokio::task::yield_now().await;
+    }
+
+    let mut sessions = state.inner.sessions.lock().await;
+    for runtime in sessions.values_mut() {
+        if runtime.running.is_some() {
+            runtime.running = None;
+        }
+    }
 }
 
 struct SessionRuntime {
@@ -578,7 +977,7 @@ async fn get_session_model_selection(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<Json<SessionModelSelectionResponse>, ApiError> {
-    session_store(&name)?;
+    session_store(&state, &name)?;
     Ok(Json(
         state.inner.model_registry.session_selection(&name).await,
     ))
@@ -589,7 +988,7 @@ async fn set_session_model_selection(
     Path(name): Path<String>,
     Json(selection): Json<ModelSelection>,
 ) -> Result<Json<SessionModelSelectionResponse>, ApiError> {
-    session_store(&name)?;
+    session_store(&state, &name)?;
     state
         .inner
         .model_registry
@@ -602,8 +1001,7 @@ async fn set_session_model_selection(
 async fn list_sessions(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<SessionEntryResponse>>, ApiError> {
-    let store = SessionStore::for_current_dir(&state.inner.options.default_session_name)
-        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let store = session_store(&state, &state.inner.options.default_session_name)?;
     let entries = store
         .list_current_scope_with_archived()
         .map_err(|error| ApiError::internal(error.to_string()))?
@@ -615,10 +1013,10 @@ async fn list_sessions(
 }
 
 async fn get_session(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<Json<SessionDocument>, ApiError> {
-    let store = session_store(&name)?;
+    let store = session_store(&state, &name)?;
     reject_archived_session(&store, &name)?;
     Ok(Json(SessionDocument::new(
         store
@@ -635,7 +1033,7 @@ async fn create_session(
         return Err(ApiError::conflict("session has a running turn"));
     }
 
-    let store = session_store(&name)?;
+    let store = session_store(&state, &name)?;
     if store.is_archived() {
         return Err(ApiError::conflict(format!(
             "session {name:?} is archived; restore it before creating a session with the same name"
@@ -666,7 +1064,7 @@ async fn reset_session(
         return Err(ApiError::conflict("session has a running turn"));
     }
 
-    let store = session_store(&name)?;
+    let store = session_store(&state, &name)?;
     reject_archived_session(&store, &name)?;
     let session = Session::new();
     store
@@ -683,7 +1081,7 @@ async fn archive_session(
         return Err(ApiError::conflict("session has a running turn"));
     }
 
-    let store = session_store(&name)?;
+    let store = session_store(&state, &name)?;
     store.archive().map_err(session_mutation_error)?;
     Ok(Json(SessionArchiveResponse {
         name,
@@ -699,7 +1097,7 @@ async fn restore_session(
         return Err(ApiError::conflict("session has a running turn"));
     }
 
-    let store = session_store(&name)?;
+    let store = session_store(&state, &name)?;
     store.restore().map_err(session_mutation_error)?;
     Ok(Json(SessionArchiveResponse {
         name,
@@ -849,6 +1247,16 @@ async fn start_turn(
         permission_mode,
         model_selection,
     } = request;
+    if state.inner.shutting_down.load(Ordering::Acquire) {
+        broadcast_message(
+            &tx,
+            ServerMessage::TurnRejected {
+                request_id,
+                reason: "server is shutting down".to_string(),
+            },
+        );
+        return;
+    }
     let prompt = if prompt_resolved {
         prompt
     } else {
@@ -880,7 +1288,7 @@ async fn start_turn(
         );
         return;
     }
-    let store = match session_store(&session_name) {
+    let store = match session_store(&state, &session_name) {
         Ok(store) => store,
         Err(error) => {
             broadcast_message(
@@ -1057,7 +1465,7 @@ async fn run_turn_task_inner(context: TurnTaskContext) -> Result<(), agent_runti
     let options = state.inner.options.clone();
     let mcp_cache = state.inner.mcp_cache.read().await.clone();
     let mcp_servers = state.inner.mcp_registry.effective_servers().await;
-    let store = SessionStore::for_current_dir(&session_name)?;
+    let store = SessionStore::for_workspace(&options.workspace_root, &session_name)?;
     let mut session = store.load()?;
     let turn_index = session.turns.len();
     let mut handler = ServerTurnHandler {
@@ -1294,7 +1702,7 @@ async fn session_sender(state: &AppState, session_name: &str) -> broadcast::Send
 }
 
 async fn snapshot_message(state: &AppState, session_name: &str) -> Result<ServerMessage, ApiError> {
-    let store = session_store(session_name)?;
+    let store = session_store(state, session_name)?;
     reject_archived_session(&store, session_name)?;
     let session = store
         .load()
@@ -1320,8 +1728,9 @@ async fn running_snapshot(state: &AppState, session_name: &str) -> Option<Runnin
         })
 }
 
-fn session_store(name: &str) -> Result<SessionStore, ApiError> {
-    SessionStore::for_current_dir(name).map_err(|error| ApiError::bad_request(error.to_string()))
+fn session_store(state: &AppState, name: &str) -> Result<SessionStore, ApiError> {
+    SessionStore::for_workspace(&state.inner.options.workspace_root, name)
+        .map_err(|error| ApiError::bad_request(error.to_string()))
 }
 
 fn requested_permissions(
@@ -1423,6 +1832,7 @@ mod tests {
     use std::sync::OnceLock;
     use std::time::Duration;
     use tokio::sync::Mutex as AsyncMutex;
+    use tower::ServiceExt;
 
     static ENV_LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
 
@@ -1489,6 +1899,8 @@ mod tests {
                 command_registry,
                 sessions: Mutex::new(HashMap::new()),
                 mcp_cache: RwLock::new(Arc::new(McpToolCache::new())),
+                access_policy: ServerAccessPolicy::Browser,
+                shutting_down: AtomicBool::new(false),
             }),
         }
     }
@@ -1516,6 +1928,174 @@ mod tests {
     #[test]
     fn router_registers_model_routes_without_conflicts() {
         let _ = router(test_options()).expect("router");
+    }
+
+    #[tokio::test]
+    async fn desktop_access_bootstraps_cookie_and_rejects_unauthorized_requests() {
+        let mut options = test_options();
+        options.port = 43123;
+        let (router, _) = build_router(options, ServerAccessPolicy::desktop("desktop-test-token"))
+            .expect("desktop router");
+        let host = "127.0.0.1:43123";
+
+        let unauthorized = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/status")
+                    .header(header::HOST, host)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let wrong_host = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/status")
+                    .header(header::HOST, "localhost:43123")
+                    .header(header::COOKIE, "morrow_desktop_session=desktop-test-token")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(wrong_host.status(), StatusCode::UNAUTHORIZED);
+
+        let bootstrap = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/?desktop_bootstrap=desktop-test-token")
+                    .header(header::HOST, host)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(bootstrap.status(), StatusCode::SEE_OTHER);
+        let cookie = bootstrap
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("session cookie")
+            .to_str()
+            .expect("cookie text")
+            .to_string();
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("SameSite=Strict"));
+
+        let authorized = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/status")
+                    .header(header::HOST, host)
+                    .header(header::COOKIE, "morrow_desktop_session=desktop-test-token")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(authorized.status(), StatusCode::OK);
+        assert!(
+            authorized
+                .headers()
+                .contains_key(header::CONTENT_SECURITY_POLICY)
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_access_remains_available_without_a_desktop_token() {
+        let response = router(test_options())
+            .expect("browser router")
+            .oneshot(
+                Request::builder()
+                    .uri("/api/status")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn desktop_access_rejects_cross_origin_mutations_and_websockets() {
+        let mut options = test_options();
+        options.port = 43124;
+        let (router, _) =
+            build_router(options, ServerAccessPolicy::desktop("token")).expect("desktop router");
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/commands/resolve")
+            .header(header::HOST, "127.0.0.1:43124")
+            .header(header::ORIGIN, "https://example.com")
+            .header(header::COOKIE, "morrow_desktop_session=token")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"input":"hello"}"#))
+            .expect("request");
+
+        let response = router.clone().oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let websocket = Request::builder()
+            .uri("/api/sessions/default/ws")
+            .header(header::HOST, "127.0.0.1:43124")
+            .header(header::ORIGIN, "https://example.com")
+            .header(header::COOKIE, "morrow_desktop_session=token")
+            .body(Body::empty())
+            .expect("request");
+        let response = router.oneshot(websocket).await.expect("response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn spawned_local_server_reports_address_and_shuts_down() {
+        let mut server = spawn_local(test_options(), ServerAccessPolicy::Browser)
+            .await
+            .expect("spawn server");
+
+        assert_ne!(server.addr().port(), 0);
+        assert!(server.base_url().starts_with("http://127.0.0.1:"));
+        assert!(server.activity().await.is_idle());
+        server
+            .shutdown(ShutdownPolicy::RequireIdle)
+            .await
+            .expect("shutdown server");
+    }
+
+    #[tokio::test]
+    async fn require_idle_rejection_keeps_the_server_available() {
+        let mut server = spawn_local(test_options(), ServerAccessPolicy::Browser)
+            .await
+            .expect("spawn server");
+        let worker = tokio::spawn(std::future::pending::<()>());
+        {
+            let mut sessions = server.state.inner.sessions.lock().await;
+            let runtime = sessions
+                .entry("default".to_string())
+                .or_insert_with(SessionRuntime::new);
+            runtime.running = Some(RunningTurn {
+                turn_id: "turn-1".to_string(),
+                pending_approval: None,
+                cancellation: CancellationToken::new(),
+                handle: worker.abort_handle(),
+            });
+        }
+
+        let result = server.shutdown(ShutdownPolicy::RequireIdle).await;
+
+        assert!(matches!(result, Err(ServerError::RunningTurns(1))));
+        assert_eq!(server.activity().await.running_turns, 1);
+        server
+            .shutdown(ShutdownPolicy::CancelRunning {
+                timeout: Duration::from_millis(10),
+            })
+            .await
+            .expect("cancel and shutdown server");
     }
 
     #[tokio::test]
@@ -1632,25 +2212,23 @@ mod tests {
     async fn create_session_saves_empty_session() {
         let lock = ENV_LOCK.get_or_init(|| AsyncMutex::new(())).lock().await;
         let home = unique_test_dir("create-home");
-        let cwd = unique_test_dir("create-cwd");
-        let previous_cwd = std::env::current_dir().expect("current dir");
         let previous_home = std::env::var_os("HOME");
         unsafe {
             std::env::set_var("HOME", &home);
         }
-        std::env::set_current_dir(&cwd).expect("set cwd");
 
-        let response = create_session(State(test_state()), Path("fresh".to_string()))
+        let state = test_state();
+        let workspace = state.inner.options.workspace_root.clone();
+        let response = create_session(State(state), Path("fresh".to_string()))
             .await
             .expect("create session");
-        let store = SessionStore::for_current_dir("fresh").expect("store");
+        let store = SessionStore::for_workspace(&workspace, "fresh").expect("store");
         let session = store.load_existing().expect("load created session");
 
         assert_eq!(response.0.session, Session::new());
         assert_eq!(session, Session::new());
         assert!(store.path().is_file());
 
-        std::env::set_current_dir(previous_cwd).expect("restore cwd");
         match previous_home {
             Some(value) => unsafe {
                 std::env::set_var("HOME", value);
@@ -1666,18 +2244,17 @@ mod tests {
     async fn create_session_rejects_existing_session() {
         let lock = ENV_LOCK.get_or_init(|| AsyncMutex::new(())).lock().await;
         let home = unique_test_dir("create-existing-home");
-        let cwd = unique_test_dir("create-existing-cwd");
-        let previous_cwd = std::env::current_dir().expect("current dir");
         let previous_home = std::env::var_os("HOME");
         unsafe {
             std::env::set_var("HOME", &home);
         }
-        std::env::set_current_dir(&cwd).expect("set cwd");
 
-        let store = SessionStore::for_current_dir("existing").expect("store");
+        let state = test_state();
+        let store = SessionStore::for_workspace(&state.inner.options.workspace_root, "existing")
+            .expect("store");
         store.save(&Session::new()).expect("save existing session");
 
-        let result = create_session(State(test_state()), Path("existing".to_string())).await;
+        let result = create_session(State(state), Path("existing".to_string())).await;
 
         assert!(matches!(
             result,
@@ -1687,7 +2264,6 @@ mod tests {
             })
         ));
 
-        std::env::set_current_dir(previous_cwd).expect("restore cwd");
         match previous_home {
             Some(value) => unsafe {
                 std::env::set_var("HOME", value);
@@ -1703,16 +2279,14 @@ mod tests {
     async fn archive_and_restore_session_updates_session_listing() {
         let lock = ENV_LOCK.get_or_init(|| AsyncMutex::new(())).lock().await;
         let home = unique_test_dir("archive-home");
-        let cwd = unique_test_dir("archive-cwd");
-        let previous_cwd = std::env::current_dir().expect("current dir");
         let previous_home = std::env::var_os("HOME");
         unsafe {
             std::env::set_var("HOME", &home);
         }
-        std::env::set_current_dir(&cwd).expect("set cwd");
 
         let state = test_state();
-        let store = SessionStore::for_current_dir("work").expect("store");
+        let store = SessionStore::for_workspace(&state.inner.options.workspace_root, "work")
+            .expect("store");
         store.save(&Session::new()).expect("save session");
 
         let archived = archive_session(State(state.clone()), Path("work".to_string()))
@@ -1735,7 +2309,6 @@ mod tests {
         assert!(!store.is_archived());
         assert!(store.load_existing().is_ok());
 
-        std::env::set_current_dir(previous_cwd).expect("restore cwd");
         match previous_home {
             Some(value) => unsafe {
                 std::env::set_var("HOME", value);

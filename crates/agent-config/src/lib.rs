@@ -305,7 +305,14 @@ pub fn load_config(explicit_path: Option<&Path>) -> Result<LoadedConfig, ConfigE
 
 pub fn load_server_config(explicit_path: Option<&Path>) -> Result<LoadedServerConfig, ConfigError> {
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    load_server_config_from_locations(explicit_path, &cwd, dirs::home_dir().as_deref())
+    load_server_config_for_workspace(explicit_path, &cwd)
+}
+
+pub fn load_server_config_for_workspace(
+    explicit_path: Option<&Path>,
+    workspace: &Path,
+) -> Result<LoadedServerConfig, ConfigError> {
+    load_server_config_from_locations(explicit_path, workspace, dirs::home_dir().as_deref())
 }
 
 fn load_server_config_from_locations(
@@ -945,6 +952,25 @@ model = "deepseek-v4-pro"
         assert_eq!(loaded.model, None);
         assert_eq!(loaded.config.agent.system_prompt, "Web bootstrap");
         assert!(loaded.diagnostics[0].contains("context_window_tokens"));
+    }
+
+    #[test]
+    fn server_config_can_be_loaded_for_an_explicit_workspace() {
+        let workspace = unique_dir("server-explicit-workspace");
+        let config = workspace.join("morrow.toml");
+        fs::write(
+            &config,
+            r#"
+[agent]
+system_prompt = "Desktop workspace"
+"#,
+        )
+        .expect("write config");
+
+        let loaded = load_server_config_for_workspace(None, &workspace).expect("workspace config");
+
+        assert_eq!(loaded.path.as_deref(), Some(config.as_path()));
+        assert_eq!(loaded.config.agent.system_prompt, "Desktop workspace");
     }
 
     #[test]

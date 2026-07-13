@@ -17,6 +17,15 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libwebkit2gtk-4.1-dev \
+            patchelf
+
       - name: Check formatting
         run: cargo fmt --check
 
@@ -28,3 +37,31 @@ jobs:
 
       - name: Build
         run: cargo build --workspace --locked
+
+  web:
+    name: Web dashboard
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.30.3
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: crates/agent-server/web/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm --dir crates/agent-server/web install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm --dir crates/agent-server/web typecheck
+
+      - name: Build dashboard assets
+        run: pnpm --dir crates/agent-server/web build

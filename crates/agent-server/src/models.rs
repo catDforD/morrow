@@ -1144,4 +1144,34 @@ mod tests {
         assert_eq!(resolved.selection, Some(selection));
         assert!(!resolved.inherited);
     }
+
+    #[tokio::test]
+    async fn session_selections_are_isolated_between_workspaces() {
+        let path = unique_path("workspace-session");
+        let first = ModelRegistry::load(path.clone(), Path::new("workspace-a"), None)
+            .expect("first registry");
+        let response = first
+            .create_provider(provider_request(Some("key")))
+            .await
+            .expect("create provider");
+        let selection = ModelSelection {
+            provider_id: response.id,
+            model_id: "deepseek-v4-pro".to_string(),
+            reasoning: ReasoningLevel::Max,
+        };
+        first
+            .set_session_selection("work", selection.clone())
+            .await
+            .expect("set first workspace selection");
+
+        let second =
+            ModelRegistry::load(path, Path::new("workspace-b"), None).expect("second registry");
+        let first_selection = first.session_selection("work").await;
+        let second_selection = second.session_selection("work").await;
+
+        assert_eq!(first_selection.selection, Some(selection));
+        assert!(!first_selection.inherited);
+        assert!(second_selection.inherited);
+        assert_ne!(second_selection.selection, first_selection.selection);
+    }
 }

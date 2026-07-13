@@ -1,0 +1,16 @@
+{
+  "name": "@morrow/agent-desktop",
+  "version": "0.3.0",
+  "private": true,
+  "scripts": {
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "build:windows": "tauri build --bundles nsis",
+    "build:macos": "tauri build --bundles dmg",
+    "icon": "tauri icon src-tauri/icons/icon.svg"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.11.4"
+  },
+  "packageManager": "pnpm@10.30.3"
+}
