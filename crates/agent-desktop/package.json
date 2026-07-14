@@ -1,6 +1,5 @@
 {
   "name": "@morrow/agent-desktop",
-  "version": "0.3.0",
   "private": true,
   "scripts": {
     "dev": "tauri dev",
