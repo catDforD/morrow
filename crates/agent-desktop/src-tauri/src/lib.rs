@@ -5,17 +5,22 @@ use agent_server::{
     RunningServer, ServerAccessPolicy, ServerOptions, ShutdownPolicy,
     server_options_from_loaded_config, spawn_local,
 };
+use serde::{Deserialize, Serialize};
 use state::{DesktopState, DesktopStateError};
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+#[cfg(target_os = "macos")]
 use tauri::menu::{AboutMetadata, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::webview::NewWindowResponse;
 use tauri::{
-    AppHandle, Manager, RunEvent, Url, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent,
+    AppHandle, Manager, RunEvent, State, Url, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
+    WindowEvent,
 };
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use tauri_plugin_log::{RotationStrategy, Target, TargetKind};
@@ -24,13 +29,21 @@ use thiserror::Error;
 use tokio::sync::{Mutex, oneshot};
 
 const MAIN_WINDOW_LABEL: &str = "main";
+#[cfg(target_os = "macos")]
 const OPEN_FOLDER_MENU_ID: &str = "file.open-folder";
+#[cfg(target_os = "macos")]
 const OPEN_RECENT_PREFIX: &str = "file.open-recent.";
+#[cfg(target_os = "macos")]
 const DOWNLOAD_RELEASE_MENU_ID: &str = "help.download-release";
+#[cfg(target_os = "macos")]
 const OPEN_LOGS_MENU_ID: &str = "help.open-logs";
 const RELEASES_URL: &str = "https://github.com/catDforD/morrow/releases/latest";
 const VITE_DEV_URL: &str = "http://127.0.0.1:5173/";
 const SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux", test))]
+const DESKTOP_SHELL_STATE_PERMISSION: &str = "allow-desktop-shell-state";
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux", test))]
+const DESKTOP_ACTION_PERMISSION: &str = "allow-desktop-action";
 
 struct DesktopRuntime {
     home: PathBuf,
@@ -39,6 +52,8 @@ struct DesktopRuntime {
     inner: Mutex<DesktopRuntimeInner>,
     operation: Mutex<()>,
     navigation_origin: RwLock<Option<String>>,
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+    authorized_origins: RwLock<HashSet<String>>,
     exit_requested: AtomicBool,
 }
 
@@ -58,6 +73,126 @@ enum StopServerOutcome {
     Cancelled(RunningServer),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum DesktopAction {
+    StartDrag {},
+    Minimize {},
+    ToggleMaximize {},
+    CloseWindow {},
+    Quit {},
+    OpenFolder {},
+    OpenRecent { index: usize },
+    OpenLogs {},
+    DownloadLatest {},
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopShellState {
+    is_maximized: bool,
+    recent_workspaces: Vec<RecentWorkspace>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RecentWorkspace {
+    index: usize,
+    label: String,
+}
+
+#[tauri::command]
+async fn desktop_shell_state(
+    window: WebviewWindow,
+    runtime: State<'_, DesktopRuntime>,
+) -> Result<DesktopShellState, String> {
+    ensure_main_window(&window)?;
+    let is_maximized = window.is_maximized().map_err(|error| error.to_string())?;
+    let recent_workspaces = runtime
+        .inner
+        .lock()
+        .await
+        .state
+        .recent_workspaces()
+        .iter()
+        .enumerate()
+        .map(|(index, workspace)| RecentWorkspace {
+            index,
+            label: workspace_label(workspace),
+        })
+        .collect();
+    Ok(DesktopShellState {
+        is_maximized,
+        recent_workspaces,
+    })
+}
+
+#[tauri::command]
+async fn desktop_action(
+    app: AppHandle,
+    window: WebviewWindow,
+    runtime: State<'_, DesktopRuntime>,
+    action: DesktopAction,
+) -> Result<(), String> {
+    ensure_main_window(&window)?;
+    match action {
+        DesktopAction::StartDrag {} => window.start_dragging().map_err(|error| error.to_string()),
+        DesktopAction::Minimize {} => window.minimize().map_err(|error| error.to_string()),
+        DesktopAction::ToggleMaximize {} => {
+            if window.is_maximized().map_err(|error| error.to_string())? {
+                window.unmaximize().map_err(|error| error.to_string())
+            } else {
+                window.maximize().map_err(|error| error.to_string())
+            }
+        }
+        DesktopAction::CloseWindow {} => window.close().map_err(|error| error.to_string()),
+        DesktopAction::Quit {} => {
+            request_exit(app);
+            Ok(())
+        }
+        DesktopAction::OpenFolder {} => {
+            request_workspace_picker(&app, false);
+            Ok(())
+        }
+        DesktopAction::OpenRecent { index } => {
+            let workspace = {
+                let inner = runtime.inner.lock().await;
+                recent_workspace_at(&inner.state, index)?
+            };
+            spawn_workspace_switch(app, workspace, false);
+            Ok(())
+        }
+        DesktopAction::OpenLogs {} => {
+            open_logs_directory(&app);
+            Ok(())
+        }
+        DesktopAction::DownloadLatest {} => app
+            .opener()
+            .open_url(RELEASES_URL, None::<&str>)
+            .map_err(|error| error.to_string()),
+    }
+}
+
+fn ensure_main_window(window: &WebviewWindow) -> Result<(), String> {
+    ensure_main_window_label(window.label())
+}
+
+fn ensure_main_window_label(label: &str) -> Result<(), String> {
+    if label == MAIN_WINDOW_LABEL {
+        Ok(())
+    } else {
+        Err("desktop shell commands are only available to the main window".to_string())
+    }
+}
+
+fn recent_workspace_at(state: &DesktopState, index: usize) -> Result<PathBuf, String> {
+    state
+        .recent_workspaces()
+        .get(index)
+        .cloned()
+        .ok_or_else(|| format!("recent workspace index {index} is out of bounds"))
+}
+
 pub fn run() {
     let log_plugin = tauri_plugin_log::Builder::new()
         .targets([Target::new(TargetKind::LogDir {
@@ -75,7 +210,7 @@ pub fn run() {
         )
         .build();
 
-    let app = tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             focus_main_window(app);
         }))
@@ -84,7 +219,14 @@ pub fn run() {
         .plugin(window_state_plugin)
         .plugin(tauri_plugin_opener::init())
         .setup(|app| setup_app(app).map_err(Into::into))
-        .on_menu_event(handle_menu_event)
+        .invoke_handler(tauri::generate_handler![
+            desktop_shell_state,
+            desktop_action
+        ]);
+    #[cfg(target_os = "macos")]
+    let builder = builder.on_menu_event(handle_menu_event);
+
+    let app = builder
         .build(tauri::generate_context!())
         .expect("failed to build Morrow desktop");
 
@@ -120,8 +262,11 @@ fn setup_app(app: &mut tauri::App) -> Result<(), DesktopError> {
         }),
         operation: Mutex::new(()),
         navigation_origin: RwLock::new(None),
+        #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+        authorized_origins: RwLock::new(HashSet::new()),
         exit_requested: AtomicBool::new(false),
     });
+    #[cfg(target_os = "macos")]
     replace_menu(app.handle(), &state)?;
     log::info!("Morrow desktop started");
 
@@ -219,6 +364,15 @@ async fn switch_workspace(app: &AppHandle, workspace: PathBuf) -> Result<(), Des
                     Ok(options) => match launch_server(options, &runtime.bootstrap_token).await {
                         Ok(recovered) => {
                             let recovered_url = recovered.navigation_url.clone();
+                            if let Err(recovery_error) =
+                                authorize_navigation_origin(app, &runtime, &recovered_url)
+                            {
+                                log::error!(
+                                    "failed to authorize the previous workspace ({})",
+                                    recovery_error.log_category()
+                                );
+                                return Err(recovery_error);
+                            }
                             runtime.inner.lock().await.server = Some(recovered.server);
                             set_navigation_origin(&runtime, &recovered_url);
                             if let Err(recovery_error) =
@@ -249,6 +403,7 @@ async fn switch_workspace(app: &AppHandle, workspace: PathBuf) -> Result<(), Des
         }
     };
 
+    authorize_navigation_origin(app, &runtime, &started.navigation_url)?;
     let mut next_state = {
         let inner = runtime.inner.lock().await;
         inner.state.clone()
@@ -271,6 +426,7 @@ async fn switch_workspace(app: &AppHandle, workspace: PathBuf) -> Result<(), Des
     }
     set_navigation_origin(&runtime, &navigation_url);
     show_workspace_window(app, &workspace, navigation_url)?;
+    #[cfg(target_os = "macos")]
     if let Err(error) = replace_menu(app, &next_state) {
         log::error!(
             "failed to refresh the application menu ({})",
@@ -393,7 +549,7 @@ fn show_workspace_window(
 
     let navigation_handle = app.clone();
     let new_window_handle = app.clone();
-    let window =
+    let builder =
         WebviewWindowBuilder::new(app, MAIN_WINDOW_LABEL, WebviewUrl::External(navigation_url))
             .title(title)
             .inner_size(1280.0, 800.0)
@@ -403,10 +559,51 @@ fn show_workspace_window(
             .on_new_window(move |url, _features| {
                 open_external_url(&new_window_handle, &url);
                 NewWindowResponse::Deny
-            })
-            .build()?;
+            });
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    let builder = builder.decorations(false).shadow(true).transparent(true);
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .decorations(true)
+        .title_bar_style(tauri::TitleBarStyle::Overlay)
+        .hidden_title(true)
+        .traffic_light_position(tauri::LogicalPosition::new(14.0, 13.0));
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+    let builder = builder.initialization_script(desktop_platform_initialization_script());
+
+    let window = builder.build()?;
     install_close_handler(&window);
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn desktop_platform_initialization_script() -> &'static str {
+    r#"Object.defineProperty(window, "__MORROW_DESKTOP__", {
+  value: Object.freeze({ platform: "windows" }),
+  writable: false,
+  configurable: false,
+  enumerable: true
+});"#
+}
+
+#[cfg(target_os = "macos")]
+fn desktop_platform_initialization_script() -> &'static str {
+    r#"Object.defineProperty(window, "__MORROW_DESKTOP__", {
+  value: Object.freeze({ platform: "macos" }),
+  writable: false,
+  configurable: false,
+  enumerable: true
+});"#
+}
+
+#[cfg(target_os = "linux")]
+fn desktop_platform_initialization_script() -> &'static str {
+    r#"Object.defineProperty(window, "__MORROW_DESKTOP__", {
+  value: Object.freeze({ platform: "linux" }),
+  writable: false,
+  configurable: false,
+  enumerable: true
+});"#
 }
 
 fn set_navigation_origin(runtime: &DesktopRuntime, url: &Url) {
@@ -415,6 +612,59 @@ fn set_navigation_origin(runtime: &DesktopRuntime, url: &Url) {
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     *origin = Some(url.origin().ascii_serialization());
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+fn authorize_navigation_origin(
+    app: &AppHandle,
+    runtime: &DesktopRuntime,
+    url: &Url,
+) -> Result<(), DesktopError> {
+    let origin = loopback_http_origin(url)?;
+    let mut authorized = runtime
+        .authorized_origins
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if authorized.contains(&origin) {
+        return Ok(());
+    }
+
+    let identifier = format!("desktop-shell-origin-{}", authorized.len());
+    app.add_capability(desktop_remote_capability(&identifier, &origin))?;
+    authorized.insert(origin);
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+fn authorize_navigation_origin(
+    _app: &AppHandle,
+    _runtime: &DesktopRuntime,
+    url: &Url,
+) -> Result<(), DesktopError> {
+    loopback_http_origin(url).map(|_| ())
+}
+
+fn loopback_http_origin(url: &Url) -> Result<String, DesktopError> {
+    let is_loopback = url
+        .host_str()
+        .and_then(|host| host.parse::<IpAddr>().ok())
+        .is_some_and(|address| address.is_loopback());
+    if url.scheme() != "http" || !is_loopback {
+        return Err(DesktopError::InvalidNavigationOrigin(
+            url.origin().ascii_serialization(),
+        ));
+    }
+    Ok(url.origin().ascii_serialization())
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux", test))]
+fn desktop_remote_capability(identifier: &str, origin: &str) -> tauri::ipc::CapabilityBuilder {
+    tauri::ipc::CapabilityBuilder::new(identifier)
+        .remote(format!("{origin}/*"))
+        .local(false)
+        .window(MAIN_WINDOW_LABEL)
+        .permission(DESKTOP_SHELL_STATE_PERMISSION)
+        .permission(DESKTOP_ACTION_PERMISSION)
 }
 
 fn handle_navigation(app: &AppHandle, url: &Url) -> bool {
@@ -463,12 +713,15 @@ fn install_close_handler(window: &WebviewWindow) {
 }
 
 fn workspace_title(workspace: &Path) -> String {
-    let name = workspace
+    format!("Morrow — {}", workspace_label(workspace))
+}
+
+fn workspace_label(workspace: &Path) -> String {
+    workspace
         .file_name()
         .filter(|name| !name.is_empty())
-        .map(|name| name.to_string_lossy())
-        .unwrap_or_else(|| workspace.as_os_str().to_string_lossy());
-    format!("Morrow — {name}")
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| workspace.display().to_string())
 }
 
 fn focus_main_window(app: &AppHandle) {
@@ -479,11 +732,13 @@ fn focus_main_window(app: &AppHandle) {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn replace_menu(app: &AppHandle, state: &DesktopState) -> Result<(), DesktopError> {
     app.set_menu(build_menu(app, state)?)?;
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 fn build_menu(app: &AppHandle, state: &DesktopState) -> tauri::Result<Menu<tauri::Wry>> {
     let open_folder = MenuItem::with_id(
         app,
@@ -515,7 +770,6 @@ fn build_menu(app: &AppHandle, state: &DesktopState) -> tauri::Result<Menu<tauri
     let file_separator = PredefinedMenuItem::separator(app)?;
     let close_window = PredefinedMenuItem::close_window(app, None)?;
     let quit = PredefinedMenuItem::quit(app, None)?;
-    #[cfg(target_os = "macos")]
     let file_menu = Submenu::with_id_and_items(
         app,
         "file",
@@ -523,21 +777,6 @@ fn build_menu(app: &AppHandle, state: &DesktopState) -> tauri::Result<Menu<tauri
         true,
         &[&open_folder, &open_recent, &file_separator, &close_window],
     )?;
-    #[cfg(not(target_os = "macos"))]
-    let file_menu = Submenu::with_id_and_items(
-        app,
-        "file",
-        "File",
-        true,
-        &[
-            &open_folder,
-            &open_recent,
-            &file_separator,
-            &close_window,
-            &quit,
-        ],
-    )?;
-
     let edit_menu = Submenu::with_id_and_items(
         app,
         "edit",
@@ -594,33 +833,29 @@ fn build_menu(app: &AppHandle, state: &DesktopState) -> tauri::Result<Menu<tauri
         ],
     )?;
 
-    #[cfg(target_os = "macos")]
-    {
-        let app_menu = Submenu::with_id_and_items(
-            app,
-            "app",
-            "Morrow",
-            true,
-            &[
-                &PredefinedMenuItem::about(app, None, Some(about_metadata))?,
-                &PredefinedMenuItem::separator(app)?,
-                &PredefinedMenuItem::services(app, None)?,
-                &PredefinedMenuItem::separator(app)?,
-                &PredefinedMenuItem::hide(app, None)?,
-                &PredefinedMenuItem::hide_others(app, None)?,
-                &PredefinedMenuItem::separator(app)?,
-                &quit,
-            ],
-        )?;
-        Menu::with_items(
-            app,
-            &[&app_menu, &file_menu, &edit_menu, &window_menu, &help_menu],
-        )
-    }
-    #[cfg(not(target_os = "macos"))]
-    Menu::with_items(app, &[&file_menu, &edit_menu, &window_menu, &help_menu])
+    let app_menu = Submenu::with_id_and_items(
+        app,
+        "app",
+        "Morrow",
+        true,
+        &[
+            &PredefinedMenuItem::about(app, None, Some(about_metadata))?,
+            &PredefinedMenuItem::separator(app)?,
+            &PredefinedMenuItem::services(app, None)?,
+            &PredefinedMenuItem::separator(app)?,
+            &PredefinedMenuItem::hide(app, None)?,
+            &PredefinedMenuItem::hide_others(app, None)?,
+            &PredefinedMenuItem::separator(app)?,
+            &quit,
+        ],
+    )?;
+    Menu::with_items(
+        app,
+        &[&app_menu, &file_menu, &edit_menu, &window_menu, &help_menu],
+    )
 }
 
+#[cfg(target_os = "macos")]
 fn handle_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
     let id = event.id().as_ref();
     match id {
@@ -766,6 +1001,8 @@ enum DesktopError {
     BackendConfiguration(String),
     #[error("invalid desktop URL: {0}")]
     InvalidUrl(String),
+    #[error("desktop navigation URL must use an HTTP loopback origin: {0}")]
+    InvalidNavigationOrigin(String),
     #[error(transparent)]
     Config(#[from] agent_config::ConfigError),
     #[error(transparent)]
@@ -783,10 +1020,144 @@ impl DesktopError {
             Self::Random(_) => "random-token",
             Self::BackendConfiguration(_) => "backend-configuration",
             Self::InvalidUrl(_) => "desktop-url",
+            Self::InvalidNavigationOrigin(_) => "navigation-origin",
             Self::Config(_) => "workspace-config",
             Self::State(_) => "desktop-state",
             Self::Server(_) => "local-server",
             Self::Tauri(_) => "tauri",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tauri::ipc::RuntimeCapability;
+    use tauri::utils::acl::capability::{CapabilityFile, PermissionEntry};
+
+    #[test]
+    fn desktop_action_deserializes_only_whitelisted_tagged_actions() {
+        let cases = [
+            (r#"{"type":"start_drag"}"#, DesktopAction::StartDrag {}),
+            (r#"{"type":"minimize"}"#, DesktopAction::Minimize {}),
+            (
+                r#"{"type":"toggle_maximize"}"#,
+                DesktopAction::ToggleMaximize {},
+            ),
+            (r#"{"type":"close_window"}"#, DesktopAction::CloseWindow {}),
+            (r#"{"type":"quit"}"#, DesktopAction::Quit {}),
+            (r#"{"type":"open_folder"}"#, DesktopAction::OpenFolder {}),
+            (
+                r#"{"type":"open_recent","index":3}"#,
+                DesktopAction::OpenRecent { index: 3 },
+            ),
+            (r#"{"type":"open_logs"}"#, DesktopAction::OpenLogs {}),
+            (
+                r#"{"type":"download_latest"}"#,
+                DesktopAction::DownloadLatest {},
+            ),
+        ];
+
+        for (json, expected) in cases {
+            assert_eq!(
+                serde_json::from_str::<DesktopAction>(json).expect("deserialize desktop action"),
+                expected
+            );
+        }
+        assert!(serde_json::from_str::<DesktopAction>(r#"{"type":"run_command"}"#).is_err());
+        assert!(
+            serde_json::from_str::<DesktopAction>(r#"{"type":"minimize","path":"/tmp"}"#).is_err()
+        );
+        assert!(serde_json::from_str::<DesktopAction>(r#"{"type":"open_recent"}"#).is_err());
+    }
+
+    #[test]
+    fn desktop_shell_state_serializes_with_the_frontend_wire_shape() {
+        let value = serde_json::to_value(DesktopShellState {
+            is_maximized: true,
+            recent_workspaces: vec![RecentWorkspace {
+                index: 0,
+                label: "morrow".to_string(),
+            }],
+        })
+        .expect("serialize desktop shell state");
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "isMaximized": true,
+                "recentWorkspaces": [{
+                    "index": 0,
+                    "label": "morrow"
+                }]
+            })
+        );
+    }
+
+    #[test]
+    fn remote_capability_is_exact_remote_only_and_has_two_app_permissions() {
+        let capability =
+            desktop_remote_capability("desktop-shell-origin-0", "http://127.0.0.1:43123").build();
+        let CapabilityFile::Capability(capability) = capability else {
+            panic!("expected a single capability");
+        };
+
+        assert_eq!(capability.identifier, "desktop-shell-origin-0");
+        assert!(!capability.local);
+        assert_eq!(capability.windows, [MAIN_WINDOW_LABEL]);
+        assert!(capability.webviews.is_empty());
+        assert_eq!(
+            capability.remote.expect("remote URL restriction").urls,
+            ["http://127.0.0.1:43123/*"]
+        );
+        let permissions = capability
+            .permissions
+            .iter()
+            .map(|permission| match permission {
+                PermissionEntry::PermissionRef(identifier) => identifier.as_ref(),
+                PermissionEntry::ExtendedPermission { .. } => {
+                    panic!("desktop shell permissions must not be scoped plugin permissions")
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            permissions,
+            [DESKTOP_SHELL_STATE_PERMISSION, DESKTOP_ACTION_PERMISSION]
+        );
+        assert!(!permissions.contains(&"core:default"));
+    }
+
+    #[test]
+    fn navigation_capability_accepts_only_http_loopback_origins() {
+        let loopback = parse_url("http://127.0.0.1:43123/workspace").expect("loopback URL");
+        assert_eq!(
+            loopback_http_origin(&loopback).expect("valid loopback origin"),
+            "http://127.0.0.1:43123"
+        );
+
+        for url in [
+            "https://127.0.0.1:43123/",
+            "http://example.com:43123/",
+            "file:///tmp/index.html",
+        ] {
+            let url = parse_url(url).expect("test URL");
+            assert!(loopback_http_origin(&url).is_err());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_initialization_script_enables_the_desktop_shell() {
+        let script = desktop_platform_initialization_script();
+        assert!(script.contains(r#"platform: "linux""#));
+        assert!(script.contains("Object.freeze"));
+        assert!(script.contains("configurable: false"));
+    }
+
+    #[test]
+    fn desktop_commands_reject_other_windows_and_invalid_recent_indexes() {
+        assert!(ensure_main_window_label(MAIN_WINDOW_LABEL).is_ok());
+        assert!(ensure_main_window_label("settings").is_err());
+        assert!(recent_workspace_at(&DesktopState::default(), 0).is_err());
     }
 }

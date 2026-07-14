@@ -18,6 +18,7 @@ import {
   ListTree,
   Moon,
   PanelLeft,
+  PanelLeftClose,
   PencilLine,
   Plug,
   Plus,
@@ -36,6 +37,7 @@ import {
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { fetchJson, sessionSocketUrl } from './api'
+import DesktopShell from './DesktopShell'
 import SettingsView from './SettingsView'
 import type { SettingsSection, ThemePreference } from './SettingsView'
 import type {
@@ -136,6 +138,8 @@ export default function App() {
   const [sessionFilter, setSessionFilter] = useState('')
   const [isSearchOpen, setIsSearchOpen] = useState(false)
   const [isSidebarOpen, setIsSidebarOpen] = useState(false)
+  const [isDesktopSidebarCollapsed, setIsDesktopSidebarCollapsed] =
+    useState(false)
   const [isNarrowViewport, setIsNarrowViewport] = useState(() =>
     window.matchMedia('(max-width: 900px)').matches,
   )
@@ -992,6 +996,11 @@ export default function App() {
     prompt.trim().length > 0 &&
     Boolean(selectedModel)
   const canCancel = Boolean(runningTurn?.turn_id && runningTurn.turn_id !== 'pending')
+  const isWorkspaceSidebarCollapsed =
+    !isNarrowViewport && isDesktopSidebarCollapsed
+  const isWorkspaceSidebarVisible = isNarrowViewport
+    ? isSidebarOpen
+    : !isWorkspaceSidebarCollapsed
 
   const openInspector = (panel: InspectorPanel) => {
     setIsSidebarOpen(false)
@@ -1001,7 +1010,11 @@ export default function App() {
 
   const openSidebar = () => {
     setIsInspectorOpen(false)
-    setIsSidebarOpen(true)
+    if (isNarrowViewport) {
+      setIsSidebarOpen(true)
+    } else {
+      setIsDesktopSidebarCollapsed(false)
+    }
   }
 
   const openSettings = (section: SettingsSection = 'general') => {
@@ -1275,134 +1288,147 @@ export default function App() {
 
   return (
     <>
-      {appView === 'settings' ? (
-        <SettingsView
-          section={settingsSection}
-          status={status}
-          theme={themePreference}
-          permissionMode={permissionMode}
-          modelSettings={modelSettings}
-          commandSettings={commandSettings}
-          isSidebarOpen={isSidebarOpen}
-          isSidebarHidden={isNarrowViewport && !isSidebarOpen}
-          onSectionChange={changeSettingsSection}
-          onBack={closeSettings}
-          onOpenSidebar={() => setIsSidebarOpen(true)}
-          onCloseSidebar={() => setIsSidebarOpen(false)}
-          onThemeChange={setThemePreference}
-          onPermissionModeChange={changePermissionMode}
-          onModelSettingsChange={async () => {
-            modelSelectionRequestRef.current += 1
-            await loadModelSettings()
-            const selection = await loadSessionModelSelection(selectedRef.current)
-            modelSelectionRef.current = selection
-            setModelSelection(selection)
-          }}
-          onCommandSettingsChange={async () => {
-            await loadCommandSettings()
-          }}
-        />
-      ) : (
-        <div className={`app-frame${isSidebarOpen ? ' sidebar-open' : ''}`}>
-          <button
-            className="mobile-sidebar-backdrop"
-            type="button"
-            aria-label="Close task navigation"
-            aria-hidden={!isSidebarOpen}
-            tabIndex={isSidebarOpen ? 0 : -1}
-            onClick={() => setIsSidebarOpen(false)}
+      <DesktopShell onOpenAbout={() => openSettings('about')}>
+        {appView === 'settings' ? (
+          <SettingsView
+            section={settingsSection}
+            status={status}
+            theme={themePreference}
+            permissionMode={permissionMode}
+            modelSettings={modelSettings}
+            commandSettings={commandSettings}
+            isSidebarOpen={isSidebarOpen}
+            isSidebarHidden={isNarrowViewport && !isSidebarOpen}
+            onSectionChange={changeSettingsSection}
+            onBack={closeSettings}
+            onOpenSidebar={() => setIsSidebarOpen(true)}
+            onCloseSidebar={() => setIsSidebarOpen(false)}
+            onThemeChange={setThemePreference}
+            onPermissionModeChange={changePermissionMode}
+            onModelSettingsChange={async () => {
+              modelSelectionRequestRef.current += 1
+              await loadModelSettings()
+              const selection = await loadSessionModelSelection(selectedRef.current)
+              modelSelectionRef.current = selection
+              setModelSelection(selection)
+            }}
+            onCommandSettingsChange={async () => {
+              await loadCommandSettings()
+            }}
           />
-          <AppSidebar
-            sessions={activeSessions}
-            archivedSessions={archivedSessions}
-            sessionCount={sessions.filter((session) => !session.archived).length}
-            runningTurn={runningTurn}
-            selected={selected}
-            sessionAction={sessionAction}
-            isCreatingSession={isCreatingSession}
-            newSessionName={newSessionName}
-            createSessionError={createSessionError}
-            isSearchOpen={isSearchOpen}
-            sessionFilter={sessionFilter}
-            theme={resolvedTheme}
-            searchInputRef={sessionSearchRef}
-            isHidden={isNarrowViewport && !isSidebarOpen}
-            onSelectSession={(name) => void selectSession(name)}
-            onStartCreateSession={startCreateSession}
-            onCancelCreateSession={cancelCreateSession}
-            onNewSessionNameChange={setNewSessionName}
-            onCreateSession={() => void createSession()}
-            onToggleSearch={toggleSearch}
-            onSessionFilterChange={setSessionFilter}
-            onArchiveSession={(name) => void archiveSession(name)}
-            onRestoreSession={(name) => void restoreSession(name)}
-            onRefresh={() => void refresh()}
-            onClose={() => setIsSidebarOpen(false)}
-            onOpenSettings={openSettings}
-            onThemeToggle={() =>
-              setThemePreference(resolvedTheme === 'dark' ? 'light' : 'dark')
-            }
-          />
-          <main className="window-main">
-            <ChatView
+        ) : (
+          <div
+            className={`app-frame${isSidebarOpen ? ' sidebar-open' : ''}${isWorkspaceSidebarCollapsed ? ' sidebar-collapsed' : ''}`}
+          >
+            <button
+              className="mobile-sidebar-backdrop"
+              type="button"
+              aria-label="Close task navigation"
+              aria-hidden={!isSidebarOpen}
+              tabIndex={isSidebarOpen ? 0 : -1}
+              onClick={() => setIsSidebarOpen(false)}
+            />
+            <AppSidebar
+              sessions={activeSessions}
+              archivedSessions={archivedSessions}
+              sessionCount={sessions.filter((session) => !session.archived).length}
+              runningTurn={runningTurn}
               selected={selected}
-              status={status}
-              connection={connection}
-              timeline={timeline}
+              sessionAction={sessionAction}
+              isCreatingSession={isCreatingSession}
+              newSessionName={newSessionName}
+              createSessionError={createSessionError}
+              isSearchOpen={isSearchOpen}
+              sessionFilter={sessionFilter}
+              theme={resolvedTheme}
+              searchInputRef={sessionSearchRef}
+              isHidden={
+                isWorkspaceSidebarCollapsed ||
+                (isNarrowViewport && !isSidebarOpen)
+              }
+              onSelectSession={(name) => void selectSession(name)}
+              onStartCreateSession={startCreateSession}
+              onCancelCreateSession={cancelCreateSession}
+              onNewSessionNameChange={setNewSessionName}
+              onCreateSession={() => void createSession()}
+              onToggleSearch={toggleSearch}
+              onSessionFilterChange={setSessionFilter}
+              onArchiveSession={(name) => void archiveSession(name)}
+              onRestoreSession={(name) => void restoreSession(name)}
+              onRefresh={() => void refresh()}
+              onClose={() => {
+                if (isNarrowViewport) {
+                  setIsSidebarOpen(false)
+                } else {
+                  setIsDesktopSidebarCollapsed(true)
+                }
+              }}
+              onOpenSettings={openSettings}
+              onThemeToggle={() =>
+                setThemePreference(resolvedTheme === 'dark' ? 'light' : 'dark')
+              }
+            />
+            <main className="window-main">
+              <ChatView
+                selected={selected}
+                status={status}
+                connection={connection}
+                timeline={timeline}
+                runningTurn={runningTurn}
+                pendingApproval={pendingApproval}
+                prompt={prompt}
+                canSend={canSend}
+                canCancel={canCancel}
+                isRunning={isRunning}
+                permissionMode={permissionMode}
+                modelSettings={modelSettings}
+                commandSettings={commandSettings}
+                modelSelection={modelSelection}
+                isResolvingCommand={isResolvingCommand}
+                isSidebarOpen={isWorkspaceSidebarVisible}
+                onPromptChange={setPrompt}
+                onPromptKeyDown={handlePromptKeyDown}
+                onSubmit={handleSubmit}
+                onCancel={cancelTurn}
+                onPermissionModeChange={changePermissionMode}
+                onModelSelectionChange={(selection) =>
+                  void changeModelSelection(selection)
+                }
+                onManageModels={() => openSettings('models')}
+                onOpenSidebar={openSidebar}
+                onOpenInspector={openInspector}
+                onToggleRun={(id) => {
+                  setTimeline((items) =>
+                    items.map((item) =>
+                      item.kind === 'run' && item.id === id
+                        ? {
+                            ...item,
+                            trace: {
+                              ...item.trace,
+                              collapsed: !item.trace.collapsed,
+                            },
+                          }
+                        : item,
+                    ),
+                  )
+                }}
+                messagesEndRef={messagesEndRef}
+              />
+            </main>
+            <InspectorDrawer
+              open={isInspectorOpen}
+              panel={inspectorPanel}
+              tools={tools}
+              activity={activity}
+              selectedEntry={selectedEntry}
               runningTurn={runningTurn}
               pendingApproval={pendingApproval}
-              prompt={prompt}
-              canSend={canSend}
-              canCancel={canCancel}
-              isRunning={isRunning}
-              permissionMode={permissionMode}
-              modelSettings={modelSettings}
-              commandSettings={commandSettings}
-              modelSelection={modelSelection}
-              isResolvingCommand={isResolvingCommand}
-              isSidebarOpen={isSidebarOpen}
-              onPromptChange={setPrompt}
-              onPromptKeyDown={handlePromptKeyDown}
-              onSubmit={handleSubmit}
-              onCancel={cancelTurn}
-              onPermissionModeChange={changePermissionMode}
-              onModelSelectionChange={(selection) =>
-                void changeModelSelection(selection)
-              }
-              onManageModels={() => openSettings('models')}
-              onOpenSidebar={openSidebar}
-              onOpenInspector={openInspector}
-              onToggleRun={(id) => {
-                setTimeline((items) =>
-                  items.map((item) =>
-                    item.kind === 'run' && item.id === id
-                      ? {
-                          ...item,
-                          trace: {
-                            ...item.trace,
-                            collapsed: !item.trace.collapsed,
-                          },
-                        }
-                      : item,
-                  ),
-                )
-              }}
-              messagesEndRef={messagesEndRef}
+              onClose={() => setIsInspectorOpen(false)}
+              onPanelChange={setInspectorPanel}
             />
-          </main>
-          <InspectorDrawer
-            open={isInspectorOpen}
-            panel={inspectorPanel}
-            tools={tools}
-            activity={activity}
-            selectedEntry={selectedEntry}
-            runningTurn={runningTurn}
-            pendingApproval={pendingApproval}
-            onClose={() => setIsInspectorOpen(false)}
-            onPanelChange={setInspectorPanel}
-          />
-        </div>
-      )}
+          </div>
+        )}
+      </DesktopShell>
       <ApprovalDialog
         request={pendingApproval}
         onApprove={() => sendApproval(true)}
@@ -1480,19 +1506,15 @@ function AppSidebar({
   return (
     <aside
       id="task-navigation"
-      className="app-sidebar"
+      className="app-sidebar workspace-sidebar"
       aria-label="Task navigation"
       aria-hidden={isHidden}
       inert={isHidden}
     >
-      <div className="sidebar-brand">
-        <div className="brand-mark">M</div>
-        <div className="sidebar-brand-copy">
-          <strong>Morrow</strong>
-          <span>Agent workspace</span>
-        </div>
-        <MiniIconButton title="Close task navigation" onClick={onClose}>
-          <X size={17} />
+      <div className="sidebar-brand workspace-brand">
+        <strong className="workspace-brand-name">Morrow</strong>
+        <MiniIconButton title="Collapse task navigation" onClick={onClose}>
+          <PanelLeftClose size={17} />
         </MiniIconButton>
       </div>
 
@@ -1877,10 +1899,7 @@ function ConversationHeader({
         >
           <PanelLeft size={19} />
         </button>
-        <div>
-          <p className="eyebrow">Current task</p>
-          <h1 title={selected}>{selected}</h1>
-        </div>
+        <h1 title={selected}>{selected}</h1>
       </div>
       <div className="conversation-actions">
         <span className={`connection-badge ${connectionState}`}>

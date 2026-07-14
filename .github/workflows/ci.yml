@@ -63,5 +63,8 @@ jobs:
       - name: Typecheck
         run: pnpm --dir crates/agent-server/web typecheck
 
+      - name: Test
+        run: pnpm --dir crates/agent-server/web test
+
       - name: Build dashboard assets
         run: pnpm --dir crates/agent-server/web build
