@@ -88,6 +88,13 @@ html {
   background: var(--surface-main);
 }
 
+html:has(.desktop-windows),
+html:has(.desktop-linux),
+html:has(.desktop-windows) body,
+html:has(.desktop-linux) body {
+  background: transparent;
+}
+
 body {
   margin: 0;
   min-height: 100dvh;
@@ -190,6 +197,19 @@ a:focus-visible {
   display: none;
 }
 
+.mobile-menu-button {
+  width: 36px;
+  height: 36px;
+  place-items: center;
+  flex: 0 0 auto;
+  border: 2px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-small);
+  background: var(--surface-panel);
+  color: var(--foreground);
+  cursor: pointer;
+}
+
 .app-sidebar {
   position: relative;
   z-index: 20;
@@ -210,6 +230,20 @@ a:focus-visible {
   grid-template-columns: 40px minmax(0, 1fr) auto;
   align-items: center;
   gap: 11px;
+}
+
+.workspace-brand {
+  min-height: 40px;
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.workspace-brand-name {
+  overflow: hidden;
+  font-size: 22px;
+  font-weight: 850;
+  line-height: 1.05;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .brand-mark {
@@ -460,7 +494,7 @@ a:focus-visible {
   box-shadow: 2px 2px 0 0 var(--border);
   background: var(--surface-panel);
   padding: 0;
-  margin-right: 7px;
+  margin-right: 2px;
   color: var(--foreground);
   cursor: pointer;
   opacity: 0;
@@ -756,6 +790,319 @@ a:focus-visible {
   display: grid;
   grid-template-rows: minmax(0, 1fr);
   background: var(--surface-main);
+}
+
+.desktop-shell {
+  --desktop-divider-width: 1px;
+  --desktop-frame-radius: 10px;
+  --desktop-frame-width: 2px;
+
+  position: relative;
+  width: 100vw;
+  height: 100dvh;
+  display: grid;
+  grid-template-rows: var(--desktop-titlebar-height) minmax(0, 1fr);
+  overflow: hidden;
+  border-radius: var(--desktop-frame-radius);
+  background: var(--surface-main);
+}
+
+.desktop-windows::before,
+.desktop-linux::before {
+  position: absolute;
+  inset: 0;
+  z-index: 1000;
+  border: var(--desktop-frame-width) solid var(--border);
+  border-radius: var(--desktop-frame-radius);
+  content: '';
+  pointer-events: none;
+}
+
+.desktop-shell-content {
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.desktop-shell-content > .app-frame {
+  height: 100%;
+  transition: grid-template-columns 170ms ease;
+}
+
+.desktop-shell .app-sidebar {
+  border-right: 0;
+  padding-top: 9px;
+  transition:
+    opacity 130ms ease,
+    transform 170ms ease;
+}
+
+.desktop-shell .workspace-sidebar {
+  gap: 12px;
+}
+
+.desktop-shell .workspace-brand {
+  padding-left: 9px;
+}
+
+.desktop-shell .workspace-brand > .mini-icon-button {
+  display: inline-grid;
+  margin-right: 10px;
+}
+
+.desktop-shell .workspace-sidebar .sidebar-action small {
+  margin-right: 4px;
+}
+
+.desktop-shell .workspace-sidebar .session-browser-head {
+  padding-right: 0;
+}
+
+.desktop-shell .workspace-sidebar .session-browser-head > .mini-icon-button {
+  margin-right: 10px;
+}
+
+.desktop-shell .workspace-sidebar .session-row-action {
+  margin-right: 7px;
+}
+
+.desktop-shell .workspace-sidebar .sidebar-session-row.active .session-row-action {
+  margin-right: 5px;
+}
+
+.desktop-shell .workspace-sidebar .archive-section-toggle {
+  padding-right: 12px;
+}
+
+.desktop-shell .workspace-sidebar .sidebar-footer-actions {
+  margin-right: 10px;
+}
+
+.desktop-shell .app-frame.sidebar-collapsed {
+  grid-template-columns: 0 minmax(0, 1fr);
+}
+
+.desktop-shell .sidebar-collapsed .app-sidebar {
+  visibility: hidden;
+  opacity: 0;
+  transform: translateX(-100%);
+}
+
+.desktop-shell .sidebar-collapsed .window-main {
+  border-left: 0;
+  border-radius: 0;
+}
+
+.desktop-shell .sidebar-collapsed .mobile-menu-button {
+  display: inline-grid;
+}
+
+.desktop-shell .window-main {
+  border-top: var(--desktop-divider-width) solid var(--border);
+  border-left: var(--desktop-divider-width) solid var(--border);
+  border-radius: var(--desktop-frame-radius) 0 0 0;
+}
+
+.desktop-shell .conversation-header {
+  border-bottom-width: var(--desktop-divider-width);
+}
+
+.desktop-shell:has(.app-frame) .desktop-titlebar::after {
+  display: none;
+}
+
+.desktop-shell .conversation-panel:not(.home-mode) {
+  grid-template-rows: 54px minmax(0, 1fr);
+}
+
+.desktop-shell .conversation-panel:not(.home-mode) > .message-scroll {
+  padding-bottom: 200px;
+}
+
+.desktop-shell .conversation-panel:not(.home-mode) > .composer {
+  position: absolute;
+  right: 11px;
+  bottom: 0;
+  left: 0;
+  z-index: 5;
+}
+
+.desktop-titlebar {
+  position: relative;
+  z-index: 100;
+  min-width: 0;
+  height: var(--desktop-titlebar-height);
+  display: flex;
+  align-items: stretch;
+  background: var(--surface-sidebar);
+  color: var(--foreground);
+  user-select: none;
+}
+
+.desktop-titlebar::after {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 264px;
+  height: var(--desktop-divider-width);
+  background: var(--border);
+  content: '';
+  pointer-events: none;
+}
+
+.desktop-titlebar-drag-region {
+  min-width: 0;
+  flex: 1;
+}
+
+.desktop-menu-bar {
+  height: 100%;
+  display: flex;
+  flex: 0 0 auto;
+  align-items: stretch;
+  gap: 2px;
+  padding: 3px 6px;
+}
+
+.desktop-menu-root {
+  position: relative;
+  display: flex;
+  align-items: stretch;
+}
+
+.desktop-menu-trigger {
+  min-width: 48px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  padding: 0 11px;
+  color: var(--foreground);
+  cursor: default;
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.desktop-menu-trigger:hover,
+.desktop-menu-trigger.active,
+.desktop-menu-trigger:focus-visible {
+  outline: 0;
+  background: color-mix(in srgb, var(--main), transparent 73%);
+}
+
+.desktop-menu {
+  position: absolute;
+  top: calc(100% + 2px);
+  left: 0;
+  z-index: 120;
+  min-width: 238px;
+  display: grid;
+  gap: 2px;
+  border: 2px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  background: var(--surface-panel);
+  padding: 6px;
+  color: var(--foreground);
+}
+
+.desktop-menu-item {
+  width: 100%;
+  min-height: 29px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 24px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  padding: 5px 8px;
+  color: var(--foreground);
+  cursor: default;
+  text-align: left;
+}
+
+.desktop-menu-item:not(:disabled):hover,
+.desktop-menu-item:not(:disabled):focus-visible {
+  outline: 0;
+  background: var(--main);
+  color: var(--main-foreground);
+}
+
+.desktop-menu-item:disabled {
+  opacity: 0.48;
+}
+
+.desktop-menu-item span {
+  overflow: hidden;
+  font-size: 12px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.desktop-menu-item kbd {
+  color: var(--muted);
+  font-family: inherit;
+  font-size: 10px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.desktop-menu-item:hover kbd,
+.desktop-menu-item:focus-visible kbd {
+  color: inherit;
+}
+
+.desktop-menu-separator {
+  height: 1.5px;
+  margin: 4px 3px;
+  background: color-mix(in srgb, var(--border), transparent 58%);
+}
+
+.desktop-submenu-root {
+  position: relative;
+}
+
+.desktop-submenu {
+  top: -7px;
+  left: calc(100% + 7px);
+  min-width: 250px;
+}
+
+.window-controls {
+  height: 38px;
+  display: flex;
+  align-items: stretch;
+}
+
+.window-controls button {
+  width: 46px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  background: transparent;
+  color: var(--foreground);
+  cursor: default;
+}
+
+.window-controls button:hover,
+.window-controls button:focus-visible {
+  outline: 0;
+  background: color-mix(in srgb, var(--foreground), transparent 87%);
+}
+
+.window-controls .window-close-button:hover,
+.window-controls .window-close-button:focus-visible {
+  background: #e81123;
+  color: #fff;
+}
+
+.restore-window-icon {
+  transform: rotate(180deg);
+}
+
+.desktop-titlebar.macos {
+  padding-left: 78px;
 }
 
 .settings-mobile-header {
@@ -1164,12 +1511,6 @@ a:focus-visible {
   display: flex;
   align-items: center;
   gap: 10px;
-}
-
-.conversation-title > div {
-  min-width: 0;
-  display: grid;
-  gap: 2px;
 }
 
 .conversation-title h1 {
@@ -3731,19 +4072,6 @@ a:focus-visible {
   .sidebar-brand > .mini-icon-button,
   .mobile-menu-button {
     display: inline-grid;
-  }
-
-  .mobile-menu-button {
-    width: 36px;
-    height: 36px;
-    place-items: center;
-    flex: 0 0 auto;
-    border: 2px solid var(--border);
-    border-radius: var(--radius);
-    box-shadow: var(--shadow-small);
-    background: var(--surface-panel);
-    color: var(--foreground);
-    cursor: pointer;
   }
 
   .home-menu-button {
