@@ -793,6 +793,7 @@ a:focus-visible {
 }
 
 .desktop-shell {
+  --desktop-divider-width: 1px;
   --desktop-frame-radius: 10px;
   --desktop-frame-width: 2px;
 
@@ -897,13 +898,13 @@ a:focus-visible {
 }
 
 .desktop-shell .window-main {
-  border-top: var(--desktop-frame-width) solid var(--border);
-  border-left: var(--desktop-frame-width) solid var(--border);
+  border-top: var(--desktop-divider-width) solid var(--border);
+  border-left: var(--desktop-divider-width) solid var(--border);
   border-radius: var(--desktop-frame-radius) 0 0 0;
 }
 
 .desktop-shell .conversation-header {
-  border-bottom-width: var(--desktop-frame-width);
+  border-bottom-width: var(--desktop-divider-width);
 }
 
 .desktop-shell:has(.app-frame) .desktop-titlebar::after {
@@ -943,7 +944,7 @@ a:focus-visible {
   right: 0;
   bottom: 0;
   left: 264px;
-  height: var(--desktop-frame-width);
+  height: var(--desktop-divider-width);
   background: var(--border);
   content: '';
   pointer-events: none;
