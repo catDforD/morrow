@@ -848,6 +848,7 @@ async fn switch_wsl_workspace(
         let mut inner = runtime.inner.lock().await;
         (inner.server.take(), inner.wsl.take())
     };
+    let reload_app_shell = old_wsl.is_some();
     if let Some(server) = old_server {
         match stop_server_with_confirmation(app, server, "connect to WSL").await? {
             StopServerOutcome::Stopped => {}
@@ -936,7 +937,7 @@ async fn switch_wsl_workspace(
     if let Err(error) = next_state.save(&runtime.state_path) {
         log::warn!("failed to save WSL workspace state: {error}");
     }
-    show_remote_workspace_window(app, &runtime, &location)?;
+    show_remote_workspace_window(app, &runtime, &location, reload_app_shell)?;
     #[cfg(target_os = "macos")]
     replace_menu(app, &next_state)?;
     let event_app = app.clone();
@@ -1321,7 +1322,9 @@ fn show_connection_window(app: &AppHandle) -> Result<(), DesktopError> {
         .inner_size(1280.0, 800.0)
         .min_inner_size(960.0, 640.0)
         .devtools(cfg!(debug_assertions));
-    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    let builder = builder.decorations(false).shadow(true);
+    #[cfg(target_os = "linux")]
     let builder = builder.decorations(false).shadow(true).transparent(true);
     #[cfg(target_os = "macos")]
     let builder = builder
@@ -1361,6 +1364,7 @@ fn show_remote_workspace_window(
     app: &AppHandle,
     runtime: &DesktopRuntime,
     workspace: &WorkspaceLocation,
+    reload_app_shell: bool,
 ) -> Result<(), DesktopError> {
     let window = app
         .get_webview_window(MAIN_WINDOW_LABEL)
@@ -1374,7 +1378,7 @@ fn show_remote_workspace_window(
             DesktopError::BackendConfiguration("desktop app URL is unavailable".into())
         })?;
     window.set_title(&workspace_location_title(workspace))?;
-    navigate_or_reload(&window, app_url)?;
+    navigate_app_shell(&window, app_url, reload_app_shell)?;
     window.show()?;
     let _ = window.unminimize();
     window.set_focus()?;
@@ -1394,20 +1398,45 @@ fn show_connection_shell(app: &AppHandle, runtime: &DesktopRuntime) -> Result<()
             DesktopError::BackendConfiguration("desktop app URL is unavailable".into())
         })?;
     window.set_title("Morrow")?;
-    navigate_or_reload(&window, app_url)?;
+    navigate_app_shell(&window, app_url, true)?;
     window.show()?;
     let _ = window.unminimize();
     window.set_focus()?;
     Ok(())
 }
 
-fn navigate_or_reload(window: &WebviewWindow, url: Url) -> Result<(), DesktopError> {
-    if window.url().ok().as_ref() == Some(&url) {
-        window.reload()?;
-    } else {
-        window.navigate(url)?;
+fn navigate_app_shell(
+    window: &WebviewWindow,
+    url: Url,
+    reload_current: bool,
+) -> Result<(), DesktopError> {
+    match app_shell_navigation(window.url().ok().as_ref(), &url, reload_current) {
+        AppShellNavigation::None => {}
+        AppShellNavigation::Reload => window.reload()?,
+        AppShellNavigation::Navigate => window.navigate(url)?,
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppShellNavigation {
+    None,
+    Reload,
+    Navigate,
+}
+
+fn app_shell_navigation(
+    current: Option<&Url>,
+    target: &Url,
+    reload_current: bool,
+) -> AppShellNavigation {
+    if current != Some(target) {
+        AppShellNavigation::Navigate
+    } else if reload_current {
+        AppShellNavigation::Reload
+    } else {
+        AppShellNavigation::None
+    }
 }
 
 fn show_workspace_window(
@@ -1438,7 +1467,9 @@ fn show_workspace_window(
                 open_external_url(&new_window_handle, &url);
                 NewWindowResponse::Deny
             });
-    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    let builder = builder.decorations(false).shadow(true);
+    #[cfg(target_os = "linux")]
     let builder = builder.decorations(false).shadow(true).transparent(true);
     #[cfg(target_os = "macos")]
     let builder = builder
@@ -2062,6 +2093,25 @@ mod tests {
         assert_eq!(
             desktop_app_url_for(Some("http://127.0.0.1:5173"), true).expect("development app URL"),
             Url::parse("http://127.0.0.1:5173?desktop_connect=1").expect("valid URL")
+        );
+    }
+
+    #[test]
+    fn app_shell_navigation_skips_startup_reload_and_refreshes_explicit_switches() {
+        let app_url = Url::parse("http://tauri.localhost").expect("valid app URL");
+        let local_url = Url::parse("http://127.0.0.1:43123").expect("valid local URL");
+
+        assert_eq!(
+            app_shell_navigation(Some(&app_url), &app_url, false),
+            AppShellNavigation::None
+        );
+        assert_eq!(
+            app_shell_navigation(Some(&app_url), &app_url, true),
+            AppShellNavigation::Reload
+        );
+        assert_eq!(
+            app_shell_navigation(Some(&local_url), &app_url, false),
+            AppShellNavigation::Navigate
         );
     }
 
