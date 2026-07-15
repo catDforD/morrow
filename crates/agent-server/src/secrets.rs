@@ -184,14 +184,14 @@ fn protect_dpapi(value: &[u8]) -> Result<Vec<u8>, SecretError> {
     use std::ptr;
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Cryptography::{
-        CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, DATA_BLOB,
+        CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData,
     };
 
-    let mut input = DATA_BLOB {
+    let mut input = CRYPT_INTEGER_BLOB {
         cbData: u32::try_from(value.len()).map_err(|_| SecretError::TooLarge)?,
         pbData: value.as_ptr().cast_mut(),
     };
-    let mut output = DATA_BLOB {
+    let mut output = CRYPT_INTEGER_BLOB {
         cbData: 0,
         pbData: ptr::null_mut(),
     };
@@ -222,14 +222,14 @@ fn unprotect_dpapi(value: &[u8]) -> Result<Vec<u8>, SecretError> {
     use std::ptr;
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Cryptography::{
-        CRYPTPROTECT_UI_FORBIDDEN, CryptUnprotectData, DATA_BLOB,
+        CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptUnprotectData,
     };
 
-    let mut input = DATA_BLOB {
+    let mut input = CRYPT_INTEGER_BLOB {
         cbData: u32::try_from(value.len()).map_err(|_| SecretError::TooLarge)?,
         pbData: value.as_ptr().cast_mut(),
     };
-    let mut output = DATA_BLOB {
+    let mut output = CRYPT_INTEGER_BLOB {
         cbData: 0,
         pbData: ptr::null_mut(),
     };
