@@ -1310,8 +1310,9 @@ fn show_connection_window(app: &AppHandle) -> Result<(), DesktopError> {
         focus_main_window(app);
         return Ok(());
     }
+    let app_url = desktop_app_url()?;
     let webview_url = if cfg!(debug_assertions) {
-        WebviewUrl::External(parse_url(&format!("{VITE_DEV_URL}?desktop_connect=1"))?)
+        WebviewUrl::External(app_url.clone())
     } else {
         WebviewUrl::App("index.html".into())
     };
@@ -1332,13 +1333,28 @@ fn show_connection_window(app: &AppHandle) -> Result<(), DesktopError> {
     let builder = builder.initialization_script(desktop_platform_initialization_script());
     let window = builder.build()?;
     install_close_handler(&window);
-    let url = window.url()?;
     let runtime = app.state::<DesktopRuntime>();
     *runtime
         .app_url
         .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(url);
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(app_url);
     Ok(())
+}
+
+fn desktop_app_url() -> Result<Url, DesktopError> {
+    desktop_app_url_for(
+        cfg!(debug_assertions).then_some(VITE_DEV_URL),
+        cfg!(target_os = "windows"),
+    )
+}
+
+fn desktop_app_url_for(dev_url: Option<&str>, windows: bool) -> Result<Url, DesktopError> {
+    let url = match dev_url {
+        Some(dev_url) => format!("{dev_url}?desktop_connect=1"),
+        None if windows => "http://tauri.localhost".to_string(),
+        None => "tauri://localhost".to_string(),
+    };
+    parse_url(&url)
 }
 
 fn show_remote_workspace_window(
@@ -1358,7 +1374,7 @@ fn show_remote_workspace_window(
             DesktopError::BackendConfiguration("desktop app URL is unavailable".into())
         })?;
     window.set_title(&workspace_location_title(workspace))?;
-    window.navigate(app_url)?;
+    navigate_or_reload(&window, app_url)?;
     window.show()?;
     let _ = window.unminimize();
     window.set_focus()?;
@@ -1378,10 +1394,19 @@ fn show_connection_shell(app: &AppHandle, runtime: &DesktopRuntime) -> Result<()
             DesktopError::BackendConfiguration("desktop app URL is unavailable".into())
         })?;
     window.set_title("Morrow")?;
-    window.navigate(app_url)?;
+    navigate_or_reload(&window, app_url)?;
     window.show()?;
     let _ = window.unminimize();
     window.set_focus()?;
+    Ok(())
+}
+
+fn navigate_or_reload(window: &WebviewWindow, url: Url) -> Result<(), DesktopError> {
+    if window.url().ok().as_ref() == Some(&url) {
+        window.reload()?;
+    } else {
+        window.navigate(url)?;
+    }
     Ok(())
 }
 
@@ -2025,6 +2050,18 @@ mod tests {
         assert_eq!(
             default_workspace_path(Path::new("/home/morrow-user")),
             PathBuf::from("/home/morrow-user/.morrow/workspaces/default")
+        );
+    }
+
+    #[test]
+    fn desktop_app_url_is_stable_for_packaged_windows_and_development() {
+        assert_eq!(
+            desktop_app_url_for(None, true).expect("Windows app URL"),
+            Url::parse("http://tauri.localhost").expect("valid URL")
+        );
+        assert_eq!(
+            desktop_app_url_for(Some("http://127.0.0.1:5173"), true).expect("development app URL"),
+            Url::parse("http://127.0.0.1:5173?desktop_connect=1").expect("valid URL")
         );
     }
 

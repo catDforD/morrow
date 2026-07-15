@@ -338,7 +338,6 @@ export function RemoteConnectionDialog({
     setError(null)
     try {
       await connectWsl(distro, probe.user, path)
-      window.location.reload()
     } catch (reason) {
       setError(errorMessage(reason))
       setBusy(false)
