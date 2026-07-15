@@ -36,10 +36,22 @@ import {
 } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { fetchJson, sessionSocketUrl } from './api'
+import { fetchJson, openSessionConnection } from './api'
+import type { SessionConnection } from './api'
+import {
+  getDesktopPlatform,
+  getDesktopShellState,
+  runDesktopAction,
+} from './desktop'
+import type { DesktopPlatform, DesktopShellState } from './desktop'
 import DesktopShell from './DesktopShell'
 import SettingsView from './SettingsView'
 import type { SettingsSection, ThemePreference } from './SettingsView'
+import {
+  ProjectsDialog,
+  RemoteConnectionDialog,
+  WorkspaceMenu,
+} from './WorkspaceManager'
 import type {
   ActivityItem,
   AgentEvent,
@@ -177,8 +189,12 @@ export default function App() {
     savedPermissionModeRef.current ?? 'read_only',
   )
   const [sessionAction, setSessionAction] = useState<string | null>(null)
+  const desktopPlatform = getDesktopPlatform()
+  const [desktopState, setDesktopState] = useState<DesktopShellState | null>(null)
+  const [workspaceDialog, setWorkspaceDialog] = useState<'projects' | 'remote' | null>(null)
+  const [workspaceAction, setWorkspaceAction] = useState<number | null>(null)
 
-  const socketRef = useRef<WebSocket | null>(null)
+  const socketRef = useRef<SessionConnection | null>(null)
   const selectedRef = useRef(selected)
   const modelSelectionRef = useRef<ModelSelection | null>(null)
   const modelSettingsRef = useRef<ModelSettingsResponse | null>(null)
@@ -198,6 +214,39 @@ export default function App() {
     idRef.current += 1
     return `${prefix}-${Date.now()}-${idRef.current}`
   }, [])
+
+  const refreshDesktopState = useCallback(async () => {
+    if (!desktopPlatform) return
+    try {
+      setDesktopState(await getDesktopShellState())
+    } catch (error) {
+      console.error('Could not read desktop project state', error)
+    }
+  }, [desktopPlatform])
+
+  useEffect(() => {
+    void refreshDesktopState()
+  }, [refreshDesktopState])
+
+  const openLocalWorkspace = () => {
+    setWorkspaceDialog(null)
+    void runDesktopAction({ type: 'open_folder' })
+  }
+
+  const openRemoteWorkspace = () => {
+    setWorkspaceDialog('remote')
+  }
+
+  const reconnectWorkspace = async (index: number) => {
+    setWorkspaceAction(index)
+    try {
+      await runDesktopAction({ type: 'open_recent', index })
+    } catch (error) {
+      showError(error)
+    } finally {
+      setWorkspaceAction(null)
+    }
+  }
 
   const recordActivity = useCallback(
     (
@@ -590,7 +639,7 @@ export default function App() {
 
   const sendSocketMessage = useCallback((message: ClientMessage) => {
     const socket = socketRef.current
-    if (!socket || socket.readyState !== WebSocket.OPEN) {
+    if (!socket || !socket.isOpen) {
       throw new Error('websocket is not connected')
     }
     socket.send(JSON.stringify(message))
@@ -728,37 +777,42 @@ export default function App() {
   const closeSocket = useCallback(() => {
     const socket = socketRef.current
     if (!socket) return
-    socket.onclose = null
     socket.close()
     socketRef.current = null
   }, [])
 
   const openSocket = useCallback(
     (name: string) => {
-      const socket = new WebSocket(sessionSocketUrl(name))
-      socketRef.current = socket
       setConnection('connecting')
-
-      socket.addEventListener('open', () => {
-        if (socketRef.current !== socket) return
-        setConnection('connected')
-        recordActivity('Socket connected', name, 'ok')
+      void openSessionConnection(name, {
+        onOpen: () => {
+          if (selectedRef.current !== name) return
+          setConnection('connected')
+          recordActivity('Session connected', name, 'ok')
+        },
+        onClose: () => {
+          if (selectedRef.current !== name) return
+          setConnection('disconnected')
+          setRunningTurn(null)
+          recordActivity('Session disconnected', name, 'neutral')
+        },
+        onMessage: (message) => {
+          if (selectedRef.current === name) {
+            handleServerMessage(message as ServerMessage)
+          }
+        },
+        onError: (error) => {
+          if (selectedRef.current === name) showError(error)
+        },
       })
-
-      socket.addEventListener('close', () => {
-        if (socketRef.current !== socket) return
-        setConnection('disconnected')
-        setRunningTurn(null)
-        recordActivity('Socket disconnected', name, 'neutral')
-      })
-
-      socket.addEventListener('message', (event) => {
-        try {
-          handleServerMessage(JSON.parse(event.data) as ServerMessage)
-        } catch (error) {
-          showError(error)
-        }
-      })
+        .then((connection) => {
+          if (selectedRef.current !== name) {
+            connection.close()
+            return
+          }
+          socketRef.current = connection
+        })
+        .catch(showError)
     },
     [handleServerMessage, recordActivity, showError],
   )
@@ -1364,6 +1418,11 @@ export default function App() {
                 }
               }}
               onOpenSettings={openSettings}
+              projectsEnabled={desktopPlatform !== null}
+              onOpenProjects={() => {
+                void refreshDesktopState()
+                setWorkspaceDialog('projects')
+              }}
               onThemeToggle={() =>
                 setThemePreference(resolvedTheme === 'dark' ? 'light' : 'dark')
               }
@@ -1395,6 +1454,15 @@ export default function App() {
                   void changeModelSelection(selection)
                 }
                 onManageModels={() => openSettings('models')}
+                desktopPlatform={desktopPlatform}
+                desktopState={desktopState}
+                onOpenLocalWorkspace={openLocalWorkspace}
+                onOpenRemoteWorkspace={openRemoteWorkspace}
+                onOpenProjects={() => {
+                  void refreshDesktopState()
+                  setWorkspaceDialog('projects')
+                }}
+                onReconnectWorkspace={(index) => void reconnectWorkspace(index)}
                 onOpenSidebar={openSidebar}
                 onOpenInspector={openInspector}
                 onToggleRun={(id) => {
@@ -1434,6 +1502,24 @@ export default function App() {
         onApprove={() => sendApproval(true)}
         onDeny={() => sendApproval(false)}
       />
+      {desktopPlatform ? (
+        <>
+          <ProjectsDialog
+            open={workspaceDialog === 'projects'}
+            state={desktopState}
+            busyIndex={workspaceAction}
+            onClose={() => setWorkspaceDialog(null)}
+            onOpenLocal={openLocalWorkspace}
+            onOpenRemote={openRemoteWorkspace}
+            onReconnect={(index) => void reconnectWorkspace(index)}
+          />
+          <RemoteConnectionDialog
+            open={workspaceDialog === 'remote'}
+            platform={desktopPlatform}
+            onClose={() => setWorkspaceDialog(null)}
+          />
+        </>
+      ) : null}
     </>
   )
 }
@@ -1465,6 +1551,8 @@ function AppSidebar({
   onRefresh,
   onClose,
   onOpenSettings,
+  projectsEnabled,
+  onOpenProjects,
   onThemeToggle,
 }: {
   sessions: SessionEntryResponse[]
@@ -1493,6 +1581,8 @@ function AppSidebar({
   onRefresh: () => void
   onClose: () => void
   onOpenSettings: () => void
+  projectsEnabled: boolean
+  onOpenProjects: () => void
   onThemeToggle: () => void
 }) {
   const [isArchiveOpen, setIsArchiveOpen] = useState(false)
@@ -1532,8 +1622,9 @@ function AppSidebar({
         <SidebarAction
           icon={<Folder size={18} />}
           label="Projects"
-          badge="Soon"
-          disabled
+          badge={projectsEnabled ? undefined : 'Desktop'}
+          disabled={!projectsEnabled}
+          onClick={onOpenProjects}
         />
         <SidebarAction
           icon={<CalendarClock size={18} />}
@@ -1747,6 +1838,12 @@ function ChatView({
   onPermissionModeChange,
   onModelSelectionChange,
   onManageModels,
+  desktopPlatform,
+  desktopState,
+  onOpenLocalWorkspace,
+  onOpenRemoteWorkspace,
+  onOpenProjects,
+  onReconnectWorkspace,
   onOpenSidebar,
   onOpenInspector,
   onToggleRun,
@@ -1775,6 +1872,12 @@ function ChatView({
   onPermissionModeChange: (mode: PermissionMode) => void
   onModelSelectionChange: (selection: ModelSelection) => void
   onManageModels: () => void
+  desktopPlatform: DesktopPlatform | null
+  desktopState: DesktopShellState | null
+  onOpenLocalWorkspace: () => void
+  onOpenRemoteWorkspace: () => void
+  onOpenProjects: () => void
+  onReconnectWorkspace: (index: number) => void
   onOpenSidebar: () => void
   onOpenInspector: (panel: InspectorPanel) => void
   onToggleRun: (id: string) => void
@@ -1801,6 +1904,12 @@ function ChatView({
       onPermissionModeChange={onPermissionModeChange}
       onModelSelectionChange={onModelSelectionChange}
       onManageModels={onManageModels}
+      desktopPlatform={desktopPlatform}
+      desktopState={desktopState}
+      onOpenLocalWorkspace={onOpenLocalWorkspace}
+      onOpenRemoteWorkspace={onOpenRemoteWorkspace}
+      onOpenProjects={onOpenProjects}
+      onReconnectWorkspace={onReconnectWorkspace}
     />
   )
 
@@ -2132,6 +2241,12 @@ function Composer({
   onPermissionModeChange,
   onModelSelectionChange,
   onManageModels,
+  desktopPlatform,
+  desktopState,
+  onOpenLocalWorkspace,
+  onOpenRemoteWorkspace,
+  onOpenProjects,
+  onReconnectWorkspace,
 }: {
   prompt: string
   canSend: boolean
@@ -2151,6 +2266,12 @@ function Composer({
   onPermissionModeChange: (mode: PermissionMode) => void
   onModelSelectionChange: (selection: ModelSelection) => void
   onManageModels: () => void
+  desktopPlatform: DesktopPlatform | null
+  desktopState: DesktopShellState | null
+  onOpenLocalWorkspace: () => void
+  onOpenRemoteWorkspace: () => void
+  onOpenProjects: () => void
+  onReconnectWorkspace: (index: number) => void
 }) {
   const [commandIndex, setCommandIndex] = useState(0)
   const [dismissedCommandPrompt, setDismissedCommandPrompt] = useState('')
@@ -2234,18 +2355,23 @@ function Composer({
     <form className={`composer ${variant}`} onSubmit={onSubmit}>
       <div className="composer-shell">
         <div className="composer-context" aria-label="Project context">
-          <span title={status?.workspace_root || ''}>
-            <Folder size={14} />
-            {workspace}
-          </span>
-          <span>
-            <Terminal size={14} />
-            Local
-          </span>
-          <span>
-            <Shield size={14} />
-            {permissionMode.replaceAll('_', ' ')}
-          </span>
+          {desktopPlatform ? (
+            <WorkspaceMenu
+              name={workspace}
+              path={status?.workspace_root || ''}
+              recentWorkspaces={desktopState?.recentWorkspaces ?? []}
+              disabled={false}
+              onOpenLocal={onOpenLocalWorkspace}
+              onOpenRemote={onOpenRemoteWorkspace}
+              onOpenProjects={onOpenProjects}
+              onReconnect={onReconnectWorkspace}
+            />
+          ) : (
+            <span title={status?.workspace_root || ''}>
+              <Folder size={14} />
+              {workspace}
+            </span>
+          )}
         </div>
         <div className="composer-card">
           {commandMenuOpen ? (

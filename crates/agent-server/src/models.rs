@@ -1,6 +1,10 @@
+use crate::secrets::{SecretString, replace_file};
 use agent_config::ModelContextLimits;
 use agent_model::{ModelError, OpenAiCompatClient, OpenAiCompatConfig, OpenAiCompatRequestOptions};
-use agent_protocol::{ModelInvocation, ModelSelection, ReasoningLevel, ReasoningProfile};
+use agent_protocol::{
+    ModelInvocation, ModelSelection, ReasoningLevel, ReasoningProfile, RemoteFallbackModelSpec,
+    RemoteModelConnectionSpec, RemoteModelSpec, RemoteTurnModel,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -9,7 +13,8 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::RwLock;
 
-const MODEL_STORE_SCHEMA_VERSION: u32 = 1;
+const MODEL_STORE_SCHEMA_VERSION: u32 = 2;
+const LEGACY_MODEL_STORE_SCHEMA_VERSION: u32 = 1;
 const FALLBACK_PROVIDER_ID: &str = "current-config";
 const DEFAULT_RESERVED_OUTPUT_TOKENS: usize = 8_192;
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
@@ -19,9 +24,25 @@ pub struct FallbackModel {
     pub provider_name: String,
     pub model_id: String,
     pub model_name: String,
-    pub client: OpenAiCompatClient,
+    pub client: Option<OpenAiCompatClient>,
     pub limits: ModelContextLimits,
     pub reasoning_profile: ReasoningProfile,
+}
+
+impl FallbackModel {
+    pub fn remote(spec: RemoteFallbackModelSpec) -> Self {
+        Self {
+            provider_name: spec.provider_name,
+            model_id: spec.model_id,
+            model_name: spec.model_name,
+            client: None,
+            limits: ModelContextLimits {
+                context_window_tokens: spec.context_window_tokens,
+                reserved_output_tokens: spec.reserved_output_tokens,
+            },
+            reasoning_profile: spec.reasoning_profile,
+        }
+    }
 }
 
 impl std::fmt::Debug for FallbackModel {
@@ -54,7 +75,7 @@ struct ManagedProvider {
     id: String,
     name: String,
     base_url: String,
-    api_key: String,
+    api_key: SecretString,
     enabled: bool,
     timeout_secs: u64,
     models: Vec<ManagedModel>,
@@ -243,6 +264,7 @@ struct RegistryState {
 
 pub struct ModelRegistry {
     path: PathBuf,
+    persistent: bool,
     workspace_scope: String,
     fallback: Option<FallbackModel>,
     state: RwLock<RegistryState>,
@@ -254,11 +276,38 @@ impl ModelRegistry {
         workspace_root: &Path,
         fallback: Option<FallbackModel>,
     ) -> Result<Self, ModelRegistryError> {
-        let store = load_store(&path)?;
+        let mut store = load_store(&path)?;
         validate_store(&store, fallback.as_ref())?;
+        if store.schema_version == LEGACY_MODEL_STORE_SCHEMA_VERSION
+            || store
+                .providers
+                .iter()
+                .any(|provider| provider.api_key.requires_rewrite())
+        {
+            let mut migrated = store.clone();
+            migrated.schema_version = MODEL_STORE_SCHEMA_VERSION;
+            save_store(&path, &migrated)?;
+            store = migrated;
+        }
         let clients = build_clients(&store)?;
         Ok(Self {
             path,
+            persistent: true,
+            workspace_scope: hex_encode(workspace_root.as_os_str().as_encoded_bytes()),
+            fallback,
+            state: RwLock::new(RegistryState { store, clients }),
+        })
+    }
+
+    pub fn in_memory(
+        workspace_root: &Path,
+        fallback: Option<FallbackModel>,
+    ) -> Result<Self, ModelRegistryError> {
+        let store = PersistedModelStore::default();
+        let clients = build_clients(&store)?;
+        Ok(Self {
+            path: PathBuf::from("<memory>"),
+            persistent: false,
             workspace_scope: hex_encode(workspace_root.as_os_str().as_encoded_bytes()),
             fallback,
             state: RwLock::new(RegistryState { store, clients }),
@@ -273,12 +322,9 @@ impl ModelRegistry {
         }
         providers.extend(state.store.providers.iter().map(provider_response));
         let default_selection = effective_default(&state.store, self.fallback.as_ref());
-        let model_ready = default_selection
-            .as_ref()
-            .and_then(|selection| {
-                resolve_from_state(&state, self.fallback.as_ref(), selection).ok()
-            })
-            .is_some();
+        let model_ready = default_selection.as_ref().is_some_and(|selection| {
+            validate_selection_from_state(&state, self.fallback.as_ref(), selection).is_ok()
+        });
         ModelSettingsResponse {
             providers,
             default_selection,
@@ -312,7 +358,13 @@ impl ModelRegistry {
             next_store.default_selection = Some(selection);
         }
         next_store.providers.push(provider.clone());
-        commit_store(&self.path, &mut state, next_store, self.fallback.as_ref())?;
+        commit_store(
+            &self.path,
+            self.persistent,
+            &mut state,
+            next_store,
+            self.fallback.as_ref(),
+        )?;
         Ok(provider_response(&provider))
     }
 
@@ -352,7 +404,13 @@ impl ModelRegistry {
             next_store.default_selection = next_default;
         }
         remove_invalid_session_selections(&mut next_store, self.fallback.as_ref());
-        commit_store(&self.path, &mut state, next_store, self.fallback.as_ref())?;
+        commit_store(
+            &self.path,
+            self.persistent,
+            &mut state,
+            next_store,
+            self.fallback.as_ref(),
+        )?;
         Ok(provider_response(&provider))
     }
 
@@ -386,7 +444,13 @@ impl ModelRegistry {
         next_store
             .session_selections
             .retain(|_, selection| selection.provider_id != provider_id);
-        commit_store(&self.path, &mut state, next_store, self.fallback.as_ref())
+        commit_store(
+            &self.path,
+            self.persistent,
+            &mut state,
+            next_store,
+            self.fallback.as_ref(),
+        )
     }
 
     pub async fn set_default(
@@ -394,10 +458,16 @@ impl ModelRegistry {
         selection: ModelSelection,
     ) -> Result<ModelSelection, ModelRegistryError> {
         let mut state = self.state.write().await;
-        resolve_from_state(&state, self.fallback.as_ref(), &selection)?;
+        validate_selection_from_state(&state, self.fallback.as_ref(), &selection)?;
         let mut next_store = state.store.clone();
         next_store.default_selection = Some(selection.clone());
-        commit_store(&self.path, &mut state, next_store, self.fallback.as_ref())?;
+        commit_store(
+            &self.path,
+            self.persistent,
+            &mut state,
+            next_store,
+            self.fallback.as_ref(),
+        )?;
         Ok(selection)
     }
 
@@ -405,7 +475,7 @@ impl ModelRegistry {
         let state = self.state.read().await;
         let key = self.session_key(session);
         if let Some(selection) = state.store.session_selections.get(&key)
-            && resolve_from_state(&state, self.fallback.as_ref(), selection).is_ok()
+            && validate_selection_from_state(&state, self.fallback.as_ref(), selection).is_ok()
         {
             return SessionModelSelectionResponse {
                 selection: Some(selection.clone()),
@@ -424,12 +494,18 @@ impl ModelRegistry {
         selection: ModelSelection,
     ) -> Result<SessionModelSelectionResponse, ModelRegistryError> {
         let mut state = self.state.write().await;
-        resolve_from_state(&state, self.fallback.as_ref(), &selection)?;
+        validate_selection_from_state(&state, self.fallback.as_ref(), &selection)?;
         let mut next_store = state.store.clone();
         next_store
             .session_selections
             .insert(self.session_key(session), selection.clone());
-        commit_store(&self.path, &mut state, next_store, self.fallback.as_ref())?;
+        commit_store(
+            &self.path,
+            self.persistent,
+            &mut state,
+            next_store,
+            self.fallback.as_ref(),
+        )?;
         Ok(SessionModelSelectionResponse {
             selection: Some(selection),
             inherited: false,
@@ -457,11 +533,57 @@ impl ModelRegistry {
         resolve_from_state(&state, self.fallback.as_ref(), &selection)
     }
 
+    pub async fn resolve_remote_for_turn(
+        &self,
+        session: &str,
+        requested: Option<ModelSelection>,
+    ) -> Result<RemoteTurnModel, ModelRegistryError> {
+        let selection = match requested {
+            Some(selection) => selection,
+            None => self
+                .session_selection(session)
+                .await
+                .selection
+                .ok_or_else(|| {
+                    ModelRegistryError::SelectionUnavailable(
+                        "no default model is configured".to_string(),
+                    )
+                })?,
+        };
+        let state = self.state.read().await;
+        remote_model_from_state(&state, self.fallback.as_ref(), &selection)
+    }
+
+    pub async fn discovery_spec(
+        &self,
+        request: DiscoverModelsRequest,
+    ) -> Result<RemoteModelConnectionSpec, ModelRegistryError> {
+        let (base_url, api_key, timeout_secs) = self.discovery_connection(request).await?;
+        Ok(RemoteModelConnectionSpec {
+            base_url,
+            api_key,
+            timeout_secs,
+        })
+    }
+
     pub async fn discover(
         &self,
         request: DiscoverModelsRequest,
     ) -> Result<DiscoverModelsResponse, ModelRegistryError> {
-        let (base_url, api_key, timeout_secs) = if let Some(provider_id) = request.provider_id {
+        let (base_url, api_key, timeout_secs) = self.discovery_connection(request).await?;
+        discover_models(RemoteModelConnectionSpec {
+            base_url,
+            api_key,
+            timeout_secs,
+        })
+        .await
+    }
+
+    async fn discovery_connection(
+        &self,
+        request: DiscoverModelsRequest,
+    ) -> Result<(String, String, u64), ModelRegistryError> {
+        if let Some(provider_id) = request.provider_id {
             let state = self.state.read().await;
             let provider = state
                 .store
@@ -469,11 +591,11 @@ impl ModelRegistry {
                 .iter()
                 .find(|provider| provider.id == provider_id)
                 .ok_or(ModelRegistryError::ProviderNotFound(provider_id))?;
-            (
+            Ok((
                 provider.base_url.clone(),
-                provider.api_key.clone(),
+                provider.api_key.expose().to_string(),
                 provider.timeout_secs,
-            )
+            ))
         } else {
             let base_url = normalize_base_url(request.base_url.as_deref().unwrap_or_default())?;
             let api_key = request
@@ -481,29 +603,35 @@ impl ModelRegistry {
                 .filter(|key| !key.trim().is_empty())
                 .ok_or_else(|| ModelRegistryError::Validation("API key is required".to_string()))?;
             validate_timeout(request.timeout_secs)?;
-            (base_url, api_key, request.timeout_secs)
-        };
-        let client = OpenAiCompatClient::new(OpenAiCompatConfig {
-            base_url,
-            model: "discovery".to_string(),
-            api_key,
-            timeout: Duration::from_secs(timeout_secs),
-        })?;
-        let models = client
-            .list_models()
-            .await?
-            .into_iter()
-            .map(|id| DiscoveredModel {
-                suggested: deepseek_model_template(&id),
-                id,
-            })
-            .collect();
-        Ok(DiscoverModelsResponse { models })
+            Ok((base_url, api_key, request.timeout_secs))
+        }
     }
 
     fn session_key(&self, session: &str) -> String {
         format!("{}:{session}", self.workspace_scope)
     }
+}
+
+pub async fn discover_models(
+    spec: RemoteModelConnectionSpec,
+) -> Result<DiscoverModelsResponse, ModelRegistryError> {
+    let client = OpenAiCompatClient::new(OpenAiCompatConfig {
+        base_url: normalize_base_url(&spec.base_url)?,
+        model: "discovery".to_string(),
+        api_key: spec.api_key,
+        timeout: Duration::from_secs(spec.timeout_secs),
+    })?;
+    validate_timeout(spec.timeout_secs)?;
+    let models = client
+        .list_models()
+        .await?
+        .into_iter()
+        .map(|id| DiscoveredModel {
+            suggested: deepseek_model_template(&id),
+            id,
+        })
+        .collect();
+    Ok(DiscoverModelsResponse { models })
 }
 
 fn load_store(path: &Path) -> Result<PersistedModelStore, ModelRegistryError> {
@@ -520,7 +648,10 @@ fn load_store(path: &Path) -> Result<PersistedModelStore, ModelRegistryError> {
             source,
         }
     })?;
-    if store.schema_version != MODEL_STORE_SCHEMA_VERSION {
+    if !matches!(
+        store.schema_version,
+        LEGACY_MODEL_STORE_SCHEMA_VERSION | MODEL_STORE_SCHEMA_VERSION
+    ) {
         return Err(ModelRegistryError::UnsupportedSchema {
             version: store.schema_version,
             expected: MODEL_STORE_SCHEMA_VERSION,
@@ -559,10 +690,13 @@ fn save_store(path: &Path, store: &PersistedModelStore) -> Result<(), ModelRegis
             }
         })?;
     }
-    fs::rename(&temp, path).map_err(|source| ModelRegistryError::Replace {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    if let Err(source) = replace_file(&temp, path) {
+        let _ = fs::remove_file(&temp);
+        return Err(ModelRegistryError::Replace {
+            path: path.to_path_buf(),
+            source,
+        });
+    }
     Ok(())
 }
 
@@ -575,7 +709,7 @@ fn build_clients(
             let client = OpenAiCompatClient::new(OpenAiCompatConfig {
                 base_url: provider.base_url.clone(),
                 model: model.id.clone(),
-                api_key: provider.api_key.clone(),
+                api_key: provider.api_key.expose().to_string(),
                 timeout: Duration::from_secs(provider.timeout_secs),
             })?;
             clients.insert((provider.id.clone(), model.id.clone()), client);
@@ -586,13 +720,16 @@ fn build_clients(
 
 fn commit_store(
     path: &Path,
+    persistent: bool,
     state: &mut RegistryState,
     store: PersistedModelStore,
     fallback: Option<&FallbackModel>,
 ) -> Result<(), ModelRegistryError> {
     validate_store(&store, fallback)?;
     let clients = build_clients(&store)?;
-    save_store(path, &store)?;
+    if persistent {
+        save_store(path, &store)?;
+    }
     state.store = store;
     state.clients = clients;
     Ok(())
@@ -617,7 +754,7 @@ fn validate_store(
             store: store.clone(),
             clients: build_clients(store)?,
         };
-        resolve_from_state(&state, fallback, selection)?;
+        validate_selection_from_state(&state, fallback, selection)?;
     }
     Ok(())
 }
@@ -651,7 +788,7 @@ fn validate_provider_request(
 }
 
 fn validate_provider(provider: &ManagedProvider) -> Result<(), ModelRegistryError> {
-    if provider.name.trim().is_empty() || provider.api_key.trim().is_empty() {
+    if provider.name.trim().is_empty() || provider.api_key.expose().trim().is_empty() {
         return Err(ModelRegistryError::Validation(format!(
             "provider {:?} is missing name or API key",
             provider.id
@@ -706,6 +843,7 @@ fn provider_from_request(
     let api_key = request
         .api_key
         .filter(|key| !key.trim().is_empty())
+        .map(SecretString::new)
         .or_else(|| current.map(|provider| provider.api_key.clone()))
         .ok_or_else(|| ModelRegistryError::Validation("API key is required".to_string()))?;
     Ok(ManagedProvider {
@@ -773,11 +911,11 @@ fn validate_reasoning(
     Ok(())
 }
 
-fn resolve_from_state(
+fn validate_selection_from_state(
     state: &RegistryState,
     fallback: Option<&FallbackModel>,
     selection: &ModelSelection,
-) -> Result<ResolvedModel, ModelRegistryError> {
+) -> Result<(), ModelRegistryError> {
     if selection.provider_id == FALLBACK_PROVIDER_ID {
         let fallback = fallback.ok_or_else(|| {
             ModelRegistryError::SelectionUnavailable(
@@ -790,9 +928,39 @@ fn resolve_from_state(
                 selection.model_id
             )));
         }
-        validate_reasoning(fallback.reasoning_profile, selection.reasoning)?;
+        return validate_reasoning(fallback.reasoning_profile, selection.reasoning);
+    }
+
+    let provider = state
+        .store
+        .providers
+        .iter()
+        .find(|provider| provider.id == selection.provider_id)
+        .ok_or_else(|| {
+            ModelRegistryError::SelectionUnavailable(format!(
+                "provider {:?} was not found",
+                selection.provider_id
+            ))
+        })?;
+    validate_selection_for_provider(provider, selection)
+}
+
+fn resolve_from_state(
+    state: &RegistryState,
+    fallback: Option<&FallbackModel>,
+    selection: &ModelSelection,
+) -> Result<ResolvedModel, ModelRegistryError> {
+    validate_selection_from_state(state, fallback, selection)?;
+    if selection.provider_id == FALLBACK_PROVIDER_ID {
+        let fallback = fallback.expect("validated fallback must exist");
         let client = fallback
             .client
+            .as_ref()
+            .ok_or_else(|| {
+                ModelRegistryError::SelectionUnavailable(
+                    "the current config model can only run in its remote workspace".to_string(),
+                )
+            })?
             .clone()
             .with_request_options(OpenAiCompatRequestOptions {
                 reasoning_profile: fallback.reasoning_profile,
@@ -818,13 +986,7 @@ fn resolve_from_state(
         .providers
         .iter()
         .find(|provider| provider.id == selection.provider_id)
-        .ok_or_else(|| {
-            ModelRegistryError::SelectionUnavailable(format!(
-                "provider {:?} was not found",
-                selection.provider_id
-            ))
-        })?;
-    validate_selection_for_provider(provider, selection)?;
+        .expect("validated provider must exist");
     let model = provider
         .models
         .iter()
@@ -861,17 +1023,58 @@ fn resolve_from_state(
     })
 }
 
+fn remote_model_from_state(
+    state: &RegistryState,
+    fallback: Option<&FallbackModel>,
+    selection: &ModelSelection,
+) -> Result<RemoteTurnModel, ModelRegistryError> {
+    validate_selection_from_state(state, fallback, selection)?;
+    if selection.provider_id == FALLBACK_PROVIDER_ID {
+        return Ok(RemoteTurnModel::WorkspaceFallback {
+            selection: selection.clone(),
+        });
+    }
+
+    let provider = state
+        .store
+        .providers
+        .iter()
+        .find(|provider| provider.id == selection.provider_id)
+        .expect("validated provider must exist");
+    let model = provider
+        .models
+        .iter()
+        .find(|model| model.id == selection.model_id)
+        .expect("validated model must exist");
+    Ok(RemoteTurnModel::Managed(RemoteModelSpec {
+        base_url: provider.base_url.clone(),
+        model: model.id.clone(),
+        api_key: provider.api_key.expose().to_string(),
+        timeout_secs: provider.timeout_secs,
+        context_window_tokens: model.context_window_tokens,
+        reserved_output_tokens: model.reserved_output_tokens,
+        reasoning_profile: model.reasoning_profile,
+        supports_tools: model.supports_tools,
+        invocation: ModelInvocation {
+            provider_id: provider.id.clone(),
+            provider_name: provider.name.clone(),
+            model_id: model.id.clone(),
+            model_name: model.name.clone(),
+            reasoning: selection.reasoning,
+        },
+    }))
+}
+
 fn effective_default(
     store: &PersistedModelStore,
     fallback: Option<&FallbackModel>,
 ) -> Option<ModelSelection> {
     if let Some(selection) = store.default_selection.as_ref() {
-        let clients = build_clients(store).ok()?;
         let state = RegistryState {
             store: store.clone(),
-            clients,
+            clients: HashMap::new(),
         };
-        if resolve_from_state(&state, fallback, selection).is_ok() {
+        if validate_selection_from_state(&state, fallback, selection).is_ok() {
             return Some(selection.clone());
         }
     }
@@ -894,14 +1097,13 @@ fn remove_invalid_session_selections(
     store: &mut PersistedModelStore,
     fallback: Option<&FallbackModel>,
 ) {
-    let clients = build_clients(store).unwrap_or_default();
     let state = RegistryState {
         store: store.clone(),
-        clients,
+        clients: HashMap::new(),
     };
     store
         .session_selections
-        .retain(|_, selection| resolve_from_state(&state, fallback, selection).is_ok());
+        .retain(|_, selection| validate_selection_from_state(&state, fallback, selection).is_ok());
 }
 
 fn provider_response(provider: &ManagedProvider) -> ModelProviderResponse {
@@ -1050,11 +1252,11 @@ mod tests {
                 .expect("json")
                 .contains("secret-key")
         );
-        assert!(
-            fs::read_to_string(&path)
-                .expect("stored")
-                .contains("secret-key")
-        );
+        let stored = fs::read_to_string(&path).expect("stored");
+        #[cfg(not(windows))]
+        assert!(stored.contains("secret-key"));
+        #[cfg(windows)]
+        assert!(!stored.contains("secret-key"));
 
         #[cfg(unix)]
         {
@@ -1173,5 +1375,114 @@ mod tests {
         assert!(!first_selection.inherited);
         assert!(second_selection.inherited);
         assert_ne!(second_selection.selection, first_selection.selection);
+    }
+
+    #[test]
+    fn schema_v1_model_store_is_atomically_rewritten_as_v2() {
+        let path = unique_path("migration");
+        fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "providers": [{
+                    "id": "deepseek",
+                    "name": "DeepSeek",
+                    "base_url": "https://api.deepseek.com",
+                    "api_key": "legacy-secret",
+                    "enabled": true,
+                    "timeout_secs": 120,
+                    "models": [{
+                        "id": "deepseek-v4-pro",
+                        "name": "DeepSeek V4 Pro",
+                        "context_window_tokens": 1_000_000,
+                        "reserved_output_tokens": 8_192,
+                        "supports_tools": true,
+                        "reasoning_profile": "deepseek"
+                    }]
+                }],
+                "default_selection": {
+                    "provider_id": "deepseek",
+                    "model_id": "deepseek-v4-pro",
+                    "reasoning": "high"
+                },
+                "session_selections": {}
+            }))
+            .expect("legacy JSON"),
+        )
+        .expect("write legacy store");
+
+        ModelRegistry::load(path.clone(), Path::new("workspace"), None).expect("migrate store");
+
+        let migrated: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("read migrated store"))
+                .expect("parse migrated store");
+        assert_eq!(migrated["schema_version"], MODEL_STORE_SCHEMA_VERSION);
+        assert!(migrated["providers"][0]["api_key"].is_object());
+        #[cfg(windows)]
+        {
+            assert_eq!(migrated["providers"][0]["api_key"]["protection"], "dpapi");
+            assert!(
+                !fs::read_to_string(path)
+                    .expect("stored")
+                    .contains("legacy-secret")
+            );
+        }
+    }
+
+    #[test]
+    fn failed_model_store_replacement_preserves_the_original_file() {
+        let path = unique_path("migration-failure");
+        fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
+        let original = br#"{"schema_version":1,"providers":[]}"#;
+        fs::write(&path, original).expect("write original");
+        let temp = path.with_file_name(format!(
+            ".{}.tmp-{}",
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .expect("filename"),
+            std::process::id()
+        ));
+        fs::create_dir(&temp).expect("block temporary file");
+
+        save_store(&path, &PersistedModelStore::default()).expect_err("save must fail");
+
+        assert_eq!(fs::read(path).expect("read original"), original);
+    }
+
+    #[tokio::test]
+    async fn remote_fallback_can_be_selected_without_exposing_a_local_client() {
+        let path = unique_path("remote-fallback");
+        let fallback = FallbackModel::remote(RemoteFallbackModelSpec {
+            provider_name: "Remote config".to_string(),
+            model_id: "remote-model".to_string(),
+            model_name: "Remote model".to_string(),
+            context_window_tokens: 32_000,
+            reserved_output_tokens: 4_000,
+            reasoning_profile: ReasoningProfile::None,
+        });
+        let registry =
+            ModelRegistry::load(path, Path::new("workspace"), Some(fallback)).expect("registry");
+        let selection = registry
+            .session_selection("default")
+            .await
+            .selection
+            .expect("fallback selection");
+
+        assert!(matches!(
+            registry
+                .resolve_remote_for_turn("default", Some(selection.clone()))
+                .await
+                .expect("remote resolution"),
+            RemoteTurnModel::WorkspaceFallback { .. }
+        ));
+        assert!(
+            registry
+                .resolve_for_turn("default", Some(selection))
+                .await
+                .expect_err("remote fallback must not execute locally")
+                .to_string()
+                .contains("remote workspace")
+        );
     }
 }

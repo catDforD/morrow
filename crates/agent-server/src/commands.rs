@@ -1,3 +1,4 @@
+use crate::secrets::replace_file;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -382,10 +383,14 @@ fn write_command(path: &Path, command: &CommandResponse) -> Result<(), CommandRe
             }
         })?;
     }
-    fs::rename(&temp, path).map_err(|source| CommandRegistryError::Replace {
-        path: path.to_path_buf(),
-        source,
-    })
+    if let Err(source) = replace_file(&temp, path) {
+        let _ = fs::remove_file(&temp);
+        return Err(CommandRegistryError::Replace {
+            path: path.to_path_buf(),
+            source,
+        });
+    }
+    Ok(())
 }
 
 fn render_command(command: &CommandResponse) -> Result<String, CommandRegistryError> {

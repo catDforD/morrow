@@ -14,6 +14,9 @@ export interface PermissionProfile {
 
 export interface StatusResponse {
   workspace_root: string
+  workspace_location:
+    | { kind: 'local'; path: string }
+    | { kind: 'wsl'; distro: string; user: string; path: string }
   config_path: string | null
   permissions: PermissionProfile
   version: string

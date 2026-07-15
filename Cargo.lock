@@ -52,12 +52,16 @@ name = "agent-desktop"
 version = "0.3.1"
 dependencies = [
  "agent-config",
+ "agent-protocol",
+ "agent-remote",
  "agent-server",
  "dirs",
  "getrandom 0.3.4",
  "log",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
@@ -67,6 +71,7 @@ dependencies = [
  "tauri-plugin-window-state",
  "thiserror 2.0.18",
  "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -90,6 +95,21 @@ version = "0.3.1"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "agent-remote"
+version = "0.3.1"
+dependencies = [
+ "agent-config",
+ "agent-protocol",
+ "agent-server",
+ "clap",
+ "dirs",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]
@@ -126,12 +146,14 @@ dependencies = [
  "agent-protocol",
  "agent-runtime",
  "axum",
+ "base64 0.22.1",
  "futures-util",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tower",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
