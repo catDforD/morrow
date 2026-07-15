@@ -14,12 +14,12 @@ pub(crate) fn replace(temporary: &Path, target: &Path) -> std::io::Result<()> {
         use std::ptr;
         use windows_sys::Win32::Storage::FileSystem::{REPLACEFILE_WRITE_THROUGH, ReplaceFileW};
 
-        let target = target
+        let target_wide = target
             .as_os_str()
             .encode_wide()
             .chain(std::iter::once(0))
             .collect::<Vec<_>>();
-        let temporary = temporary
+        let temporary_wide = temporary
             .as_os_str()
             .encode_wide()
             .chain(std::iter::once(0))
@@ -30,8 +30,8 @@ pub(crate) fn replace(temporary: &Path, target: &Path) -> std::io::Result<()> {
             }
             let replaced = unsafe {
                 ReplaceFileW(
-                    target.as_ptr(),
-                    temporary.as_ptr(),
+                    target_wide.as_ptr(),
+                    temporary_wide.as_ptr(),
                     ptr::null(),
                     REPLACEFILE_WRITE_THROUGH,
                     ptr::null(),
