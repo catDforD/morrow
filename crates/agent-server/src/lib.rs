@@ -712,6 +712,8 @@ fn build_router_with_settings(
 
     let mut router = Router::new()
         .route("/", get(index))
+        .route("/app.js", get(app_js))
+        .route("/style.css", get(style_css))
         .route("/assets/{*path}", get(asset))
         .route("/api/status", get(status))
         .route("/api/sessions", get(list_sessions))
@@ -1110,8 +1112,20 @@ async fn index() -> Html<&'static str> {
     Html(include_str!("../assets/index.html"))
 }
 
+async fn app_js() -> Response {
+    asset_response("app.js")
+}
+
+async fn style_css() -> Response {
+    asset_response("style.css")
+}
+
 async fn asset(Path(path): Path<String>) -> Response {
-    match path.as_str() {
+    asset_response(&path)
+}
+
+fn asset_response(path: &str) -> Response {
+    match path {
         "app.js" => (
             [(
                 header::CONTENT_TYPE,
@@ -2338,6 +2352,43 @@ mod tests {
     #[test]
     fn router_registers_model_routes_without_conflicts() {
         let _ = router(test_options()).expect("router");
+    }
+
+    #[test]
+    fn embedded_index_references_assets_present_at_the_tauri_root() {
+        let html = include_str!("../assets/index.html");
+
+        assert!(html.contains(r#"src="/app.js""#));
+        assert!(html.contains(r#"href="/style.css""#));
+    }
+
+    #[tokio::test]
+    async fn browser_router_serves_root_and_legacy_asset_paths() {
+        let router = router(test_options()).expect("browser router");
+        for (path, content_type) in [
+            ("/app.js", "application/javascript; charset=utf-8"),
+            ("/style.css", "text/css; charset=utf-8"),
+            ("/assets/app.js", "application/javascript; charset=utf-8"),
+            ("/assets/style.css", "text/css; charset=utf-8"),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .body(Body::empty())
+                        .expect("asset request"),
+                )
+                .await
+                .expect("asset response");
+
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert_eq!(
+                response.headers().get(header::CONTENT_TYPE),
+                Some(&HeaderValue::from_static(content_type)),
+                "{path}"
+            );
+        }
     }
 
     #[tokio::test]
