@@ -58,6 +58,7 @@ const menuLabels: Record<MenuId, string> = {
 const initialShellState: DesktopShellState = {
   isMaximized: false,
   recentWorkspaces: [],
+  activeWorkspace: null,
 }
 
 const desktopShellStyle = {

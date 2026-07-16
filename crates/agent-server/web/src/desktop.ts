@@ -1,15 +1,87 @@
-import { invoke } from '@tauri-apps/api/core'
+import { Channel, invoke } from '@tauri-apps/api/core'
+import { listen } from '@tauri-apps/api/event'
 
 export type DesktopPlatform = 'windows' | 'macos' | 'linux'
 
 export interface RecentWorkspace {
   index: number
   label: string
+  target: string
+  path: string
 }
+
+export type WorkspaceLocation =
+  | { kind: 'local'; path: string }
+  | { kind: 'wsl'; distro: string; user: string; path: string }
 
 export interface DesktopShellState {
   isMaximized: boolean
   recentWorkspaces: RecentWorkspace[]
+  activeWorkspace: WorkspaceLocation | null
+}
+
+export interface WslDistribution {
+  name: string
+  version: number
+  is_default: boolean
+}
+
+export interface WslProbe {
+  distro: string
+  user: string
+  home: string
+  arch: string
+}
+
+export type RemoteRequest =
+  | { type: 'ping' }
+  | { type: 'activity' }
+  | { type: 'environment' }
+  | { type: 'list_directory'; data: { path?: string; show_hidden: boolean } }
+  | { type: 'http'; data: { method: string; path: string; body?: unknown } }
+  | { type: 'subscribe_session'; data: { session: string } }
+  | { type: 'unsubscribe_session'; data: { subscription_id: string } }
+  | { type: 'session_message'; data: { session: string; message: unknown } }
+
+export type RemoteResponse =
+  | { type: 'pong' }
+  | { type: 'ack' }
+  | { type: 'activity'; data: { running_turns: number; pending_approvals: number } }
+  | {
+      type: 'directory'
+      data: {
+        path: string
+        parent?: string
+        entries: Array<{
+          name: string
+          path: string
+          directory: boolean
+          hidden: boolean
+        }>
+      }
+    }
+  | { type: 'http'; data: { status: number; body?: unknown } }
+  | {
+      type: 'session_subscribed'
+      data: { subscription_id: string; snapshot: unknown }
+    }
+  | { type: 'error'; data: { code: string; message: string } }
+
+export interface RemoteEnvelope {
+  protocol_version: number
+  channel_id: number
+  request_id: string
+  message: {
+    type: 'event'
+    data:
+      | {
+          type: 'session_message'
+          data: { subscription_id: string; message: unknown }
+        }
+      | { type: 'workspace_log'; data: { level: string; message: string } }
+      | { type: 'worker_exited'; data: { channel_id: number; code?: number } }
+      | { type: 'workspace_reconnected'; data: { channel_id: number } }
+  }
 }
 
 export type DesktopAction =
@@ -66,6 +138,56 @@ export async function getDesktopShellState(): Promise<DesktopShellState> {
 
 export async function runDesktopAction(action: DesktopAction): Promise<void> {
   await invoke('desktop_action', { action })
+}
+
+export async function listWslDistributions(): Promise<WslDistribution[]> {
+  return invoke<WslDistribution[]>('desktop_wsl_distributions')
+}
+
+export async function probeWsl(distro: string, user: string): Promise<WslProbe> {
+  return invoke<WslProbe>('desktop_wsl_probe', { distro, user })
+}
+
+export async function prepareWsl(distro: string, user: string): Promise<WslProbe> {
+  return invoke<WslProbe>('desktop_wsl_prepare', { distro, user })
+}
+
+export async function connectWsl(
+  distro: string,
+  user: string,
+  path: string,
+): Promise<void> {
+  await invoke('desktop_wsl_connect', { distro, user, path })
+}
+
+export async function remoteRequest<T extends RemoteResponse>(
+  request: RemoteRequest,
+): Promise<T> {
+  const response = await invoke<T>('desktop_remote_request', { request })
+  if (response.type === 'error') throw new Error(response.data.message)
+  return response
+}
+
+export function listenRemoteEvents(
+  listener: (envelope: RemoteEnvelope) => void,
+): Promise<() => void> {
+  const channel = new Channel<RemoteEnvelope>()
+  channel.onmessage = listener
+  return invoke<number>('desktop_remote_subscribe', { onEvent: channel }).then(
+    (subscriptionId) => {
+      let active = true
+      return () => {
+        if (!active) return
+        active = false
+        channel.onmessage = () => undefined
+        void invoke('desktop_remote_unsubscribe', { subscriptionId })
+      }
+    },
+  )
+}
+
+export function listenWslLogs(listener: (message: string) => void): Promise<() => void> {
+  return listen<string>('morrow-wsl-log', (event) => listener(event.payload))
 }
 
 export function captureEditingContext(

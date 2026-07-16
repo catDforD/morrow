@@ -14,6 +14,12 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
-
-[dev-dependencies]
 tower = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+base64 = { workspace = true }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+] }

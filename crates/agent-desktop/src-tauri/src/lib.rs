@@ -1,32 +1,44 @@
+mod atomic_file;
 mod state;
+mod wsl;
 
-use agent_config::load_server_config_for_workspace;
+use agent_config::{
+    ContextConfig, McpServerConfig, McpTransport, load_server_config_for_workspace,
+};
+use agent_protocol::{
+    PermissionProfile, RemoteEnvelope, RemoteEvent, RemoteMcpTransport, RemoteMessage,
+    RemoteRequest, RemoteResponse, RemoteWorkspaceConfiguration, WorkspaceLocation,
+};
 use agent_server::{
-    RunningServer, ServerAccessPolicy, ServerOptions, ShutdownPolicy,
-    server_options_from_loaded_config, spawn_local,
+    EmbeddedServer, FallbackModel, RunningServer, ServerAccessPolicy, ServerOptions,
+    ShutdownPolicy, server_options_from_loaded_config, spawn_local,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use state::{DesktopState, DesktopStateError};
+use std::collections::HashMap;
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex as StdMutex, RwLock};
 use std::time::Duration;
+use tauri::ipc::Channel;
 #[cfg(target_os = "macos")]
 use tauri::menu::{AboutMetadata, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::webview::NewWindowResponse;
 use tauri::{
-    AppHandle, Manager, RunEvent, State, Url, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
-    WindowEvent,
+    AppHandle, Emitter, Manager, RunEvent, State, Url, WebviewUrl, WebviewWindow,
+    WebviewWindowBuilder, WindowEvent,
 };
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use tauri_plugin_log::{RotationStrategy, Target, TargetKind};
 use tauri_plugin_opener::OpenerExt;
 use thiserror::Error;
 use tokio::sync::{Mutex, oneshot};
+use wsl::{WslConnection, WslDistribution, WslProbe};
 
 const MAIN_WINDOW_LABEL: &str = "main";
 #[cfg(target_os = "macos")]
@@ -44,6 +56,20 @@ const SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const DESKTOP_SHELL_STATE_PERMISSION: &str = "allow-desktop-shell-state";
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux", test))]
 const DESKTOP_ACTION_PERMISSION: &str = "allow-desktop-action";
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux", test))]
+const DESKTOP_WSL_DISTRIBUTIONS_PERMISSION: &str = "allow-desktop-wsl-distributions";
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux", test))]
+const DESKTOP_WSL_PROBE_PERMISSION: &str = "allow-desktop-wsl-probe";
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux", test))]
+const DESKTOP_WSL_PREPARE_PERMISSION: &str = "allow-desktop-wsl-prepare";
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux", test))]
+const DESKTOP_WSL_CONNECT_PERMISSION: &str = "allow-desktop-wsl-connect";
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux", test))]
+const DESKTOP_REMOTE_REQUEST_PERMISSION: &str = "allow-desktop-remote-request";
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux", test))]
+const DESKTOP_REMOTE_SUBSCRIBE_PERMISSION: &str = "allow-desktop-remote-subscribe";
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux", test))]
+const DESKTOP_REMOTE_UNSUBSCRIBE_PERMISSION: &str = "allow-desktop-remote-unsubscribe";
 
 struct DesktopRuntime {
     home: PathBuf,
@@ -52,6 +78,9 @@ struct DesktopRuntime {
     inner: Mutex<DesktopRuntimeInner>,
     operation: Mutex<()>,
     navigation_origin: RwLock<Option<String>>,
+    app_url: RwLock<Option<Url>>,
+    remote_channels: StdMutex<HashMap<u64, Channel<RemoteEnvelope>>>,
+    next_remote_channel: AtomicU64,
     #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
     authorized_origins: RwLock<HashSet<String>>,
     exit_requested: AtomicBool,
@@ -59,8 +88,11 @@ struct DesktopRuntime {
 
 struct DesktopRuntimeInner {
     state: DesktopState,
-    workspace: Option<PathBuf>,
+    workspace: Option<WorkspaceLocation>,
     server: Option<RunningServer>,
+    wsl: Option<WslConnection>,
+    pending_wsl: Option<WslConnection>,
+    remote_settings: Option<EmbeddedServer>,
 }
 
 struct StartedServer {
@@ -71,6 +103,11 @@ struct StartedServer {
 enum StopServerOutcome {
     Stopped,
     Cancelled(RunningServer),
+}
+
+enum StopWslOutcome {
+    Stopped,
+    Cancelled(Box<WslConnection>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -92,6 +129,7 @@ enum DesktopAction {
 struct DesktopShellState {
     is_maximized: bool,
     recent_workspaces: Vec<RecentWorkspace>,
+    active_workspace: Option<WorkspaceLocation>,
 }
 
 #[derive(Debug, Serialize)]
@@ -99,6 +137,8 @@ struct DesktopShellState {
 struct RecentWorkspace {
     index: usize,
     label: String,
+    target: String,
+    path: String,
 }
 
 #[tauri::command]
@@ -108,23 +148,285 @@ async fn desktop_shell_state(
 ) -> Result<DesktopShellState, String> {
     ensure_main_window(&window)?;
     let is_maximized = window.is_maximized().map_err(|error| error.to_string())?;
-    let recent_workspaces = runtime
-        .inner
-        .lock()
-        .await
+    let inner = runtime.inner.lock().await;
+    let recent_workspaces = inner
         .state
         .recent_workspaces()
         .iter()
         .enumerate()
         .map(|(index, workspace)| RecentWorkspace {
             index,
-            label: workspace_label(workspace),
+            label: workspace_project_label(workspace),
+            target: workspace.target_label(),
+            path: workspace.display_path(),
         })
         .collect();
     Ok(DesktopShellState {
         is_maximized,
         recent_workspaces,
+        active_workspace: inner.workspace.clone(),
     })
+}
+
+#[tauri::command]
+async fn desktop_wsl_distributions(window: WebviewWindow) -> Result<Vec<WslDistribution>, String> {
+    ensure_main_window(&window)?;
+    wsl::list_distributions()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn desktop_wsl_probe(
+    window: WebviewWindow,
+    distro: String,
+    user: String,
+) -> Result<WslProbe, String> {
+    ensure_main_window(&window)?;
+    wsl::probe(&distro, &user)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn desktop_wsl_connect(
+    app: AppHandle,
+    window: WebviewWindow,
+    distro: String,
+    user: String,
+    path: String,
+) -> Result<(), String> {
+    ensure_main_window(&window)?;
+    switch_wsl_workspace(&app, distro, user, path)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn desktop_wsl_prepare(
+    window: WebviewWindow,
+    runtime: State<'_, DesktopRuntime>,
+    distro: String,
+    user: String,
+) -> Result<WslProbe, String> {
+    ensure_main_window(&window)?;
+    let _ = window.emit(
+        "morrow-wsl-log",
+        format!("Probing WSL distribution {distro}…"),
+    );
+    let probe = wsl::probe(&distro, &user)
+        .await
+        .map_err(|error| error.to_string())?;
+    let _ = window.emit(
+        "morrow-wsl-log",
+        format!(
+            "Detected {} as {} ({})",
+            probe.distro, probe.user, probe.arch
+        ),
+    );
+    let _ = window.emit(
+        "morrow-wsl-log",
+        "Checking the signed Runtime cache and remote installation…",
+    );
+    let connection = WslConnection::start(distro, user)
+        .await
+        .map_err(|error| error.to_string())?;
+    let _ = window.emit(
+        "morrow-wsl-log",
+        "Runtime version and stdio protocol handshake verified.",
+    );
+    let old = runtime.inner.lock().await.pending_wsl.replace(connection);
+    if let Some(old) = old {
+        old.shutdown(true).await;
+    }
+    Ok(probe)
+}
+
+#[tauri::command]
+async fn desktop_remote_request(
+    window: WebviewWindow,
+    runtime: State<'_, DesktopRuntime>,
+    request: RemoteRequest,
+) -> Result<RemoteResponse, String> {
+    ensure_main_window(&window)?;
+    let operation = runtime.operation.lock().await;
+    let (client, settings) = {
+        let inner = runtime.inner.lock().await;
+        if let Some(connection) = inner.wsl.as_ref() {
+            let settings = inner.remote_settings.clone().ok_or_else(|| {
+                "Windows workspace settings are not ready; wait for WSL to reconnect".to_string()
+            })?;
+            (connection.request_client(), Some(settings))
+        } else {
+            let connection = inner
+                .pending_wsl
+                .as_ref()
+                .ok_or_else(|| "no WSL workspace is connected".to_string())?;
+            if !request_allowed_while_wsl_pending(&request) {
+                return Err(
+                    "WSL project is still connecting; finish opening a project first".to_string(),
+                );
+            }
+            (connection.request_client(), None)
+        }
+    };
+    drop(operation);
+    match settings {
+        Some(settings) => route_active_remote_request(client, settings, request).await,
+        None => client
+            .request(request)
+            .await
+            .map_err(|error| error.to_string()),
+    }
+}
+
+#[tauri::command]
+fn desktop_remote_subscribe(
+    window: WebviewWindow,
+    runtime: State<'_, DesktopRuntime>,
+    on_event: Channel<RemoteEnvelope>,
+) -> Result<u64, String> {
+    ensure_main_window(&window)?;
+    let subscription_id = runtime.next_remote_channel.fetch_add(1, Ordering::Relaxed);
+    runtime
+        .remote_channels
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(subscription_id, on_event);
+    Ok(subscription_id)
+}
+
+#[tauri::command]
+fn desktop_remote_unsubscribe(
+    window: WebviewWindow,
+    runtime: State<'_, DesktopRuntime>,
+    subscription_id: u64,
+) -> Result<(), String> {
+    ensure_main_window(&window)?;
+    runtime
+        .remote_channels
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&subscription_id);
+    Ok(())
+}
+
+async fn route_active_remote_request(
+    client: wsl::WslRequestClient,
+    settings: EmbeddedServer,
+    request: RemoteRequest,
+) -> Result<RemoteResponse, String> {
+    match request {
+        RemoteRequest::Http { method, path, body } if path == "/api/status" => {
+            let remote = client
+                .request(RemoteRequest::Http {
+                    method: method.clone(),
+                    path: path.clone(),
+                    body: body.clone(),
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+            let local = settings.request(&method, &path, body).await?;
+            merge_remote_status(remote, local)
+        }
+        RemoteRequest::Http {
+            method: _,
+            path,
+            body,
+        } if path == "/api/model-providers/discover" => {
+            let spec = settings
+                .prepare_remote_model_discovery(body.unwrap_or(serde_json::Value::Null))
+                .await?;
+            client
+                .request(RemoteRequest::DiscoverModels { model: spec })
+                .await
+                .map_err(|error| error.to_string())
+        }
+        RemoteRequest::Http {
+            method: _,
+            path,
+            body,
+        } if path == "/api/mcp-servers/test" => {
+            let server = settings
+                .prepare_remote_mcp_test(body.unwrap_or(serde_json::Value::Null))
+                .await?;
+            client
+                .request(RemoteRequest::InspectMcp {
+                    server: Box::new(server),
+                })
+                .await
+                .map_err(|error| error.to_string())
+        }
+        RemoteRequest::Http { method, path, body } if is_windows_owned_settings_path(&path) => {
+            let response = settings.request(&method, &path, body).await?;
+            Ok(RemoteResponse::Http(agent_protocol::RemoteHttpResponse {
+                status: response.status,
+                body: response.body,
+            }))
+        }
+        RemoteRequest::SessionMessage { session, message }
+            if message.get("type").and_then(serde_json::Value::as_str) == Some("start_turn") =>
+        {
+            let turn = settings.prepare_remote_turn(&session, message).await?;
+            client
+                .request(RemoteRequest::StartTurn {
+                    turn: Box::new(turn),
+                })
+                .await
+                .map_err(|error| error.to_string())
+        }
+        request => client
+            .request(request)
+            .await
+            .map_err(|error| error.to_string()),
+    }
+}
+
+fn request_allowed_while_wsl_pending(request: &RemoteRequest) -> bool {
+    matches!(
+        request,
+        RemoteRequest::Ping
+            | RemoteRequest::Activity
+            | RemoteRequest::Environment
+            | RemoteRequest::ListDirectory { .. }
+    )
+}
+
+fn is_windows_owned_settings_path(path: &str) -> bool {
+    path == "/api/model-settings"
+        || path == "/api/model-default"
+        || path.starts_with("/api/model-providers")
+        || path == "/api/mcp-settings"
+        || path.starts_with("/api/mcp-servers")
+        || path == "/api/commands"
+        || path.starts_with("/api/commands/")
+        || (path.starts_with("/api/sessions/") && path.ends_with("/model-selection"))
+}
+
+fn merge_remote_status(
+    remote: RemoteResponse,
+    local: agent_server::EmbeddedHttpResponse,
+) -> Result<RemoteResponse, String> {
+    let RemoteResponse::Http(mut remote) = remote else {
+        return Err("remote workspace returned an invalid status response".to_string());
+    };
+    let Some(serde_json::Value::Object(local)) = local.body else {
+        return Ok(RemoteResponse::Http(remote));
+    };
+    let Some(serde_json::Value::Object(remote_body)) = remote.body.as_mut() else {
+        return Ok(RemoteResponse::Http(remote));
+    };
+    for key in [
+        "model_ready",
+        "model_store_path",
+        "mcp_store_path",
+        "command_store_path",
+    ] {
+        if let Some(value) = local.get(key) {
+            remote_body.insert(key.to_string(), value.clone());
+        }
+    }
+    Ok(RemoteResponse::Http(remote))
 }
 
 #[tauri::command]
@@ -159,7 +461,7 @@ async fn desktop_action(
                 let inner = runtime.inner.lock().await;
                 recent_workspace_at(&inner.state, index)?
             };
-            spawn_workspace_switch(app, workspace, false);
+            spawn_location_switch(app, workspace, false);
             Ok(())
         }
         DesktopAction::OpenLogs {} => {
@@ -185,7 +487,7 @@ fn ensure_main_window_label(label: &str) -> Result<(), String> {
     }
 }
 
-fn recent_workspace_at(state: &DesktopState, index: usize) -> Result<PathBuf, String> {
+fn recent_workspace_at(state: &DesktopState, index: usize) -> Result<WorkspaceLocation, String> {
     state
         .recent_workspaces()
         .get(index)
@@ -221,7 +523,14 @@ pub fn run() {
         .setup(|app| setup_app(app).map_err(Into::into))
         .invoke_handler(tauri::generate_handler![
             desktop_shell_state,
-            desktop_action
+            desktop_action,
+            desktop_wsl_distributions,
+            desktop_wsl_probe,
+            desktop_wsl_prepare,
+            desktop_wsl_connect,
+            desktop_remote_request,
+            desktop_remote_subscribe,
+            desktop_remote_unsubscribe
         ]);
     #[cfg(target_os = "macos")]
     let builder = builder.on_menu_event(handle_menu_event);
@@ -236,6 +545,13 @@ pub fn run() {
 fn setup_app(app: &mut tauri::App) -> Result<(), DesktopError> {
     let home = dirs::home_dir().ok_or(DesktopError::HomeDirectoryNotFound)?;
     let state_path = home.join(".morrow").join("desktop.json");
+    let default_workspace = default_workspace_path(&home);
+    std::fs::create_dir_all(&default_workspace).map_err(|error| {
+        DesktopError::BackendConfiguration(format!(
+            "failed to create default workspace {}: {error}",
+            default_workspace.display()
+        ))
+    })?;
     let mut state = match DesktopState::load(&state_path) {
         Ok(state) => state,
         Err(error) => {
@@ -248,7 +564,12 @@ fn setup_app(app: &mut tauri::App) -> Result<(), DesktopError> {
     {
         log::warn!("failed to persist pruned desktop state: {error}");
     }
-    let initial_workspace = state.last_workspace().map(Path::to_path_buf);
+    let initial_workspace = state
+        .last_workspace()
+        .cloned()
+        .unwrap_or(WorkspaceLocation::Local {
+            path: default_workspace,
+        });
     let bootstrap_token = generate_bootstrap_token()?;
 
     app.manage(DesktopRuntime {
@@ -259,9 +580,15 @@ fn setup_app(app: &mut tauri::App) -> Result<(), DesktopError> {
             state: state.clone(),
             workspace: None,
             server: None,
+            wsl: None,
+            pending_wsl: None,
+            remote_settings: None,
         }),
         operation: Mutex::new(()),
         navigation_origin: RwLock::new(None),
+        app_url: RwLock::new(None),
+        remote_channels: StdMutex::new(HashMap::new()),
+        next_remote_channel: AtomicU64::new(1),
         #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
         authorized_origins: RwLock::new(HashSet::new()),
         exit_requested: AtomicBool::new(false),
@@ -270,12 +597,13 @@ fn setup_app(app: &mut tauri::App) -> Result<(), DesktopError> {
     replace_menu(app.handle(), &state)?;
     log::info!("Morrow desktop started");
 
-    if let Some(workspace) = initial_workspace {
-        spawn_workspace_switch(app.handle().clone(), workspace, true);
-    } else {
-        request_workspace_picker(app.handle(), true);
-    }
+    show_connection_window(app.handle())?;
+    spawn_location_switch(app.handle().clone(), initial_workspace, true);
     Ok(())
+}
+
+fn default_workspace_path(home: &Path) -> PathBuf {
+    home.join(".morrow").join("workspaces").join("default")
 }
 
 fn generate_bootstrap_token() -> Result<String, DesktopError> {
@@ -302,6 +630,37 @@ fn request_workspace_picker(app: &AppHandle, exit_on_cancel: bool) {
             };
             spawn_workspace_switch(handle, workspace, exit_on_cancel);
         });
+}
+
+fn spawn_location_switch(app: AppHandle, workspace: WorkspaceLocation, exit_on_error: bool) {
+    match workspace {
+        WorkspaceLocation::Local { path } => spawn_workspace_switch(app, path, exit_on_error),
+        WorkspaceLocation::Wsl { distro, user, path } => {
+            tauri::async_runtime::spawn(async move {
+                if let Err(error) = switch_wsl_workspace(&app, distro, user, path).await {
+                    log::error!("failed to restore WSL workspace: {error}");
+                    if exit_on_error {
+                        let default_workspace = {
+                            let runtime = app.state::<DesktopRuntime>();
+                            default_workspace_path(&runtime.home)
+                        };
+                        if let Err(fallback_error) = switch_workspace(&app, default_workspace).await
+                        {
+                            show_error(
+                                &app,
+                                "Morrow could not open a workspace",
+                                &format!(
+                                    "WSL reconnect failed: {error}\n\nDefault workspace failed: {fallback_error}"
+                                ),
+                            );
+                        }
+                    } else {
+                        show_error(&app, "Morrow could not connect to WSL", &error.to_string());
+                    }
+                }
+            });
+        }
+    }
 }
 
 fn spawn_workspace_switch(app: AppHandle, workspace: PathBuf, exit_on_error: bool) {
@@ -333,18 +692,25 @@ async fn switch_workspace(app: &AppHandle, workspace: PathBuf) -> Result<(), Des
     }
 
     let workspace = DesktopState::validate_workspace(&workspace)?;
+    let location = WorkspaceLocation::Local {
+        path: workspace.clone(),
+    };
     {
         let inner = runtime.inner.lock().await;
-        if inner.workspace.as_ref() == Some(&workspace) {
+        if inner.workspace.as_ref() == Some(&location) {
             focus_main_window(app);
             return Ok(());
         }
     }
     let options = prepare_server_options(&runtime.home, &workspace)?;
 
-    let (old_server, old_workspace) = {
+    let (old_server, old_wsl, old_workspace) = {
         let mut inner = runtime.inner.lock().await;
-        (inner.server.take(), inner.workspace.clone())
+        (
+            inner.server.take(),
+            inner.wsl.take(),
+            inner.workspace.clone(),
+        )
     };
     if let Some(server) = old_server {
         match stop_server_with_confirmation(app, server, "switch workspaces").await? {
@@ -355,11 +721,23 @@ async fn switch_workspace(app: &AppHandle, workspace: PathBuf) -> Result<(), Des
             }
         }
     }
+    if let Some(connection) = old_wsl {
+        match stop_wsl_with_confirmation(app, connection, "switch workspaces").await? {
+            StopWslOutcome::Stopped => {}
+            StopWslOutcome::Cancelled(connection) => {
+                runtime.inner.lock().await.wsl = Some(*connection);
+                return Ok(());
+            }
+        }
+    }
 
     let started = match launch_server(options, &runtime.bootstrap_token).await {
         Ok(started) => started,
         Err(error) => {
-            if let Some(old_workspace) = old_workspace {
+            if let Some(WorkspaceLocation::Local {
+                path: old_workspace,
+            }) = old_workspace
+            {
                 match prepare_server_options(&runtime.home, &old_workspace) {
                     Ok(options) => match launch_server(options, &runtime.bootstrap_token).await {
                         Ok(recovered) => {
@@ -399,6 +777,18 @@ async fn switch_workspace(app: &AppHandle, workspace: PathBuf) -> Result<(), Des
                     }
                 }
             }
+            let has_runtime = {
+                let mut inner = runtime.inner.lock().await;
+                let has_runtime = inner.server.is_some() || inner.wsl.is_some();
+                if !has_runtime {
+                    inner.workspace = None;
+                    inner.remote_settings = None;
+                }
+                has_runtime
+            };
+            if !has_runtime {
+                show_connection_shell(app, &runtime)?;
+            }
             return Err(error);
         }
     };
@@ -408,13 +798,15 @@ async fn switch_workspace(app: &AppHandle, workspace: PathBuf) -> Result<(), Des
         let inner = runtime.inner.lock().await;
         inner.state.clone()
     };
-    next_state.record_workspace(&workspace)?;
+    next_state.record_local_workspace(&workspace)?;
     let navigation_url = started.navigation_url.clone();
     {
         let mut inner = runtime.inner.lock().await;
         inner.state = next_state.clone();
-        inner.workspace = Some(workspace.clone());
+        inner.workspace = Some(location);
         inner.server = Some(started.server);
+        inner.wsl = None;
+        inner.remote_settings = None;
     }
     if let Err(error) = next_state.save(&runtime.state_path) {
         log::warn!("failed to save desktop state: {error}");
@@ -442,6 +834,313 @@ async fn switch_workspace(app: &AppHandle, workspace: PathBuf) -> Result<(), Des
     Ok(())
 }
 
+async fn switch_wsl_workspace(
+    app: &AppHandle,
+    distro: String,
+    user: String,
+    path: String,
+) -> Result<(), DesktopError> {
+    let runtime = app.state::<DesktopRuntime>();
+    let _operation = runtime.operation.lock().await;
+    if runtime.exit_requested.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let requested = WorkspaceLocation::Wsl {
+        distro: distro.clone(),
+        user: user.clone(),
+        path: path.clone(),
+    };
+    {
+        let inner = runtime.inner.lock().await;
+        if inner.workspace.as_ref() == Some(&requested) && inner.wsl.is_some() {
+            focus_main_window(app);
+            return Ok(());
+        }
+    }
+
+    let (old_server, old_wsl) = {
+        let mut inner = runtime.inner.lock().await;
+        (inner.server.take(), inner.wsl.take())
+    };
+    let reload_app_shell = old_wsl.is_some();
+    if let Some(server) = old_server {
+        match stop_server_with_confirmation(app, server, "connect to WSL").await? {
+            StopServerOutcome::Stopped => {}
+            StopServerOutcome::Cancelled(server) => {
+                runtime.inner.lock().await.server = Some(server);
+                return Ok(());
+            }
+        }
+    }
+    if let Some(connection) = old_wsl {
+        match stop_wsl_with_confirmation(app, connection, "switch WSL workspaces").await? {
+            StopWslOutcome::Stopped => {}
+            StopWslOutcome::Cancelled(connection) => {
+                runtime.inner.lock().await.wsl = Some(*connection);
+                return Ok(());
+            }
+        }
+    }
+
+    let pending = runtime.inner.lock().await.pending_wsl.take();
+    let connection_result: Result<_, DesktopError> = async {
+        let mut connection = match pending {
+            Some(connection)
+                if connection.distro == distro && (user.is_empty() || connection.user == user) =>
+            {
+                connection
+            }
+            Some(connection) => {
+                connection.shutdown(true).await;
+                WslConnection::start(distro, user)
+                    .await
+                    .map_err(|error| DesktopError::Wsl(error.to_string()))?
+            }
+            None => WslConnection::start(distro, user)
+                .await
+                .map_err(|error| DesktopError::Wsl(error.to_string()))?,
+        };
+        let configuration = connection
+            .open_workspace(path)
+            .await
+            .map_err(|error| DesktopError::Wsl(error.to_string()))?;
+        Ok((connection, configuration))
+    }
+    .await;
+    let (connection, workspace_configuration) = match connection_result {
+        Ok(connection) => connection,
+        Err(error) => {
+            let mut inner = runtime.inner.lock().await;
+            inner.workspace = None;
+            inner.remote_settings = None;
+            drop(inner);
+            show_connection_shell(app, &runtime)?;
+            return Err(error);
+        }
+    };
+    let location = WorkspaceLocation::Wsl {
+        distro: connection.distro.clone(),
+        user: connection.user.clone(),
+        path: connection.workspace.clone(),
+    };
+    let remote_settings =
+        match prepare_remote_settings(&runtime.home, &location, workspace_configuration) {
+            Ok(settings) => settings,
+            Err(error) => {
+                let mut inner = runtime.inner.lock().await;
+                inner.workspace = None;
+                inner.remote_settings = None;
+                drop(inner);
+                show_connection_shell(app, &runtime)?;
+                return Err(error);
+            }
+        };
+    let mut events = connection.subscribe_events();
+    let mut host_closed = connection.subscribe_closed();
+
+    let mut next_state = runtime.inner.lock().await.state.clone();
+    next_state.record_workspace(location.clone())?;
+    {
+        let mut inner = runtime.inner.lock().await;
+        inner.state = next_state.clone();
+        inner.workspace = Some(location.clone());
+        inner.server = None;
+        inner.wsl = Some(connection);
+        inner.remote_settings = Some(remote_settings);
+    }
+    if let Err(error) = next_state.save(&runtime.state_path) {
+        log::warn!("failed to save WSL workspace state: {error}");
+    }
+    show_remote_workspace_window(app, &runtime, &location, reload_app_shell)?;
+    #[cfg(target_os = "macos")]
+    replace_menu(app, &next_state)?;
+    let event_app = app.clone();
+    let reconnect_location = location.clone();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::select! {
+                event = events.recv() => match event {
+                    Ok(event) => {
+                        let worker_exited = matches!(
+                            &event.message,
+                            RemoteMessage::Event(RemoteEvent::WorkerExited { .. })
+                        );
+                        send_remote_event(&event_app, event);
+                        if worker_exited {
+                            match reconnect_wsl_worker(&event_app, &reconnect_location).await {
+                                Ok(Some(channel_id)) => {
+                                    emit_workspace_reconnected(&event_app, channel_id);
+                                }
+                                Ok(None) => break,
+                                Err(error) => {
+                                    log::warn!(
+                                        "failed to reconnect WSL workspace worker; restarting host: {error}"
+                                    );
+                                    match reconnect_wsl_host(&event_app, &reconnect_location).await {
+                                        Ok(Some(reconnected)) => {
+                                            events = reconnected.events;
+                                            host_closed = reconnected.closed;
+                                            emit_workspace_reconnected(
+                                                &event_app,
+                                                reconnected.channel_id,
+                                            );
+                                        }
+                                        Ok(None) => break,
+                                        Err(error) => {
+                                            log::error!("failed to reconnect WSL host: {error}");
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        log::warn!("dropped {skipped} remote workspace events");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        match reconnect_wsl_host(&event_app, &reconnect_location).await {
+                            Ok(Some(reconnected)) => {
+                                events = reconnected.events;
+                                host_closed = reconnected.closed;
+                                emit_workspace_reconnected(&event_app, reconnected.channel_id);
+                            }
+                            Ok(None) => break,
+                            Err(error) => {
+                                log::error!("failed to reconnect WSL host: {error}");
+                                break;
+                            }
+                        }
+                    }
+                },
+                _ = host_closed.changed() => {
+                    match reconnect_wsl_host(&event_app, &reconnect_location).await {
+                        Ok(Some(reconnected)) => {
+                            events = reconnected.events;
+                            host_closed = reconnected.closed;
+                            emit_workspace_reconnected(&event_app, reconnected.channel_id);
+                        }
+                        Ok(None) => break,
+                        Err(error) => {
+                            log::error!("failed to reconnect WSL host: {error}");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+    log::info!("connected workspace {}", location.display_path());
+    Ok(())
+}
+
+fn emit_workspace_reconnected(app: &AppHandle, channel_id: u32) {
+    let reconnected = RemoteEnvelope::new(
+        channel_id,
+        format!("workspace-reconnected-{channel_id}"),
+        RemoteMessage::Event(RemoteEvent::WorkspaceReconnected { channel_id }),
+    );
+    send_remote_event(app, reconnected);
+}
+
+fn send_remote_event(app: &AppHandle, event: RemoteEnvelope) {
+    let Some(runtime) = app.try_state::<DesktopRuntime>() else {
+        return;
+    };
+    runtime
+        .remote_channels
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .retain(|_, channel| channel.send(event.clone()).is_ok());
+}
+
+struct ReconnectedWslHost {
+    events: tokio::sync::broadcast::Receiver<RemoteEnvelope>,
+    closed: tokio::sync::watch::Receiver<bool>,
+    channel_id: u32,
+}
+
+async fn reconnect_wsl_host(
+    app: &AppHandle,
+    location: &WorkspaceLocation,
+) -> Result<Option<ReconnectedWslHost>, String> {
+    let runtime = app.state::<DesktopRuntime>();
+    let _operation = runtime.operation.lock().await;
+    if runtime.exit_requested.load(Ordering::Acquire) {
+        return Ok(None);
+    }
+    let (distro, user, path) = match location {
+        WorkspaceLocation::Wsl { distro, user, path } => {
+            (distro.clone(), user.clone(), path.clone())
+        }
+        WorkspaceLocation::Local { .. } => return Ok(None),
+    };
+    let old = {
+        let mut inner = runtime.inner.lock().await;
+        if inner.workspace.as_ref() != Some(location) {
+            return Ok(None);
+        }
+        inner.remote_settings = None;
+        inner.wsl.take()
+    };
+    if let Some(old) = old {
+        old.shutdown(true).await;
+    }
+    let mut connection = WslConnection::start(distro, user)
+        .await
+        .map_err(|error| error.to_string())?;
+    let configuration = connection
+        .open_workspace(path)
+        .await
+        .map_err(|error| error.to_string())?;
+    let settings = prepare_remote_settings(&runtime.home, location, configuration)
+        .map_err(|error| error.to_string())?;
+    let reconnected = ReconnectedWslHost {
+        events: connection.subscribe_events(),
+        closed: connection.subscribe_closed(),
+        channel_id: connection.channel_id,
+    };
+    let mut inner = runtime.inner.lock().await;
+    if inner.workspace.as_ref() != Some(location) || runtime.exit_requested.load(Ordering::Acquire)
+    {
+        drop(inner);
+        connection.shutdown(true).await;
+        return Ok(None);
+    }
+    inner.remote_settings = Some(settings);
+    inner.wsl = Some(connection);
+    Ok(Some(reconnected))
+}
+
+async fn reconnect_wsl_worker(
+    app: &AppHandle,
+    location: &WorkspaceLocation,
+) -> Result<Option<u32>, String> {
+    let runtime = app.state::<DesktopRuntime>();
+    let _operation = runtime.operation.lock().await;
+    if runtime.exit_requested.load(Ordering::Acquire) {
+        return Ok(None);
+    }
+    let mut inner = runtime.inner.lock().await;
+    if inner.workspace.as_ref() != Some(location) {
+        return Ok(None);
+    }
+    let connection = inner
+        .wsl
+        .as_mut()
+        .ok_or_else(|| "WSL connection disappeared during reconnect".to_string())?;
+    let configuration = connection
+        .open_workspace(location.display_path())
+        .await
+        .map_err(|error| error.to_string())?;
+    let channel_id = connection.channel_id;
+    inner.remote_settings = Some(
+        prepare_remote_settings(&runtime.home, location, configuration)
+            .map_err(|error| error.to_string())?,
+    );
+    Ok(Some(channel_id))
+}
+
 fn prepare_server_options(home: &Path, workspace: &Path) -> Result<ServerOptions, DesktopError> {
     let loaded = load_server_config_for_workspace(None, workspace)?;
     let port = if cfg!(debug_assertions) { 3000 } else { 0 };
@@ -454,6 +1153,74 @@ fn prepare_server_options(home: &Path, workspace: &Path) -> Result<ServerOptions
         "default".to_string(),
     )
     .map_err(|error| DesktopError::BackendConfiguration(error.to_string()))
+}
+
+fn prepare_remote_settings(
+    home: &Path,
+    location: &WorkspaceLocation,
+    configuration: RemoteWorkspaceConfiguration,
+) -> Result<EmbeddedServer, DesktopError> {
+    let scope_bytes = serde_json::to_vec(location)
+        .map_err(|error| DesktopError::BackendConfiguration(error.to_string()))?;
+    let scope = format!("{:x}", Sha256::digest(scope_bytes));
+    let morrow_home = home.join(".morrow");
+    let workspace_scope = morrow_home.join("remote-workspaces").join(scope);
+    std::fs::create_dir_all(&workspace_scope)
+        .map_err(|error| DesktopError::BackendConfiguration(error.to_string()))?;
+    let fallback_model = configuration.fallback_model.map(FallbackModel::remote);
+    let fallback_mcp_servers = configuration
+        .fallback_mcp_servers
+        .into_iter()
+        .map(|server| McpServerConfig {
+            name: server.name,
+            transport: match server.transport {
+                RemoteMcpTransport::Stdio => McpTransport::Stdio,
+                RemoteMcpTransport::Http => McpTransport::Http,
+            },
+            command: server.command,
+            args: server.args,
+            env: server
+                .env_keys
+                .into_iter()
+                .map(|key| (key, String::new()))
+                .collect(),
+            cwd: server.cwd.map(PathBuf::from),
+            url: server.url,
+            http_headers: server
+                .http_header_keys
+                .into_iter()
+                .map(|key| (key, String::new()))
+                .collect(),
+            enabled: server.enabled,
+            startup_timeout_sec: server.startup_timeout_sec,
+            tool_timeout_sec: server.tool_timeout_sec,
+        })
+        .collect();
+    let options = ServerOptions {
+        host: IpAddr::V4(Ipv4Addr::LOCALHOST),
+        port: 0,
+        fallback_model,
+        model_store_path: morrow_home.join("web-models.json"),
+        mcp_store_path: morrow_home.join("web-mcp.json"),
+        command_store_path: morrow_home.join("commands"),
+        system_prompt: String::new(),
+        context_config: ContextConfig {
+            auto_compact: true,
+            auto_compact_threshold: 0.835,
+            retain_recent_turns: 6,
+            summary_target_tokens: 12_000,
+            compact_max_retries: 2,
+        },
+        workspace_root: workspace_scope,
+        workspace_location: location.clone(),
+        config_path: None,
+        config_diagnostics: Vec::new(),
+        permissions: PermissionProfile::for_mode(agent_server::DEFAULT_WEB_PERMISSION_MODE),
+        mcp_servers: fallback_mcp_servers,
+        default_session_name: "default".to_string(),
+    };
+    EmbeddedServer::new(options)
+        .map_err(|error| DesktopError::BackendConfiguration(error.to_string()))
 }
 
 async fn launch_server(
@@ -513,6 +1280,27 @@ async fn stop_server_with_confirmation(
     }
 }
 
+async fn stop_wsl_with_confirmation(
+    app: &AppHandle,
+    connection: WslConnection,
+    action: &str,
+) -> Result<StopWslOutcome, DesktopError> {
+    let running_turns = match connection.request(RemoteRequest::Activity).await {
+        Ok(RemoteResponse::Activity(activity)) => activity.running_turns,
+        Ok(_) => 0,
+        Err(error) => {
+            log::warn!("WSL activity check failed during shutdown: {error}");
+            connection.shutdown(true).await;
+            return Ok(StopWslOutcome::Stopped);
+        }
+    };
+    if running_turns > 0 && !confirm_cancel_running_turns(app, running_turns, action).await {
+        return Ok(StopWslOutcome::Cancelled(Box::new(connection)));
+    }
+    connection.shutdown(running_turns > 0).await;
+    Ok(StopWslOutcome::Stopped)
+}
+
 async fn confirm_cancel_running_turns(app: &AppHandle, count: usize, action: &str) -> bool {
     let noun = if count == 1 { "turn" } else { "turns" };
     let message =
@@ -530,6 +1318,139 @@ async fn confirm_cancel_running_turns(app: &AppHandle, count: usize, action: &st
             let _ = sender.send(confirmed);
         });
     receiver.await.unwrap_or(false)
+}
+
+fn show_connection_window(app: &AppHandle) -> Result<(), DesktopError> {
+    if app.get_webview_window(MAIN_WINDOW_LABEL).is_some() {
+        focus_main_window(app);
+        return Ok(());
+    }
+    let app_url = desktop_app_url()?;
+    let webview_url = if cfg!(debug_assertions) {
+        WebviewUrl::External(app_url.clone())
+    } else {
+        WebviewUrl::App("index.html".into())
+    };
+    let builder = WebviewWindowBuilder::new(app, MAIN_WINDOW_LABEL, webview_url)
+        .title("Morrow")
+        .inner_size(1280.0, 800.0)
+        .min_inner_size(960.0, 640.0)
+        .devtools(cfg!(debug_assertions));
+    #[cfg(target_os = "windows")]
+    let builder = builder.decorations(false).shadow(true);
+    #[cfg(target_os = "linux")]
+    let builder = builder.decorations(false).shadow(true).transparent(true);
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .decorations(true)
+        .title_bar_style(tauri::TitleBarStyle::Overlay)
+        .hidden_title(true)
+        .traffic_light_position(tauri::LogicalPosition::new(14.0, 13.0));
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+    let builder = builder.initialization_script(desktop_platform_initialization_script());
+    let window = builder.build()?;
+    install_close_handler(&window);
+    let runtime = app.state::<DesktopRuntime>();
+    *runtime
+        .app_url
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(app_url);
+    Ok(())
+}
+
+fn desktop_app_url() -> Result<Url, DesktopError> {
+    desktop_app_url_for(
+        cfg!(debug_assertions).then_some(VITE_DEV_URL),
+        cfg!(target_os = "windows"),
+    )
+}
+
+fn desktop_app_url_for(dev_url: Option<&str>, windows: bool) -> Result<Url, DesktopError> {
+    let url = match dev_url {
+        Some(dev_url) => format!("{dev_url}?desktop_connect=1"),
+        None if windows => "http://tauri.localhost".to_string(),
+        None => "tauri://localhost".to_string(),
+    };
+    parse_url(&url)
+}
+
+fn show_remote_workspace_window(
+    app: &AppHandle,
+    runtime: &DesktopRuntime,
+    workspace: &WorkspaceLocation,
+    reload_app_shell: bool,
+) -> Result<(), DesktopError> {
+    let window = app
+        .get_webview_window(MAIN_WINDOW_LABEL)
+        .ok_or_else(|| DesktopError::BackendConfiguration("main window is unavailable".into()))?;
+    let app_url = runtime
+        .app_url
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+        .ok_or_else(|| {
+            DesktopError::BackendConfiguration("desktop app URL is unavailable".into())
+        })?;
+    window.set_title(&workspace_location_title(workspace))?;
+    navigate_app_shell(&window, app_url, reload_app_shell)?;
+    window.show()?;
+    let _ = window.unminimize();
+    window.set_focus()?;
+    Ok(())
+}
+
+fn show_connection_shell(app: &AppHandle, runtime: &DesktopRuntime) -> Result<(), DesktopError> {
+    let window = app
+        .get_webview_window(MAIN_WINDOW_LABEL)
+        .ok_or_else(|| DesktopError::BackendConfiguration("main window is unavailable".into()))?;
+    let app_url = runtime
+        .app_url
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+        .ok_or_else(|| {
+            DesktopError::BackendConfiguration("desktop app URL is unavailable".into())
+        })?;
+    window.set_title("Morrow")?;
+    navigate_app_shell(&window, app_url, true)?;
+    window.show()?;
+    let _ = window.unminimize();
+    window.set_focus()?;
+    Ok(())
+}
+
+fn navigate_app_shell(
+    window: &WebviewWindow,
+    url: Url,
+    reload_current: bool,
+) -> Result<(), DesktopError> {
+    match app_shell_navigation(window.url().ok().as_ref(), &url, reload_current) {
+        AppShellNavigation::None => {}
+        AppShellNavigation::Reload => window.reload()?,
+        AppShellNavigation::Navigate => window.navigate(url)?,
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppShellNavigation {
+    None,
+    Reload,
+    Navigate,
+}
+
+fn app_shell_navigation(
+    current: Option<&Url>,
+    target: &Url,
+    reload_current: bool,
+) -> AppShellNavigation {
+    if current != Some(target) {
+        AppShellNavigation::Navigate
+    } else if reload_current {
+        AppShellNavigation::Reload
+    } else {
+        AppShellNavigation::None
+    }
 }
 
 fn show_workspace_window(
@@ -560,7 +1481,9 @@ fn show_workspace_window(
                 open_external_url(&new_window_handle, &url);
                 NewWindowResponse::Deny
             });
-    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    let builder = builder.decorations(false).shadow(true);
+    #[cfg(target_os = "linux")]
     let builder = builder.decorations(false).shadow(true).transparent(true);
     #[cfg(target_os = "macos")]
     let builder = builder
@@ -665,6 +1588,13 @@ fn desktop_remote_capability(identifier: &str, origin: &str) -> tauri::ipc::Capa
         .window(MAIN_WINDOW_LABEL)
         .permission(DESKTOP_SHELL_STATE_PERMISSION)
         .permission(DESKTOP_ACTION_PERMISSION)
+        .permission(DESKTOP_WSL_DISTRIBUTIONS_PERMISSION)
+        .permission(DESKTOP_WSL_PROBE_PERMISSION)
+        .permission(DESKTOP_WSL_PREPARE_PERMISSION)
+        .permission(DESKTOP_WSL_CONNECT_PERMISSION)
+        .permission(DESKTOP_REMOTE_REQUEST_PERMISSION)
+        .permission(DESKTOP_REMOTE_SUBSCRIBE_PERMISSION)
+        .permission(DESKTOP_REMOTE_UNSUBSCRIBE_PERMISSION)
 }
 
 fn handle_navigation(app: &AppHandle, url: &Url) -> bool {
@@ -716,6 +1646,38 @@ fn workspace_title(workspace: &Path) -> String {
     format!("Morrow — {}", workspace_label(workspace))
 }
 
+fn workspace_location_title(workspace: &WorkspaceLocation) -> String {
+    format!("Morrow — {}", workspace_location_label(workspace))
+}
+
+fn workspace_location_label(workspace: &WorkspaceLocation) -> String {
+    match workspace {
+        WorkspaceLocation::Local { path } => workspace_label(path),
+        WorkspaceLocation::Wsl { distro, path, .. } => {
+            let name = path
+                .trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .filter(|name| !name.is_empty())
+                .unwrap_or(path);
+            format!("{name} — {distro} (WSL)")
+        }
+    }
+}
+
+fn workspace_project_label(workspace: &WorkspaceLocation) -> String {
+    match workspace {
+        WorkspaceLocation::Local { path } => workspace_label(path),
+        WorkspaceLocation::Wsl { path, .. } => path
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .filter(|name| !name.is_empty())
+            .unwrap_or(path)
+            .to_string(),
+    }
+}
+
 fn workspace_label(workspace: &Path) -> String {
     workspace
         .file_name()
@@ -761,7 +1723,11 @@ fn build_menu(app: &AppHandle, state: &DesktopState) -> tauri::Result<Menu<tauri
             open_recent.append(&MenuItem::with_id(
                 app,
                 format!("{OPEN_RECENT_PREFIX}{index}"),
-                workspace.display().to_string(),
+                format!(
+                    "{} — {}",
+                    workspace_location_label(workspace),
+                    workspace.target_label()
+                ),
                 true,
                 None::<&str>,
             )?)?;
@@ -891,7 +1857,7 @@ fn handle_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
                         .cloned()
                 };
                 if let Some(workspace) = workspace {
-                    spawn_workspace_switch(handle, workspace, false);
+                    spawn_location_switch(handle, workspace, false);
                 }
             });
         }
@@ -946,7 +1912,10 @@ fn request_exit(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         let runtime = app.state::<DesktopRuntime>();
         let _operation = runtime.operation.lock().await;
-        let server = runtime.inner.lock().await.server.take();
+        let (server, wsl) = {
+            let mut inner = runtime.inner.lock().await;
+            (inner.server.take(), inner.wsl.take())
+        };
         if let Some(server) = server {
             match stop_server_with_confirmation(&app, server, "quit Morrow").await {
                 Ok(StopServerOutcome::Stopped) => {}
@@ -960,6 +1929,19 @@ fn request_exit(app: AppHandle) {
                         "failed to shut down the local server cleanly ({})",
                         error.log_category()
                     );
+                }
+            }
+        }
+        if let Some(connection) = wsl {
+            match stop_wsl_with_confirmation(&app, connection, "quit Morrow").await {
+                Ok(StopWslOutcome::Stopped) => {}
+                Ok(StopWslOutcome::Cancelled(connection)) => {
+                    runtime.inner.lock().await.wsl = Some(*connection);
+                    runtime.exit_requested.store(false, Ordering::Release);
+                    return;
+                }
+                Err(error) => {
+                    log::error!("failed to shut down WSL runtime cleanly: {error}");
                 }
             }
         }
@@ -1009,6 +1991,8 @@ enum DesktopError {
     State(#[from] DesktopStateError),
     #[error(transparent)]
     Server(#[from] agent_server::ServerError),
+    #[error("WSL connection failed: {0}")]
+    Wsl(String),
     #[error(transparent)]
     Tauri(#[from] tauri::Error),
 }
@@ -1024,6 +2008,7 @@ impl DesktopError {
             Self::Config(_) => "workspace-config",
             Self::State(_) => "desktop-state",
             Self::Server(_) => "local-server",
+            Self::Wsl(_) => "wsl",
             Self::Tauri(_) => "tauri",
         }
     }
@@ -1078,7 +2063,12 @@ mod tests {
             recent_workspaces: vec![RecentWorkspace {
                 index: 0,
                 label: "morrow".to_string(),
+                target: "Local".to_string(),
+                path: "/tmp/morrow".to_string(),
             }],
+            active_workspace: Some(WorkspaceLocation::Local {
+                path: PathBuf::from("/tmp/morrow"),
+            }),
         })
         .expect("serialize desktop shell state");
 
@@ -1088,14 +2078,74 @@ mod tests {
                 "isMaximized": true,
                 "recentWorkspaces": [{
                     "index": 0,
-                    "label": "morrow"
-                }]
+                    "label": "morrow",
+                    "target": "Local",
+                    "path": "/tmp/morrow"
+                }],
+                "activeWorkspace": {
+                    "kind": "local",
+                    "path": "/tmp/morrow"
+                }
             })
         );
     }
 
     #[test]
-    fn remote_capability_is_exact_remote_only_and_has_two_app_permissions() {
+    fn default_workspace_is_kept_inside_the_private_morrow_home() {
+        assert_eq!(
+            default_workspace_path(Path::new("/home/morrow-user")),
+            PathBuf::from("/home/morrow-user/.morrow/workspaces/default")
+        );
+    }
+
+    #[test]
+    fn desktop_app_url_is_stable_for_packaged_windows_and_development() {
+        assert_eq!(
+            desktop_app_url_for(None, true).expect("Windows app URL"),
+            Url::parse("http://tauri.localhost").expect("valid URL")
+        );
+        assert_eq!(
+            desktop_app_url_for(Some("http://127.0.0.1:5173"), true).expect("development app URL"),
+            Url::parse("http://127.0.0.1:5173?desktop_connect=1").expect("valid URL")
+        );
+    }
+
+    #[test]
+    fn app_shell_navigation_skips_startup_reload_and_refreshes_explicit_switches() {
+        let app_url = Url::parse("http://tauri.localhost").expect("valid app URL");
+        let local_url = Url::parse("http://127.0.0.1:43123").expect("valid local URL");
+
+        assert_eq!(
+            app_shell_navigation(Some(&app_url), &app_url, false),
+            AppShellNavigation::None
+        );
+        assert_eq!(
+            app_shell_navigation(Some(&app_url), &app_url, true),
+            AppShellNavigation::Reload
+        );
+        assert_eq!(
+            app_shell_navigation(Some(&local_url), &app_url, false),
+            AppShellNavigation::Navigate
+        );
+    }
+
+    #[test]
+    fn remote_project_label_keeps_the_target_out_of_the_project_name() {
+        let workspace = WorkspaceLocation::Wsl {
+            distro: "Ubuntu".to_string(),
+            user: "morrow".to_string(),
+            path: "/home/morrow/code/project".to_string(),
+        };
+
+        assert_eq!(workspace_project_label(&workspace), "project");
+        assert_eq!(
+            workspace_location_label(&workspace),
+            "project — Ubuntu (WSL)"
+        );
+    }
+
+    #[test]
+    fn remote_capability_is_exact_remote_only_and_has_all_app_permissions() {
         let capability =
             desktop_remote_capability("desktop-shell-origin-0", "http://127.0.0.1:43123").build();
         let CapabilityFile::Capability(capability) = capability else {
@@ -1122,7 +2172,17 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             permissions,
-            [DESKTOP_SHELL_STATE_PERMISSION, DESKTOP_ACTION_PERMISSION]
+            [
+                DESKTOP_SHELL_STATE_PERMISSION,
+                DESKTOP_ACTION_PERMISSION,
+                DESKTOP_WSL_DISTRIBUTIONS_PERMISSION,
+                DESKTOP_WSL_PROBE_PERMISSION,
+                DESKTOP_WSL_PREPARE_PERMISSION,
+                DESKTOP_WSL_CONNECT_PERMISSION,
+                DESKTOP_REMOTE_REQUEST_PERMISSION,
+                DESKTOP_REMOTE_SUBSCRIBE_PERMISSION,
+                DESKTOP_REMOTE_UNSUBSCRIBE_PERMISSION,
+            ]
         );
         assert!(!permissions.contains(&"core:default"));
     }
@@ -1159,5 +2219,79 @@ mod tests {
         assert!(ensure_main_window_label(MAIN_WINDOW_LABEL).is_ok());
         assert!(ensure_main_window_label("settings").is_err());
         assert!(recent_workspace_at(&DesktopState::default(), 0).is_err());
+    }
+
+    #[test]
+    fn pending_wsl_requests_cannot_bypass_windows_settings() {
+        for request in [
+            RemoteRequest::Ping,
+            RemoteRequest::Activity,
+            RemoteRequest::Environment,
+            RemoteRequest::ListDirectory {
+                path: Some("/home/morrow".to_string()),
+                show_hidden: false,
+            },
+        ] {
+            assert!(request_allowed_while_wsl_pending(&request));
+        }
+
+        for request in [
+            RemoteRequest::Http {
+                method: "GET".to_string(),
+                path: "/api/model-settings".to_string(),
+                body: None,
+            },
+            RemoteRequest::SubscribeSession {
+                session: "default".to_string(),
+            },
+            RemoteRequest::SessionMessage {
+                session: "default".to_string(),
+                message: serde_json::json!({
+                    "type": "start_turn",
+                    "data": { "prompt": "hello" }
+                }),
+            },
+        ] {
+            assert!(!request_allowed_while_wsl_pending(&request));
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_settings_scope_supports_session_model_selection_routes() {
+        let root = std::env::temp_dir().join(format!(
+            "morrow-desktop-remote-settings-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("create test home");
+        let location = WorkspaceLocation::Wsl {
+            distro: "Ubuntu".to_string(),
+            user: "morrow".to_string(),
+            path: "/home/morrow/code/project".to_string(),
+        };
+        let server = prepare_remote_settings(
+            &root,
+            &location,
+            RemoteWorkspaceConfiguration {
+                fallback_model: None,
+                fallback_mcp_servers: Vec::new(),
+            },
+        )
+        .expect("remote settings server");
+
+        let response = server
+            .request("GET", "/api/sessions/default/model-selection", None)
+            .await
+            .expect("model selection response");
+
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            response.body.expect("response body")["selection"],
+            serde_json::Value::Null
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }
