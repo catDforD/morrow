@@ -1,5 +1,12 @@
-import type { FormEvent, KeyboardEvent, ReactNode } from 'react'
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type { FormEvent, KeyboardEvent, ReactNode, UIEvent } from 'react'
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
 import {
   Activity,
   Archive,
@@ -45,6 +52,10 @@ import {
 } from './desktop'
 import type { DesktopPlatform, DesktopShellState } from './desktop'
 import DesktopShell from './DesktopShell'
+import {
+  isMessageScrollNearBottom,
+  scrollMessageListToBottom,
+} from './messageScroll'
 import SettingsView from './SettingsView'
 import type { SettingsSection, ThemePreference } from './SettingsView'
 import {
@@ -205,7 +216,8 @@ export default function App() {
   const idRef = useRef(0)
   const selectionRef = useRef(0)
   const modelSelectionRequestRef = useRef(0)
-  const messagesEndRef = useRef<HTMLDivElement | null>(null)
+  const messageScrollRef = useRef<HTMLDivElement | null>(null)
+  const followMessagesRef = useRef(true)
   const sessionSearchRef = useRef<HTMLInputElement | null>(null)
   const resolvedTheme: ResolvedTheme =
     themePreference === 'system' ? systemTheme : themePreference
@@ -823,6 +835,7 @@ export default function App() {
       selectionRef.current = selectionId
       modelSelectionRequestRef.current += 1
       selectedRef.current = name
+      followMessagesRef.current = true
       setSelected(name)
       setIsSidebarOpen(false)
       setRunningTurn(null)
@@ -970,12 +983,15 @@ export default function App() {
     return () => media.removeEventListener('change', handleChange)
   }, [])
 
-  useEffect(() => {
+  const handleMessageScroll = useCallback((event: UIEvent<HTMLDivElement>) => {
+    followMessagesRef.current = isMessageScrollNearBottom(event.currentTarget)
+  }, [])
+
+  useLayoutEffect(() => {
     if (appView !== 'workspace') return
-    const frame = requestAnimationFrame(() => {
-      messagesEndRef.current?.scrollIntoView({ block: 'end' })
-    })
-    return () => cancelAnimationFrame(frame)
+    const scroller = messageScrollRef.current
+    if (!scroller || !followMessagesRef.current) return
+    scrollMessageListToBottom(scroller)
   }, [appView, timeline])
 
   useEffect(() => {
@@ -1141,6 +1157,7 @@ export default function App() {
         : { matched: false, prompt: trimmed }
       const resolvedPrompt = resolved.prompt.trim()
       if (!resolvedPrompt) throw new Error('resolved prompt must not be empty')
+      followMessagesRef.current = true
       addTimelineMessage('user', resolvedPrompt)
       createRunTrace(
         'Request queued',
@@ -1480,7 +1497,8 @@ export default function App() {
                     ),
                   )
                 }}
-                messagesEndRef={messagesEndRef}
+                messageScrollRef={messageScrollRef}
+                onMessageScroll={handleMessageScroll}
               />
             </main>
             <InspectorDrawer
@@ -1847,7 +1865,8 @@ function ChatView({
   onOpenSidebar,
   onOpenInspector,
   onToggleRun,
-  messagesEndRef,
+  messageScrollRef,
+  onMessageScroll,
 }: {
   selected: string
   status: StatusResponse | null
@@ -1881,7 +1900,8 @@ function ChatView({
   onOpenSidebar: () => void
   onOpenInspector: (panel: InspectorPanel) => void
   onToggleRun: (id: string) => void
-  messagesEndRef: React.RefObject<HTMLDivElement | null>
+  messageScrollRef: React.RefObject<HTMLDivElement | null>
+  onMessageScroll: (event: UIEvent<HTMLDivElement>) => void
 }) {
   const isEmpty = timeline.length === 0
   const composer = (
@@ -1942,7 +1962,8 @@ function ChatView({
           />
           <ConversationTimeline
             items={timeline}
-            messagesEndRef={messagesEndRef}
+            messageScrollRef={messageScrollRef}
+            onMessageScroll={onMessageScroll}
             onToggleRun={onToggleRun}
           />
           {composer}
@@ -2034,15 +2055,21 @@ function ConversationHeader({
 
 function ConversationTimeline({
   items,
-  messagesEndRef,
+  messageScrollRef,
+  onMessageScroll,
   onToggleRun,
 }: {
   items: TimelineItem[]
-  messagesEndRef: React.RefObject<HTMLDivElement | null>
+  messageScrollRef: React.RefObject<HTMLDivElement | null>
+  onMessageScroll: (event: UIEvent<HTMLDivElement>) => void
   onToggleRun: (id: string) => void
 }) {
   return (
-    <div className="message-scroll main-scroll">
+    <div
+      ref={messageScrollRef}
+      className="message-scroll main-scroll"
+      onScroll={onMessageScroll}
+    >
       <div className="message-column">
         {items.map((item) => {
           if (item.kind === 'message') {
@@ -2059,7 +2086,6 @@ function ConversationTimeline({
           }
           return <TimelineNotice key={item.id} notice={item} />
         })}
-        <div ref={messagesEndRef} />
       </div>
     </div>
   )
