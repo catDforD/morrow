@@ -249,16 +249,35 @@ async fn desktop_remote_request(
     request: RemoteRequest,
 ) -> Result<RemoteResponse, String> {
     ensure_main_window(&window)?;
+    let operation = runtime.operation.lock().await;
     let (client, settings) = {
         let inner = runtime.inner.lock().await;
-        let connection = inner
-            .wsl
-            .as_ref()
-            .or(inner.pending_wsl.as_ref())
-            .ok_or_else(|| "no WSL workspace is connected".to_string())?;
-        (connection.request_client(), inner.remote_settings.clone())
+        if let Some(connection) = inner.wsl.as_ref() {
+            let settings = inner.remote_settings.clone().ok_or_else(|| {
+                "Windows workspace settings are not ready; wait for WSL to reconnect".to_string()
+            })?;
+            (connection.request_client(), Some(settings))
+        } else {
+            let connection = inner
+                .pending_wsl
+                .as_ref()
+                .ok_or_else(|| "no WSL workspace is connected".to_string())?;
+            if !request_allowed_while_wsl_pending(&request) {
+                return Err(
+                    "WSL project is still connecting; finish opening a project first".to_string(),
+                );
+            }
+            (connection.request_client(), None)
+        }
     };
-    route_remote_request(client, settings, request).await
+    drop(operation);
+    match settings {
+        Some(settings) => route_active_remote_request(client, settings, request).await,
+        None => client
+            .request(request)
+            .await
+            .map_err(|error| error.to_string()),
+    }
 }
 
 #[tauri::command]
@@ -292,9 +311,9 @@ fn desktop_remote_unsubscribe(
     Ok(())
 }
 
-async fn route_remote_request(
+async fn route_active_remote_request(
     client: wsl::WslRequestClient,
-    settings: Option<EmbeddedServer>,
+    settings: EmbeddedServer,
     request: RemoteRequest,
 ) -> Result<RemoteResponse, String> {
     match request {
@@ -307,9 +326,6 @@ async fn route_remote_request(
                 })
                 .await
                 .map_err(|error| error.to_string())?;
-            let Some(settings) = settings else {
-                return Ok(remote);
-            };
             let local = settings.request(&method, &path, body).await?;
             merge_remote_status(remote, local)
         }
@@ -317,8 +333,7 @@ async fn route_remote_request(
             method: _,
             path,
             body,
-        } if settings.is_some() && path == "/api/model-providers/discover" => {
-            let settings = settings.expect("guarded settings must exist");
+        } if path == "/api/model-providers/discover" => {
             let spec = settings
                 .prepare_remote_model_discovery(body.unwrap_or(serde_json::Value::Null))
                 .await?;
@@ -331,8 +346,7 @@ async fn route_remote_request(
             method: _,
             path,
             body,
-        } if settings.is_some() && path == "/api/mcp-servers/test" => {
-            let settings = settings.expect("guarded settings must exist");
+        } if path == "/api/mcp-servers/test" => {
             let server = settings
                 .prepare_remote_mcp_test(body.unwrap_or(serde_json::Value::Null))
                 .await?;
@@ -343,27 +357,17 @@ async fn route_remote_request(
                 .await
                 .map_err(|error| error.to_string())
         }
-        RemoteRequest::Http { method, path, body }
-            if settings.is_some() && is_windows_owned_settings_path(&path) =>
-        {
-            let response = settings
-                .expect("guarded settings must exist")
-                .request(&method, &path, body)
-                .await?;
+        RemoteRequest::Http { method, path, body } if is_windows_owned_settings_path(&path) => {
+            let response = settings.request(&method, &path, body).await?;
             Ok(RemoteResponse::Http(agent_protocol::RemoteHttpResponse {
                 status: response.status,
                 body: response.body,
             }))
         }
         RemoteRequest::SessionMessage { session, message }
-            if settings.is_some()
-                && message.get("type").and_then(serde_json::Value::as_str)
-                    == Some("start_turn") =>
+            if message.get("type").and_then(serde_json::Value::as_str) == Some("start_turn") =>
         {
-            let turn = settings
-                .expect("guarded settings must exist")
-                .prepare_remote_turn(&session, message)
-                .await?;
+            let turn = settings.prepare_remote_turn(&session, message).await?;
             client
                 .request(RemoteRequest::StartTurn {
                     turn: Box::new(turn),
@@ -376,6 +380,16 @@ async fn route_remote_request(
             .await
             .map_err(|error| error.to_string()),
     }
+}
+
+fn request_allowed_while_wsl_pending(request: &RemoteRequest) -> bool {
+    matches!(
+        request,
+        RemoteRequest::Ping
+            | RemoteRequest::Activity
+            | RemoteRequest::Environment
+            | RemoteRequest::ListDirectory { .. }
+    )
 }
 
 fn is_windows_owned_settings_path(path: &str) -> bool {
@@ -2205,6 +2219,41 @@ mod tests {
         assert!(ensure_main_window_label(MAIN_WINDOW_LABEL).is_ok());
         assert!(ensure_main_window_label("settings").is_err());
         assert!(recent_workspace_at(&DesktopState::default(), 0).is_err());
+    }
+
+    #[test]
+    fn pending_wsl_requests_cannot_bypass_windows_settings() {
+        for request in [
+            RemoteRequest::Ping,
+            RemoteRequest::Activity,
+            RemoteRequest::Environment,
+            RemoteRequest::ListDirectory {
+                path: Some("/home/morrow".to_string()),
+                show_hidden: false,
+            },
+        ] {
+            assert!(request_allowed_while_wsl_pending(&request));
+        }
+
+        for request in [
+            RemoteRequest::Http {
+                method: "GET".to_string(),
+                path: "/api/model-settings".to_string(),
+                body: None,
+            },
+            RemoteRequest::SubscribeSession {
+                session: "default".to_string(),
+            },
+            RemoteRequest::SessionMessage {
+                session: "default".to_string(),
+                message: serde_json::json!({
+                    "type": "start_turn",
+                    "data": { "prompt": "hello" }
+                }),
+            },
+        ] {
+            assert!(!request_allowed_while_wsl_pending(&request));
+        }
     }
 
     #[tokio::test]
