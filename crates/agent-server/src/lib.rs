@@ -1741,6 +1741,7 @@ async fn start_turn(
         );
         return;
     }
+    let persist_model_selection = resolved_model.is_none();
     let resolved_model = match resolved_model {
         Some(model) => model,
         None => match state
@@ -1762,11 +1763,12 @@ async fn start_turn(
             }
         },
     };
-    if let Err(error) = state
-        .inner
-        .model_registry
-        .set_session_selection(&session_name, resolved_model.selection.clone())
-        .await
+    if persist_model_selection
+        && let Err(error) = state
+            .inner
+            .model_registry
+            .set_session_selection(&session_name, resolved_model.selection.clone())
+            .await
     {
         broadcast_message(
             &tx,
@@ -2249,7 +2251,9 @@ mod tests {
     use super::*;
     use agent_config::ModelContextLimits;
     use agent_model::{OpenAiCompatClient, OpenAiCompatConfig};
-    use agent_protocol::{PermissionMode, ReasoningProfile, ShellPolicy};
+    use agent_protocol::{
+        ModelInvocation, PermissionMode, ReasoningLevel, ReasoningProfile, ShellPolicy,
+    };
     use std::fs;
     use std::path::PathBuf;
     use std::sync::OnceLock;
@@ -2473,6 +2477,74 @@ mod tests {
                 .map(String::as_str),
             Some("managed-mcp-secret")
         );
+    }
+
+    #[tokio::test]
+    async fn workspace_accepts_managed_model_resolved_by_desktop() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind model listener");
+        let mut options = test_options();
+        options.fallback_model = None;
+        let server = EmbeddedServer::new_workspace(options).expect("workspace server");
+        let mut subscription = server
+            .subscribe_session("remote")
+            .await
+            .expect("subscribe session");
+
+        server
+            .start_remote_turn(RemoteTurnSpec {
+                session: "remote".to_string(),
+                request_id: "request-remote-model".to_string(),
+                prompt: "hello".to_string(),
+                permission_mode: Some(PermissionMode::WorkspaceWrite),
+                model: RemoteTurnModel::Managed(RemoteModelSpec {
+                    base_url: format!(
+                        "http://{}/v1",
+                        listener.local_addr().expect("model address")
+                    ),
+                    model: "deepseek-v4-pro".to_string(),
+                    api_key: "remote-model-secret".to_string(),
+                    timeout_secs: 30,
+                    context_window_tokens: 65_536,
+                    reserved_output_tokens: 8_192,
+                    reasoning_profile: ReasoningProfile::Deepseek,
+                    supports_tools: true,
+                    invocation: ModelInvocation {
+                        provider_id: "opencode".to_string(),
+                        provider_name: "opencode".to_string(),
+                        model_id: "deepseek-v4-pro".to_string(),
+                        model_name: "DeepSeek V4 Pro".to_string(),
+                        reasoning: ReasoningLevel::High,
+                    },
+                }),
+                managed_mcp_servers: Vec::new(),
+            })
+            .await
+            .expect("start remote turn");
+
+        let accepted = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let message = subscription.recv().await?;
+                match message["type"].as_str() {
+                    Some("turn_rejected") => {
+                        return Err(message["data"]["reason"]
+                            .as_str()
+                            .unwrap_or("turn rejected")
+                            .to_string());
+                    }
+                    Some("snapshot") if !message["data"]["running_turn"].is_null() => {
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("remote turn acceptance event");
+
+        assert!(accepted.is_ok(), "remote turn was rejected: {accepted:?}");
+        server.shutdown(true).await;
     }
 
     #[tokio::test]
