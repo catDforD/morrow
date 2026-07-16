@@ -1,21 +1,33 @@
+<div align="center">
+
 # Morrow
 
-Morrow is a local coding agent CLI and web dashboard backed by an OpenAI-compatible Chat Completions API. It streams model output, persists project-scoped sessions, reads and edits files, applies patches, runs shell commands behind explicit permissions, and can emit JSONL events for automation.
+**A local-first coding agent — CLI, interactive REPL, web dashboard, and desktop app, backed by any OpenAI-compatible API.**
 
-![Morrow web dashboard screenshot](web_design/dashboard_v2.png)
+[![Release](https://img.shields.io/github/v/release/catDforD/morrow?style=flat-square)](https://github.com/catDforD/morrow/releases)
+[![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-2024%20edition-orange?style=flat-square)](Cargo.toml)
 
-## Highlights
+**English** · [简体中文](README.zh-CN.md)
 
-- CLI, interactive REPL, and local browser dashboard.
-- OpenAI-compatible model configuration through `--config`, local `morrow.toml`, or `~/.morrow/config.toml`.
-- Web-only model provider management with per-session model and reasoning selection.
-- Persistent named sessions scoped to the current project.
-- Built-in tools for file reads, file edits, patch application, text search, directory listing, and shell commands.
-- Read-only, workspace-write, and full-access permission profiles, with shell execution controlled separately.
-- Automatic context compaction for long sessions.
-- JSONL event output for scripts and integrations.
+![Morrow web dashboard](web_design/dashboard_v2.png)
 
-## Install
+</div>
+
+Morrow streams model output, persists project-scoped sessions, reads and edits files, applies patches, runs shell commands behind explicit permissions, and can emit JSONL events for automation. Everything runs against your own OpenAI-compatible Chat Completions endpoint.
+
+## Features
+
+- **Three faces, one runtime** — CLI one-shots, an interactive REPL, a local browser dashboard, and a Tauri 2 desktop app.
+- **Bring your own model** — OpenAI-compatible configuration via `--config`, local `morrow.toml`, or `~/.morrow/config.toml`; Web-only provider management with per-session model and reasoning selection.
+- **Persistent sessions** — named, project-scoped sessions you can list, rename, export, and resume.
+- **Real tools** — file reads, file edits, patch application, text search, directory listing, and shell commands.
+- **Permission profiles** — read-only, workspace-write, and full-access modes, with shell execution controlled separately.
+- **MCP support** — stdio and Streamable HTTP MCP servers, configured from TOML or the dashboard.
+- **Long-session friendly** — automatic context compaction.
+- **Scriptable** — JSONL event output for automation and integrations.
+
+## Installation
 
 ### Desktop app (early access)
 
@@ -23,15 +35,16 @@ The Tauri 2 desktop app uses the same dashboard and local agent runtime as `morr
 
 Download the installer for your machine from [GitHub Releases](https://github.com/catDforD/morrow/releases):
 
-- Windows 10 22H2/Windows 11 x64: `Morrow_<version>_x64-setup.exe`.
-- macOS 14+ on Apple Silicon: `Morrow_<version>_aarch64.dmg`.
-- macOS 14+ on Intel: `Morrow_<version>_x64.dmg`.
+| Platform | Installer |
+| --- | --- |
+| Windows 10 22H2 / Windows 11 x64 | `Morrow_<version>_x64-setup.exe` |
+| macOS 14+ (Apple Silicon) | `Morrow_<version>_aarch64.dmg` |
+| macOS 14+ (Intel) | `Morrow_<version>_x64.dmg` |
 
 These early builds are not formally code-signed or notarized. Download them only from the project GitHub Release page.
 
-On Windows, run the NSIS installer. If SmartScreen blocks it, select **More info**, verify that the installer came from this repository’s Release page, then select **Run anyway**.
-
-On macOS, drag Morrow into Applications. For the first launch, right-click Morrow in Finder and choose **Open**. If it is still blocked, go to **System Settings → Privacy & Security** and choose **Open Anyway**.
+- **Windows** — run the NSIS installer. If SmartScreen blocks it, select **More info**, verify that the installer came from this repository's Release page, then select **Run anyway**.
+- **macOS** — drag Morrow into Applications. For the first launch, right-click Morrow in Finder and choose **Open**. If it is still blocked, go to **System Settings → Privacy & Security** and choose **Open Anyway**.
 
 The app restores the last valid workspace and offers **File → Open Folder** and **File → Open Recent**. Closing the window exits on Windows; on macOS it hides Morrow until it is reopened, while `Cmd+Q` exits.
 
@@ -66,7 +79,31 @@ Install from source:
 cargo install --git https://github.com/catDforD/morrow --locked -p agent-cli
 ```
 
-## Configure
+## Quick start
+
+Run one prompt in the current project:
+
+```bash
+morrow "summarize this repository"
+```
+
+Start interactive mode:
+
+```bash
+morrow
+```
+
+Start the local web dashboard:
+
+```bash
+morrow server
+```
+
+The dashboard listens on `127.0.0.1:3000` by default and uses the current workspace, config, session store, and permission profile. It is local-first and unauthenticated; do not bind it to a public interface unless you add your own network protections. Customize the bind address with `morrow server --host 127.0.0.1 --port 3000`.
+
+The dashboard selects permissions independently for each turn and remembers the latest browser choice. It defaults to `workspace_write`; `[permissions]` in `morrow.toml` applies to CLI runs only. The sidebar also supports archiving and restoring project-scoped task sessions.
+
+## Configuration
 
 Create a user config:
 
@@ -74,19 +111,7 @@ Create a user config:
 morrow init
 ```
 
-This writes `~/.morrow/config.toml` and prompts for an API key. The generated file stores the key inline as `[model].OPENAI_API_KEY`, so treat it as private and do not commit it.
-
-Generate an editable template without entering a real key:
-
-```bash
-morrow init --template
-```
-
-Overwrite an existing generated config:
-
-```bash
-morrow init --force
-```
+This writes `~/.morrow/config.toml` and prompts for an API key. The generated file stores the key inline as `[model].OPENAI_API_KEY`, so treat it as private and do not commit it. Use `morrow init --template` to generate an editable template without entering a real key, and `morrow init --force` to overwrite an existing generated config.
 
 Config lookup order:
 
@@ -163,49 +188,23 @@ Review $ARGUMENTS carefully.
 
 Type `/` in the Web composer to search commands. When `/review src/lib.rs` is sent, every `$ARGUMENTS` placeholder is replaced with `src/lib.rs`; if the template has no placeholder, the arguments are appended to the prompt. Unknown slash names are sent unchanged, and `//review` sends the literal text `/review`. The expanded prompt is what the model receives and what the session history stores.
 
-## Run
-
-Run one prompt in the current project:
-
-```bash
-morrow "summarize this repository"
-```
-
-Start interactive mode:
-
-```bash
-morrow
-```
-
-Start the local web dashboard:
-
-```bash
-morrow server
-```
-
-The dashboard listens on `127.0.0.1:3000` by default. It uses the current workspace, config, session store, and permission profile. It is local-first and unauthenticated; do not bind it to a public interface unless you add your own network protections.
-
-Customize the dashboard bind address:
-
-```bash
-morrow server --host 127.0.0.1 --port 3000
-```
-
-The dashboard selects permissions independently for each turn and remembers the latest browser choice. It defaults to `workspace_write`; `[permissions]` in `morrow.toml` applies to CLI runs only. The sidebar also supports archiving and restoring project-scoped task sessions.
-
 ## Permissions
 
 CLI file access is controlled by `permissions.mode`:
 
-- `read_only`: write tools are denied.
-- `workspace_write`: file changes require approval and are limited to the workspace.
-- `danger_full_access`: file reads and writes may access paths outside the workspace.
+| Mode | Behavior |
+| --- | --- |
+| `read_only` | Write tools are denied. |
+| `workspace_write` | File changes require approval and are limited to the workspace. |
+| `danger_full_access` | File reads and writes may access paths outside the workspace. |
 
 Shell execution is controlled separately by `permissions.shell`:
 
-- `deny`: shell commands are denied.
-- `prompt`: shell commands require approval.
-- `allow`: shell commands run without an approval prompt.
+| Mode | Behavior |
+| --- | --- |
+| `deny` | Shell commands are denied. |
+| `prompt` | Shell commands require approval. |
+| `allow` | Shell commands run without an approval prompt. |
 
 The default `morrow init` config uses `read_only` and `shell = "deny"`.
 
@@ -265,16 +264,18 @@ For the crate boundaries, dependency direction, turn lifecycle, extension points
 
 Morrow is a Rust workspace:
 
-- `crates/agent-cli`: CLI entry point, REPL, JSONL output, server command, and config wiring.
-- `crates/agent-desktop/src-tauri`: Tauri 2 desktop shell, native menus, project switching, and local server lifecycle.
-- `crates/agent-config`: `morrow.toml` and `~/.morrow/config.toml` loading.
-- `crates/agent-core`: agent turn execution and event stream orchestration.
-- `crates/agent-model`: OpenAI-compatible HTTP client and streaming response parsing.
-- `crates/agent-protocol`: shared protocol, session, permission, and event types.
-- `crates/agent-runtime`: reusable runtime helpers for sessions, compaction, workspace detection, and turn execution.
-- `crates/agent-server`: Axum HTTP/WebSocket server and embedded dashboard assets.
-- `crates/agent-sandbox`: permission evaluation.
-- `crates/agent-tools`: built-in file and shell tools.
+| Crate | Responsibility |
+| --- | --- |
+| `crates/agent-cli` | CLI entry point, REPL, JSONL output, server command, and config wiring. |
+| `crates/agent-desktop/src-tauri` | Tauri 2 desktop shell, native menus, project switching, and local server lifecycle. |
+| `crates/agent-config` | `morrow.toml` and `~/.morrow/config.toml` loading. |
+| `crates/agent-core` | Agent turn execution and event stream orchestration. |
+| `crates/agent-model` | OpenAI-compatible HTTP client and streaming response parsing. |
+| `crates/agent-protocol` | Shared protocol, session, permission, and event types. |
+| `crates/agent-runtime` | Reusable runtime helpers for sessions, compaction, workspace detection, and turn execution. |
+| `crates/agent-server` | Axum HTTP/WebSocket server and embedded dashboard assets. |
+| `crates/agent-sandbox` | Permission evaluation. |
+| `crates/agent-tools` | Built-in file and shell tools. |
 
 Common Rust checks:
 
@@ -293,7 +294,7 @@ cargo run -p agent-cli -- --session work "continue"
 cargo run -p agent-cli -- server
 ```
 
-Develop the web dashboard:
+### Web dashboard
 
 ```bash
 cd crates/agent-server/web
@@ -311,7 +312,7 @@ pnpm build
 pnpm typecheck
 ```
 
-Develop the desktop app:
+### Desktop app
 
 ```bash
 pnpm --dir crates/agent-server/web install
@@ -321,7 +322,7 @@ pnpm --dir crates/agent-desktop dev
 
 Desktop development starts Vite at `127.0.0.1:5173`; the native shell starts its browser-mode Axum backend at `127.0.0.1:3000`. Keep port 3000 free. Release builds instead start an authenticated backend on a random loopback port and serve the embedded dashboard assets.
 
-Native bundles must be built on their target operating system. Before native desktop development or a Windows/macOS bundle build, place the matching ripgrep binary in `crates/agent-desktop/src-tauri/binaries/` using Tauri’s target-suffixed names:
+Native bundles must be built on their target operating system. Before native desktop development or a Windows/macOS bundle build, place the matching ripgrep binary in `crates/agent-desktop/src-tauri/binaries/` using Tauri's target-suffixed names:
 
 ```text
 morrow-rg-x86_64-pc-windows-msvc.exe
@@ -346,3 +347,7 @@ Remove the CLI binary or uninstall/delete the desktop app. Local private state i
 rm -f ~/.local/bin/morrow
 rm -rf ~/.morrow
 ```
+
+## License
+
+[MIT](LICENSE) © 2026 Gargantua
