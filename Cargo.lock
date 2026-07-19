@@ -10,7 +10,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agent-cli"
-version = "0.3.1"
+version = "0.3.2-hotfix.1"
 dependencies = [
  "agent-config",
  "agent-model",
@@ -27,7 +27,7 @@ dependencies = [
 
 [[package]]
 name = "agent-config"
-version = "0.3.1"
+version = "0.3.2-hotfix.1"
 dependencies = [
  "agent-protocol",
  "dirs",
@@ -38,7 +38,7 @@ dependencies = [
 
 [[package]]
 name = "agent-core"
-version = "0.3.1"
+version = "0.3.2-hotfix.1"
 dependencies = [
  "agent-protocol",
  "futures-util",
@@ -49,7 +49,7 @@ dependencies = [
 
 [[package]]
 name = "agent-desktop"
-version = "0.3.1"
+version = "0.3.2-hotfix.1"
 dependencies = [
  "agent-config",
  "agent-protocol",
@@ -76,7 +76,7 @@ dependencies = [
 
 [[package]]
 name = "agent-model"
-version = "0.3.1"
+version = "0.3.2-hotfix.1"
 dependencies = [
  "agent-core",
  "agent-protocol",
@@ -91,7 +91,7 @@ dependencies = [
 
 [[package]]
 name = "agent-protocol"
-version = "0.3.1"
+version = "0.3.2-hotfix.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -99,7 +99,7 @@ dependencies = [
 
 [[package]]
 name = "agent-remote"
-version = "0.3.1"
+version = "0.3.2-hotfix.1"
 dependencies = [
  "agent-config",
  "agent-protocol",
@@ -114,7 +114,7 @@ dependencies = [
 
 [[package]]
 name = "agent-runtime"
-version = "0.3.1"
+version = "0.3.2-hotfix.1"
 dependencies = [
  "agent-config",
  "agent-core",
@@ -131,7 +131,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sandbox"
-version = "0.3.1"
+version = "0.3.2-hotfix.1"
 dependencies = [
  "agent-protocol",
  "thiserror 2.0.18",
@@ -139,7 +139,7 @@ dependencies = [
 
 [[package]]
 name = "agent-server"
-version = "0.3.1"
+version = "0.3.2-hotfix.1"
 dependencies = [
  "agent-config",
  "agent-model",
@@ -158,7 +158,7 @@ dependencies = [
 
 [[package]]
 name = "agent-tools"
-version = "0.3.1"
+version = "0.3.2-hotfix.1"
 dependencies = [
  "agent-config",
  "agent-core",
