@@ -173,7 +173,9 @@ impl OpenAiCompatClient {
     }
 
     fn build(config: OpenAiCompatConfig, disable_proxy: bool) -> Result<Self, ModelError> {
-        let mut builder = reqwest::Client::builder().timeout(config.timeout);
+        let mut builder = reqwest::Client::builder()
+            .connect_timeout(config.timeout)
+            .read_timeout(config.timeout);
         if disable_proxy {
             builder = builder.no_proxy();
         }
@@ -564,9 +566,12 @@ impl Stream for ChatCompletionStream {
                 }
                 Poll::Ready(Some(Err(err))) => {
                     this.done = true;
-                    return Poll::Ready(Some(Err(ModelError::Stream(
-                        err.without_url().to_string(),
-                    ))));
+                    let message = if err.is_timeout() {
+                        "timed out while waiting for model stream data".to_string()
+                    } else {
+                        err.without_url().to_string()
+                    };
+                    return Poll::Ready(Some(Err(ModelError::Stream(message))));
                 }
                 Poll::Ready(None) => {
                     this.done = true;
@@ -631,6 +636,29 @@ mod tests {
                 .expect("write response");
         });
         (format!("http://{addr}/v1"), requests)
+    }
+
+    async fn spawn_delayed_stream(chunks: Vec<(Duration, &'static str)>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind server");
+        let addr = listener.local_addr().expect("server addr");
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept request");
+            let mut request = vec![0_u8; 4096];
+            let _ = socket.read(&mut request).await.expect("read request");
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .expect("write response headers");
+            for (delay, chunk) in chunks {
+                tokio::time::sleep(delay).await;
+                if socket.write_all(chunk.as_bytes()).await.is_err() {
+                    break;
+                }
+            }
+        });
+        format!("http://{addr}/v1")
     }
 
     fn conversation() -> Conversation {
@@ -726,6 +754,88 @@ mod tests {
             &ModelEvent::TextDelta("lo".to_string())
         );
         assert_eq!(events[2].as_ref().expect("event"), &ModelEvent::Completed);
+    }
+
+    #[tokio::test]
+    async fn configured_timeout_allows_active_streams_to_run_longer_than_the_interval() {
+        let base_url = spawn_delayed_stream(vec![
+            (
+                Duration::from_millis(100),
+                "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"first\"},\"finish_reason\":null}]}\n\n",
+            ),
+            (
+                Duration::from_millis(100),
+                "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"second\"},\"finish_reason\":null}]}\n\n",
+            ),
+            (
+                Duration::from_millis(100),
+                "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":null}]}\n\n",
+            ),
+            (Duration::from_millis(100), "data: [DONE]\n\n"),
+        ])
+        .await;
+        let client = OpenAiCompatClient::new_without_proxy(OpenAiCompatConfig {
+            base_url,
+            model: "test-model".to_string(),
+            api_key: "test-key".to_string(),
+            timeout: Duration::from_millis(250),
+        })
+        .expect("client");
+
+        let events = collect_events(
+            client
+                .stream_chat(&conversation(), &[])
+                .await
+                .expect("stream chat"),
+        )
+        .await;
+
+        assert!(
+            matches!(
+                events.as_slice(),
+                [
+                    Ok(ModelEvent::ReasoningDelta(first)),
+                    Ok(ModelEvent::ReasoningDelta(second)),
+                    Ok(ModelEvent::TextDelta(answer)),
+                    Ok(ModelEvent::Completed),
+                ] if first == "first" && second == "second" && answer == "answer"
+            ),
+            "unexpected events: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_timeout_still_rejects_stalled_streams() {
+        let base_url = spawn_delayed_stream(vec![
+            (
+                Duration::from_millis(20),
+                "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n",
+            ),
+            (Duration::from_millis(300), "data: [DONE]\n\n"),
+        ])
+        .await;
+        let client = OpenAiCompatClient::new_without_proxy(OpenAiCompatConfig {
+            base_url,
+            model: "test-model".to_string(),
+            api_key: "test-key".to_string(),
+            timeout: Duration::from_millis(100),
+        })
+        .expect("client");
+
+        let events = collect_events(
+            client
+                .stream_chat(&conversation(), &[])
+                .await
+                .expect("stream chat"),
+        )
+        .await;
+
+        assert!(matches!(
+            events.as_slice(),
+            [Ok(ModelEvent::TextDelta(text)), Err(ModelError::Stream(message))]
+                if text == "partial"
+                    && message == "timed out while waiting for model stream data"
+        ));
     }
 
     #[tokio::test]
