@@ -63,7 +63,7 @@ jobs:
           if (-not (Test-Path $destination)) { throw "ripgrep sidecar was not prepared" }
 
       - name: Build NSIS installer
-        run: pnpm --dir crates/agent-desktop exec tauri build --target x86_64-pc-windows-msvc --bundles nsis
+        run: pnpm --dir crates/agent-desktop exec tauri build --target x86_64-pc-windows-msvc --bundles nsis --config '{"version":"0.3.2-hotfix.1"}'
 
       - name: Verify and stage installer
         shell: pwsh
@@ -74,7 +74,7 @@ jobs:
           if ($listing -notmatch "morrow-rg.exe") { throw "NSIS installer does not contain morrow-rg.exe" }
 
           New-Item -ItemType Directory -Force -Path dist/windows | Out-Null
-          $artifactName = "Morrow_0.3.1_windows-hotfix_0b50f1c_x64-setup.exe"
+          $artifactName = "Morrow_0.3.2-hotfix.1_windows-hotfix_0b50f1c_x64-setup.exe"
           $artifactPath = "dist/windows/$artifactName"
           Copy-Item $installer.FullName $artifactPath
           $hash = (Get-FileHash $artifactPath -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -83,7 +83,7 @@ jobs:
       - name: Upload installer artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Morrow-windows-hotfix-0b50f1c
+          name: Morrow-0.3.2-hotfix.1-windows-x64
           path: dist/windows/*
           if-no-files-found: error
           retention-days: 14
