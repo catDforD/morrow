@@ -1,0 +1,25 @@
+name: Mark Hotfix Prerelease
+
+on:
+  push:
+    branches:
+      - release/v0.3.2-hotfix.1
+
+permissions:
+  contents: write
+
+jobs:
+  mark-prerelease:
+    name: Mark v0.3.2-hotfix.1 as prerelease
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Update release metadata
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v0.3.2-hotfix.1
+          prerelease: true
+          draft: false
+          body_path: .github/release-notes.md
