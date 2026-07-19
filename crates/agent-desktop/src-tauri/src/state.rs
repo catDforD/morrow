@@ -1,15 +1,27 @@
+use crate::atomic_file;
+use agent_protocol::WorkspaceLocation;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-const DESKTOP_STATE_SCHEMA: u32 = 1;
+const DESKTOP_STATE_SCHEMA: u32 = 2;
 const MAX_RECENT_WORKSPACES: usize = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DesktopState {
+    schema: u32,
+    #[serde(default)]
+    last_workspace: Option<WorkspaceLocation>,
+    #[serde(default)]
+    recent_workspaces: Vec<WorkspaceLocation>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyDesktopState {
     schema: u32,
     #[serde(default)]
     last_workspace: Option<PathBuf>,
@@ -45,15 +57,48 @@ impl DesktopState {
                 });
             }
         };
-        let state: Self =
+        let value: serde_json::Value =
             serde_json::from_slice(&content).map_err(|source| DesktopStateError::Parse {
                 path: path.to_path_buf(),
                 source,
             })?;
-        if state.schema != DESKTOP_STATE_SCHEMA {
-            return Err(DesktopStateError::UnsupportedSchema(state.schema));
+        let schema = value
+            .get("schema")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or(DesktopStateError::MissingSchema)?;
+        match schema {
+            1 => {
+                let legacy =
+                    serde_json::from_value::<LegacyDesktopState>(value).map_err(|source| {
+                        DesktopStateError::Parse {
+                            path: path.to_path_buf(),
+                            source,
+                        }
+                    })?;
+                debug_assert_eq!(legacy.schema, 1);
+                let state = Self {
+                    schema: DESKTOP_STATE_SCHEMA,
+                    last_workspace: legacy
+                        .last_workspace
+                        .map(|path| WorkspaceLocation::Local { path }),
+                    recent_workspaces: legacy
+                        .recent_workspaces
+                        .into_iter()
+                        .map(|path| WorkspaceLocation::Local { path })
+                        .collect(),
+                };
+                state.save(path)?;
+                Ok(state)
+            }
+            DESKTOP_STATE_SCHEMA => {
+                serde_json::from_value::<Self>(value).map_err(|source| DesktopStateError::Parse {
+                    path: path.to_path_buf(),
+                    source,
+                })
+            }
+            other => Err(DesktopStateError::UnsupportedSchema(other)),
         }
-        Ok(state)
     }
 
     pub(crate) fn save(&self, path: &Path) -> Result<(), DesktopStateError> {
@@ -100,7 +145,7 @@ impl DesktopState {
             });
         }
 
-        fs::rename(&temporary_path, path).map_err(|source| {
+        atomic_file::replace(&temporary_path, path).map_err(|source| {
             let _ = fs::remove_file(&temporary_path);
             DesktopStateError::Replace {
                 path: path.to_path_buf(),
@@ -132,19 +177,28 @@ impl DesktopState {
         Ok(())
     }
 
-    pub(crate) fn last_workspace(&self) -> Option<&Path> {
-        self.last_workspace.as_deref()
+    pub(crate) fn last_workspace(&self) -> Option<&WorkspaceLocation> {
+        self.last_workspace.as_ref()
     }
 
-    pub(crate) fn recent_workspaces(&self) -> &[PathBuf] {
+    pub(crate) fn recent_workspaces(&self) -> &[WorkspaceLocation] {
         &self.recent_workspaces
+    }
+
+    pub(crate) fn record_local_workspace(
+        &mut self,
+        workspace: &Path,
+    ) -> Result<WorkspaceLocation, DesktopStateError> {
+        self.record_workspace(WorkspaceLocation::Local {
+            path: workspace.to_path_buf(),
+        })
     }
 
     pub(crate) fn record_workspace(
         &mut self,
-        workspace: &Path,
-    ) -> Result<PathBuf, DesktopStateError> {
-        let workspace = canonical_workspace(workspace)?;
+        workspace: WorkspaceLocation,
+    ) -> Result<WorkspaceLocation, DesktopStateError> {
+        let workspace = validate_workspace_location(workspace)?;
         self.last_workspace = Some(workspace.clone());
         self.recent_workspaces.retain(|recent| recent != &workspace);
         self.recent_workspaces.insert(0, workspace.clone());
@@ -156,12 +210,12 @@ impl DesktopState {
         let original = self.clone();
         self.last_workspace = self
             .last_workspace
-            .as_deref()
-            .and_then(|workspace| canonical_workspace(workspace).ok());
+            .take()
+            .and_then(|workspace| validate_workspace_location(workspace).ok());
 
         let mut recent = Vec::with_capacity(self.recent_workspaces.len());
         for workspace in &self.recent_workspaces {
-            let Ok(workspace) = canonical_workspace(workspace) else {
+            let Ok(workspace) = validate_workspace_location(workspace.clone()) else {
                 continue;
             };
             if !recent.contains(&workspace) {
@@ -173,6 +227,25 @@ impl DesktopState {
         }
         self.recent_workspaces = recent;
         *self != original
+    }
+}
+
+fn validate_workspace_location(
+    workspace: WorkspaceLocation,
+) -> Result<WorkspaceLocation, DesktopStateError> {
+    match workspace {
+        WorkspaceLocation::Local { path } => {
+            canonical_workspace(&path).map(|path| WorkspaceLocation::Local { path })
+        }
+        WorkspaceLocation::Wsl { distro, user, path } => {
+            let distro = distro.trim().to_string();
+            let user = user.trim().to_string();
+            let path = path.trim().to_string();
+            if distro.is_empty() || user.is_empty() || !path.starts_with('/') {
+                return Err(DesktopStateError::InvalidRemoteWorkspace);
+            }
+            Ok(WorkspaceLocation::Wsl { distro, user, path })
+        }
     }
 }
 
@@ -194,6 +267,10 @@ pub(crate) enum DesktopStateError {
     MissingParent(PathBuf),
     #[error("unsupported desktop state schema {0}")]
     UnsupportedSchema(u32),
+    #[error("desktop state is missing its schema")]
+    MissingSchema,
+    #[error("remote workspace requires a distro, user, and absolute Linux path")]
+    InvalidRemoteWorkspace,
     #[error("failed to read desktop state from {path}: {source}")]
     Read {
         path: PathBuf,
@@ -280,14 +357,29 @@ mod tests {
             fs::create_dir(&workspace).expect("create workspace");
             workspaces.push(fs::canonicalize(&workspace).expect("canonical workspace"));
             state
-                .record_workspace(&workspace)
+                .record_local_workspace(&workspace)
                 .expect("record workspace");
         }
 
         assert_eq!(state.recent_workspaces().len(), 10);
-        assert_eq!(state.last_workspace(), Some(workspaces[11].as_path()));
-        assert_eq!(state.recent_workspaces()[0], workspaces[11]);
-        assert_eq!(state.recent_workspaces()[9], workspaces[2]);
+        assert_eq!(
+            state.last_workspace(),
+            Some(&WorkspaceLocation::Local {
+                path: workspaces[11].clone()
+            })
+        );
+        assert_eq!(
+            state.recent_workspaces()[0],
+            WorkspaceLocation::Local {
+                path: workspaces[11].clone()
+            }
+        );
+        assert_eq!(
+            state.recent_workspaces()[9],
+            WorkspaceLocation::Local {
+                path: workspaces[2].clone()
+            }
+        );
     }
 
     #[test]
@@ -298,27 +390,39 @@ mod tests {
         fs::create_dir(&valid).expect("create workspace");
         let mut state = DesktopState {
             schema: DESKTOP_STATE_SCHEMA,
-            last_workspace: Some(missing.clone()),
-            recent_workspaces: vec![missing, valid.clone(), valid.clone()],
+            last_workspace: Some(WorkspaceLocation::Local {
+                path: missing.clone(),
+            }),
+            recent_workspaces: vec![
+                WorkspaceLocation::Local { path: missing },
+                WorkspaceLocation::Local {
+                    path: valid.clone(),
+                },
+                WorkspaceLocation::Local {
+                    path: valid.clone(),
+                },
+            ],
         };
 
         assert!(state.prune_invalid_workspaces());
         assert_eq!(state.last_workspace(), None);
         assert_eq!(
             state.recent_workspaces(),
-            &[fs::canonicalize(valid).expect("canonical workspace")]
+            &[WorkspaceLocation::Local {
+                path: fs::canonicalize(valid).expect("canonical workspace")
+            }]
         );
     }
 
     #[test]
-    fn saves_and_loads_schema_v1_state_atomically() {
+    fn saves_and_loads_schema_v2_state_atomically() {
         let root = TestDirectory::new("save");
         let workspace = root.0.join("workspace");
         fs::create_dir(&workspace).expect("create workspace");
         let path = root.0.join("state").join("desktop.json");
         let mut state = DesktopState::default();
         state
-            .record_workspace(&workspace)
+            .record_local_workspace(&workspace)
             .expect("record workspace");
 
         state.save(&path).expect("save state");
@@ -346,14 +450,43 @@ mod tests {
     }
 
     #[test]
+    fn migrates_schema_v1_local_workspaces() {
+        let root = TestDirectory::new("migrate");
+        let workspace = root.0.join("workspace");
+        fs::create_dir(&workspace).expect("create workspace");
+        let path = root.0.join("desktop.json");
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema": 1,
+                "last_workspace": workspace,
+                "recent_workspaces": [workspace]
+            }))
+            .expect("serialize legacy state"),
+        )
+        .expect("write legacy state");
+
+        let state = DesktopState::load(&path).expect("migrate state");
+        assert_eq!(state.schema, DESKTOP_STATE_SCHEMA);
+        assert!(matches!(
+            state.last_workspace(),
+            Some(WorkspaceLocation::Local { .. })
+        ));
+        let migrated: serde_json::Value =
+            serde_json::from_slice(&fs::read(path).expect("read migrated state"))
+                .expect("parse migrated state");
+        assert_eq!(migrated["schema"], DESKTOP_STATE_SCHEMA);
+    }
+
+    #[test]
     fn rejects_unknown_schema_versions() {
         let root = TestDirectory::new("schema");
         let path = root.0.join("desktop.json");
-        fs::write(&path, r#"{"schema":2}"#).expect("write state");
+        fs::write(&path, r#"{"schema":3}"#).expect("write state");
 
         assert!(matches!(
             DesktopState::load(&path),
-            Err(DesktopStateError::UnsupportedSchema(2))
+            Err(DesktopStateError::UnsupportedSchema(3))
         ));
     }
 }

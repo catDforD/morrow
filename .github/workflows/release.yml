@@ -124,6 +124,79 @@ jobs:
           name: morrow-${{ matrix.target }}
           path: dist/morrow-*
 
+  remote-runtime:
+    name: WSL remote Runtime
+    needs: verify-version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends musl-tools
+
+      - name: Build static remote Runtime
+        run: cargo build --release --locked -p agent-remote --bin morrow-remote --target x86_64-unknown-linux-musl
+
+      - name: Download static ripgrep
+        shell: bash
+        run: |
+          mkdir -p dist/remote dist/rg
+          asset="ripgrep-${RIPGREP_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          curl -fsSL "https://github.com/BurntSushi/ripgrep/releases/download/${RIPGREP_VERSION}/${asset}" -o "dist/${asset}"
+          tar -xzf "dist/${asset}" -C dist/rg --strip-components=1 "ripgrep-${RIPGREP_VERSION}-x86_64-unknown-linux-musl/rg"
+          cp target/x86_64-unknown-linux-musl/release/morrow-remote dist/remote/morrow-remote-linux-x64
+          cp dist/rg/rg dist/remote/morrow-rg-linux-x64
+          chmod +x dist/remote/morrow-remote-linux-x64 dist/remote/morrow-rg-linux-x64
+
+      - name: Generate Runtime manifest
+        working-directory: dist/remote
+        shell: bash
+        run: |
+          remote_sha="$(sha256sum morrow-remote-linux-x64 | cut -d ' ' -f 1)"
+          rg_sha="$(sha256sum morrow-rg-linux-x64 | cut -d ' ' -f 1)"
+          protocol_version="$(sed -n 's/^pub const REMOTE_PROTOCOL_VERSION: u32 = \([0-9][0-9]*\);$/\1/p' ../../crates/agent-protocol/src/lib.rs)"
+          test -n "${protocol_version}"
+          jq -n \
+            --arg version "${{ needs.verify-version.outputs.version }}" \
+            --arg remote_sha "${remote_sha}" \
+            --arg rg_sha "${rg_sha}" \
+            --argjson protocol_version "${protocol_version}" \
+            '{
+              version: $version,
+              protocol_version: $protocol_version,
+              platform: "linux-x64",
+              files: [
+                {name: "morrow-remote-linux-x64", sha256: $remote_sha, executable: true},
+                {name: "morrow-rg-linux-x64", sha256: $rg_sha, executable: true}
+              ]
+            }' > morrow-remote-linux-x64-manifest.json
+
+      - name: Verify static binaries
+        working-directory: dist/remote
+        shell: bash
+        run: |
+          file morrow-remote-linux-x64 morrow-rg-linux-x64
+          for binary in morrow-remote-linux-x64 morrow-rg-linux-x64; do
+            if ldd "${binary}" 2>&1 | grep -q '=>'; then
+              echo "${binary} is dynamically linked" >&2
+              exit 1
+            fi
+          done
+
+      - name: Upload remote Runtime artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: morrow-remote-linux-x64
+          path: dist/remote/morrow-*
+
   desktop:
     name: Desktop ${{ matrix.target }}
     needs: verify-version
@@ -246,7 +319,7 @@ jobs:
 
   publish:
     name: Publish GitHub Release
-    needs: [build, desktop]
+    needs: [build, desktop, remote-runtime]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

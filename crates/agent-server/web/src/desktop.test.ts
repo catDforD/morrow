@@ -1,17 +1,23 @@
 // @vitest-environment jsdom
 
-import { invoke } from '@tauri-apps/api/core'
+import { Channel, invoke } from '@tauri-apps/api/core'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   captureEditingContext,
   executeEditCommand,
   getDesktopPlatform,
   getDesktopShellState,
+  listenRemoteEvents,
   runDesktopAction,
 } from './desktop'
 import type { DesktopPlatform } from './desktop'
 
-vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }))
+vi.mock('@tauri-apps/api/core', () => ({
+  invoke: vi.fn(),
+  Channel: class<T> {
+    onmessage: (message: T) => void = () => undefined
+  },
+}))
 
 const invokeMock = vi.mocked(invoke)
 
@@ -54,6 +60,27 @@ describe('desktop bridge', () => {
     expect(invokeMock).toHaveBeenNthCalledWith(2, 'desktop_action', {
       action: { type: 'open_recent', index: 2 },
     })
+  })
+
+  it('streams remote events through a Tauri channel and unsubscribes once', async () => {
+    invokeMock.mockResolvedValueOnce(17).mockResolvedValueOnce(undefined)
+    const listener = vi.fn()
+
+    const stop = await listenRemoteEvents(listener)
+    const args = invokeMock.mock.calls[0][1] as Record<string, unknown>
+    const channel = args.onEvent as Channel<{ value: number }>
+    channel.onmessage({ value: 3 })
+    stop()
+    stop()
+
+    expect(listener).toHaveBeenCalledWith({ value: 3 })
+    expect(invokeMock).toHaveBeenNthCalledWith(1, 'desktop_remote_subscribe', {
+      onEvent: channel,
+    })
+    expect(invokeMock).toHaveBeenNthCalledWith(2, 'desktop_remote_unsubscribe', {
+      subscriptionId: 17,
+    })
+    expect(invokeMock).toHaveBeenCalledTimes(2)
   })
 })
 

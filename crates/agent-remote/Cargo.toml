@@ -1,0 +1,19 @@
+[package]
+name = "agent-remote"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "morrow-remote"
+path = "src/main.rs"
+
+[dependencies]
+agent-config = { workspace = true }
+agent-protocol = { workspace = true }
+agent-server = { workspace = true }
+clap = { workspace = true }
+dirs = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }

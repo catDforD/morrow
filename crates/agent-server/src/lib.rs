@@ -1,14 +1,16 @@
 mod commands;
 mod mcp_settings;
 mod models;
+mod secrets;
 
-pub use models::FallbackModel;
+pub use models::{FallbackModel, discover_models as discover_remote_models};
 
 use agent_config::{ContextConfig, LoadedServerConfig, McpServerConfig};
 use agent_model::{ModelError, OpenAiCompatClient, OpenAiCompatConfig};
 use agent_protocol::{
-    ApprovalDecision, ModelSelection, PermissionMode, PermissionProfile, ReasoningProfile, Session,
-    SessionDocument,
+    ApprovalDecision, ModelSelection, PermissionMode, PermissionProfile, ReasoningProfile,
+    RemoteMcpServerSpec, RemoteModelConnectionSpec, RemoteModelSpec, RemoteTurnModel,
+    RemoteTurnSpec, Session, SessionDocument, WorkspaceLocation,
 };
 use agent_runtime::{
     AgentEventEnvelope, CancellationToken, McpInspection, McpToolCache, RunAgentTurnContext,
@@ -31,7 +33,7 @@ use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use mcp_settings::{
     McpRegistry, McpRegistryError, McpServerResponse, McpServerTestRequest, McpServerWriteRequest,
-    McpSettingsResponse,
+    McpSettingsResponse, config_from_remote_spec, remote_spec_from_config,
 };
 use models::{
     DiscoverModelsRequest, DiscoverModelsResponse, ModelProviderResponse, ModelRegistry,
@@ -40,7 +42,7 @@ use models::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -50,6 +52,7 @@ use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, RwLock, broadcast, oneshot};
 use tokio::task::{AbortHandle, JoinHandle};
+use tower::ServiceExt;
 
 pub const DEFAULT_WEB_PERMISSION_MODE: PermissionMode = PermissionMode::WorkspaceWrite;
 
@@ -64,6 +67,7 @@ pub struct ServerOptions {
     pub system_prompt: String,
     pub context_config: ContextConfig,
     pub workspace_root: PathBuf,
+    pub workspace_location: WorkspaceLocation,
     pub config_path: Option<PathBuf>,
     pub config_diagnostics: Vec<String>,
     /// Default for legacy clients that do not select a permission mode per turn.
@@ -95,13 +99,16 @@ pub fn server_options_from_loaded_config(
                 provider_name: "默认配置".to_string(),
                 model_id: model_name.clone(),
                 model_name: model_name.clone(),
-                client,
+                client: Some(client),
                 limits,
                 reasoning_profile: reasoning_profile(&model_name),
             })
         })
         .transpose()?;
 
+    let workspace_location = WorkspaceLocation::Local {
+        path: workspace_root.clone(),
+    };
     Ok(ServerOptions {
         host,
         port,
@@ -112,6 +119,7 @@ pub fn server_options_from_loaded_config(
         system_prompt: loaded.config.agent.system_prompt,
         context_config: loaded.config.context,
         workspace_root,
+        workspace_location,
         config_path: loaded.path,
         config_diagnostics: loaded.diagnostics,
         permissions: PermissionProfile::for_mode(DEFAULT_WEB_PERMISSION_MODE),
@@ -134,6 +142,7 @@ pub enum ServerAccessPolicy {
     Desktop {
         token: Arc<str>,
     },
+    Embedded,
 }
 
 impl ServerAccessPolicy {
@@ -152,6 +161,7 @@ impl std::fmt::Debug for ServerAccessPolicy {
                 .debug_struct("Desktop")
                 .field("token", &"<redacted>")
                 .finish(),
+            Self::Embedded => formatter.write_str("Embedded"),
         }
     }
 }
@@ -176,9 +186,351 @@ pub enum ShutdownPolicy {
 
 pub struct RunningServer {
     addr: SocketAddr,
-    state: AppState,
+    state: WorkspaceService,
     shutdown: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<Result<(), ServerError>>>,
+}
+
+#[derive(Clone)]
+pub struct EmbeddedServer {
+    router: Router,
+    service: WorkspaceService,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmbeddedHttpResponse {
+    pub status: u16,
+    pub body: Option<serde_json::Value>,
+}
+
+pub struct EmbeddedSessionSubscription {
+    pub snapshot: serde_json::Value,
+    receiver: broadcast::Receiver<ServerMessage>,
+}
+
+impl EmbeddedSessionSubscription {
+    pub async fn recv(&mut self) -> Result<serde_json::Value, String> {
+        loop {
+            match self.receiver.recv().await {
+                Ok(message) => {
+                    return serde_json::to_value(message).map_err(|error| error.to_string());
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => {
+                    return Err("session event stream closed".to_string());
+                }
+            }
+        }
+    }
+}
+
+impl EmbeddedServer {
+    pub fn new(options: ServerOptions) -> Result<Self, ModelRegistryError> {
+        let (router, service) = build_router(options, ServerAccessPolicy::Embedded)?;
+        Ok(Self { router, service })
+    }
+
+    pub fn new_workspace(options: ServerOptions) -> Result<Self, ModelRegistryError> {
+        let (router, service) = build_workspace_router(options, ServerAccessPolicy::Embedded)?;
+        Ok(Self { router, service })
+    }
+
+    pub async fn request(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> Result<EmbeddedHttpResponse, String> {
+        if !path.starts_with('/') {
+            return Err("embedded request path must start with '/'".to_string());
+        }
+        let method = Method::from_bytes(method.as_bytes()).map_err(|error| error.to_string())?;
+        let mut builder = Request::builder().method(method).uri(path);
+        let request_body = match body {
+            Some(value) => {
+                builder = builder.header(header::CONTENT_TYPE, "application/json");
+                Body::from(serde_json::to_vec(&value).map_err(|error| error.to_string())?)
+            }
+            None => Body::empty(),
+        };
+        let request = builder
+            .body(request_body)
+            .map_err(|error| error.to_string())?;
+        let response = self
+            .router
+            .clone()
+            .oneshot(request)
+            .await
+            .map_err(|error| error.to_string())?;
+        let status = response.status().as_u16();
+        let bytes = axum::body::to_bytes(response.into_body(), 32 * 1024 * 1024)
+            .await
+            .map_err(|error| error.to_string())?;
+        let body = if bytes.is_empty() {
+            None
+        } else {
+            Some(serde_json::from_slice(&bytes).map_err(|error| error.to_string())?)
+        };
+        Ok(EmbeddedHttpResponse { status, body })
+    }
+
+    pub async fn subscribe_session(
+        &self,
+        session_name: &str,
+    ) -> Result<EmbeddedSessionSubscription, String> {
+        self.service.subscribe_session(session_name).await
+    }
+
+    pub async fn send_session_message(
+        &self,
+        session_name: &str,
+        value: serde_json::Value,
+    ) -> Result<(), String> {
+        self.service.send_session_message(session_name, value).await
+    }
+
+    pub async fn prepare_remote_turn(
+        &self,
+        session_name: &str,
+        value: serde_json::Value,
+    ) -> Result<RemoteTurnSpec, String> {
+        let message = serde_json::from_value::<ClientMessage>(value)
+            .map_err(|error| format!("invalid session message: {error}"))?;
+        let ClientMessage::StartTurn {
+            request_id,
+            prompt,
+            prompt_resolved,
+            permission_mode,
+            model_selection,
+        } = message
+        else {
+            return Err("only start_turn can be prepared for a remote workspace".to_string());
+        };
+        let prompt = if prompt_resolved {
+            prompt
+        } else {
+            self.service
+                .inner
+                .command_registry
+                .resolve(ResolveCommandRequest { input: prompt })
+                .map_err(|error| error.to_string())?
+                .prompt
+        };
+        if prompt.trim().is_empty() {
+            return Err("prompt must not be empty".to_string());
+        }
+        let model = self
+            .service
+            .inner
+            .model_registry
+            .resolve_remote_for_turn(session_name, model_selection)
+            .await
+            .map_err(|error| error.to_string())?;
+        let selection = match &model {
+            RemoteTurnModel::WorkspaceFallback { selection } => selection.clone(),
+            RemoteTurnModel::Managed(spec) => ModelSelection {
+                provider_id: spec.invocation.provider_id.clone(),
+                model_id: spec.invocation.model_id.clone(),
+                reasoning: spec.invocation.reasoning,
+            },
+        };
+        self.service
+            .inner
+            .model_registry
+            .set_session_selection(session_name, selection)
+            .await
+            .map_err(|error| error.to_string())?;
+        let managed_mcp_servers = self
+            .service
+            .inner
+            .mcp_registry
+            .managed_servers()
+            .await
+            .iter()
+            .map(remote_spec_from_config)
+            .collect();
+        Ok(RemoteTurnSpec {
+            session: session_name.to_string(),
+            request_id,
+            prompt,
+            permission_mode,
+            model,
+            managed_mcp_servers,
+        })
+    }
+
+    pub async fn start_remote_turn(&self, turn: RemoteTurnSpec) -> Result<(), String> {
+        let RemoteTurnSpec {
+            session,
+            request_id,
+            prompt,
+            permission_mode,
+            model,
+            managed_mcp_servers,
+        } = turn;
+        let resolved_model = match model {
+            RemoteTurnModel::WorkspaceFallback { selection } => self
+                .service
+                .inner
+                .model_registry
+                .resolve_for_turn(&session, Some(selection))
+                .await
+                .map_err(|error| error.to_string())?,
+            RemoteTurnModel::Managed(spec) => resolved_model_from_remote(spec)?,
+        };
+        let mut mcp_servers = self.service.inner.mcp_registry.fallback_servers().to_vec();
+        let mut names = mcp_servers
+            .iter()
+            .map(|server| server.name.clone())
+            .collect::<HashSet<_>>();
+        for server in managed_mcp_servers {
+            if !names.insert(server.name.clone()) {
+                return Err(format!("duplicate MCP server name {:?}", server.name));
+            }
+            mcp_servers.push(config_from_remote_spec(server));
+        }
+        let tx = session_sender(&self.service, &session).await;
+        start_turn(
+            self.service.clone(),
+            session,
+            StartTurnRequest {
+                request_id,
+                prompt,
+                prompt_resolved: true,
+                permission_mode,
+                model_selection: None,
+                resolved_model: Some(resolved_model),
+                mcp_servers: Some(mcp_servers),
+            },
+            tx,
+        )
+        .await;
+        Ok(())
+    }
+
+    pub async fn prepare_remote_model_discovery(
+        &self,
+        value: serde_json::Value,
+    ) -> Result<RemoteModelConnectionSpec, String> {
+        let request = serde_json::from_value::<DiscoverModelsRequest>(value)
+            .map_err(|error| format!("invalid model discovery request: {error}"))?;
+        self.service
+            .inner
+            .model_registry
+            .discovery_spec(request)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn prepare_remote_mcp_test(
+        &self,
+        value: serde_json::Value,
+    ) -> Result<RemoteMcpServerSpec, String> {
+        let request = serde_json::from_value::<McpServerTestRequest>(value)
+            .map_err(|error| format!("invalid MCP test request: {error}"))?;
+        self.service
+            .inner
+            .mcp_registry
+            .config_for_test(request)
+            .await
+            .map(|server| remote_spec_from_config(&server))
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn inspect_remote_mcp(&self, server: RemoteMcpServerSpec) -> McpInspection {
+        inspect_mcp_servers(
+            &self.service.inner.options.workspace_root,
+            &[config_from_remote_spec(server)],
+        )
+        .await
+    }
+
+    pub async fn activity(&self) -> ServerActivity {
+        self.service.activity().await
+    }
+
+    pub async fn shutdown(&self, cancel_running: bool) {
+        self.service.shutdown(cancel_running).await;
+    }
+}
+
+impl WorkspaceService {
+    pub async fn subscribe_session(
+        &self,
+        session_name: &str,
+    ) -> Result<EmbeddedSessionSubscription, String> {
+        let tx = session_sender(self, session_name).await;
+        let receiver = tx.subscribe();
+        let snapshot = snapshot_message(self, session_name)
+            .await
+            .map_err(|error| error.message)?;
+        Ok(EmbeddedSessionSubscription {
+            snapshot: serde_json::to_value(snapshot).map_err(|error| error.to_string())?,
+            receiver,
+        })
+    }
+
+    pub async fn send_session_message(
+        &self,
+        session_name: &str,
+        value: serde_json::Value,
+    ) -> Result<(), String> {
+        let message = serde_json::from_value::<ClientMessage>(value)
+            .map_err(|error| format!("invalid session message: {error}"))?;
+        let tx = session_sender(self, session_name).await;
+        dispatch_client_message(message, self, session_name, &tx).await;
+        Ok(())
+    }
+
+    pub async fn activity(&self) -> ServerActivity {
+        server_activity(self).await
+    }
+
+    pub async fn shutdown(&self, cancel_running: bool) {
+        self.inner.shutting_down.store(true, Ordering::Release);
+        if cancel_running {
+            cancel_all_turns(self, Duration::from_secs(5)).await;
+        }
+        reset_mcp_cache(self).await;
+    }
+}
+
+fn resolved_model_from_remote(spec: RemoteModelSpec) -> Result<ResolvedModel, String> {
+    if spec.context_window_tokens == 0
+        || spec.reserved_output_tokens == 0
+        || spec.reserved_output_tokens >= spec.context_window_tokens
+    {
+        return Err("remote model context limits are invalid".to_string());
+    }
+    if !(1..=600).contains(&spec.timeout_secs) {
+        return Err("remote model timeout must be between 1 and 600 seconds".to_string());
+    }
+    let selection = ModelSelection {
+        provider_id: spec.invocation.provider_id.clone(),
+        model_id: spec.invocation.model_id.clone(),
+        reasoning: spec.invocation.reasoning,
+    };
+    let client = OpenAiCompatClient::new(OpenAiCompatConfig {
+        base_url: spec.base_url,
+        model: spec.model,
+        api_key: spec.api_key,
+        timeout: Duration::from_secs(spec.timeout_secs),
+    })
+    .map_err(|error| error.to_string())?
+    .with_request_options(agent_model::OpenAiCompatRequestOptions {
+        reasoning_profile: spec.reasoning_profile,
+        reasoning: selection.reasoning,
+        supports_tools: spec.supports_tools,
+    });
+    Ok(ResolvedModel {
+        selection,
+        invocation: spec.invocation,
+        client,
+        limits: agent_config::ModelContextLimits {
+            context_window_tokens: spec.context_window_tokens,
+            reserved_output_tokens: spec.reserved_output_tokens,
+        },
+    })
 }
 
 impl RunningServer {
@@ -314,14 +666,36 @@ fn build_router(
     options: ServerOptions,
     access_policy: ServerAccessPolicy,
 ) -> Result<(Router, AppState), ModelRegistryError> {
-    let model_registry = ModelRegistry::load(
-        options.model_store_path.clone(),
-        &options.workspace_root,
-        options.fallback_model.clone(),
-    )?;
-    let mcp_registry =
+    build_router_with_settings(options, access_policy, true)
+}
+
+fn build_workspace_router(
+    options: ServerOptions,
+    access_policy: ServerAccessPolicy,
+) -> Result<(Router, AppState), ModelRegistryError> {
+    build_router_with_settings(options, access_policy, false)
+}
+
+fn build_router_with_settings(
+    options: ServerOptions,
+    access_policy: ServerAccessPolicy,
+    persistent_settings: bool,
+) -> Result<(Router, AppState), ModelRegistryError> {
+    let model_registry = if persistent_settings {
+        ModelRegistry::load(
+            options.model_store_path.clone(),
+            &options.workspace_root,
+            options.fallback_model.clone(),
+        )?
+    } else {
+        ModelRegistry::in_memory(&options.workspace_root, options.fallback_model.clone())?
+    };
+    let mcp_registry = if persistent_settings {
         McpRegistry::load(options.mcp_store_path.clone(), options.mcp_servers.clone())
-            .map_err(|error| ModelRegistryError::Validation(error.to_string()))?;
+    } else {
+        McpRegistry::in_memory(options.mcp_servers.clone())
+    }
+    .map_err(|error| ModelRegistryError::Validation(error.to_string()))?;
     let command_registry = CommandRegistry::new(options.command_store_path.clone());
     let state = AppState {
         inner: Arc::new(ServerState {
@@ -336,35 +710,12 @@ fn build_router(
         }),
     };
 
-    let router = Router::new()
+    let mut router = Router::new()
         .route("/", get(index))
+        .route("/app.js", get(app_js))
+        .route("/style.css", get(style_css))
         .route("/assets/{*path}", get(asset))
         .route("/api/status", get(status))
-        .route("/api/model-settings", get(model_settings))
-        .route("/api/model-providers", post(create_model_provider))
-        .route(
-            "/api/model-providers/{provider_id}",
-            put(update_model_provider).delete(delete_model_provider),
-        )
-        .route(
-            "/api/model-providers/discover",
-            post(discover_model_provider),
-        )
-        .route("/api/model-default", put(set_default_model))
-        .route("/api/mcp-settings", get(mcp_settings))
-        .route("/api/mcp-servers", post(create_mcp_server))
-        .route("/api/mcp-servers/import", post(import_mcp_servers))
-        .route("/api/mcp-servers/test", post(test_mcp_server))
-        .route(
-            "/api/mcp-servers/{name}",
-            put(update_mcp_server).delete(delete_mcp_server),
-        )
-        .route("/api/commands", get(command_settings).post(create_command))
-        .route("/api/commands/resolve", post(resolve_command))
-        .route(
-            "/api/commands/{name}",
-            put(update_command).delete(delete_command),
-        )
         .route("/api/sessions", get(list_sessions))
         .route(
             "/api/sessions/{name}",
@@ -373,11 +724,40 @@ fn build_router(
         .route("/api/sessions/{name}/reset", post(reset_session))
         .route("/api/sessions/{name}/archive", post(archive_session))
         .route("/api/sessions/{name}/restore", post(restore_session))
-        .route(
-            "/api/sessions/{name}/model-selection",
-            get(get_session_model_selection).put(set_session_model_selection),
-        )
-        .route("/api/sessions/{name}/ws", get(session_ws))
+        .route("/api/sessions/{name}/ws", get(session_ws));
+    if persistent_settings {
+        router = router
+            .route("/api/model-settings", get(model_settings))
+            .route("/api/model-providers", post(create_model_provider))
+            .route(
+                "/api/model-providers/{provider_id}",
+                put(update_model_provider).delete(delete_model_provider),
+            )
+            .route(
+                "/api/model-providers/discover",
+                post(discover_model_provider),
+            )
+            .route("/api/model-default", put(set_default_model))
+            .route("/api/mcp-settings", get(mcp_settings))
+            .route("/api/mcp-servers", post(create_mcp_server))
+            .route("/api/mcp-servers/import", post(import_mcp_servers))
+            .route("/api/mcp-servers/test", post(test_mcp_server))
+            .route(
+                "/api/mcp-servers/{name}",
+                put(update_mcp_server).delete(delete_mcp_server),
+            )
+            .route("/api/commands", get(command_settings).post(create_command))
+            .route("/api/commands/resolve", post(resolve_command))
+            .route(
+                "/api/commands/{name}",
+                put(update_command).delete(delete_command),
+            )
+            .route(
+                "/api/sessions/{name}/model-selection",
+                get(get_session_model_selection).put(set_session_model_selection),
+            );
+    }
+    let router = router
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -387,9 +767,11 @@ fn build_router(
 }
 
 #[derive(Clone)]
-struct AppState {
+pub struct WorkspaceService {
     inner: Arc<ServerState>,
 }
+
+type AppState = WorkspaceService;
 
 struct ServerState {
     options: ServerOptions,
@@ -407,8 +789,12 @@ async fn access_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response {
+    if matches!(state.inner.access_policy, ServerAccessPolicy::Embedded) {
+        return next.run(request).await;
+    }
     let response = match &state.inner.access_policy {
         ServerAccessPolicy::Browser => next.run(request).await,
+        ServerAccessPolicy::Embedded => next.run(request).await,
         ServerAccessPolicy::Desktop { token } => {
             let expected_host =
                 format!("{}:{}", state.inner.options.host, state.inner.options.port);
@@ -590,6 +976,7 @@ struct PendingApproval {
 #[derive(Debug, Clone, Serialize)]
 struct StatusResponse {
     workspace_root: String,
+    workspace_location: WorkspaceLocation,
     config_path: Option<String>,
     permissions: PermissionProfile,
     version: &'static str,
@@ -618,14 +1005,14 @@ struct SessionArchiveResponse {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct RunningTurnSnapshot {
+pub struct RunningTurnSnapshot {
     turn_id: String,
     pending_approval: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
-enum ServerMessage {
+pub enum ServerMessage {
     Snapshot {
         session: Session,
         running_turn: Option<RunningTurnSnapshot>,
@@ -647,7 +1034,7 @@ enum ServerMessage {
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
-enum ClientMessage {
+pub enum ClientMessage {
     StartTurn {
         request_id: String,
         prompt: String,
@@ -725,8 +1112,20 @@ async fn index() -> Html<&'static str> {
     Html(include_str!("../assets/index.html"))
 }
 
+async fn app_js() -> Response {
+    asset_response("app.js")
+}
+
+async fn style_css() -> Response {
+    asset_response("style.css")
+}
+
 async fn asset(Path(path): Path<String>) -> Response {
-    match path.as_str() {
+    asset_response(&path)
+}
+
+fn asset_response(path: &str) -> Response {
+    match path {
         "app.js" => (
             [(
                 header::CONTENT_TYPE,
@@ -748,6 +1147,7 @@ async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
     let settings = state.inner.model_registry.settings().await;
     Json(StatusResponse {
         workspace_root: state.inner.options.workspace_root.display().to_string(),
+        workspace_location: state.inner.options.workspace_location.clone(),
         config_path: state
             .inner
             .options
@@ -1190,6 +1590,16 @@ async fn handle_client_ws_message(
         return true;
     };
 
+    dispatch_client_message(message, state, session_name, tx).await;
+    true
+}
+
+async fn dispatch_client_message(
+    message: ClientMessage,
+    state: &AppState,
+    session_name: &str,
+    tx: &broadcast::Sender<ServerMessage>,
+) {
     match message {
         ClientMessage::StartTurn {
             request_id,
@@ -1207,6 +1617,8 @@ async fn handle_client_ws_message(
                     prompt_resolved,
                     permission_mode,
                     model_selection,
+                    resolved_model: None,
+                    mcp_servers: None,
                 },
                 tx.clone(),
             )
@@ -1222,8 +1634,6 @@ async fn handle_client_ws_message(
             cancel_turn(state, session_name, turn_id, tx).await;
         }
     }
-
-    true
 }
 
 struct StartTurnRequest {
@@ -1232,6 +1642,8 @@ struct StartTurnRequest {
     prompt_resolved: bool,
     permission_mode: Option<PermissionMode>,
     model_selection: Option<ModelSelection>,
+    resolved_model: Option<ResolvedModel>,
+    mcp_servers: Option<Vec<McpServerConfig>>,
 }
 
 async fn start_turn(
@@ -1246,6 +1658,8 @@ async fn start_turn(
         prompt_resolved,
         permission_mode,
         model_selection,
+        resolved_model,
+        mcp_servers,
     } = request;
     if state.inner.shutting_down.load(Ordering::Acquire) {
         broadcast_message(
@@ -1327,29 +1741,34 @@ async fn start_turn(
         );
         return;
     }
-    let resolved_model = match state
-        .inner
-        .model_registry
-        .resolve_for_turn(&session_name, model_selection)
-        .await
-    {
-        Ok(model) => model,
-        Err(error) => {
-            broadcast_message(
-                &tx,
-                ServerMessage::TurnRejected {
-                    request_id,
-                    reason: error.to_string(),
-                },
-            );
-            return;
-        }
+    let persist_model_selection = resolved_model.is_none();
+    let resolved_model = match resolved_model {
+        Some(model) => model,
+        None => match state
+            .inner
+            .model_registry
+            .resolve_for_turn(&session_name, model_selection)
+            .await
+        {
+            Ok(model) => model,
+            Err(error) => {
+                broadcast_message(
+                    &tx,
+                    ServerMessage::TurnRejected {
+                        request_id,
+                        reason: error.to_string(),
+                    },
+                );
+                return;
+            }
+        },
     };
-    if let Err(error) = state
-        .inner
-        .model_registry
-        .set_session_selection(&session_name, resolved_model.selection.clone())
-        .await
+    if persist_model_selection
+        && let Err(error) = state
+            .inner
+            .model_registry
+            .set_session_selection(&session_name, resolved_model.selection.clone())
+            .await
     {
         broadcast_message(
             &tx,
@@ -1388,6 +1807,7 @@ async fn start_turn(
                 prompt,
                 permissions,
                 resolved_model,
+                mcp_servers,
                 tx: tx_for_task,
                 cancellation: cancellation_for_task,
             })
@@ -1425,6 +1845,7 @@ struct TurnTaskContext {
     prompt: String,
     permissions: PermissionProfile,
     resolved_model: ResolvedModel,
+    mcp_servers: Option<Vec<McpServerConfig>>,
     tx: broadcast::Sender<ServerMessage>,
     cancellation: CancellationToken,
 }
@@ -1459,12 +1880,16 @@ async fn run_turn_task_inner(context: TurnTaskContext) -> Result<(), agent_runti
         prompt,
         permissions,
         resolved_model,
+        mcp_servers,
         tx,
         cancellation,
     } = context;
     let options = state.inner.options.clone();
     let mcp_cache = state.inner.mcp_cache.read().await.clone();
-    let mcp_servers = state.inner.mcp_registry.effective_servers().await;
+    let mcp_servers = match mcp_servers {
+        Some(servers) => servers,
+        None => state.inner.mcp_registry.effective_servers().await,
+    };
     let store = SessionStore::for_workspace(&options.workspace_root, &session_name)?;
     let mut session = store.load()?;
     let turn_index = session.turns.len();
@@ -1826,7 +2251,9 @@ mod tests {
     use super::*;
     use agent_config::ModelContextLimits;
     use agent_model::{OpenAiCompatClient, OpenAiCompatConfig};
-    use agent_protocol::{PermissionMode, ReasoningProfile, ShellPolicy};
+    use agent_protocol::{
+        ModelInvocation, PermissionMode, ReasoningLevel, ReasoningProfile, ShellPolicy,
+    };
     use std::fs;
     use std::path::PathBuf;
     use std::sync::OnceLock;
@@ -1852,7 +2279,7 @@ mod tests {
                 provider_name: "Current config".to_string(),
                 model_id: "test-model".to_string(),
                 model_name: "test-model".to_string(),
-                client,
+                client: Some(client),
                 limits: ModelContextLimits {
                     context_window_tokens: 65_536,
                     reserved_output_tokens: 8_192,
@@ -1871,6 +2298,7 @@ mod tests {
                 compact_max_retries: 2,
             },
             workspace_root: root.clone(),
+            workspace_location: WorkspaceLocation::Local { path: root.clone() },
             config_path: Some(root.join("morrow.toml")),
             config_diagnostics: Vec::new(),
             permissions: PermissionProfile::for_mode(DEFAULT_WEB_PERMISSION_MODE),
@@ -1928,6 +2356,212 @@ mod tests {
     #[test]
     fn router_registers_model_routes_without_conflicts() {
         let _ = router(test_options()).expect("router");
+    }
+
+    #[test]
+    fn embedded_index_references_assets_present_at_the_tauri_root() {
+        let html = include_str!("../assets/index.html");
+
+        assert!(html.contains(r#"src="/app.js""#));
+        assert!(html.contains(r#"href="/style.css""#));
+    }
+
+    #[tokio::test]
+    async fn browser_router_serves_root_and_legacy_asset_paths() {
+        let router = router(test_options()).expect("browser router");
+        for (path, content_type) in [
+            ("/app.js", "application/javascript; charset=utf-8"),
+            ("/style.css", "text/css; charset=utf-8"),
+            ("/assets/app.js", "application/javascript; charset=utf-8"),
+            ("/assets/style.css", "text/css; charset=utf-8"),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .body(Body::empty())
+                        .expect("asset request"),
+                )
+                .await
+                .expect("asset response");
+
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert_eq!(
+                response.headers().get(header::CONTENT_TYPE),
+                Some(&HeaderValue::from_static(content_type)),
+                "{path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn embedded_settings_prepare_ephemeral_remote_turn_runtime() {
+        let server = EmbeddedServer::new(test_options()).expect("embedded server");
+        let provider = server
+            .request(
+                "POST",
+                "/api/model-providers",
+                Some(serde_json::json!({
+                    "name": "Managed",
+                    "base_url": "https://models.example/v1",
+                    "api_key": "managed-model-secret",
+                    "enabled": true,
+                    "timeout_secs": 30,
+                    "models": [{
+                        "id": "managed-model",
+                        "name": "Managed model",
+                        "context_window_tokens": 32_000,
+                        "reserved_output_tokens": 4_000,
+                        "supports_tools": true,
+                        "reasoning_profile": "none"
+                    }]
+                })),
+            )
+            .await
+            .expect("create provider");
+        assert_eq!(provider.status, 200);
+        let provider_id = provider.body.expect("provider body")["id"]
+            .as_str()
+            .expect("provider id")
+            .to_string();
+        let mcp = server
+            .request(
+                "POST",
+                "/api/mcp-servers",
+                Some(serde_json::json!({
+                    "name": "managed-mcp",
+                    "transport": "stdio",
+                    "command": "managed-mcp",
+                    "args": [],
+                    "env": {"TOKEN": "managed-mcp-secret"},
+                    "enabled": true,
+                    "startup_timeout_sec": 10,
+                    "tool_timeout_sec": 60
+                })),
+            )
+            .await
+            .expect("create MCP server");
+        assert_eq!(mcp.status, 200);
+
+        let turn = server
+            .prepare_remote_turn(
+                "default",
+                serde_json::json!({
+                    "type": "start_turn",
+                    "data": {
+                        "request_id": "request-1",
+                        "prompt": "hello",
+                        "prompt_resolved": true,
+                        "permission_mode": "workspace_write",
+                        "model_selection": {
+                            "provider_id": provider_id,
+                            "model_id": "managed-model",
+                            "reasoning": "off"
+                        }
+                    }
+                }),
+            )
+            .await
+            .expect("prepare remote turn");
+
+        let RemoteTurnModel::Managed(model) = turn.model else {
+            panic!("managed model expected");
+        };
+        assert_eq!(model.api_key, "managed-model-secret");
+        assert_eq!(turn.managed_mcp_servers.len(), 1);
+        assert_eq!(
+            turn.managed_mcp_servers[0]
+                .env
+                .get("TOKEN")
+                .map(String::as_str),
+            Some("managed-mcp-secret")
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_accepts_managed_model_resolved_by_desktop() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind model listener");
+        let mut options = test_options();
+        options.fallback_model = None;
+        let server = EmbeddedServer::new_workspace(options).expect("workspace server");
+        let mut subscription = server
+            .subscribe_session("remote")
+            .await
+            .expect("subscribe session");
+
+        server
+            .start_remote_turn(RemoteTurnSpec {
+                session: "remote".to_string(),
+                request_id: "request-remote-model".to_string(),
+                prompt: "hello".to_string(),
+                permission_mode: Some(PermissionMode::WorkspaceWrite),
+                model: RemoteTurnModel::Managed(RemoteModelSpec {
+                    base_url: format!(
+                        "http://{}/v1",
+                        listener.local_addr().expect("model address")
+                    ),
+                    model: "deepseek-v4-pro".to_string(),
+                    api_key: "remote-model-secret".to_string(),
+                    timeout_secs: 30,
+                    context_window_tokens: 65_536,
+                    reserved_output_tokens: 8_192,
+                    reasoning_profile: ReasoningProfile::Deepseek,
+                    supports_tools: true,
+                    invocation: ModelInvocation {
+                        provider_id: "opencode".to_string(),
+                        provider_name: "opencode".to_string(),
+                        model_id: "deepseek-v4-pro".to_string(),
+                        model_name: "DeepSeek V4 Pro".to_string(),
+                        reasoning: ReasoningLevel::High,
+                    },
+                }),
+                managed_mcp_servers: Vec::new(),
+            })
+            .await
+            .expect("start remote turn");
+
+        let accepted = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let message = subscription.recv().await?;
+                match message["type"].as_str() {
+                    Some("turn_rejected") => {
+                        return Err(message["data"]["reason"]
+                            .as_str()
+                            .unwrap_or("turn rejected")
+                            .to_string());
+                    }
+                    Some("snapshot") if !message["data"]["running_turn"].is_null() => {
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("remote turn acceptance event");
+
+        assert!(accepted.is_ok(), "remote turn was rejected: {accepted:?}");
+        server.shutdown(true).await;
+    }
+
+    #[tokio::test]
+    async fn workspace_embedded_server_keeps_managed_settings_in_memory() {
+        let options = test_options();
+        let model_store = options.model_store_path.clone();
+        let mcp_store = options.mcp_store_path.clone();
+        let server = EmbeddedServer::new_workspace(options).expect("workspace server");
+
+        let response = server
+            .request("GET", "/api/model-settings", None)
+            .await
+            .expect("embedded response");
+
+        assert_eq!(response.status, 404);
+        assert!(!model_store.exists());
+        assert!(!mcp_store.exists());
     }
 
     #[tokio::test]

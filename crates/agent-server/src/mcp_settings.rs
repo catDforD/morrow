@@ -1,4 +1,6 @@
+use crate::secrets::{SecretString, replace_file};
 use agent_config::{McpServerConfig, McpTransport};
+use agent_protocol::{RemoteMcpServerSpec, RemoteMcpTransport};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
@@ -7,7 +9,8 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 use tokio::sync::RwLock;
 
-const MCP_STORE_SCHEMA_VERSION: u32 = 1;
+const MCP_STORE_SCHEMA_VERSION: u32 = 2;
+const LEGACY_MCP_STORE_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_STARTUP_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 60;
 
@@ -45,13 +48,13 @@ struct ManagedMcpServer {
     #[serde(default)]
     args: Vec<String>,
     #[serde(default)]
-    env: BTreeMap<String, String>,
+    env: BTreeMap<String, SecretString>,
     #[serde(default)]
     cwd: Option<String>,
     #[serde(default)]
     url: Option<String>,
     #[serde(default)]
-    http_headers: BTreeMap<String, String>,
+    http_headers: BTreeMap<String, SecretString>,
     #[serde(default = "default_true")]
     enabled: bool,
     #[serde(default = "default_startup_timeout_secs")]
@@ -67,10 +70,18 @@ impl ManagedMcpServer {
             transport: self.transport.into(),
             command: self.command.clone(),
             args: self.args.clone(),
-            env: self.env.clone(),
+            env: self
+                .env
+                .iter()
+                .map(|(key, value)| (key.clone(), value.expose().to_string()))
+                .collect(),
             cwd: self.cwd.as_deref().map(PathBuf::from),
             url: self.url.clone(),
-            http_headers: self.http_headers.clone(),
+            http_headers: self
+                .http_headers
+                .iter()
+                .map(|(key, value)| (key.clone(), value.expose().to_string()))
+                .collect(),
             enabled: self.enabled,
             startup_timeout_sec: self.startup_timeout_sec,
             tool_timeout_sec: self.tool_timeout_sec,
@@ -222,16 +233,43 @@ pub enum McpRegistryError {
 
 pub struct McpRegistry {
     path: PathBuf,
+    persistent: bool,
     fallback: Vec<McpServerConfig>,
     state: RwLock<PersistedMcpStore>,
 }
 
 impl McpRegistry {
     pub fn load(path: PathBuf, fallback: Vec<McpServerConfig>) -> Result<Self, McpRegistryError> {
-        let store = load_store(&path)?;
+        let mut store = load_store(&path)?;
         validate_store(&store, &fallback)?;
+        if store.schema_version == LEGACY_MCP_STORE_SCHEMA_VERSION
+            || store.servers.iter().any(|server| {
+                server.env.values().any(SecretString::requires_rewrite)
+                    || server
+                        .http_headers
+                        .values()
+                        .any(SecretString::requires_rewrite)
+            })
+        {
+            let mut migrated = store.clone();
+            migrated.schema_version = MCP_STORE_SCHEMA_VERSION;
+            save_store(&path, &migrated)?;
+            store = migrated;
+        }
         Ok(Self {
             path,
+            persistent: true,
+            fallback,
+            state: RwLock::new(store),
+        })
+    }
+
+    pub fn in_memory(fallback: Vec<McpServerConfig>) -> Result<Self, McpRegistryError> {
+        let store = PersistedMcpStore::default();
+        validate_store(&store, &fallback)?;
+        Ok(Self {
+            path: PathBuf::from("<memory>"),
+            persistent: false,
             fallback,
             state: RwLock::new(store),
         })
@@ -258,6 +296,20 @@ impl McpRegistry {
         servers
     }
 
+    pub async fn managed_servers(&self) -> Vec<McpServerConfig> {
+        self.state
+            .read()
+            .await
+            .servers
+            .iter()
+            .map(ManagedMcpServer::runtime_config)
+            .collect()
+    }
+
+    pub fn fallback_servers(&self) -> &[McpServerConfig] {
+        &self.fallback
+    }
+
     pub async fn create(
         &self,
         request: McpServerWriteRequest,
@@ -269,7 +321,7 @@ impl McpRegistry {
         next.servers.push(server.clone());
         next.servers
             .sort_by(|left, right| left.name.cmp(&right.name));
-        commit_store(&self.path, &mut state, next)?;
+        commit_store(&self.path, self.persistent, &mut state, next)?;
         Ok(managed_response(&server))
     }
 
@@ -295,7 +347,7 @@ impl McpRegistry {
         next.servers[index] = server.clone();
         next.servers
             .sort_by(|left, right| left.name.cmp(&right.name));
-        commit_store(&self.path, &mut state, next)?;
+        commit_store(&self.path, self.persistent, &mut state, next)?;
         Ok(managed_response(&server))
     }
 
@@ -307,7 +359,7 @@ impl McpRegistry {
         if next.servers.len() == previous_len {
             return Err(McpRegistryError::NotFound(name.to_string()));
         }
-        commit_store(&self.path, &mut state, next)
+        commit_store(&self.path, self.persistent, &mut state, next)
     }
 
     pub async fn import(&self, value: Value) -> Result<Vec<McpServerResponse>, McpRegistryError> {
@@ -323,7 +375,7 @@ impl McpRegistry {
         }
         next.servers
             .sort_by(|left, right| left.name.cmp(&right.name));
-        commit_store(&self.path, &mut state, next)?;
+        commit_store(&self.path, self.persistent, &mut state, next)?;
         Ok(imported.iter().map(managed_response).collect())
     }
 
@@ -362,7 +414,10 @@ fn load_store(path: &Path) -> Result<PersistedMcpStore, McpRegistryError> {
             source,
         }
     })?;
-    if store.schema_version != MCP_STORE_SCHEMA_VERSION {
+    if !matches!(
+        store.schema_version,
+        LEGACY_MCP_STORE_SCHEMA_VERSION | MCP_STORE_SCHEMA_VERSION
+    ) {
         return Err(McpRegistryError::UnsupportedSchema {
             version: store.schema_version,
             expected: MCP_STORE_SCHEMA_VERSION,
@@ -421,21 +476,65 @@ fn save_store(path: &Path, store: &PersistedMcpStore) -> Result<(), McpRegistryE
             }
         })?;
     }
-    fs::rename(&temp, path).map_err(|source| McpRegistryError::Replace {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    if let Err(source) = replace_file(&temp, path) {
+        let _ = fs::remove_file(&temp);
+        return Err(McpRegistryError::Replace {
+            path: path.to_path_buf(),
+            source,
+        });
+    }
     Ok(())
 }
 
 fn commit_store(
     path: &Path,
+    persistent: bool,
     state: &mut PersistedMcpStore,
     next: PersistedMcpStore,
 ) -> Result<(), McpRegistryError> {
-    save_store(path, &next)?;
+    if persistent {
+        save_store(path, &next)?;
+    }
     *state = next;
     Ok(())
+}
+
+pub(crate) fn remote_spec_from_config(server: &McpServerConfig) -> RemoteMcpServerSpec {
+    RemoteMcpServerSpec {
+        name: server.name.clone(),
+        transport: match server.transport {
+            McpTransport::Stdio => RemoteMcpTransport::Stdio,
+            McpTransport::Http => RemoteMcpTransport::Http,
+        },
+        command: server.command.clone(),
+        args: server.args.clone(),
+        env: server.env.clone(),
+        cwd: server.cwd.as_ref().map(|path| path.display().to_string()),
+        url: server.url.clone(),
+        http_headers: server.http_headers.clone(),
+        enabled: server.enabled,
+        startup_timeout_sec: server.startup_timeout_sec,
+        tool_timeout_sec: server.tool_timeout_sec,
+    }
+}
+
+pub(crate) fn config_from_remote_spec(server: RemoteMcpServerSpec) -> McpServerConfig {
+    McpServerConfig {
+        name: server.name,
+        transport: match server.transport {
+            RemoteMcpTransport::Stdio => McpTransport::Stdio,
+            RemoteMcpTransport::Http => McpTransport::Http,
+        },
+        command: server.command,
+        args: server.args,
+        env: server.env,
+        cwd: server.cwd.map(PathBuf::from),
+        url: server.url,
+        http_headers: server.http_headers,
+        enabled: server.enabled,
+        startup_timeout_sec: server.startup_timeout_sec,
+        tool_timeout_sec: server.tool_timeout_sec,
+    }
 }
 
 fn ensure_name_available(
@@ -547,9 +646,9 @@ fn managed_from_request(
 
 fn resolve_secret_map(
     requested: BTreeMap<String, Option<String>>,
-    existing: Option<&BTreeMap<String, String>>,
+    existing: Option<&BTreeMap<String, SecretString>>,
     label: &str,
-) -> Result<BTreeMap<String, String>, McpRegistryError> {
+) -> Result<BTreeMap<String, SecretString>, McpRegistryError> {
     let mut resolved = BTreeMap::new();
     for (raw_key, value) in requested {
         let key = raw_key.trim().to_string();
@@ -559,7 +658,7 @@ fn resolve_secret_map(
             )));
         }
         let value = match value {
-            Some(value) => value,
+            Some(value) => SecretString::new(value),
             None => existing
                 .and_then(|values| values.get(&key))
                 .cloned()
@@ -591,7 +690,10 @@ fn validate_managed_server(server: &ManagedMcpServer) -> Result<(), McpRegistryE
         }
     }
     for (key, value) in &server.http_headers {
-        if key.trim().is_empty() || key.contains(['\r', '\n']) || value.contains(['\r', '\n']) {
+        if key.trim().is_empty()
+            || key.contains(['\r', '\n'])
+            || value.expose().contains(['\r', '\n'])
+        {
             return Err(McpRegistryError::Validation(format!(
                 "MCP server {:?} has an invalid HTTP header",
                 server.name
@@ -689,10 +791,12 @@ fn fallback_response(server: &McpServerConfig) -> McpServerResponse {
         read_only: true,
         source: "runtime_config",
         command: (server.transport == McpTransport::Stdio).then(|| server.command.clone()),
-        args: Vec::new(),
+        args: server.args.clone(),
         env_keys: server.env.keys().cloned().collect(),
         cwd: server.cwd.as_ref().map(|path| path.display().to_string()),
-        url: None,
+        url: (server.transport == McpTransport::Http)
+            .then(|| server.url.clone())
+            .flatten(),
         http_header_keys: server.http_headers.keys().cloned().collect(),
         startup_timeout_sec: server.startup_timeout_sec,
         tool_timeout_sec: server.tool_timeout_sec,
@@ -773,7 +877,10 @@ mod tests {
         let content = fs::read_to_string(path).expect("stored settings");
         let response = serde_json::to_string(&settings).expect("response");
 
+        #[cfg(not(windows))]
         assert!(content.contains("secret"));
+        #[cfg(windows)]
+        assert!(!content.contains("secret"));
         assert!(!response.contains("\"secret\""));
         assert_eq!(settings.servers[0].env_keys, ["TOKEN"]);
     }
@@ -880,5 +987,72 @@ mod tests {
         };
 
         assert!(matches!(error, McpRegistryError::UnsupportedSchema { .. }));
+    }
+
+    #[test]
+    fn schema_v1_mcp_store_is_atomically_rewritten_as_v2() {
+        let path = unique_path("migration");
+        fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "servers": [{
+                    "name": "docs",
+                    "transport": "stdio",
+                    "command": "docs-server",
+                    "args": [],
+                    "env": {"TOKEN": "legacy-env-secret"},
+                    "cwd": null,
+                    "url": null,
+                    "http_headers": {},
+                    "enabled": true,
+                    "startup_timeout_sec": 10,
+                    "tool_timeout_sec": 60
+                }]
+            }))
+            .expect("legacy JSON"),
+        )
+        .expect("write legacy store");
+
+        McpRegistry::load(path.clone(), Vec::new()).expect("migrate store");
+
+        let migrated: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("read migrated store"))
+                .expect("parse migrated store");
+        assert_eq!(migrated["schema_version"], MCP_STORE_SCHEMA_VERSION);
+        assert!(migrated["servers"][0]["env"]["TOKEN"].is_object());
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                migrated["servers"][0]["env"]["TOKEN"]["protection"],
+                "dpapi"
+            );
+            assert!(
+                !fs::read_to_string(path)
+                    .expect("stored")
+                    .contains("legacy-env-secret")
+            );
+        }
+    }
+
+    #[test]
+    fn failed_mcp_store_replacement_preserves_the_original_file() {
+        let path = unique_path("migration-failure");
+        fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
+        let original = br#"{"schema_version":1,"servers":[]}"#;
+        fs::write(&path, original).expect("write original");
+        let temp = path.with_file_name(format!(
+            ".{}.tmp-{}",
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .expect("filename"),
+            std::process::id()
+        ));
+        fs::create_dir(&temp).expect("block temporary file");
+
+        save_store(&path, &PersistedMcpStore::default()).expect_err("save must fail");
+
+        assert_eq!(fs::read(path).expect("read original"), original);
     }
 }

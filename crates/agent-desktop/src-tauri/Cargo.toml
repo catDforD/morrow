@@ -16,12 +16,16 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 agent-config = { workspace = true }
+agent-protocol = { workspace = true }
+agent-remote = { workspace = true }
 agent-server = { workspace = true }
 dirs = { workspace = true }
 getrandom = "0.3"
 log = "0.4"
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 tauri-plugin-log = "2"
@@ -30,3 +34,6 @@ tauri-plugin-single-instance = "2"
 tauri-plugin-window-state = "2"
 thiserror = { workspace = true }
 tokio = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
