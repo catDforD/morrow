@@ -9,6 +9,7 @@ use futures_util::{FutureExt, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use thiserror::Error;
@@ -320,6 +321,12 @@ impl Model for OpenAiCompatClient {
             Ok(stream)
         }
         .boxed()
+    }
+
+    fn shared_clone(&self) -> Option<Arc<dyn Model>> {
+        self.request_options
+            .supports_tools
+            .then(|| Arc::new(self.clone()) as Arc<dyn Model>)
     }
 }
 

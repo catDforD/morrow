@@ -1929,6 +1929,10 @@ a:focus-visible {
   background: var(--surface-panel-muted);
 }
 
+.run-step.subagent .run-step-icon {
+  border-radius: 7px;
+}
+
 .run-step.running .run-step-icon,
 .run-step.approval .run-step-icon {
   background: var(--warn);
@@ -2007,6 +2011,21 @@ a:focus-visible {
   font-size: 11px;
   line-height: 1.45;
   white-space: pre;
+}
+
+.subagent-summary {
+  margin-top: 9px;
+}
+
+.subagent-summary > strong {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.subagent-summary > p {
+  margin: 5px 0 0;
+  color: var(--muted);
+  font-size: 11px;
 }
 
 .run-file-list,

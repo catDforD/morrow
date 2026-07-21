@@ -24,6 +24,7 @@ Morrow streams model output, persists project-scoped sessions, reads and edits f
 - **Real tools** — file reads, file edits, patch application, text search, directory listing, and shell commands.
 - **Permission profiles** — read-only, workspace-write, and full-access modes, with shell execution controlled separately.
 - **MCP support** — stdio and Streamable HTTP MCP servers, configured from TOML or the dashboard.
+- **Read-only subagents** — delegate isolated workspace investigations and run independent tasks in parallel.
 - **Long-session friendly** — automatic context compaction.
 - **Scriptable** — JSONL event output for automation and integrations.
 
@@ -173,6 +174,14 @@ For a Streamable HTTP example with environment-backed headers, see [`morrow.exam
 The dashboard's **Settings → MCP Servers** page adds Web-only stdio and HTTP servers without changing the CLI configuration. Web entries are stored in `~/.morrow/web-mcp.json` and merged with read-only servers loaded from `morrow.toml`; duplicate names are rejected. Changes apply from the next Web turn, while a turn that is already running keeps its original server snapshot. The page can import direct JSON server maps or an `mcpServers` wrapper and can test a draft configuration without saving it.
 
 Web MCP environment variables and HTTP header values are stored as local plaintext with mode `0600` on Unix. Their values are never returned by the settings API: leaving an existing value blank preserves it, while removing its row deletes it. Testing or using a configured MCP server may execute local programs or contact remote services.
+
+### Read-only subagents
+
+Models with tool support automatically receive a `delegate_task` tool for self-contained workspace investigations. A model can issue several `delegate_task` calls in one response to run independent research in parallel; the parent turn waits for the results before continuing.
+
+Each subagent uses the currently selected model and reasoning level plus the configured system prompt, but starts with an isolated conversation containing only its delegated task. It can use `read_file`, `list_files`, and `search_text`; it cannot modify files, run shell commands, call MCP tools, or delegate another subagent.
+
+A parent turn may start at most four subagents, with at most four running concurrently. Each task has a five-minute timeout and its returned report is capped at 12,000 characters. CLI, JSONL, Web, Desktop, and WSL surfaces expose subagent start/finish events. The parent session stores the delegated task and final tool result, not the subagent's full reasoning or internal transcript.
 
 ### Web custom commands
 

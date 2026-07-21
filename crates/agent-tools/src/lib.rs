@@ -2,18 +2,20 @@ pub mod mcp;
 
 use agent_config::McpServerConfig;
 pub use agent_core::{
-    CancellationToken, ToolApproval, ToolExecution, ToolExecutionContext, ToolExecutionMode,
-    ToolFuture, ToolResult, ToolRuntime,
+    CancellationToken, ToolApproval, ToolExecution, ToolExecutionContext, ToolExecutionKind,
+    ToolExecutionMode, ToolFuture, ToolResult, ToolRuntime,
 };
 use agent_protocol::{
-    ApprovalDecision, ApprovalRequest, FileChangeOperation, FileChangeSummary, PermissionProfile,
-    ShellCommandSummary, ToolCall, ToolDefinition, ToolExecutionSummary,
+    ApprovalDecision, ApprovalRequest, FileChangeOperation, FileChangeSummary, PermissionMode,
+    PermissionProfile, ShellCommandSummary, ShellPolicy, SubagentExecutionSummary, ToolCall,
+    ToolDefinition, ToolExecutionSummary,
 };
 use agent_sandbox::{PermissionDecision, PermissionEvaluator, PermissionEvaluatorError};
 use async_trait::async_trait;
 use futures_util::FutureExt;
-use serde::Deserialize;
+use futures_util::future::BoxFuture;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::borrow::Borrow;
 use std::collections::HashSet;
@@ -47,6 +49,8 @@ const MAX_FILE_DIFF_BYTES: usize = 20_000;
 const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 const TOOL_CANCELLED_ERROR: &str = "tool execution cancelled";
 const SEARCH_SKIP_NAMES: &[&str] = &[".git", "node_modules", "dist", "build", "target"];
+pub const DELEGATE_TASK_TOOL_NAME: &str = "delegate_task";
+pub const MAX_SUBAGENT_TASK_CHARS: usize = 4_000;
 
 #[derive(Debug, Error)]
 pub enum ToolRegistryError {
@@ -66,12 +70,48 @@ pub trait Tool: Send + Sync {
         ToolExecutionMode::Concurrent
     }
 
+    fn execution_kind(&self, _call: &ToolCall) -> ToolExecutionKind {
+        ToolExecutionKind::Standard
+    }
+
     async fn execute(
         &self,
         call: ToolCall,
         approval: Option<ToolApproval>,
         context: ToolExecutionContext,
     ) -> ToolExecution;
+}
+
+pub trait SubagentExecutor: Send + Sync {
+    fn execute(
+        &self,
+        task: String,
+        cancellation: CancellationToken,
+    ) -> BoxFuture<'static, SubagentExecutionSummary>;
+}
+
+#[derive(Clone)]
+struct DelegateTaskTool {
+    executor: Arc<dyn SubagentExecutor>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DelegateTaskArgs {
+    task: String,
+}
+
+#[derive(Serialize)]
+struct DelegateTaskOutput<'a> {
+    ok: bool,
+    task: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<&'a str>,
+    model_calls: usize,
+    tool_calls: usize,
+    truncated: bool,
 }
 
 #[derive(Clone)]
@@ -116,7 +156,26 @@ impl ToolRegistry {
     ) -> Result<Self, ToolRegistryError> {
         let evaluator = PermissionEvaluator::new(root, permissions)?;
         let mut registry = Self::empty();
-        registry.register(Arc::new(BuiltInTools { evaluator }))?;
+        registry.register(Arc::new(BuiltInTools {
+            evaluator,
+            scope: BuiltInToolScope::All,
+        }))?;
+        Ok(registry)
+    }
+
+    pub fn research(root: impl Into<PathBuf>) -> Result<Self, ToolRegistryError> {
+        let evaluator = PermissionEvaluator::new(
+            root,
+            PermissionProfile {
+                mode: PermissionMode::ReadOnly,
+                shell: ShellPolicy::Deny,
+            },
+        )?;
+        let mut registry = Self::empty();
+        registry.register(Arc::new(BuiltInTools {
+            evaluator,
+            scope: BuiltInToolScope::Research,
+        }))?;
         Ok(registry)
     }
 
@@ -161,6 +220,13 @@ impl ToolRegistry {
         Ok(())
     }
 
+    pub fn register_subagent(
+        &mut self,
+        executor: Arc<dyn SubagentExecutor>,
+    ) -> Result<(), ToolRegistryError> {
+        self.register(Arc::new(DelegateTaskTool { executor }))
+    }
+
     pub fn definitions(&self) -> Vec<ToolDefinition> {
         self.tools
             .iter()
@@ -174,6 +240,14 @@ impl ToolRegistry {
             .find(|registered| registered.definition.function.name == call.function.name)
             .map(|registered| registered.tool.execution_mode(call))
             .unwrap_or(ToolExecutionMode::Concurrent)
+    }
+
+    pub fn execution_kind(&self, call: &ToolCall) -> ToolExecutionKind {
+        self.tools
+            .iter()
+            .find(|registered| registered.definition.function.name == call.function.name)
+            .map(|registered| registered.tool.execution_kind(call))
+            .unwrap_or(ToolExecutionKind::Standard)
     }
 
     pub async fn execute<C>(&self, call: C) -> ToolExecution
@@ -251,6 +325,10 @@ impl ToolRuntime for ToolRegistry {
         ToolRegistry::execution_mode(self, call)
     }
 
+    fn execution_kind(&self, call: &ToolCall) -> ToolExecutionKind {
+        ToolRegistry::execution_kind(self, call)
+    }
+
     fn execute(
         &self,
         call: ToolCall,
@@ -262,15 +340,27 @@ impl ToolRuntime for ToolRegistry {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BuiltInToolScope {
+    All,
+    Research,
+}
+
 #[derive(Debug, Clone)]
 struct BuiltInTools {
     evaluator: PermissionEvaluator,
+    scope: BuiltInToolScope,
 }
 
 #[async_trait]
 impl Tool for BuiltInTools {
     fn definitions(&self) -> Vec<ToolDefinition> {
         built_in_definitions()
+            .into_iter()
+            .filter(|definition| {
+                self.scope == BuiltInToolScope::All || is_research_tool(&definition.function.name)
+            })
+            .collect()
     }
 
     fn execution_mode(&self, call: &ToolCall) -> ToolExecutionMode {
@@ -291,6 +381,13 @@ impl Tool for BuiltInTools {
     ) -> ToolExecution {
         if context.cancellation.is_cancelled() {
             return ToolExecution::error(TOOL_CANCELLED_ERROR);
+        }
+
+        if self.scope == BuiltInToolScope::Research && !is_research_tool(&call.function.name) {
+            return ToolExecution::error(format!(
+                "tool {:?} is not available to read-only subagents",
+                call.function.name
+            ));
         }
 
         if call.function.name == "shell_command" {
@@ -319,6 +416,70 @@ impl Tool for BuiltInTools {
         .await
         .unwrap_or_else(|error| {
             ToolExecution::error(format!("tool execution task failed: {error}"))
+        })
+    }
+}
+
+#[async_trait]
+impl Tool for DelegateTaskTool {
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        vec![ToolDefinition::function(
+            DELEGATE_TASK_TOOL_NAME,
+            "Delegate one self-contained, read-only workspace investigation to an isolated subagent. The call waits for the result. Issue multiple delegate_task calls in the same response when independent investigations can run in parallel; use direct tools for simple lookups.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAX_SUBAGENT_TASK_CHARS
+                    }
+                },
+                "required": ["task"],
+                "additionalProperties": false
+            }),
+        )]
+    }
+
+    fn execution_kind(&self, call: &ToolCall) -> ToolExecutionKind {
+        ToolExecutionKind::Subagent {
+            task: delegate_task_label(call),
+        }
+    }
+
+    async fn execute(
+        &self,
+        call: ToolCall,
+        _approval: Option<ToolApproval>,
+        context: ToolExecutionContext,
+    ) -> ToolExecution {
+        let summary = match parse_delegate_task(&call) {
+            Ok(task) if context.cancellation.is_cancelled() => {
+                SubagentExecutionSummary::failure(task, "subagent execution cancelled", 0, 0)
+            }
+            Ok(task) => self.executor.execute(task, context.cancellation).await,
+            Err(error) => {
+                SubagentExecutionSummary::failure(delegate_task_label(&call), error, 0, 0)
+            }
+        };
+        let ok = summary.error.is_none();
+        let error = summary.error.clone();
+        let content = serde_json::to_string(&DelegateTaskOutput {
+            ok,
+            task: &summary.task,
+            result: summary.result.as_deref(),
+            error: summary.error.as_deref(),
+            model_calls: summary.model_calls,
+            tool_calls: summary.tool_calls,
+            truncated: summary.truncated,
+        })
+        .expect("subagent tool output must serialize");
+
+        ToolExecution::Completed(ToolResult {
+            ok,
+            content,
+            error,
+            summary: Some(ToolExecutionSummary::subagent(summary)),
         })
     }
 }
@@ -1263,6 +1424,39 @@ fn built_in_definitions() -> Vec<ToolDefinition> {
             }),
         ),
     ]
+}
+
+fn is_research_tool(name: &str) -> bool {
+    matches!(name, "read_file" | "list_files" | "search_text")
+}
+
+fn parse_delegate_task(call: &ToolCall) -> Result<String, String> {
+    let args = parse_args::<DelegateTaskArgs>(call)?;
+    let task = args.task.trim().to_string();
+    if task.is_empty() {
+        return Err("task must not be empty".to_string());
+    }
+    let length = task.chars().count();
+    if length > MAX_SUBAGENT_TASK_CHARS {
+        return Err(format!(
+            "task must not exceed {MAX_SUBAGENT_TASK_CHARS} characters (received {length})"
+        ));
+    }
+    Ok(task)
+}
+
+fn delegate_task_label(call: &ToolCall) -> String {
+    serde_json::from_str::<DelegateTaskArgs>(&call.function.arguments)
+        .ok()
+        .map(|args| {
+            args.task
+                .trim()
+                .chars()
+                .take(MAX_SUBAGENT_TASK_CHARS)
+                .collect()
+        })
+        .filter(|task: &String| !task.is_empty())
+        .unwrap_or_else(|| "invalid delegated task".to_string())
 }
 
 fn parse_args<T: DeserializeOwned>(call: &ToolCall) -> Result<T, String> {
@@ -2507,6 +2701,19 @@ mod tests {
 
     struct TestTool(&'static str);
 
+    struct TestSubagentExecutor;
+
+    impl SubagentExecutor for TestSubagentExecutor {
+        fn execute(
+            &self,
+            task: String,
+            _cancellation: CancellationToken,
+        ) -> BoxFuture<'static, SubagentExecutionSummary> {
+            async move { SubagentExecutionSummary::success(task, "research complete", 2, 1, false) }
+                .boxed()
+        }
+    }
+
     #[async_trait]
     impl Tool for TestTool {
         fn definitions(&self) -> Vec<ToolDefinition> {
@@ -2632,6 +2839,66 @@ mod tests {
             .expect_err("duplicate must fail");
 
         assert!(matches!(error, ToolRegistryError::DuplicateTool { name } if name == "same"));
+    }
+
+    #[test]
+    fn research_registry_only_exposes_read_only_tools() {
+        let root = unique_dir("research-registry-root");
+        let registry = ToolRegistry::research(&root).expect("research registry");
+        let names = registry
+            .definitions()
+            .into_iter()
+            .map(|definition| definition.function.name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["read_file", "list_files", "search_text"]);
+        let result = completed_result(registry.execute(&call(
+            "write_file",
+            json!({"path": "blocked.txt", "content": "blocked"}),
+        )));
+        assert!(!result.ok);
+        assert!(!root.join("blocked.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn delegate_task_returns_structured_subagent_result() {
+        let mut registry = ToolRegistry::empty();
+        registry
+            .register_subagent(Arc::new(TestSubagentExecutor))
+            .expect("register subagent");
+        let call = call(
+            DELEGATE_TASK_TOOL_NAME,
+            json!({"task": "Inspect the runtime"}),
+        );
+
+        assert_eq!(
+            registry.execution_kind(&call),
+            ToolExecutionKind::Subagent {
+                task: "Inspect the runtime".to_string()
+            }
+        );
+        let ToolExecution::Completed(result) = registry.execute(&call).await else {
+            panic!("expected completed delegation");
+        };
+        assert!(result.ok);
+        assert_eq!(
+            serde_json::from_str::<Value>(&result.content).expect("subagent JSON"),
+            json!({
+                "ok": true,
+                "task": "Inspect the runtime",
+                "result": "research complete",
+                "model_calls": 2,
+                "tool_calls": 1,
+                "truncated": false
+            })
+        );
+        assert_eq!(
+            result
+                .summary
+                .and_then(|summary| summary.subagent)
+                .and_then(|summary| summary.result),
+            Some("research complete".to_string())
+        );
     }
 
     #[test]
@@ -2858,6 +3125,7 @@ mod tests {
                 PermissionProfile::for_mode(PermissionMode::WorkspaceWrite),
             )
             .expect("permission evaluator"),
+            scope: BuiltInToolScope::All,
         };
         let options = SearchOptions {
             query: "needle",
@@ -3612,6 +3880,7 @@ mod tests {
                 PermissionProfile::for_mode(PermissionMode::DangerFullAccess),
             )
             .expect("permission evaluator"),
+            scope: BuiltInToolScope::All,
         };
         let change = StagedPatchChange {
             path: path.clone(),
