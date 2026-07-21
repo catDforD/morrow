@@ -1018,7 +1018,7 @@ pub enum ServerMessage {
         running_turn: Option<RunningTurnSnapshot>,
         permissions: PermissionProfile,
     },
-    AgentEvent(AgentEventEnvelope),
+    AgentEvent(Box<AgentEventEnvelope>),
     TurnSaved {
         session: String,
         turn_index: usize,
@@ -2067,7 +2067,10 @@ impl TurnEventHandler for ServerTurnHandler {
         &mut self,
         envelope: &AgentEventEnvelope,
     ) -> Result<(), agent_runtime::RuntimeError> {
-        broadcast_message(&self.tx, ServerMessage::AgentEvent(envelope.clone()));
+        broadcast_message(
+            &self.tx,
+            ServerMessage::AgentEvent(Box::new(envelope.clone())),
+        );
         Ok(())
     }
 

@@ -1,6 +1,6 @@
 use agent_protocol::{
-    AgentEvent, ApprovalDecision, ApprovalRequest, Conversation, Message, Thread, ToolCall,
-    ToolDefinition, ToolExecutionSummary, Turn, TurnRecord, TurnStep,
+    AgentEvent, ApprovalDecision, ApprovalRequest, Conversation, Message, SubagentExecutionSummary,
+    Thread, ToolCall, ToolDefinition, ToolExecutionSummary, Turn, TurnRecord, TurnStep,
 };
 use futures_util::future::{BoxFuture, FutureExt};
 use futures_util::stream::{BoxStream, FuturesUnordered, Stream};
@@ -13,7 +13,7 @@ use std::sync::{Arc as Shared, Mutex as StdMutex};
 use std::task::{Context, Poll, Waker};
 use thiserror::Error;
 
-const DEFAULT_MAX_TOOL_ROUNDS: usize = 8;
+const DEFAULT_MAX_TOOL_ROUNDS: usize = 99;
 const MAX_CONCURRENT_TOOL_CALLS: usize = 4;
 
 #[derive(Debug, Clone)]
@@ -63,12 +63,23 @@ pub type ModelFuture = BoxFuture<'static, Result<ModelStream, ModelFailure>>;
 pub trait Model: Send + Sync {
     /// 返回拥有所有数据的 future，便于 turn 状态机跨多次 poll 持有模型请求。
     fn stream(&self, request: ModelRequest) -> ModelFuture;
+
+    /// 返回可安全共享给隔离子任务的模型副本。不支持共享的实现保持默认 `None`。
+    fn shared_clone(&self) -> Option<Shared<dyn Model>> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolExecutionMode {
     Concurrent,
     Serial,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolExecutionKind {
+    Standard,
+    Subagent { task: String },
 }
 
 #[derive(Debug, Clone)]
@@ -199,6 +210,10 @@ pub trait ToolRuntime: Send + Sync {
     fn definitions(&self) -> Vec<ToolDefinition>;
 
     fn execution_mode(&self, call: &ToolCall) -> ToolExecutionMode;
+
+    fn execution_kind(&self, _call: &ToolCall) -> ToolExecutionKind {
+        ToolExecutionKind::Standard
+    }
 
     fn execute(
         &self,
@@ -565,10 +580,20 @@ impl AgentTurnStream<'_> {
         self.turn
             .steps
             .push(TurnStep::running_tool_call(name.clone(), id.clone()));
-        self.pending.push_back(AgentEvent::ToolCallStarted {
-            id: id.clone(),
-            name: name.clone(),
-        });
+        match self.tools.execution_kind(&tool_call) {
+            ToolExecutionKind::Standard => {
+                self.pending.push_back(AgentEvent::ToolCallStarted {
+                    id: id.clone(),
+                    name: name.clone(),
+                });
+            }
+            ToolExecutionKind::Subagent { task } => {
+                self.pending.push_back(AgentEvent::SubagentStarted {
+                    id: id.clone(),
+                    task,
+                });
+            }
+        }
 
         let call_for_result = tool_call.clone();
         let execution =
@@ -674,18 +699,38 @@ impl AgentTurnStream<'_> {
         let id = tool_call.id.clone();
         let name = tool_call.function.name.clone();
         let ok = result.ok;
+        let error = result.error.clone();
         let summary = result.summary.clone();
         self.finish_tool_step(&tool_call, &result);
         let tool_message = Message::tool_result(id.clone(), result.content);
         self.conversation.push(tool_message.clone());
         self.turn_messages.push(tool_message);
 
-        self.pending.push_back(AgentEvent::ToolCallFinished {
-            id,
-            name,
-            ok,
-            summary,
-        });
+        match self.tools.execution_kind(&tool_call) {
+            ToolExecutionKind::Standard => {
+                self.pending.push_back(AgentEvent::ToolCallFinished {
+                    id,
+                    name,
+                    ok,
+                    summary,
+                });
+            }
+            ToolExecutionKind::Subagent { task } => {
+                let summary = summary
+                    .and_then(|summary| summary.subagent)
+                    .unwrap_or_else(|| SubagentExecutionSummary {
+                        task,
+                        result: None,
+                        error: error
+                            .or_else(|| (!ok).then(|| "subagent execution failed".to_string())),
+                        model_calls: 0,
+                        tool_calls: 0,
+                        truncated: false,
+                    });
+                self.pending
+                    .push_back(AgentEvent::SubagentFinished { id, ok, summary });
+            }
+        }
     }
 
     fn finish_tool_step(&mut self, tool_call: &ToolCall, result: &ToolResult) {
@@ -1127,6 +1172,60 @@ mod tests {
         }
     }
 
+    struct SubagentTestTools;
+
+    impl ToolRuntime for SubagentTestTools {
+        fn definitions(&self) -> Vec<ToolDefinition> {
+            vec![ToolDefinition::function(
+                "delegate_task",
+                "delegate a test task",
+                json!({}),
+            )]
+        }
+
+        fn execution_mode(&self, _call: &ToolCall) -> ToolExecutionMode {
+            ToolExecutionMode::Concurrent
+        }
+
+        fn execution_kind(&self, _call: &ToolCall) -> ToolExecutionKind {
+            ToolExecutionKind::Subagent {
+                task: "Inspect runtime".to_string(),
+            }
+        }
+
+        fn execute(
+            &self,
+            _call: ToolCall,
+            _approval: Option<ToolApproval>,
+            _context: ToolExecutionContext,
+        ) -> ToolFuture {
+            async {
+                let subagent = SubagentExecutionSummary::success(
+                    "Inspect runtime",
+                    "Runtime uses a reusable turn helper.",
+                    2,
+                    1,
+                    false,
+                );
+                ToolExecution::Completed(ToolResult {
+                    ok: true,
+                    content: serde_json::to_string(&json!({
+                        "ok": true,
+                        "task": &subagent.task,
+                        "result": &subagent.result,
+                        "model_calls": subagent.model_calls,
+                        "tool_calls": subagent.tool_calls,
+                        "truncated": subagent.truncated,
+                    }))
+                    .expect("subagent output"),
+                    error: None,
+                    summary: Some(ToolExecutionSummary::subagent(subagent)),
+                })
+            }
+            .boxed()
+        }
+    }
+
     impl TestTools {
         fn execute_now(&self, call: ToolCall, approval: Option<ToolApproval>) -> ToolExecution {
             let arguments: Value = match serde_json::from_str(&call.function.arguments) {
@@ -1382,6 +1481,14 @@ mod tests {
         .expect("all cancellation waiters must wake");
     }
 
+    #[test]
+    fn agent_defaults_to_two_hundred_tool_rounds() {
+        let model = ScriptedModel::new(Vec::new());
+        let agent = Agent::new(&model, "system");
+
+        assert_eq!(agent.max_tool_rounds, 200);
+    }
+
     #[tokio::test]
     async fn run_turn_emits_events_and_updates_thread() {
         let body = concat!(
@@ -1418,6 +1525,49 @@ mod tests {
             thread.messages,
             vec![Message::user("Say hi"), Message::assistant("Hello world"),]
         );
+    }
+
+    #[tokio::test]
+    async fn subagent_tools_emit_semantic_events_and_return_results_to_model() {
+        let model = ScriptedModel::new(vec![
+            ScriptedResponse::Events(vec![Ok(ModelEvent::ToolCalls(vec![ToolCall::function(
+                "call-1",
+                "delegate_task",
+                json!({"task": "Inspect runtime"}).to_string(),
+            )]))]),
+            ScriptedResponse::Events(vec![
+                Ok(ModelEvent::TextDelta("Used subagent result".to_string())),
+                Ok(ModelEvent::Completed),
+            ]),
+        ]);
+        let tools = SubagentTestTools;
+        let agent = Agent::with_tools(&model, "system", &tools);
+        let mut thread = Thread::new();
+
+        let stream = agent
+            .run_turn(&thread, "Research runtime")
+            .await
+            .expect("run turn");
+        let (events, turn) = collect_events(stream, &mut thread).await;
+
+        assert!(matches!(
+            events.as_slice(),
+            [
+                AgentEvent::TurnStarted,
+                AgentEvent::SubagentStarted { id: start_id, task },
+                AgentEvent::SubagentFinished { id: finish_id, ok: true, summary },
+                AgentEvent::TextDelta(_),
+                AgentEvent::AgentMessage(_),
+                AgentEvent::TurnCompleted,
+            ] if start_id == "call-1"
+                && finish_id == "call-1"
+                && task == "Inspect runtime"
+                && summary.result.as_deref() == Some("Runtime uses a reusable turn helper.")
+        ));
+        assert_eq!(turn.status, TurnStatus::Completed);
+        let requests = model.recorded_requests();
+        let requests = requests.lock().expect("requests lock poisoned");
+        assert!(requests[1].contains("Runtime uses a reusable turn helper."));
     }
 
     #[tokio::test]
@@ -2384,8 +2534,9 @@ mod tests {
 
     #[tokio::test]
     async fn too_many_tool_rounds_fails_without_updating_thread() {
+        const TEST_MAX_TOOL_ROUNDS: usize = 3;
         let root = unique_dir("tool-limit");
-        let bodies = (0..=DEFAULT_MAX_TOOL_ROUNDS)
+        let bodies = (0..=TEST_MAX_TOOL_ROUNDS)
             .map(|index| {
                 tool_call_body(
                     &format!("call_{index}"),
@@ -2397,7 +2548,8 @@ mod tests {
         let (base_url, requests) = spawn_recording_sse_server(bodies).await;
         let model = client(base_url);
         let tools = tools(&root);
-        let agent = Agent::with_tools(&model, "You are helpful.", &tools);
+        let mut agent = Agent::with_tools(&model, "You are helpful.", &tools);
+        agent.max_tool_rounds = TEST_MAX_TOOL_ROUNDS;
         let mut thread = Thread::new();
 
         let stream = agent.run_turn(&thread, "Loop").await.expect("run turn");
@@ -2414,6 +2566,6 @@ mod tests {
         assert_eq!(thread.messages, Vec::<Message>::new());
 
         let requests = requests.lock().expect("requests lock poisoned");
-        assert_eq!(requests.len(), DEFAULT_MAX_TOOL_ROUNDS + 1);
+        assert_eq!(requests.len(), TEST_MAX_TOOL_ROUNDS + 1);
     }
 }

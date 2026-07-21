@@ -269,11 +269,21 @@ export interface ShellCommandSummary {
   stderr_truncated: boolean
 }
 
+export interface SubagentExecutionSummary {
+  task: string
+  result?: string
+  error?: string
+  model_calls: number
+  tool_calls: number
+  truncated: boolean
+}
+
 export interface ToolExecutionSummary {
   files?: FileChangeSummary[]
   diff?: string
   shell?: ShellCommandSummary
   error?: string
+  subagent?: SubagentExecutionSummary
 }
 
 export type ApprovalAction =
@@ -306,6 +316,15 @@ export type AgentEvent =
   | { type: 'reasoning_delta'; data: string }
   | { type: 'text_delta'; data: string }
   | { type: 'agent_message'; data: string }
+  | { type: 'subagent_started'; data: { id: string; task: string } }
+  | {
+      type: 'subagent_finished'
+      data: {
+        id: string
+        ok: boolean
+        summary: SubagentExecutionSummary
+      }
+    }
   | { type: 'tool_call_started'; data: { id: string; name: string } }
   | {
       type: 'tool_call_finished'
@@ -400,7 +419,13 @@ export interface TimelineNoticeItem {
 }
 
 export type RunTraceStatus = 'running' | 'completed' | 'failed' | 'approval'
-export type RunStepKind = 'model' | 'tool' | 'approval' | 'error' | 'final'
+export type RunStepKind =
+  | 'model'
+  | 'subagent'
+  | 'tool'
+  | 'approval'
+  | 'error'
+  | 'final'
 export type RunStepStatus = 'running' | 'ok' | 'error' | 'approval'
 
 export interface RunStep {

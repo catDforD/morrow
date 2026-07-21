@@ -547,6 +547,27 @@ impl TurnEventHandler for CliTurnHandler<'_, '_> {
                 }
             }
             AgentEvent::AgentMessage(_) => {}
+            AgentEvent::SubagentStarted { task, .. } => {
+                if self.context.output == OutputMode::Human {
+                    eprintln!("subagent started: {}", compact_line(task, 120));
+                }
+            }
+            AgentEvent::SubagentFinished { ok, summary, .. } => {
+                if self.context.output == OutputMode::Human {
+                    let status = if *ok { "ok" } else { "error" };
+                    eprintln!(
+                        "subagent {status}: {} (model_calls={}, tool_calls={})",
+                        compact_line(&summary.task, 120),
+                        summary.model_calls,
+                        summary.tool_calls,
+                    );
+                }
+                self.execution_records.push(ExecutionRecord {
+                    name: "delegate_task".to_string(),
+                    ok: *ok,
+                    summary: Some(ToolExecutionSummary::subagent(summary.clone())),
+                });
+            }
             AgentEvent::ToolCallStarted { name, .. } => {
                 if self.context.output == OutputMode::Human {
                     eprintln!("tool {name} started");
@@ -959,10 +980,34 @@ fn format_execution_summary(records: &[ExecutionRecord]) -> Option<String> {
             if let Some(error) = summary.error.as_ref() {
                 let _ = writeln!(output, "  error: {error}");
             }
+            if let Some(subagent) = summary.subagent.as_ref() {
+                let _ = writeln!(output, "  task: {}", compact_line(&subagent.task, 160));
+                let _ = writeln!(
+                    output,
+                    "  subagent: model_calls={}, tool_calls={}, truncated={}",
+                    subagent.model_calls, subagent.tool_calls, subagent.truncated
+                );
+                if let Some(error) = subagent.error.as_ref() {
+                    let _ = writeln!(output, "  error: {error}");
+                }
+            }
         }
     }
 
     Some(output)
+}
+
+fn compact_line(value: &str, max_chars: usize) -> String {
+    let one_line = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() <= max_chars {
+        return one_line;
+    }
+    let mut compact = one_line
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    compact.push('…');
+    compact
 }
 
 fn append_file_list(output: &mut String, files: &[FileChangeSummary]) {
@@ -1615,7 +1660,7 @@ compact test
             .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json line"))
             .collect::<Vec<_>>();
         assert_eq!(lines.len(), 4);
-        assert_eq!(lines[0]["schema_version"], json!(2));
+        assert_eq!(lines[0]["schema_version"], json!(3));
         assert!(lines[0]["timestamp_ms"].as_u64().is_some());
         assert_eq!(lines[0]["session"], "default");
         assert_eq!(lines[0]["workspace_root"], root.display().to_string());

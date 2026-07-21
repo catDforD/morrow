@@ -873,6 +873,53 @@ pub struct ShellCommandSummary {
     pub stderr_truncated: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct SubagentExecutionSummary {
+    pub task: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub model_calls: usize,
+    pub tool_calls: usize,
+    pub truncated: bool,
+}
+
+impl SubagentExecutionSummary {
+    pub fn success(
+        task: impl Into<String>,
+        result: impl Into<String>,
+        model_calls: usize,
+        tool_calls: usize,
+        truncated: bool,
+    ) -> Self {
+        Self {
+            task: task.into(),
+            result: Some(result.into()),
+            error: None,
+            model_calls,
+            tool_calls,
+            truncated,
+        }
+    }
+
+    pub fn failure(
+        task: impl Into<String>,
+        error: impl Into<String>,
+        model_calls: usize,
+        tool_calls: usize,
+    ) -> Self {
+        Self {
+            task: task.into(),
+            result: None,
+            error: Some(error.into()),
+            model_calls,
+            tool_calls,
+            truncated: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ToolExecutionSummary {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -883,6 +930,8 @@ pub struct ToolExecutionSummary {
     pub shell: Option<ShellCommandSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subagent: Option<SubagentExecutionSummary>,
 }
 
 impl ToolExecutionSummary {
@@ -892,6 +941,7 @@ impl ToolExecutionSummary {
             diff: Some(diff.into()),
             shell: None,
             error: None,
+            subagent: None,
         }
     }
 
@@ -901,6 +951,7 @@ impl ToolExecutionSummary {
             diff: None,
             shell: Some(shell),
             error: None,
+            subagent: None,
         }
     }
 
@@ -910,6 +961,17 @@ impl ToolExecutionSummary {
             diff: None,
             shell: None,
             error: Some(error.into()),
+            subagent: None,
+        }
+    }
+
+    pub fn subagent(subagent: SubagentExecutionSummary) -> Self {
+        Self {
+            files: Vec::new(),
+            diff: None,
+            shell: None,
+            error: None,
+            subagent: Some(subagent),
         }
     }
 }
@@ -1053,6 +1115,15 @@ pub enum AgentEvent {
     ReasoningDelta(String),
     TextDelta(String),
     AgentMessage(String),
+    SubagentStarted {
+        id: String,
+        task: String,
+    },
+    SubagentFinished {
+        id: String,
+        ok: bool,
+        summary: SubagentExecutionSummary,
+    },
     ToolCallStarted {
         id: String,
         name: String,
@@ -1592,5 +1663,67 @@ mod tests {
         assert_eq!(failed.turn.status, TurnStatus::Failed);
         assert_eq!(failed.messages, vec![Message::user("Broken")]);
         assert_eq!(failed.turn.error.as_deref(), Some("model error"));
+    }
+
+    #[test]
+    fn serializes_subagent_events_and_summary() {
+        let summary = SubagentExecutionSummary::success(
+            "Inspect session storage",
+            "Sessions are scoped by workspace hash.",
+            2,
+            3,
+            false,
+        );
+        let events = vec![
+            AgentEvent::SubagentStarted {
+                id: "call-1".to_string(),
+                task: summary.task.clone(),
+            },
+            AgentEvent::SubagentFinished {
+                id: "call-1".to_string(),
+                ok: true,
+                summary: summary.clone(),
+            },
+        ];
+
+        assert_eq!(
+            serde_json::to_value(events).expect("serialize subagent events"),
+            json!([
+                {
+                    "type": "subagent_started",
+                    "data": {
+                        "id": "call-1",
+                        "task": "Inspect session storage"
+                    }
+                },
+                {
+                    "type": "subagent_finished",
+                    "data": {
+                        "id": "call-1",
+                        "ok": true,
+                        "summary": {
+                            "task": "Inspect session storage",
+                            "result": "Sessions are scoped by workspace hash.",
+                            "model_calls": 2,
+                            "tool_calls": 3,
+                            "truncated": false
+                        }
+                    }
+                }
+            ])
+        );
+        assert_eq!(
+            serde_json::to_value(ToolExecutionSummary::subagent(summary))
+                .expect("serialize subagent summary"),
+            json!({
+                "subagent": {
+                    "task": "Inspect session storage",
+                    "result": "Sessions are scoped by workspace hash.",
+                    "model_calls": 2,
+                    "tool_calls": 3,
+                    "truncated": false
+                }
+            })
+        );
     }
 }

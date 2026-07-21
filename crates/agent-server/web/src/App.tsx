@@ -56,6 +56,11 @@ import {
   isMessageScrollNearBottom,
   scrollMessageListToBottom,
 } from './messageScroll'
+import {
+  finishedSubagentStep,
+  runningSubagentStep,
+  subagentHistory,
+} from './subagentTrace'
 import SettingsView from './SettingsView'
 import type { SettingsSection, ThemePreference } from './SettingsView'
 import {
@@ -84,6 +89,7 @@ import type {
   SessionEntryResponse,
   SessionModelSelectionResponse,
   StatusResponse,
+  SubagentExecutionSummary,
   TimelineItem,
   TimelineMessageItem,
   TimelineNoticeItem,
@@ -461,6 +467,22 @@ export default function App() {
     [ensureLiveModelStep, updateRunTrace, upsertRunStep],
   )
 
+  const startSubagentStep = useCallback(
+    (id: string, task: string) => {
+      const runId = ensureLiveModelStep('ok')
+      updateRunTrace(runId, (trace) => ({
+        ...trace,
+        steps: trace.steps.map((step) =>
+          step.kind === 'model' && step.status === 'running'
+            ? { ...step, status: 'ok' }
+            : step,
+        ),
+      }))
+      upsertRunStep(runId, runningSubagentStep(id, task))
+    },
+    [ensureLiveModelStep, updateRunTrace, upsertRunStep],
+  )
+
   const finishToolStep = useCallback(
     (
       id: string,
@@ -477,6 +499,14 @@ export default function App() {
         detail: formatToolSummary(summary),
         summary,
       })
+    },
+    [ensureRunTrace, upsertRunStep],
+  )
+
+  const finishSubagentStep = useCallback(
+    (id: string, ok: boolean, summary: SubagentExecutionSummary) => {
+      const runId = ensureRunTrace('Subagent result received', summary.task)
+      upsertRunStep(runId, finishedSubagentStep(id, ok, summary))
     },
     [ensureRunTrace, upsertRunStep],
   )
@@ -689,6 +719,29 @@ export default function App() {
           }
           assistantMessageIdRef.current = null
           break
+        case 'subagent_started':
+          upsertTool(event.data.id, 'delegate_task', 'running')
+          startSubagentStep(event.data.id, event.data.task)
+          recordActivity('Subagent started', event.data.task, 'running')
+          break
+        case 'subagent_finished':
+          upsertTool(
+            event.data.id,
+            'delegate_task',
+            event.data.ok ? 'ok' : 'error',
+            { subagent: event.data.summary },
+          )
+          finishSubagentStep(
+            event.data.id,
+            event.data.ok,
+            event.data.summary,
+          )
+          recordActivity(
+            event.data.ok ? 'Subagent finished' : 'Subagent failed',
+            event.data.summary.task,
+            event.data.ok ? 'ok' : 'error',
+          )
+          break
         case 'tool_call_started':
           upsertTool(event.data.id, event.data.name, 'running')
           startToolStep(event.data.id, event.data.name)
@@ -749,11 +802,13 @@ export default function App() {
       appendReasoningDelta,
       appendAssistantDelta,
       completeCurrentRun,
+      finishSubagentStep,
       finishToolStep,
       recordActivity,
       refreshCurrentModelStep,
       setApprovalStep,
       showError,
+      startSubagentStep,
       startToolStep,
       upsertTool,
     ],
@@ -2218,6 +2273,22 @@ function RunStepDetails({ step }: { step: RunStep }) {
       {summary ? (
         <details className="run-step-details">
           <summary>Details</summary>
+          {summary.subagent ? (
+            <div className="subagent-summary">
+              <strong>{summary.subagent.task}</strong>
+              <p>
+                {summary.subagent.model_calls} model calls ·{' '}
+                {summary.subagent.tool_calls} read-only tools
+                {summary.subagent.truncated ? ' · result truncated' : ''}
+              </p>
+              {summary.subagent.result ? (
+                <pre>{summary.subagent.result}</pre>
+              ) : null}
+              {summary.subagent.error ? (
+                <pre>{summary.subagent.error}</pre>
+              ) : null}
+            </div>
+          ) : null}
           {summary.shell ? (
         <pre>
           {[
@@ -3217,18 +3288,28 @@ function historyRunTrace(
   turnIndex: number,
 ): RunTrace {
   const turn = record.turn
+  const subagents = subagentHistory(record.messages)
   const modelMessages = record.messages.filter(
     (message) => message.role === 'assistant',
   )
   let modelMessageIndex = 0
   const steps: RunStep[] = turn.steps.map((step, stepIndex) => {
+    const isSubagent =
+      step.kind === 'tool_call' && step.tool_name === 'delegate_task'
+    const subagent = step.tool_call_id
+      ? subagents.get(step.tool_call_id)
+      : undefined
     const modelMessage =
       step.kind === 'model_call'
         ? modelMessages[modelMessageIndex++]
         : undefined
     return {
       id: `history-${turnIndex}-step-${stepIndex}`,
-      kind: step.kind === 'tool_call' ? 'tool' : 'model',
+      kind: isSubagent
+        ? 'subagent'
+        : step.kind === 'tool_call'
+          ? 'tool'
+          : 'model',
       status:
         step.status === 'completed'
           ? 'ok'
@@ -3236,16 +3317,22 @@ function historyRunTrace(
             ? 'error'
             : 'running',
       title:
-        step.kind === 'tool_call'
+        isSubagent
+          ? 'Subagent'
+          : step.kind === 'tool_call'
           ? step.tool_name || 'Tool call'
           : turn.model?.model_name || 'Model call',
       detail:
+        (isSubagent && subagent?.task) ||
         step.error ||
         step.tool_call_id ||
         (turn.model
           ? `${turn.model.provider_name} · ${reasoningLabel(turn.model.reasoning)}`
           : undefined),
       reasoning: modelMessage?.reasoning_content || undefined,
+      summary: subagent?.summary
+        ? { subagent: subagent.summary }
+        : undefined,
     }
   })
 
@@ -3345,6 +3432,11 @@ function formatToolCalls(message: Message): string {
 function formatToolSummary(summary?: ToolExecutionSummary): string {
   if (!summary) return 'running'
   if (summary.error) return summary.error
+  if (summary.subagent) {
+    if (summary.subagent.error) return summary.subagent.error
+    const truncated = summary.subagent.truncated ? ' / truncated' : ''
+    return `${summary.subagent.model_calls} model calls / ${summary.subagent.tool_calls} tools${truncated}`
+  }
   const parts: string[] = []
   if (summary.shell) {
     parts.push(
@@ -3410,6 +3502,8 @@ function runStepIcon(step: RunStep): ReactNode {
     case 'final':
       return <CheckCircle2 size={18} />
     case 'model':
+      return <Bot size={18} />
+    case 'subagent':
       return <Bot size={18} />
     case 'tool':
       return step.summary?.files?.length ? (

@@ -6,23 +6,26 @@ use agent_core::{
 };
 use agent_protocol::{
     AgentEvent, ApprovalDecision, ApprovalRequest, Conversation, Message, PermissionProfile,
-    Session, ToolDefinition, TurnRecord, TurnStatus,
+    Session, SubagentExecutionSummary, Thread, ToolDefinition, TurnRecord, TurnStatus,
+    TurnStepKind,
 };
-use agent_tools::{ToolRegistry, ToolRegistryError};
+use agent_tools::{SubagentExecutor, ToolRegistry, ToolRegistryError};
 use futures_util::StreamExt;
 use futures_util::future::{BoxFuture, FutureExt};
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 pub use agent_core::CancellationToken;
 pub use agent_tools::McpToolCache;
 pub use session_store::{SessionEntry, SessionListingEntry, SessionStore, SessionStoreError};
 
-pub const EVENT_SCHEMA_VERSION: u32 = 2;
+pub const EVENT_SCHEMA_VERSION: u32 = 3;
 const MESSAGE_BASE_TOKENS: usize = 6;
 const TOOL_CALL_BASE_TOKENS: usize = 12;
 const REQUEST_PADDING_NUMERATOR: usize = 4;
@@ -36,6 +39,11 @@ const REQUIRED_SUMMARY_SECTIONS: [&str; 7] = [
     "Pending Tasks",
     "Open Questions",
 ];
+const MAX_SUBAGENTS_PER_TURN: usize = 4;
+const SUBAGENT_TIMEOUT: Duration = Duration::from_secs(300);
+const MAX_SUBAGENT_RESULT_CHARS: usize = 12_000;
+const PARENT_SUBAGENT_GUIDANCE: &str = "You may delegate up to four independent, read-only workspace investigations with delegate_task. Each delegated task must be self-contained. Issue multiple delegate_task calls in the same response when the investigations can run in parallel, and use direct tools for simple lookups.";
+const CHILD_SUBAGENT_GUIDANCE: &str = "You are a read-only research subagent working for another coding agent. Complete only the delegated task. Inspect the workspace with read_file, list_files, and search_text. Do not modify files, run commands, call external services, or delegate further. Return a concise, evidence-based report with relevant file paths or symbols and any unresolved uncertainty.";
 
 #[derive(Debug, Error)]
 pub enum RuntimeError {
@@ -109,6 +117,201 @@ pub struct McpInspectionTool {
 pub struct McpInspection {
     pub tools: Vec<McpInspectionTool>,
     pub diagnostics: Vec<String>,
+}
+
+#[derive(Clone)]
+struct RuntimeSubagentExecutor {
+    model: Arc<dyn Model>,
+    system_prompt: Arc<str>,
+    workspace_root: Arc<PathBuf>,
+    started: Arc<AtomicUsize>,
+    timeout: Duration,
+    max_result_chars: usize,
+}
+
+impl RuntimeSubagentExecutor {
+    fn new(
+        model: Arc<dyn Model>,
+        system_prompt: impl Into<Arc<str>>,
+        workspace_root: impl Into<Arc<PathBuf>>,
+    ) -> Self {
+        Self {
+            model,
+            system_prompt: system_prompt.into(),
+            workspace_root: workspace_root.into(),
+            started: Arc::new(AtomicUsize::new(0)),
+            timeout: SUBAGENT_TIMEOUT,
+            max_result_chars: MAX_SUBAGENT_RESULT_CHARS,
+        }
+    }
+
+    async fn execute_inner(
+        self,
+        task: String,
+        parent_cancellation: CancellationToken,
+    ) -> SubagentExecutionSummary {
+        if self
+            .started
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |started| {
+                (started < MAX_SUBAGENTS_PER_TURN).then_some(started + 1)
+            })
+            .is_err()
+        {
+            return SubagentExecutionSummary::failure(
+                task,
+                format!("subagent limit exceeded ({MAX_SUBAGENTS_PER_TURN} per turn)"),
+                0,
+                0,
+            );
+        }
+
+        let child_cancellation = CancellationToken::new();
+        let run = self.run_task(task.clone(), child_cancellation.clone());
+        tokio::pin!(run);
+
+        tokio::select! {
+            biased;
+            _ = parent_cancellation.cancelled() => {
+                child_cancellation.cancel();
+                let summary = run.await;
+                fail_subagent_summary(summary, "subagent execution cancelled")
+            }
+            _ = tokio::time::sleep(self.timeout) => {
+                child_cancellation.cancel();
+                let summary = run.await;
+                fail_subagent_summary(
+                    summary,
+                    format!("subagent timed out after {} seconds", self.timeout.as_secs()),
+                )
+            }
+            summary = &mut run => summary,
+        }
+    }
+
+    async fn run_task(
+        &self,
+        task: String,
+        cancellation: CancellationToken,
+    ) -> SubagentExecutionSummary {
+        let tools = match ToolRegistry::research(self.workspace_root.as_ref()) {
+            Ok(tools) => tools,
+            Err(error) => {
+                return SubagentExecutionSummary::failure(task, error.to_string(), 0, 0);
+            }
+        };
+        let system_prompt = format!("{}\n\n{CHILD_SUBAGENT_GUIDANCE}", self.system_prompt);
+        let agent = Agent::with_tools(self.model.as_ref(), system_prompt, &tools);
+        let mut stream = match agent
+            .run_turn_with_context(
+                &Thread::new(),
+                task.clone(),
+                ToolExecutionContext {
+                    cancellation: cancellation.clone(),
+                },
+            )
+            .await
+        {
+            Ok(stream) => stream,
+            Err(error) => {
+                return SubagentExecutionSummary::failure(task, error.to_string(), 0, 0);
+            }
+        };
+
+        let mut cancellation_observed = false;
+        loop {
+            let event = if cancellation_observed {
+                stream.next().await
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => {
+                        stream.cancel();
+                        cancellation_observed = true;
+                        continue;
+                    }
+                    event = stream.next() => event,
+                }
+            };
+            let Some(event) = event else {
+                break;
+            };
+            if let AgentEvent::ApprovalRequested(request) = event
+                && let Err(error) = stream.resolve_approval(ApprovalDecision::deny(request.id))
+            {
+                stream.cancel_with_reason(error);
+                cancellation_observed = true;
+            }
+        }
+
+        let record = stream.into_turn_record();
+        let model_calls = record
+            .turn
+            .steps
+            .iter()
+            .filter(|step| step.kind == TurnStepKind::ModelCall)
+            .count();
+        let tool_calls = record
+            .turn
+            .steps
+            .iter()
+            .filter(|step| step.kind == TurnStepKind::ToolCall)
+            .count();
+        if record.turn.status != TurnStatus::Completed {
+            return SubagentExecutionSummary::failure(
+                task,
+                record
+                    .turn
+                    .error
+                    .unwrap_or_else(|| "subagent turn failed".to_string()),
+                model_calls,
+                tool_calls,
+            );
+        }
+
+        let Some(result) = record
+            .turn
+            .assistant_message
+            .and_then(|message| message.content)
+            .filter(|result| !result.trim().is_empty())
+        else {
+            return SubagentExecutionSummary::failure(
+                task,
+                "subagent returned an empty result",
+                model_calls,
+                tool_calls,
+            );
+        };
+        let (result, truncated) = truncate_chars(result, self.max_result_chars);
+        SubagentExecutionSummary::success(task, result, model_calls, tool_calls, truncated)
+    }
+}
+
+impl SubagentExecutor for RuntimeSubagentExecutor {
+    fn execute(
+        &self,
+        task: String,
+        cancellation: CancellationToken,
+    ) -> BoxFuture<'static, SubagentExecutionSummary> {
+        let executor = self.clone();
+        async move { executor.execute_inner(task, cancellation).await }.boxed()
+    }
+}
+
+fn fail_subagent_summary(
+    mut summary: SubagentExecutionSummary,
+    error: impl Into<String>,
+) -> SubagentExecutionSummary {
+    summary.result = None;
+    summary.error = Some(error.into());
+    summary.truncated = false;
+    summary
+}
+
+fn truncate_chars(value: String, max_chars: usize) -> (String, bool) {
+    if value.chars().count() <= max_chars {
+        return (value, false);
+    }
+    (value.chars().take(max_chars).collect(), true)
 }
 
 pub async fn inspect_mcp_servers(
@@ -193,7 +396,18 @@ async fn run_agent_turn_inner(
         return Ok(record_cancelled_turn(session, prompt));
     };
     let build = build?;
-    let tools = build.registry;
+    let mut tools = build.registry;
+    let diagnostics = build.diagnostics;
+    let effective_system_prompt = if let Some(model) = context.client.shared_clone() {
+        tools.register_subagent(Arc::new(RuntimeSubagentExecutor::new(
+            model,
+            Arc::<str>::from(context.system_prompt),
+            Arc::new(context.workspace_root.to_path_buf()),
+        )))?;
+        format!("{}\n\n{PARENT_SUBAGENT_GUIDANCE}", context.system_prompt)
+    } else {
+        context.system_prompt.to_string()
+    };
     let tool_definitions = tools.definitions();
 
     let compaction = tokio::select! {
@@ -201,7 +415,7 @@ async fn run_agent_turn_inner(
         _ = cancellation.cancelled() => None,
         result = maybe_auto_compact_with_tools(
             context.client,
-            context.system_prompt,
+            &effective_system_prompt,
             session,
             context.context_config,
             context.model_limits,
@@ -221,13 +435,13 @@ async fn run_agent_turn_inner(
         });
     }
 
-    let agent = Agent::with_tools(context.client, context.system_prompt.to_string(), &tools);
+    let agent = Agent::with_tools(context.client, effective_system_prompt, &tools);
     let mut agent_error = None;
     let mut handler_error = None;
     let mut turn_completed = false;
     let mut event_index = 0;
 
-    for diagnostic in build.diagnostics {
+    for diagnostic in diagnostics {
         let envelope = make_event_envelope(
             context.session_name,
             context.workspace_root,
@@ -290,6 +504,8 @@ async fn run_agent_turn_inner(
                 | AgentEvent::ReasoningDelta(_)
                 | AgentEvent::TextDelta(_)
                 | AgentEvent::AgentMessage(_)
+                | AgentEvent::SubagentStarted { .. }
+                | AgentEvent::SubagentFinished { .. }
                 | AgentEvent::ToolCallStarted { .. }
                 | AgentEvent::ToolCallFinished { .. }
                 | AgentEvent::ApprovalRequested(_)
@@ -1200,6 +1416,50 @@ compact test
         }
     }
 
+    #[derive(Clone)]
+    struct ConstantModel {
+        text: String,
+    }
+
+    impl Model for ConstantModel {
+        fn stream(&self, _request: ModelRequest) -> agent_core::ModelFuture {
+            let text = self.text.clone();
+            async move {
+                let stream: agent_core::ModelStream = futures_util::stream::iter(vec![
+                    Ok(ModelEvent::TextDelta(text)),
+                    Ok(ModelEvent::Completed),
+                ])
+                .boxed();
+                Ok(stream)
+            }
+            .boxed()
+        }
+    }
+
+    #[derive(Clone)]
+    struct GatedModel {
+        started: Arc<AtomicUsize>,
+        release: Arc<tokio::sync::Barrier>,
+    }
+
+    impl Model for GatedModel {
+        fn stream(&self, _request: ModelRequest) -> agent_core::ModelFuture {
+            let started = Arc::clone(&self.started);
+            let release = Arc::clone(&self.release);
+            async move {
+                started.fetch_add(1, Ordering::AcqRel);
+                release.wait().await;
+                let stream: agent_core::ModelStream = futures_util::stream::iter(vec![
+                    Ok(ModelEvent::TextDelta("done".to_string())),
+                    Ok(ModelEvent::Completed),
+                ])
+                .boxed();
+                Ok(stream)
+            }
+            .boxed()
+        }
+    }
+
     struct CancelOnTurnStarted {
         cancellation: CancellationToken,
         events: Vec<AgentEventEnvelope>,
@@ -1253,6 +1513,117 @@ compact test
         assert_eq!(envelope.turn_index, 7);
         assert_eq!(envelope.event_index, 3);
         assert_eq!(envelope.event, AgentEvent::TurnStarted);
+    }
+
+    #[tokio::test]
+    async fn subagent_executor_runs_four_tasks_concurrently_and_rejects_the_fifth() {
+        let root = unique_dir("subagent-limit");
+        let started = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Barrier::new(MAX_SUBAGENTS_PER_TURN + 1));
+        let executor = RuntimeSubagentExecutor::new(
+            Arc::new(GatedModel {
+                started: Arc::clone(&started),
+                release: Arc::clone(&release),
+            }),
+            Arc::<str>::from("system"),
+            Arc::new(root),
+        );
+        let cancellation = CancellationToken::new();
+        let futures = (0..MAX_SUBAGENTS_PER_TURN)
+            .map(|index| executor.execute(format!("task {index}"), cancellation.clone()))
+            .collect::<Vec<_>>();
+        let join = tokio::spawn(async move { futures_util::future::join_all(futures).await });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while started.load(Ordering::Acquire) < MAX_SUBAGENTS_PER_TURN {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all subagents should start concurrently");
+        release.wait().await;
+        let summaries = join.await.expect("join subagents");
+        assert!(summaries.iter().all(|summary| summary.error.is_none()));
+
+        let rejected = executor
+            .execute("fifth task".to_string(), cancellation)
+            .await;
+        assert_eq!(
+            rejected.error.as_deref(),
+            Some("subagent limit exceeded (4 per turn)")
+        );
+        assert_eq!(started.load(Ordering::Acquire), MAX_SUBAGENTS_PER_TURN);
+    }
+
+    #[tokio::test]
+    async fn subagent_timeout_does_not_cancel_the_parent_token() {
+        let root = unique_dir("subagent-timeout");
+        let mut executor = RuntimeSubagentExecutor::new(
+            Arc::new(PendingModel),
+            Arc::<str>::from("system"),
+            Arc::new(root),
+        );
+        executor.timeout = Duration::from_millis(10);
+        let parent_cancellation = CancellationToken::new();
+
+        let summary = executor
+            .execute("wait forever".to_string(), parent_cancellation.clone())
+            .await;
+
+        assert!(
+            summary
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("timed out"))
+        );
+        assert!(!parent_cancellation.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn parent_cancellation_stops_a_running_subagent() {
+        let root = unique_dir("subagent-cancel");
+        let executor = RuntimeSubagentExecutor::new(
+            Arc::new(PendingModel),
+            Arc::<str>::from("system"),
+            Arc::new(root),
+        );
+        let parent_cancellation = CancellationToken::new();
+        let run = executor.execute("wait forever".to_string(), parent_cancellation.clone());
+        let worker = tokio::spawn(run);
+
+        tokio::task::yield_now().await;
+        parent_cancellation.cancel();
+        let summary = tokio::time::timeout(Duration::from_secs(1), worker)
+            .await
+            .expect("cancelled subagent should stop")
+            .expect("subagent worker");
+
+        assert_eq!(
+            summary.error.as_deref(),
+            Some("subagent execution cancelled")
+        );
+    }
+
+    #[tokio::test]
+    async fn subagent_results_are_truncated_on_unicode_boundaries() {
+        let root = unique_dir("subagent-truncate");
+        let mut executor = RuntimeSubagentExecutor::new(
+            Arc::new(ConstantModel {
+                text: "甲乙丙丁".to_string(),
+            }),
+            Arc::<str>::from("system"),
+            Arc::new(root),
+        );
+        executor.max_result_chars = 3;
+
+        let summary = executor
+            .execute("unicode result".to_string(), CancellationToken::new())
+            .await;
+
+        assert_eq!(summary.result.as_deref(), Some("甲乙丙"));
+        assert!(summary.truncated);
+        assert_eq!(summary.model_calls, 1);
+        assert_eq!(summary.tool_calls, 0);
     }
 
     #[test]
@@ -1428,6 +1799,99 @@ compact test
             handler.events[1].event,
             AgentEvent::TextDelta("ok".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn delegate_task_runs_an_isolated_read_only_subagent() {
+        let root = unique_dir("subagent-success");
+        fs::write(root.join("note.txt"), "workspace evidence\n").expect("write note");
+        let (base_url, requests) = spawn_recording_sse_server(vec![
+            tool_call_body(
+                "delegate-1",
+                "delegate_task",
+                json!({"task": "Read note.txt and report the evidence"}),
+            ),
+            tool_call_body(
+                "read-1",
+                "read_file",
+                json!({"path": "note.txt", "max_lines": 20}),
+            ),
+            sse_text_body("The file contains workspace evidence."),
+            sse_text_body("The subagent confirmed the workspace evidence."),
+        ])
+        .await;
+        let client = client(base_url);
+        let mut session = Session::new();
+        let mut handler = RecordingHandler::default();
+        let mcp_cache = McpToolCache::new();
+
+        let outcome = run_agent_turn(
+            RunAgentTurnContext {
+                client: &client,
+                system_prompt: "project policy",
+                context_config: context_config(2),
+                model_limits: model_limits(100_000),
+                workspace_root: &root,
+                permissions: PermissionProfile::for_mode(
+                    agent_protocol::PermissionMode::DangerFullAccess,
+                ),
+                mcp_servers: &[],
+                mcp_cache: &mcp_cache,
+                session_name: "default",
+                turn_index: 0,
+            },
+            &mut session,
+            "Use a subagent to inspect the note",
+            &mut handler,
+        )
+        .await
+        .expect("run delegated turn");
+
+        assert_eq!(outcome.error, None);
+        assert_eq!(session.turns.len(), 1);
+        assert_eq!(session.turns[0].turn.status, TurnStatus::Completed);
+        assert_eq!(session.turns[0].messages.len(), 4);
+        assert!(session.turns[0].messages.iter().any(|message| {
+            message.role == agent_protocol::Role::Tool
+                && message.content.as_deref().is_some_and(|content| {
+                    content.contains("The file contains workspace evidence.")
+                })
+        }));
+        assert!(!session.turns[0].messages.iter().any(|message| {
+            message
+                .content
+                .as_deref()
+                .is_some_and(|content| content == "workspace evidence\n")
+        }));
+        assert!(handler.events.iter().any(|event| matches!(
+            &event.event,
+            AgentEvent::SubagentStarted { id, task }
+                if id == "delegate-1" && task == "Read note.txt and report the evidence"
+        )));
+        assert!(handler.events.iter().any(|event| matches!(
+            &event.event,
+            AgentEvent::SubagentFinished { id, ok: true, summary }
+                if id == "delegate-1"
+                    && summary.model_calls == 2
+                    && summary.tool_calls == 1
+                    && summary.result.as_deref() == Some("The file contains workspace evidence.")
+        )));
+
+        let requests = requests.lock().expect("requests lock poisoned");
+        assert_eq!(requests.len(), 4);
+        assert!(requests[0].contains("delegate_task"));
+        assert!(requests[0].contains(PARENT_SUBAGENT_GUIDANCE));
+        assert!(requests[1].contains("Read note.txt and report the evidence"));
+        assert!(requests[1].contains(CHILD_SUBAGENT_GUIDANCE));
+        assert!(requests[1].contains("read_file"));
+        assert!(requests[1].contains("list_files"));
+        assert!(requests[1].contains("search_text"));
+        assert!(!requests[1].contains("delegate_task"));
+        assert!(!requests[1].contains("write_file"));
+        assert!(!requests[1].contains("shell_command"));
+        assert!(!requests[1].contains("Use a subagent to inspect the note"));
+        assert!(requests[2].contains("workspace evidence"));
+        assert!(requests[3].contains("The file contains workspace evidence."));
     }
 
     #[tokio::test]
