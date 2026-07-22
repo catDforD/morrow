@@ -27,6 +27,7 @@ describe('subagentHistory', () => {
         tool_call_id: 'call-1',
         content: JSON.stringify({
           ok: true,
+          agent_id: 'builtin-01',
           agent_name: '后藤一里',
           task: 'Inspect session storage',
           result: 'Sessions are stored by workspace hash.',
@@ -39,8 +40,10 @@ describe('subagentHistory', () => {
 
     expect(subagentHistory(messages).get('call-1')).toEqual({
       task: 'Inspect session storage',
+      agentId: 'builtin-01',
       agentName: '后藤一里',
       summary: {
+        agent_id: 'builtin-01',
         agent_name: '后藤一里',
         task: 'Inspect session storage',
         result: 'Sessions are stored by workspace hash.',
@@ -111,15 +114,18 @@ describe('subagentHistory', () => {
   })
 
   it('builds live running and completed subagent steps', () => {
-    expect(runningSubagentStep('call-3', '后藤一里', 'Inspect events')).toEqual({
+    expect(runningSubagentStep('call-3', 'builtin-01', '后藤一里', 'Inspect events')).toEqual({
       id: 'call-3',
       kind: 'subagent',
       status: 'running',
       title: '子智能体 · 后藤一里',
       detail: 'Inspect events',
+      agentId: 'builtin-01',
+      agentName: '后藤一里',
     })
     expect(
       finishedSubagentStep('call-3', true, {
+        agent_id: 'builtin-01',
         agent_name: '后藤一里',
         task: 'Inspect events',
         result: 'Events use schema version 3.',
@@ -133,8 +139,11 @@ describe('subagentHistory', () => {
       status: 'ok',
       title: '子智能体 · 后藤一里',
       detail: 'Inspect events',
+      agentId: 'builtin-01',
+      agentName: '后藤一里',
       summary: {
         subagent: {
+          agent_id: 'builtin-01',
           agent_name: '后藤一里',
           task: 'Inspect events',
           result: 'Events use schema version 3.',

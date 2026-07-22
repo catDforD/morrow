@@ -1927,9 +1927,19 @@ a:focus-visible {
   border: 2px solid var(--border);
   border-radius: 50%;
   background: var(--surface-panel-muted);
+  overflow: hidden;
+}
+
+.run-step-icon img {
+  width: 100%;
+  height: 100%;
+  display: block;
+  border-radius: inherit;
+  object-fit: cover;
 }
 
 .run-step.subagent .run-step-icon {
+  border-color: var(--border);
   border-radius: 7px;
 }
 
@@ -4115,6 +4125,82 @@ a:focus-visible {
   box-shadow: none;
 }
 
+.subagent-profile-row {
+  grid-template-columns: 38px minmax(0, 1fr) auto;
+}
+
+.subagent-profile-avatar {
+  width: 36px;
+  height: 36px;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  border: 1.5px solid color-mix(in srgb, var(--border), transparent 32%);
+  border-radius: 7px;
+  background: var(--surface-panel-muted);
+}
+
+.subagent-profile-avatar.large {
+  width: 96px;
+  height: 96px;
+  flex: 0 0 auto;
+  border-width: 2px;
+  border-radius: 12px;
+}
+
+.subagent-profile-avatar img {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: cover;
+}
+
+.subagent-avatar-editor {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  border: 1.5px solid color-mix(in srgb, var(--border), transparent 58%);
+  border-radius: var(--radius);
+  background: var(--surface-panel-muted);
+  padding: 16px;
+}
+
+.subagent-avatar-actions {
+  min-width: 0;
+  display: grid;
+  gap: 7px;
+}
+
+.subagent-avatar-actions > strong {
+  font-size: 12px;
+}
+
+.subagent-avatar-actions > p,
+.subagent-store-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.subagent-avatar-actions > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.subagent-avatar-actions button {
+  min-height: 34px;
+  padding: 0 10px;
+  font-size: 10px;
+  font-weight: 800;
+}
+
+.subagent-store-note {
+  padding: 0 3px;
+}
+
 .command-name-input {
   height: 39px;
   display: grid;
@@ -4457,6 +4543,15 @@ a:focus-visible {
 
   .resource-list-row {
     grid-template-columns: 36px minmax(0, 1fr);
+  }
+
+  .subagent-profile-row {
+    grid-template-columns: 36px minmax(0, 1fr) auto;
+  }
+
+  .subagent-avatar-editor {
+    align-items: flex-start;
+    flex-direction: column;
   }
 
   .resource-list-row > .resource-status {

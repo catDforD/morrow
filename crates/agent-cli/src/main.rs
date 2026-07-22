@@ -5,7 +5,7 @@ use agent_model::{ModelError, OpenAiCompatClient, OpenAiCompatConfig};
 use agent_protocol::{
     AgentEvent, ApprovalAction, ApprovalDecision, ApprovalRequest, FileChangeSummary,
     ModelInvocation, PermissionMode, PermissionProfile, ReasoningLevel, Session,
-    ShellCommandSummary, ShellPolicy, ToolExecutionSummary,
+    ShellCommandSummary, ShellPolicy, SubagentIdentity, ToolExecutionSummary,
 };
 use agent_runtime::{
     AgentEventEnvelope, CompactionOutcome, McpToolCache, RunAgentTurnOutcome, SessionStore,
@@ -117,6 +117,8 @@ enum CliError {
     SessionStore(#[from] agent_runtime::SessionStoreError),
     #[error(transparent)]
     Server(#[from] agent_server::ServerError),
+    #[error(transparent)]
+    SubagentSettings(#[from] agent_server::SubagentRegistryError),
     #[error("agent run failed: {0}")]
     AgentRun(String),
     #[error("--session and --thread cannot be used together")]
@@ -204,6 +206,8 @@ async fn run() -> Result<(), CliError> {
     }
 
     let reset_session = args.reset_session || args.reset_thread;
+    let home = dirs::home_dir().ok_or(CliError::HomeDirNotFound)?;
+    let subagent_store_path = home.join(".morrow").join("subagents.json");
     let loaded = load_config(args.config.as_deref())?;
     let model_limits = loaded.config.model.context_limits();
     let model_invocation = config_model_invocation(&loaded.config.model.model);
@@ -238,6 +242,7 @@ async fn run() -> Result<(), CliError> {
                 config_path: &loaded.path,
                 mcp_servers: &loaded.config.mcp_servers,
                 mcp_cache: &mcp_cache,
+                subagent_store_path: &subagent_store_path,
             },
             &mut session,
             &mut permissions,
@@ -247,10 +252,12 @@ async fn run() -> Result<(), CliError> {
     }
 
     let mut stdout = io::stdout().lock();
+    let subagent_identities = agent_server::load_subagent_identities(&subagent_store_path)?;
     let outcome = run_agent_turn(
         RunAgentTurnContext {
             client: &client,
             model: &model_invocation,
+            subagent_identities: &subagent_identities,
             system_prompt: &loaded.config.agent.system_prompt,
             context_config: loaded.config.context,
             model_limits,
@@ -296,12 +303,14 @@ struct ReplContext<'a> {
     config_path: &'a Path,
     mcp_servers: &'a [McpServerConfig],
     mcp_cache: &'a McpToolCache,
+    subagent_store_path: &'a Path,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct RunAgentTurnContext<'a> {
     client: &'a OpenAiCompatClient,
     model: &'a ModelInvocation,
+    subagent_identities: &'a [SubagentIdentity],
     system_prompt: &'a str,
     context_config: ContextConfig,
     model_limits: ModelContextLimits,
@@ -364,10 +373,13 @@ async fn run_repl(
         }
 
         let mut stdout = io::stdout().lock();
+        let subagent_identities =
+            agent_server::load_subagent_identities(context.subagent_store_path)?;
         let outcome = run_agent_turn(
             RunAgentTurnContext {
                 client: context.client,
                 model: context.model,
+                subagent_identities: &subagent_identities,
                 system_prompt: context.system_prompt,
                 context_config: context.context_config,
                 model_limits: context.model_limits,
@@ -485,6 +497,7 @@ async fn run_agent_turn(
         agent_runtime::RunAgentTurnContext {
             client: context.client,
             model: context.model,
+            subagent_identities: context.subagent_identities,
             system_prompt: context.system_prompt,
             context_config: context.context_config,
             model_limits: context.model_limits,
@@ -535,6 +548,7 @@ impl TurnEventHandler for CliTurnHandler<'_, '_> {
 
         match &envelope.event {
             AgentEvent::TurnStarted => {}
+            AgentEvent::ModelCallStarted => {}
             AgentEvent::Warning(message) => {
                 if self.context.output == OutputMode::Human {
                     eprintln!("warning: {message}");
@@ -1646,6 +1660,7 @@ compact test
             RunAgentTurnContext {
                 client: &client,
                 model: test_model_invocation(),
+                subagent_identities: &[],
                 system_prompt: "system",
                 context_config: context_config(2),
                 model_limits: model_limits(10_000),
@@ -1697,6 +1712,7 @@ compact test
             RunAgentTurnContext {
                 client: &client,
                 model: test_model_invocation(),
+                subagent_identities: &[],
                 system_prompt: "system",
                 context_config: context_config(2),
                 model_limits: model_limits(10_000),
@@ -1723,23 +1739,24 @@ compact test
             .lines()
             .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json line"))
             .collect::<Vec<_>>();
-        assert_eq!(lines.len(), 4);
-        assert_eq!(lines[0]["schema_version"], json!(4));
+        assert_eq!(lines.len(), 5);
+        assert_eq!(lines[0]["schema_version"], json!(6));
         assert!(lines[0]["timestamp_ms"].as_u64().is_some());
         assert_eq!(lines[0]["session"], "default");
         assert_eq!(lines[0]["workspace_root"], root.display().to_string());
         assert_eq!(lines[0]["turn_index"], json!(0));
         assert_eq!(lines[0]["event_index"], json!(0));
         assert_eq!(lines[0]["event"], json!({"type": "turn_started"}));
+        assert_eq!(lines[1]["event"], json!({"type": "model_call_started"}));
         assert_eq!(
-            lines[1]["event"],
+            lines[2]["event"],
             json!({"type": "text_delta", "data": "ok"})
         );
         assert_eq!(
-            lines[2]["event"],
+            lines[3]["event"],
             json!({"type": "agent_message", "data": "ok"})
         );
-        assert_eq!(lines[3]["event"], json!({"type": "turn_completed"}));
+        assert_eq!(lines[4]["event"], json!({"type": "turn_completed"}));
     }
 
     #[test]
@@ -1752,6 +1769,7 @@ compact test
             3,
             AgentEvent::SubagentStarted {
                 id: "call-1".to_string(),
+                agent_id: Some("builtin-01".to_string()),
                 agent_name: Some("后藤一里".to_string()),
                 task: "Inspect runtime".to_string(),
             },
@@ -1761,13 +1779,14 @@ compact test
         write_jsonl_event(&mut output, &envelope).expect("write JSONL event");
 
         let value: serde_json::Value = serde_json::from_slice(&output).expect("parse JSONL event");
-        assert_eq!(value["schema_version"], json!(4));
+        assert_eq!(value["schema_version"], json!(6));
         assert_eq!(
             value["event"],
             json!({
                 "type": "subagent_started",
                 "data": {
                     "id": "call-1",
+                    "agent_id": "builtin-01",
                     "agent_name": "后藤一里",
                     "task": "Inspect runtime"
                 }
@@ -1801,6 +1820,7 @@ compact test
             RunAgentTurnContext {
                 client: &client,
                 model: test_model_invocation(),
+                subagent_identities: &[],
                 system_prompt: "system",
                 context_config: context_config(2),
                 model_limits: model_limits(10_000),
@@ -1861,6 +1881,7 @@ compact test
             RunAgentTurnContext {
                 client: &client,
                 model: test_model_invocation(),
+                subagent_identities: &[],
                 system_prompt: "system",
                 context_config: context_config(2),
                 model_limits: model_limits(10_000),
@@ -1911,6 +1932,7 @@ compact test
             RunAgentTurnContext {
                 client: &client,
                 model: test_model_invocation(),
+                subagent_identities: &[],
                 system_prompt: "system",
                 context_config: context_config(2),
                 model_limits: model_limits(1),

@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-pub const REMOTE_PROTOCOL_VERSION: u32 = 1;
+pub const REMOTE_PROTOCOL_VERSION: u32 = 2;
 pub const REMOTE_MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -164,6 +164,47 @@ pub enum RemoteTurnModel {
     Managed(RemoteModelSpec),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
+pub struct SubagentIdentity {
+    pub id: String,
+    pub name: String,
+}
+
+pub fn default_subagent_identities() -> Vec<SubagentIdentity> {
+    const NAMES: &[&str] = &[
+        "后藤一里",
+        "山田凉",
+        "喜多郁代",
+        "伊地知虹夏",
+        "中野梓",
+        "平泽唯",
+        "琴吹䌷",
+        "秋山澪",
+        "田井中律",
+        "井芹仁菜",
+        "河原木桃香",
+        "安和昴",
+        "海老冢智",
+        "露帕",
+        "高松灯",
+        "千早爱音",
+        "要乐奈",
+        "长崎爽世",
+        "椎名立希",
+        "丰川祥子",
+        "若叶睦",
+        "三角初华",
+    ];
+    NAMES
+        .iter()
+        .enumerate()
+        .map(|(index, name)| SubagentIdentity {
+            id: format!("builtin-{:02}", index + 1),
+            name: (*name).to_string(),
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct RemoteTurnSpec {
     pub session: String,
@@ -172,6 +213,7 @@ pub struct RemoteTurnSpec {
     pub permission_mode: Option<PermissionMode>,
     pub model: RemoteTurnModel,
     pub managed_mcp_servers: Vec<RemoteMcpServerSpec>,
+    pub subagent_identities: Vec<SubagentIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -876,6 +918,8 @@ pub struct ShellCommandSummary {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct SubagentExecutionSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_name: Option<String>,
     pub task: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -896,6 +940,7 @@ impl SubagentExecutionSummary {
         truncated: bool,
     ) -> Self {
         Self {
+            agent_id: None,
             agent_name: None,
             task: task.into(),
             result: Some(result.into()),
@@ -913,6 +958,7 @@ impl SubagentExecutionSummary {
         tool_calls: usize,
     ) -> Self {
         Self {
+            agent_id: None,
             agent_name: None,
             task: task.into(),
             result: None,
@@ -925,6 +971,12 @@ impl SubagentExecutionSummary {
 
     pub fn with_agent_name(mut self, agent_name: impl Into<String>) -> Self {
         self.agent_name = Some(agent_name.into());
+        self
+    }
+
+    pub fn with_agent_identity(mut self, identity: &SubagentIdentity) -> Self {
+        self.agent_id = Some(identity.id.clone());
+        self.agent_name = Some(identity.name.clone());
         self
     }
 }
@@ -1120,12 +1172,15 @@ impl TurnRecord {
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum AgentEvent {
     TurnStarted,
+    ModelCallStarted,
     Warning(String),
     ReasoningDelta(String),
     TextDelta(String),
     AgentMessage(String),
     SubagentStarted {
         id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_name: Option<String>,
         task: String,
@@ -1198,6 +1253,36 @@ mod tests {
         assert!(!debug.contains("mcp-env-secret"));
         assert!(!debug.contains("mcp-header-secret"));
         assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn remote_turn_protocol_v2_carries_subagent_identities_without_avatars() {
+        assert_eq!(REMOTE_PROTOCOL_VERSION, 2);
+        let turn = RemoteTurnSpec {
+            session: "default".to_string(),
+            request_id: "request-1".to_string(),
+            prompt: "inspect".to_string(),
+            permission_mode: None,
+            model: RemoteTurnModel::WorkspaceFallback {
+                selection: ModelSelection {
+                    provider_id: "provider".to_string(),
+                    model_id: "model".to_string(),
+                    reasoning: ReasoningLevel::Off,
+                },
+            },
+            managed_mcp_servers: Vec::new(),
+            subagent_identities: vec![SubagentIdentity {
+                id: "builtin-01".to_string(),
+                name: "后藤一里".to_string(),
+            }],
+        };
+
+        let value = serde_json::to_value(turn).expect("serialize remote turn");
+        assert_eq!(
+            value["subagent_identities"],
+            json!([{"id": "builtin-01", "name": "后藤一里"}])
+        );
+        assert!(!value.to_string().contains("avatar"));
     }
 
     #[test]
@@ -1433,6 +1518,14 @@ mod tests {
                 "type": "warning",
                 "data": "mcp server docs: failed to start"
             })
+        );
+    }
+
+    #[test]
+    fn serializes_model_call_started_event() {
+        assert_eq!(
+            serde_json::to_value(AgentEvent::ModelCallStarted).expect("serialize model call event"),
+            json!({"type": "model_call_started"})
         );
     }
 
@@ -1685,10 +1778,14 @@ mod tests {
             3,
             false,
         )
-        .with_agent_name("后藤一里");
+        .with_agent_identity(&SubagentIdentity {
+            id: "builtin-01".to_string(),
+            name: "后藤一里".to_string(),
+        });
         let events = vec![
             AgentEvent::SubagentStarted {
                 id: "call-1".to_string(),
+                agent_id: summary.agent_id.clone(),
                 agent_name: summary.agent_name.clone(),
                 task: summary.task.clone(),
             },
@@ -1706,6 +1803,7 @@ mod tests {
                     "type": "subagent_started",
                     "data": {
                         "id": "call-1",
+                        "agent_id": "builtin-01",
                         "agent_name": "后藤一里",
                         "task": "Inspect session storage"
                     }
@@ -1716,6 +1814,7 @@ mod tests {
                         "id": "call-1",
                         "ok": true,
                         "summary": {
+                            "agent_id": "builtin-01",
                             "agent_name": "后藤一里",
                             "task": "Inspect session storage",
                             "result": "Sessions are scoped by workspace hash.",
@@ -1732,6 +1831,7 @@ mod tests {
                 .expect("serialize subagent summary"),
             json!({
                 "subagent": {
+                    "agent_id": "builtin-01",
                     "agent_name": "后藤一里",
                     "task": "Inspect session storage",
                     "result": "Sessions are scoped by workspace hash.",
@@ -1753,6 +1853,7 @@ mod tests {
         assert!(matches!(
             legacy_event,
             AgentEvent::SubagentStarted {
+                agent_id: None,
                 agent_name: None,
                 ..
             }

@@ -1,8 +1,12 @@
 // @vitest-environment jsdom
 
 import { describe, expect, it } from 'vitest'
-import { modelStepPresentation } from './App'
-import type { ModelSelection, ModelSettingsResponse } from './types'
+import { completeRunningModelStep, modelStepPresentation } from './App'
+import type {
+  ModelSelection,
+  ModelSettingsResponse,
+  RunTrace,
+} from './types'
 
 const selection: ModelSelection = {
   provider_id: 'opencode',
@@ -49,6 +53,40 @@ describe('modelStepPresentation', () => {
   it('falls back only when the model cannot be resolved', () => {
     expect(modelStepPresentation(settings, null)).toEqual({
       title: 'Model call',
+    })
+  })
+})
+
+describe('completeRunningModelStep', () => {
+  it('does not create duplicate model rows for one concurrent tool batch', () => {
+    const trace: RunTrace = {
+      id: 'run-1',
+      status: 'running',
+      collapsed: false,
+      startedAt: 'now',
+      toolCount: 0,
+      steps: [
+        {
+          id: 'model-1',
+          kind: 'model',
+          status: 'running',
+          title: 'DeepSeek V4 Pro',
+        },
+      ],
+    }
+
+    const firstSubagent = completeRunningModelStep(trace)
+    const fourthSubagent = completeRunningModelStep(
+      completeRunningModelStep(
+        completeRunningModelStep(firstSubagent),
+      ),
+    )
+
+    expect(fourthSubagent.steps).toHaveLength(1)
+    expect(fourthSubagent.steps[0]).toMatchObject({
+      id: 'model-1',
+      kind: 'model',
+      status: 'ok',
     })
   })
 })

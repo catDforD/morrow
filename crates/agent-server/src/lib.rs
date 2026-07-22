@@ -2,15 +2,20 @@ mod commands;
 mod mcp_settings;
 mod models;
 mod secrets;
+mod subagent_settings;
 
 pub use models::{FallbackModel, discover_models as discover_remote_models};
+pub use subagent_settings::{
+    SubagentProfileResponse, SubagentProfileWriteRequest, SubagentRegistryError,
+    SubagentSettingsResponse, load_subagent_identities,
+};
 
 use agent_config::{ContextConfig, LoadedServerConfig, McpServerConfig};
 use agent_model::{ModelError, OpenAiCompatClient, OpenAiCompatConfig};
 use agent_protocol::{
     ApprovalDecision, ModelSelection, PermissionMode, PermissionProfile, ReasoningProfile,
     RemoteMcpServerSpec, RemoteModelConnectionSpec, RemoteModelSpec, RemoteTurnModel,
-    RemoteTurnSpec, Session, SessionDocument, WorkspaceLocation,
+    RemoteTurnSpec, Session, SessionDocument, SubagentIdentity, WorkspaceLocation,
 };
 use agent_runtime::{
     AgentEventEnvelope, CancellationToken, McpInspection, McpToolCache, RunAgentTurnContext,
@@ -48,6 +53,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use subagent_settings::SubagentRegistry;
 use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, RwLock, broadcast, oneshot};
@@ -64,6 +70,7 @@ pub struct ServerOptions {
     pub model_store_path: PathBuf,
     pub mcp_store_path: PathBuf,
     pub command_store_path: PathBuf,
+    pub subagent_store_path: PathBuf,
     pub system_prompt: String,
     pub context_config: ContextConfig,
     pub workspace_root: PathBuf,
@@ -116,6 +123,7 @@ pub fn server_options_from_loaded_config(
         model_store_path: home.join(".morrow").join("web-models.json"),
         mcp_store_path: home.join(".morrow").join("web-mcp.json"),
         command_store_path: home.join(".morrow").join("commands"),
+        subagent_store_path: home.join(".morrow").join("subagents.json"),
         system_prompt: loaded.config.agent.system_prompt,
         context_config: loaded.config.context,
         workspace_root,
@@ -349,6 +357,7 @@ impl EmbeddedServer {
             .iter()
             .map(remote_spec_from_config)
             .collect();
+        let subagent_identities = self.service.inner.subagent_registry.identities().await;
         Ok(RemoteTurnSpec {
             session: session_name.to_string(),
             request_id,
@@ -356,6 +365,7 @@ impl EmbeddedServer {
             permission_mode,
             model,
             managed_mcp_servers,
+            subagent_identities,
         })
     }
 
@@ -367,6 +377,7 @@ impl EmbeddedServer {
             permission_mode,
             model,
             managed_mcp_servers,
+            subagent_identities,
         } = turn;
         let resolved_model = match model {
             RemoteTurnModel::WorkspaceFallback { selection } => self
@@ -401,6 +412,7 @@ impl EmbeddedServer {
                 model_selection: None,
                 resolved_model: Some(resolved_model),
                 mcp_servers: Some(mcp_servers),
+                subagent_identities: Some(subagent_identities),
             },
             tx,
         )
@@ -697,12 +709,21 @@ fn build_router_with_settings(
     }
     .map_err(|error| ModelRegistryError::Validation(error.to_string()))?;
     let command_registry = CommandRegistry::new(options.command_store_path.clone());
+    let subagent_registry = if persistent_settings {
+        SubagentRegistry::load(options.subagent_store_path.clone())
+    } else {
+        Ok(SubagentRegistry::in_memory(
+            options.subagent_store_path.clone(),
+        ))
+    }
+    .map_err(|error| ModelRegistryError::Validation(error.to_string()))?;
     let state = AppState {
         inner: Arc::new(ServerState {
             options,
             model_registry,
             mcp_registry,
             command_registry,
+            subagent_registry,
             sessions: Mutex::new(HashMap::new()),
             mcp_cache: RwLock::new(Arc::new(McpToolCache::new())),
             access_policy,
@@ -752,6 +773,13 @@ fn build_router_with_settings(
                 "/api/commands/{name}",
                 put(update_command).delete(delete_command),
             )
+            .route("/api/subagent-settings", get(subagent_settings))
+            .route("/api/subagents", post(create_subagent))
+            .route(
+                "/api/subagents/{id}",
+                put(update_subagent).delete(delete_subagent),
+            )
+            .route("/api/subagent-settings/reset", post(reset_subagents))
             .route(
                 "/api/sessions/{name}/model-selection",
                 get(get_session_model_selection).put(set_session_model_selection),
@@ -778,6 +806,7 @@ struct ServerState {
     model_registry: ModelRegistry,
     mcp_registry: McpRegistry,
     command_registry: CommandRegistry,
+    subagent_registry: SubagentRegistry,
     sessions: Mutex<HashMap<String, SessionRuntime>>,
     mcp_cache: RwLock<Arc<McpToolCache>>,
     access_policy: ServerAccessPolicy,
@@ -984,6 +1013,7 @@ struct StatusResponse {
     model_store_path: String,
     mcp_store_path: String,
     command_store_path: String,
+    subagent_store_path: String,
     config_diagnostics: Vec<String>,
 }
 
@@ -1160,6 +1190,7 @@ async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
         model_store_path: settings.store_path,
         mcp_store_path: state.inner.options.mcp_store_path.display().to_string(),
         command_store_path: state.inner.command_registry.root().display().to_string(),
+        subagent_store_path: state.inner.subagent_registry.path().display().to_string(),
         config_diagnostics: state.inner.options.config_diagnostics.clone(),
     })
 }
@@ -1319,6 +1350,62 @@ async fn command_settings(
         .settings()
         .map(Json)
         .map_err(command_registry_error)
+}
+
+async fn subagent_settings(State(state): State<AppState>) -> Json<SubagentSettingsResponse> {
+    Json(state.inner.subagent_registry.settings().await)
+}
+
+async fn create_subagent(
+    State(state): State<AppState>,
+    Json(request): Json<SubagentProfileWriteRequest>,
+) -> Result<Json<SubagentProfileResponse>, ApiError> {
+    state
+        .inner
+        .subagent_registry
+        .create(request)
+        .await
+        .map(Json)
+        .map_err(subagent_registry_error)
+}
+
+async fn update_subagent(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<SubagentProfileWriteRequest>,
+) -> Result<Json<SubagentProfileResponse>, ApiError> {
+    state
+        .inner
+        .subagent_registry
+        .update(&id, request)
+        .await
+        .map(Json)
+        .map_err(subagent_registry_error)
+}
+
+async fn delete_subagent(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .inner
+        .subagent_registry
+        .delete(&id)
+        .await
+        .map_err(subagent_registry_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn reset_subagents(
+    State(state): State<AppState>,
+) -> Result<Json<SubagentSettingsResponse>, ApiError> {
+    state
+        .inner
+        .subagent_registry
+        .reset()
+        .await
+        .map(Json)
+        .map_err(subagent_registry_error)
 }
 
 async fn create_command(
@@ -1619,6 +1706,7 @@ async fn dispatch_client_message(
                     model_selection,
                     resolved_model: None,
                     mcp_servers: None,
+                    subagent_identities: None,
                 },
                 tx.clone(),
             )
@@ -1644,6 +1732,7 @@ struct StartTurnRequest {
     model_selection: Option<ModelSelection>,
     resolved_model: Option<ResolvedModel>,
     mcp_servers: Option<Vec<McpServerConfig>>,
+    subagent_identities: Option<Vec<SubagentIdentity>>,
 }
 
 async fn start_turn(
@@ -1660,6 +1749,7 @@ async fn start_turn(
         model_selection,
         resolved_model,
         mcp_servers,
+        subagent_identities,
     } = request;
     if state.inner.shutting_down.load(Ordering::Acquire) {
         broadcast_message(
@@ -1779,6 +1869,25 @@ async fn start_turn(
         );
         return;
     }
+    let subagent_identities = match subagent_identities {
+        Some(identities) if identities.len() >= subagent_settings::MIN_SUBAGENT_PROFILES => {
+            identities
+        }
+        Some(_) => {
+            broadcast_message(
+                &tx,
+                ServerMessage::TurnRejected {
+                    request_id,
+                    reason: format!(
+                        "at least {} subagent identities are required",
+                        subagent_settings::MIN_SUBAGENT_PROFILES
+                    ),
+                },
+            );
+            return;
+        }
+        None => state.inner.subagent_registry.identities().await,
+    };
     {
         let mut sessions = state.inner.sessions.lock().await;
         let runtime = sessions
@@ -1808,6 +1917,7 @@ async fn start_turn(
                 permissions,
                 resolved_model,
                 mcp_servers,
+                subagent_identities,
                 tx: tx_for_task,
                 cancellation: cancellation_for_task,
             })
@@ -1846,6 +1956,7 @@ struct TurnTaskContext {
     permissions: PermissionProfile,
     resolved_model: ResolvedModel,
     mcp_servers: Option<Vec<McpServerConfig>>,
+    subagent_identities: Vec<SubagentIdentity>,
     tx: broadcast::Sender<ServerMessage>,
     cancellation: CancellationToken,
 }
@@ -1881,6 +1992,7 @@ async fn run_turn_task_inner(context: TurnTaskContext) -> Result<(), agent_runti
         permissions,
         resolved_model,
         mcp_servers,
+        subagent_identities,
         tx,
         cancellation,
     } = context;
@@ -1904,6 +2016,7 @@ async fn run_turn_task_inner(context: TurnTaskContext) -> Result<(), agent_runti
         RunAgentTurnContext {
             client: &resolved_model.client,
             model: &resolved_model.invocation,
+            subagent_identities: &subagent_identities,
             system_prompt: &options.system_prompt,
             context_config: options.context_config,
             model_limits: resolved_model.limits,
@@ -2220,6 +2333,15 @@ fn command_registry_error(error: CommandRegistryError) -> ApiError {
     }
 }
 
+fn subagent_registry_error(error: SubagentRegistryError) -> ApiError {
+    match error {
+        SubagentRegistryError::Validation(_) => ApiError::bad_request(error.to_string()),
+        SubagentRegistryError::Conflict(_) => ApiError::conflict(error.to_string()),
+        SubagentRegistryError::NotFound(_) => ApiError::not_found(error.to_string()),
+        _ => ApiError::internal(error.to_string()),
+    }
+}
+
 fn session_entry_response(entry: SessionListingEntry) -> SessionEntryResponse {
     let session = entry.session;
     SessionEntryResponse {
@@ -2289,6 +2411,7 @@ mod tests {
             model_store_path: root.join("web-models.json"),
             mcp_store_path: root.join("web-mcp.json"),
             command_store_path: root.join("commands"),
+            subagent_store_path: root.join("subagents.json"),
             system_prompt: "system".to_string(),
             context_config: ContextConfig {
                 auto_compact: false,
@@ -2319,12 +2442,15 @@ mod tests {
             McpRegistry::load(options.mcp_store_path.clone(), options.mcp_servers.clone())
                 .expect("MCP registry");
         let command_registry = CommandRegistry::new(options.command_store_path.clone());
+        let subagent_registry =
+            SubagentRegistry::load(options.subagent_store_path.clone()).expect("subagent registry");
         AppState {
             inner: Arc::new(ServerState {
                 options,
                 model_registry,
                 mcp_registry,
                 command_registry,
+                subagent_registry,
                 sessions: Mutex::new(HashMap::new()),
                 mcp_cache: RwLock::new(Arc::new(McpToolCache::new())),
                 access_policy: ServerAccessPolicy::Browser,
@@ -2350,7 +2476,79 @@ mod tests {
 
         assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(value["permissions"]["mode"], "workspace_write");
+        assert!(
+            value["subagent_store_path"]
+                .as_str()
+                .is_some_and(|path| path.ends_with("subagents.json"))
+        );
         assert!(!value.to_string().contains("secret-test-key"));
+    }
+
+    #[tokio::test]
+    async fn embedded_subagent_settings_routes_manage_the_global_profile_list() {
+        let server = EmbeddedServer::new(test_options()).expect("embedded server");
+
+        let settings = server
+            .request("GET", "/api/subagent-settings", None)
+            .await
+            .expect("read subagent settings");
+        assert_eq!(settings.status, 200);
+        let settings = settings.body.expect("settings body");
+        assert_eq!(settings["profiles"].as_array().map(Vec::len), Some(22));
+        assert_eq!(settings["profiles"][0]["id"], "builtin-01");
+
+        let created = server
+            .request(
+                "POST",
+                "/api/subagents",
+                Some(json!({"name": "测试成员", "avatar_data_url": null})),
+            )
+            .await
+            .expect("create subagent");
+        assert_eq!(created.status, 200);
+        let id = created.body.expect("created body")["id"]
+            .as_str()
+            .expect("created id")
+            .to_string();
+
+        let updated = server
+            .request(
+                "PUT",
+                &format!("/api/subagents/{id}"),
+                Some(json!({"name": "更新成员", "avatar_data_url": null})),
+            )
+            .await
+            .expect("update subagent");
+        assert_eq!(updated.status, 200);
+        assert_eq!(updated.body.expect("updated body")["name"], "更新成员");
+
+        let duplicate = server
+            .request(
+                "POST",
+                "/api/subagents",
+                Some(json!({"name": "后藤一里", "avatar_data_url": null})),
+            )
+            .await
+            .expect("duplicate response");
+        assert_eq!(duplicate.status, 409);
+
+        let deleted = server
+            .request("DELETE", &format!("/api/subagents/{id}"), None)
+            .await
+            .expect("delete subagent");
+        assert_eq!(deleted.status, 204);
+
+        let reset = server
+            .request("POST", "/api/subagent-settings/reset", None)
+            .await
+            .expect("reset subagents");
+        assert_eq!(reset.status, 200);
+        assert_eq!(
+            reset.body.expect("reset body")["profiles"]
+                .as_array()
+                .map(Vec::len),
+            Some(22)
+        );
     }
 
     #[test]
@@ -2470,6 +2668,8 @@ mod tests {
         };
         assert_eq!(model.api_key, "managed-model-secret");
         assert_eq!(turn.managed_mcp_servers.len(), 1);
+        assert_eq!(turn.subagent_identities.len(), 22);
+        assert_eq!(turn.subagent_identities[0].id, "builtin-01");
         assert_eq!(
             turn.managed_mcp_servers[0]
                 .env
@@ -2519,6 +2719,7 @@ mod tests {
                     },
                 }),
                 managed_mcp_servers: Vec::new(),
+                subagent_identities: agent_protocol::default_subagent_identities(),
             })
             .await
             .expect("start remote turn");

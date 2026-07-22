@@ -1,11 +1,13 @@
 import type { FormEvent, KeyboardEvent, ReactNode, UIEvent } from 'react'
 import {
+  createContext,
   useCallback,
   useEffect,
   useLayoutEffect,
   useMemo,
   useRef,
   useState,
+  useContext,
 } from 'react'
 import {
   Activity,
@@ -91,6 +93,8 @@ import type {
   SessionModelSelectionResponse,
   StatusResponse,
   SubagentExecutionSummary,
+  SubagentProfileResponse,
+  SubagentSettingsResponse,
   TimelineItem,
   TimelineMessageItem,
   TimelineNoticeItem,
@@ -106,6 +110,7 @@ type AppView = 'workspace' | 'settings'
 type ResolvedTheme = Exclude<ThemePreference, 'system'>
 
 const markdownPlugins = [remarkGfm]
+const SubagentProfilesContext = createContext<SubagentProfileResponse[]>([])
 
 const permissionOptions: Array<{
   id: PermissionMode | 'plan'
@@ -192,6 +197,8 @@ export default function App() {
     useState<ModelSettingsResponse | null>(null)
   const [commandSettings, setCommandSettings] =
     useState<CommandSettingsResponse | null>(null)
+  const [subagentSettings, setSubagentSettings] =
+    useState<SubagentSettingsResponse | null>(null)
   const [isResolvingCommand, setIsResolvingCommand] = useState(false)
   const [modelSelection, setModelSelection] = useState<ModelSelection | null>(
     null,
@@ -407,6 +414,16 @@ export default function App() {
     [ensureRunTrace, nextId, updateRunTrace],
   )
 
+  const completeLiveModelStep = useCallback(() => {
+    const modelStep = modelStepPresentation(
+      modelSettingsRef.current,
+      modelSelectionRef.current,
+    )
+    const id = ensureRunTrace(modelStep.title, modelStep.detail)
+    updateRunTrace(id, completeRunningModelStep)
+    return id
+  }, [ensureRunTrace, updateRunTrace])
+
   const appendReasoningDelta = useCallback(
     (text: string) => {
       const id = ensureLiveModelStep()
@@ -447,15 +464,7 @@ export default function App() {
 
   const startToolStep = useCallback(
     (id: string, name: string) => {
-      const runId = ensureLiveModelStep('ok')
-      updateRunTrace(runId, (trace) => ({
-        ...trace,
-        steps: trace.steps.map((step) =>
-          step.kind === 'model' && step.status === 'running'
-            ? { ...step, status: 'ok' }
-            : step,
-        ),
-      }))
+      const runId = completeLiveModelStep()
       upsertRunStep(runId, {
         id,
         kind: 'tool',
@@ -464,23 +473,20 @@ export default function App() {
         detail: 'Tool call started',
       })
     },
-    [ensureLiveModelStep, updateRunTrace, upsertRunStep],
+    [completeLiveModelStep, upsertRunStep],
   )
 
   const startSubagentStep = useCallback(
-    (id: string, agentName: string | undefined, task: string) => {
-      const runId = ensureLiveModelStep('ok')
-      updateRunTrace(runId, (trace) => ({
-        ...trace,
-        steps: trace.steps.map((step) =>
-          step.kind === 'model' && step.status === 'running'
-            ? { ...step, status: 'ok' }
-            : step,
-        ),
-      }))
-      upsertRunStep(runId, runningSubagentStep(id, agentName, task))
+    (
+      id: string,
+      agentId: string | undefined,
+      agentName: string | undefined,
+      task: string,
+    ) => {
+      const runId = completeLiveModelStep()
+      upsertRunStep(runId, runningSubagentStep(id, agentId, agentName, task))
     },
-    [ensureLiveModelStep, updateRunTrace, upsertRunStep],
+    [completeLiveModelStep, upsertRunStep],
   )
 
   const finishToolStep = useCallback(
@@ -672,6 +678,12 @@ export default function App() {
     return settings
   }, [])
 
+  const loadSubagentSettings = useCallback(async () => {
+    const settings = await fetchJson<SubagentSettingsResponse>('/api/subagent-settings')
+    setSubagentSettings(settings)
+    return settings
+  }, [])
+
   const loadSessionModelSelection = useCallback(async (name: string) => {
     const response = await fetchJson<SessionModelSelectionResponse>(
       `/api/sessions/${encodeURIComponent(name)}/model-selection`,
@@ -701,6 +713,9 @@ export default function App() {
           recordActivity('Turn started', selectedRef.current, 'running')
           break
         }
+        case 'model_call_started':
+          ensureLiveModelStep()
+          break
         case 'warning':
           recordActivity('Warning', event.data, 'error')
           break
@@ -724,6 +739,7 @@ export default function App() {
           )
           startSubagentStep(
             event.data.id,
+            event.data.agent_id,
             event.data.agent_name,
             event.data.task,
           )
@@ -815,6 +831,7 @@ export default function App() {
       completeCurrentRun,
       finishSubagentStep,
       finishToolStep,
+      ensureLiveModelStep,
       recordActivity,
       refreshCurrentModelStep,
       setApprovalStep,
@@ -1069,7 +1086,11 @@ export default function App() {
         setStatus(loadedStatus)
         const savedMode = savedPermissionModeRef.current
         setPermissionMode(savedMode ?? loadedStatus.permissions.mode)
-        await Promise.all([loadModelSettings(), loadCommandSettings()])
+        await Promise.all([
+          loadModelSettings(),
+          loadCommandSettings(),
+          loadSubagentSettings(),
+        ])
         const requestedName = initialLocationRef.current.session
         const entries = await loadSessions()
         const requestedEntry = entries.find(
@@ -1095,6 +1116,7 @@ export default function App() {
     closeSocket,
     loadCommandSettings,
     loadModelSettings,
+    loadSubagentSettings,
     loadSessions,
     selectSession,
     showError,
@@ -1426,7 +1448,8 @@ export default function App() {
   }
 
   return (
-    <>
+    <SubagentProfilesContext.Provider value={subagentSettings?.profiles ?? []}>
+      <>
       <DesktopShell onOpenAbout={() => openSettings('about')}>
         {appView === 'settings' ? (
           <SettingsView
@@ -1436,6 +1459,7 @@ export default function App() {
             permissionMode={permissionMode}
             modelSettings={modelSettings}
             commandSettings={commandSettings}
+            subagentSettings={subagentSettings}
             isSidebarOpen={isSidebarOpen}
             isSidebarHidden={isNarrowViewport && !isSidebarOpen}
             onSectionChange={changeSettingsSection}
@@ -1453,6 +1477,9 @@ export default function App() {
             }}
             onCommandSettingsChange={async () => {
               await loadCommandSettings()
+            }}
+            onSubagentSettingsChange={async () => {
+              await loadSubagentSettings()
             }}
           />
         ) : (
@@ -1606,7 +1633,8 @@ export default function App() {
           />
         </>
       ) : null}
-    </>
+      </>
+    </SubagentProfilesContext.Provider>
   )
 }
 
@@ -2269,7 +2297,7 @@ function RunStepRow({ step }: { step: RunStep }) {
   const isSubagent = step.kind === 'subagent'
   return (
     <article className={`run-step ${step.kind} ${step.status}`}>
-      <div className="run-step-icon">{runStepIcon(step)}</div>
+      <div className="run-step-icon"><RunStepIcon step={step} /></div>
       <div className="run-step-main">
         {isSubagent ? (
           <SubagentStepDisclosure step={step} />
@@ -3419,6 +3447,8 @@ function historyRunTrace(
       summary: subagent?.summary
         ? { subagent: subagent.summary }
         : undefined,
+      agentId: subagent?.agentId,
+      agentName: subagent?.agentName,
     }
   })
 
@@ -3576,7 +3606,48 @@ function noticeIcon(tone: TimelineNoticeItem['tone']): ReactNode {
   }
 }
 
+function RunStepIcon({ step }: { step: RunStep }) {
+  const profiles = useContext(SubagentProfilesContext)
+  if (step.kind === 'subagent') {
+    return <SubagentRunStepIcon step={step} profiles={profiles} />
+  }
+  return runStepIcon(step)
+}
+
+export function SubagentRunStepIcon({
+  step,
+  profiles,
+}: {
+  step: RunStep
+  profiles: SubagentProfileResponse[]
+}) {
+  const profile = findSubagentProfile(profiles, step.agentId, step.agentName)
+  const avatar = profile?.avatar_data_url
+  const [imageFailed, setImageFailed] = useState(false)
+
+  useEffect(() => setImageFailed(false), [avatar])
+
+  if (avatar && !imageFailed) {
+    return <img src={avatar} alt="" onError={() => setImageFailed(true)} />
+  }
+  return <Bot size={18} />
+}
+
+export function findSubagentProfile(
+  profiles: SubagentProfileResponse[],
+  agentId?: string,
+  agentName?: string,
+): SubagentProfileResponse | undefined {
+  if (agentId) return profiles.find((profile) => profile.id === agentId)
+  const normalizedName = agentName?.trim().toLocaleLowerCase()
+  if (!normalizedName) return undefined
+  return profiles.find(
+    (profile) => profile.name.trim().toLocaleLowerCase() === normalizedName,
+  )
+}
+
 function runStepIcon(step: RunStep): ReactNode {
+  if (step.kind === 'subagent') return <Bot size={18} />
   if (step.status === 'running') return <Clock3 size={18} />
   if (step.status === 'error') return <CircleAlert size={18} />
 
@@ -3588,8 +3659,6 @@ function runStepIcon(step: RunStep): ReactNode {
     case 'final':
       return <CheckCircle2 size={18} />
     case 'model':
-      return <Bot size={18} />
-    case 'subagent':
       return <Bot size={18} />
     case 'tool':
       return step.summary?.files?.length ? (
@@ -3651,6 +3720,16 @@ function modelSelectionLabel(
   const selected = findSelectedModel(settings, selection)
   if (!selected || !selection) return '未配置模型'
   return `${selected.provider.name} · ${selected.model.name} · ${reasoningLabel(selection.reasoning)}`
+}
+
+export function completeRunningModelStep(trace: RunTrace): RunTrace {
+  let changed = false
+  const steps = trace.steps.map((step) => {
+    if (step.kind !== 'model' || step.status !== 'running') return step
+    changed = true
+    return { ...step, status: 'ok' as const }
+  })
+  return changed ? { ...trace, steps } : trace
 }
 
 export function modelStepPresentation(
@@ -3722,6 +3801,7 @@ function readAppLocation(): AppLocation {
     view === 'settings' &&
     (requestedSection === 'about' ||
       requestedSection === 'models' ||
+      requestedSection === 'subagents' ||
       requestedSection === 'mcp' ||
       requestedSection === 'commands')
       ? requestedSection

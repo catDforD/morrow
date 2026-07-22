@@ -9,6 +9,7 @@ agent-model = { workspace = true }
 agent-protocol = { workspace = true }
 agent-runtime = { workspace = true }
 axum = { workspace = true }
+base64 = { workspace = true }
 futures-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -17,7 +18,6 @@ tokio = { workspace = true }
 tower = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-base64 = { workspace = true }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security_Cryptography",

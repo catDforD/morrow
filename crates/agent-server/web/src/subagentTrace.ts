@@ -4,12 +4,14 @@ const delegateTaskTool = 'delegate_task'
 
 export interface SubagentHistoryEntry {
   task: string
+  agentId?: string
   agentName?: string
   summary?: SubagentExecutionSummary
 }
 
 export function runningSubagentStep(
   id: string,
+  agentId: string | undefined,
   agentName: string | undefined,
   task: string,
 ): RunStep {
@@ -19,6 +21,8 @@ export function runningSubagentStep(
     status: 'running',
     title: subagentStepTitle(agentName),
     detail: task,
+    ...(agentId ? { agentId } : {}),
+    ...(agentName ? { agentName } : {}),
   }
 }
 
@@ -34,6 +38,8 @@ export function finishedSubagentStep(
     title: subagentStepTitle(summary.agent_name),
     detail: summary.task,
     summary: { subagent: summary },
+    ...(summary.agent_id ? { agentId: summary.agent_id } : {}),
+    ...(summary.agent_name ? { agentName: summary.agent_name } : {}),
   }
 }
 
@@ -62,7 +68,8 @@ export function subagentHistory(
     if (summary) {
       entries.set(message.tool_call_id, {
         task: summary.task,
-        agentName: summary.agent_name,
+        ...(summary.agent_id ? { agentId: summary.agent_id } : {}),
+        ...(summary.agent_name ? { agentName: summary.agent_name } : {}),
         summary,
       })
     }
@@ -92,6 +99,7 @@ function parseSubagentResult(
     const value: unknown = JSON.parse(content)
     if (!isRecord(value)) return undefined
     const task = typeof value.task === 'string' ? value.task : fallbackTask
+    const agentId = nonEmptyString(value.agent_id)
     const agentName = nonEmptyString(value.agent_name)
     const modelCalls = numberOrZero(value.model_calls)
     const toolCalls = numberOrZero(value.tool_calls)
@@ -99,6 +107,7 @@ function parseSubagentResult(
     const result = typeof value.result === 'string' ? value.result : undefined
     const error = typeof value.error === 'string' ? value.error : undefined
     return {
+      agent_id: agentId,
       agent_name: agentName,
       task,
       result,

@@ -6,8 +6,8 @@ use agent_core::{
 };
 use agent_protocol::{
     AgentEvent, ApprovalDecision, ApprovalRequest, Conversation, Message, ModelInvocation,
-    PermissionProfile, Session, SubagentExecutionSummary, Thread, ToolDefinition, TurnRecord,
-    TurnStatus, TurnStepKind,
+    PermissionProfile, Session, SubagentExecutionSummary, SubagentIdentity, Thread, ToolDefinition,
+    TurnRecord, TurnStatus, TurnStepKind,
 };
 use agent_tools::{SubagentExecutor, ToolRegistry, ToolRegistryError};
 use futures_util::StreamExt;
@@ -25,7 +25,7 @@ pub use agent_core::CancellationToken;
 pub use agent_tools::McpToolCache;
 pub use session_store::{SessionEntry, SessionListingEntry, SessionStore, SessionStoreError};
 
-pub const EVENT_SCHEMA_VERSION: u32 = 4;
+pub const EVENT_SCHEMA_VERSION: u32 = 6;
 const MESSAGE_BASE_TOKENS: usize = 6;
 const TOOL_CALL_BASE_TOKENS: usize = 12;
 const REQUEST_PADDING_NUMERATOR: usize = 4;
@@ -88,6 +88,7 @@ pub struct AgentEventEnvelope {
 pub struct RunAgentTurnContext<'a> {
     pub client: &'a dyn Model,
     pub model: &'a ModelInvocation,
+    pub subagent_identities: &'a [SubagentIdentity],
     pub system_prompt: &'a str,
     pub context_config: ContextConfig,
     pub model_limits: ModelContextLimits,
@@ -400,11 +401,14 @@ async fn run_agent_turn_inner(
     let mut tools = build.registry;
     let diagnostics = build.diagnostics;
     let effective_system_prompt = if let Some(model) = context.client.shared_clone() {
-        tools.register_subagent(Arc::new(RuntimeSubagentExecutor::new(
-            model,
-            Arc::<str>::from(context.system_prompt),
-            Arc::new(context.workspace_root.to_path_buf()),
-        )))?;
+        tools.register_subagent(
+            Arc::new(RuntimeSubagentExecutor::new(
+                model,
+                Arc::<str>::from(context.system_prompt),
+                Arc::new(context.workspace_root.to_path_buf()),
+            )),
+            context.subagent_identities,
+        )?;
         format!("{}\n\n{PARENT_SUBAGENT_GUIDANCE}", context.system_prompt)
     } else {
         context.system_prompt.to_string()
@@ -511,6 +515,7 @@ async fn run_agent_turn_inner(
                     agent_error = Some(message.clone());
                 }
                 AgentEvent::TurnStarted
+                | AgentEvent::ModelCallStarted
                 | AgentEvent::Warning(_)
                 | AgentEvent::ReasoningDelta(_)
                 | AgentEvent::TextDelta(_)
@@ -1795,6 +1800,7 @@ compact test
             RunAgentTurnContext {
                 client: &client,
                 model: test_model_invocation(),
+                subagent_identities: &[],
                 system_prompt: "system",
                 context_config: context_config(2),
                 model_limits: model_limits(10_000),
@@ -1837,10 +1843,11 @@ compact test
                 .iter()
                 .map(|event| event.event_index)
                 .collect::<Vec<_>>(),
-            vec![0, 1, 2, 3]
+            vec![0, 1, 2, 3, 4]
         );
+        assert_eq!(handler.events[1].event, AgentEvent::ModelCallStarted);
         assert_eq!(
-            handler.events[1].event,
+            handler.events[2].event,
             AgentEvent::TextDelta("ok".to_string())
         );
     }
@@ -1868,11 +1875,16 @@ compact test
         let mut session = Session::new();
         let mut handler = RecordingHandler::default();
         let mcp_cache = McpToolCache::new();
+        let subagent_identities = [SubagentIdentity {
+            id: "custom-researcher".to_string(),
+            name: "测试研究员".to_string(),
+        }];
 
         let outcome = run_agent_turn(
             RunAgentTurnContext {
                 client: &client,
                 model: test_model_invocation(),
+                subagent_identities: &subagent_identities,
                 system_prompt: "project policy",
                 context_config: context_config(2),
                 model_limits: model_limits(100_000),
@@ -1900,6 +1912,8 @@ compact test
             message.role == agent_protocol::Role::Tool
                 && message.content.as_deref().is_some_and(|content| {
                     content.contains("The file contains workspace evidence.")
+                        && content.contains("\"agent_id\":\"custom-researcher\"")
+                        && content.contains("\"agent_name\":\"测试研究员\"")
                 })
         }));
         assert!(!session.turns[0].messages.iter().any(|message| {
@@ -1910,13 +1924,16 @@ compact test
         }));
         assert!(handler.events.iter().any(|event| matches!(
             &event.event,
-            AgentEvent::SubagentStarted {
-                id,
-                agent_name: Some(agent_name),
+                AgentEvent::SubagentStarted {
+                    id,
+                    agent_id: Some(agent_id),
+                    agent_name: Some(agent_name),
                 task,
+                ..
             }
                 if id == "delegate-1"
-                    && !agent_name.is_empty()
+                    && agent_id == "custom-researcher"
+                    && agent_name == "测试研究员"
                     && task == "Read note.txt and report the evidence"
         )));
         let started_name = handler
@@ -1931,6 +1948,7 @@ compact test
             &event.event,
             AgentEvent::SubagentFinished { id, ok: true, summary }
                 if id == "delegate-1"
+                    && summary.agent_id.as_deref() == Some("custom-researcher")
                     && summary.agent_name.as_deref() == Some(started_name)
                     && summary.model_calls == 2
                     && summary.tool_calls == 1
@@ -1969,6 +1987,7 @@ compact test
             RunAgentTurnContext {
                 client: &client,
                 model: test_model_invocation(),
+                subagent_identities: &[],
                 system_prompt: "system",
                 context_config: context_config(2),
                 model_limits: model_limits(10_000),
@@ -2022,6 +2041,7 @@ compact test
             RunAgentTurnContext {
                 client: &client,
                 model: test_model_invocation(),
+                subagent_identities: &[],
                 system_prompt: "system",
                 context_config: context_config(2),
                 model_limits: model_limits(10_000),
@@ -2080,6 +2100,7 @@ compact test
             RunAgentTurnContext {
                 client: &model,
                 model: test_model_invocation(),
+                subagent_identities: &[],
                 system_prompt: "system",
                 context_config: context_config(2),
                 model_limits: model_limits(1_000_000),
@@ -2210,6 +2231,7 @@ done
             RunAgentTurnContext {
                 client: &client,
                 model: test_model_invocation(),
+                subagent_identities: &[],
                 system_prompt: "system",
                 context_config: context_config(2),
                 model_limits: model_limits(10_000),
@@ -2260,6 +2282,7 @@ done
             RunAgentTurnContext {
                 client: &client,
                 model: test_model_invocation(),
+                subagent_identities: &[],
                 system_prompt: "system",
                 context_config: context_config(2),
                 model_limits: model_limits(10_000),
@@ -2344,6 +2367,7 @@ done
                 RunAgentTurnContext {
                     client: &client,
                     model: test_model_invocation(),
+                    subagent_identities: &[],
                     system_prompt: "system",
                     context_config: context_config(2),
                     model_limits: model_limits(10_000),
@@ -2397,6 +2421,7 @@ done
             RunAgentTurnContext {
                 client: &client,
                 model: test_model_invocation(),
+                subagent_identities: &[],
                 system_prompt: "system",
                 context_config: context_config(2),
                 model_limits: model_limits(10_000),
@@ -2449,6 +2474,7 @@ done
             RunAgentTurnContext {
                 client: &client,
                 model: test_model_invocation(),
+                subagent_identities: &[],
                 system_prompt: "system",
                 context_config: context_config(2),
                 model_limits: model_limits(2_000),
