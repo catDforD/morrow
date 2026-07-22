@@ -152,6 +152,8 @@ CLI commands continue to require a valid model and API key in the resolved TOML 
 
 The dashboard's **Settings → Models** page manages Web-only OpenAI Chat Completions compatible providers. These settings do not change the CLI model. Provider data is stored in `~/.morrow/web-models.json`; API keys are kept as local plaintext, never returned by the API, and the file is written with mode `0600` on Unix. A valid TOML model appears as a read-only provider and becomes the initial Web default until another default is selected.
 
+Every new turn persists its resolved model invocation in the shared runtime record. Live execution steps and restored session history therefore use the same model name across Web, CLI, Desktop, WSL, and remote workspaces.
+
 The built-in DeepSeek template adds `deepseek-v4-flash` and `deepseek-v4-pro` with 1,000,000-token context windows, tool support, and **Off / High / Max** reasoning choices. New browser sessions inherit the global default, while each existing session remembers its own model and reasoning level.
 
 ### MCP tools
@@ -182,6 +184,8 @@ Models with tool support automatically receive a `delegate_task` tool for self-c
 Each subagent uses the currently selected model and reasoning level plus the configured system prompt, but starts with an isolated conversation containing only its delegated task. It can use `read_file`, `list_files`, and `search_text`; it cannot modify files, run shell commands, call MCP tools, or delegate another subagent.
 
 A parent turn may start at most four subagents, with at most four running concurrently. Each task has a five-minute timeout and its returned report is capped at 12,000 characters. CLI, JSONL, Web, Desktop, and WSL surfaces expose subagent start/finish events. The parent session stores the delegated task and final tool result, not the subagent's full reasoning or internal transcript.
+
+Each delegated call receives a display name from Morrow's built-in name pool. Names are unique within one parent turn, may be reused by later turns, and are persisted with the final tool result so live events and session history stay consistent. The dashboard keeps each subagent step collapsed by default; opening it reveals a fixed-height prompt/output card with independent scrolling. The output pane displays the final Markdown report after completion rather than streaming the subagent's internal transcript.
 
 ### Web custom commands
 

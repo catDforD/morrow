@@ -875,6 +875,8 @@ pub struct ShellCommandSummary {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct SubagentExecutionSummary {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_name: Option<String>,
     pub task: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<String>,
@@ -894,6 +896,7 @@ impl SubagentExecutionSummary {
         truncated: bool,
     ) -> Self {
         Self {
+            agent_name: None,
             task: task.into(),
             result: Some(result.into()),
             error: None,
@@ -910,6 +913,7 @@ impl SubagentExecutionSummary {
         tool_calls: usize,
     ) -> Self {
         Self {
+            agent_name: None,
             task: task.into(),
             result: None,
             error: Some(error.into()),
@@ -917,6 +921,11 @@ impl SubagentExecutionSummary {
             tool_calls,
             truncated: false,
         }
+    }
+
+    pub fn with_agent_name(mut self, agent_name: impl Into<String>) -> Self {
+        self.agent_name = Some(agent_name.into());
+        self
     }
 }
 
@@ -1117,6 +1126,8 @@ pub enum AgentEvent {
     AgentMessage(String),
     SubagentStarted {
         id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_name: Option<String>,
         task: String,
     },
     SubagentFinished {
@@ -1673,10 +1684,12 @@ mod tests {
             2,
             3,
             false,
-        );
+        )
+        .with_agent_name("后藤一里");
         let events = vec![
             AgentEvent::SubagentStarted {
                 id: "call-1".to_string(),
+                agent_name: summary.agent_name.clone(),
                 task: summary.task.clone(),
             },
             AgentEvent::SubagentFinished {
@@ -1693,6 +1706,7 @@ mod tests {
                     "type": "subagent_started",
                     "data": {
                         "id": "call-1",
+                        "agent_name": "后藤一里",
                         "task": "Inspect session storage"
                     }
                 },
@@ -1702,6 +1716,7 @@ mod tests {
                         "id": "call-1",
                         "ok": true,
                         "summary": {
+                            "agent_name": "后藤一里",
                             "task": "Inspect session storage",
                             "result": "Sessions are scoped by workspace hash.",
                             "model_calls": 2,
@@ -1717,6 +1732,7 @@ mod tests {
                 .expect("serialize subagent summary"),
             json!({
                 "subagent": {
+                    "agent_name": "后藤一里",
                     "task": "Inspect session storage",
                     "result": "Sessions are scoped by workspace hash.",
                     "model_calls": 2,
@@ -1725,5 +1741,21 @@ mod tests {
                 }
             })
         );
+
+        let legacy_event: AgentEvent = serde_json::from_value(json!({
+            "type": "subagent_started",
+            "data": {
+                "id": "legacy-call",
+                "task": "Inspect legacy state"
+            }
+        }))
+        .expect("deserialize legacy subagent event");
+        assert!(matches!(
+            legacy_event,
+            AgentEvent::SubagentStarted {
+                agent_name: None,
+                ..
+            }
+        ));
     }
 }

@@ -270,6 +270,7 @@ export interface ShellCommandSummary {
 }
 
 export interface SubagentExecutionSummary {
+  agent_name?: string
   task: string
   result?: string
   error?: string
@@ -316,7 +317,10 @@ export type AgentEvent =
   | { type: 'reasoning_delta'; data: string }
   | { type: 'text_delta'; data: string }
   | { type: 'agent_message'; data: string }
-  | { type: 'subagent_started'; data: { id: string; task: string } }
+  | {
+      type: 'subagent_started'
+      data: { id: string; agent_name?: string; task: string }
+    }
   | {
       type: 'subagent_finished'
       data: {

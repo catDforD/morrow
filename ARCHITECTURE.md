@@ -352,7 +352,9 @@ CLI 没有独立的 turn cancellation 协议；进程级中断仍属于入口层
 
 `agent-runtime::SessionStore` 把 Session 保存为版本化 JSON 文档。当前写出 schema v3，并兼容读取旧的 v1/v2 Thread 文档。旧文档加载后会转换为 Session，再在下一次保存时写成 v3。
 
-实时事件使用 `AgentEventEnvelope` 包装，包含：
+每次 turn 的 runtime 上下文必须携带解析后的 `ModelInvocation`，并在 Turn 创建时写入记录；Web、CLI、Desktop、WSL 与远端入口不得在持久化后各自补写模型信息。这样实时展示和历史恢复都以同一份模型元数据为准。
+
+实时事件使用当前 schema v4 的 `AgentEventEnvelope` 包装，包含：
 
 - 事件 schema version。
 - Session 名称和 workspace root。

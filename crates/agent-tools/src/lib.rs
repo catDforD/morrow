@@ -18,12 +18,14 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::borrow::Borrow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -51,6 +53,31 @@ const TOOL_CANCELLED_ERROR: &str = "tool execution cancelled";
 const SEARCH_SKIP_NAMES: &[&str] = &[".git", "node_modules", "dist", "build", "target"];
 pub const DELEGATE_TASK_TOOL_NAME: &str = "delegate_task";
 pub const MAX_SUBAGENT_TASK_CHARS: usize = 4_000;
+const SUBAGENT_NAMES: &[&str] = &[
+    "后藤一里",
+    "山田凉",
+    "喜多郁代",
+    "伊地知虹夏",
+    "中野梓",
+    "平泽唯",
+    "琴吹䌷",
+    "秋山澪",
+    "田井中律",
+    "井芹仁菜",
+    "河原木桃香",
+    "安和昴",
+    "海老冢智",
+    "露帕",
+    "高松灯",
+    "千早爱音",
+    "要乐奈",
+    "长崎爽世",
+    "椎名立希",
+    "丰川祥子",
+    "若叶睦",
+    "三角初华",
+];
+static SUBAGENT_NAME_SEED_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Error)]
 pub enum ToolRegistryError {
@@ -93,6 +120,65 @@ pub trait SubagentExecutor: Send + Sync {
 #[derive(Clone)]
 struct DelegateTaskTool {
     executor: Arc<dyn SubagentExecutor>,
+    names: Arc<Mutex<SubagentNameAllocator>>,
+}
+
+struct SubagentNameAllocator {
+    seed: u64,
+    assigned: HashMap<String, String>,
+    available: Vec<&'static str>,
+}
+
+impl SubagentNameAllocator {
+    fn new() -> Self {
+        Self::with_seed(subagent_name_seed())
+    }
+
+    fn with_seed(seed: u64) -> Self {
+        Self {
+            seed,
+            assigned: HashMap::new(),
+            available: SUBAGENT_NAMES.to_vec(),
+        }
+    }
+
+    fn name_for(&mut self, call_id: &str) -> String {
+        if let Some(name) = self.assigned.get(call_id) {
+            return name.clone();
+        }
+
+        let mut hasher = DefaultHasher::new();
+        self.seed.hash(&mut hasher);
+        call_id.hash(&mut hasher);
+        self.assigned.len().hash(&mut hasher);
+        let hash = hasher.finish() as usize;
+        let name = if self.available.is_empty() {
+            SUBAGENT_NAMES[hash % SUBAGENT_NAMES.len()]
+        } else {
+            let index = hash % self.available.len();
+            self.available.swap_remove(index)
+        }
+        .to_string();
+        self.assigned.insert(call_id.to_string(), name.clone());
+        name
+    }
+}
+
+impl DelegateTaskTool {
+    fn agent_name(&self, call_id: &str) -> String {
+        self.names
+            .lock()
+            .expect("subagent name allocator lock poisoned")
+            .name_for(call_id)
+    }
+}
+
+fn subagent_name_seed() -> u64 {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    timestamp ^ SUBAGENT_NAME_SEED_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
 #[derive(Debug, Deserialize)]
@@ -104,6 +190,7 @@ struct DelegateTaskArgs {
 #[derive(Serialize)]
 struct DelegateTaskOutput<'a> {
     ok: bool,
+    agent_name: &'a str,
     task: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     result: Option<&'a str>,
@@ -224,7 +311,10 @@ impl ToolRegistry {
         &mut self,
         executor: Arc<dyn SubagentExecutor>,
     ) -> Result<(), ToolRegistryError> {
-        self.register(Arc::new(DelegateTaskTool { executor }))
+        self.register(Arc::new(DelegateTaskTool {
+            executor,
+            names: Arc::new(Mutex::new(SubagentNameAllocator::new())),
+        }))
     }
 
     pub fn definitions(&self) -> Vec<ToolDefinition> {
@@ -444,6 +534,7 @@ impl Tool for DelegateTaskTool {
     fn execution_kind(&self, call: &ToolCall) -> ToolExecutionKind {
         ToolExecutionKind::Subagent {
             task: delegate_task_label(call),
+            agent_name: self.agent_name(&call.id),
         }
     }
 
@@ -453,6 +544,7 @@ impl Tool for DelegateTaskTool {
         _approval: Option<ToolApproval>,
         context: ToolExecutionContext,
     ) -> ToolExecution {
+        let agent_name = self.agent_name(&call.id);
         let summary = match parse_delegate_task(&call) {
             Ok(task) if context.cancellation.is_cancelled() => {
                 SubagentExecutionSummary::failure(task, "subagent execution cancelled", 0, 0)
@@ -461,11 +553,13 @@ impl Tool for DelegateTaskTool {
             Err(error) => {
                 SubagentExecutionSummary::failure(delegate_task_label(&call), error, 0, 0)
             }
-        };
+        }
+        .with_agent_name(agent_name.clone());
         let ok = summary.error.is_none();
         let error = summary.error.clone();
         let content = serde_json::to_string(&DelegateTaskOutput {
             ok,
+            agent_name: &agent_name,
             task: &summary.task,
             result: summary.result.as_deref(),
             error: summary.error.as_deref(),
@@ -2871,20 +2965,22 @@ mod tests {
             json!({"task": "Inspect the runtime"}),
         );
 
-        assert_eq!(
-            registry.execution_kind(&call),
-            ToolExecutionKind::Subagent {
-                task: "Inspect the runtime".to_string()
-            }
-        );
+        let ToolExecutionKind::Subagent { task, agent_name } = registry.execution_kind(&call)
+        else {
+            panic!("expected subagent execution kind");
+        };
+        assert_eq!(task, "Inspect the runtime");
+        assert!(SUBAGENT_NAMES.contains(&agent_name.as_str()));
         let ToolExecution::Completed(result) = registry.execute(&call).await else {
             panic!("expected completed delegation");
         };
         assert!(result.ok);
+        let content = serde_json::from_str::<Value>(&result.content).expect("subagent JSON");
         assert_eq!(
-            serde_json::from_str::<Value>(&result.content).expect("subagent JSON"),
+            content,
             json!({
                 "ok": true,
+                "agent_name": agent_name,
                 "task": "Inspect the runtime",
                 "result": "research complete",
                 "model_calls": 2,
@@ -2892,12 +2988,31 @@ mod tests {
                 "truncated": false
             })
         );
+        let summary = result
+            .summary
+            .and_then(|summary| summary.subagent)
+            .expect("subagent summary");
         assert_eq!(
-            result
-                .summary
-                .and_then(|summary| summary.subagent)
-                .and_then(|summary| summary.result),
-            Some("research complete".to_string())
+            summary.agent_name.as_deref(),
+            content["agent_name"].as_str()
+        );
+        assert_eq!(summary.result.as_deref(), Some("research complete"));
+    }
+
+    #[test]
+    fn subagent_names_are_stable_per_call_and_unique_within_a_turn() {
+        let mut names = SubagentNameAllocator::with_seed(7);
+        let first = names.name_for("call-1");
+        let assigned = (1..=4)
+            .map(|index| names.name_for(&format!("call-{index}")))
+            .collect::<HashSet<_>>();
+
+        assert_eq!(names.name_for("call-1"), first);
+        assert_eq!(assigned.len(), 4);
+        assert!(
+            assigned
+                .iter()
+                .all(|name| SUBAGENT_NAMES.contains(&name.as_str()))
         );
     }
 

@@ -1,6 +1,7 @@
 use agent_protocol::{
-    AgentEvent, ApprovalDecision, ApprovalRequest, Conversation, Message, SubagentExecutionSummary,
-    Thread, ToolCall, ToolDefinition, ToolExecutionSummary, Turn, TurnRecord, TurnStep,
+    AgentEvent, ApprovalDecision, ApprovalRequest, Conversation, Message, ModelInvocation,
+    SubagentExecutionSummary, Thread, ToolCall, ToolDefinition, ToolExecutionSummary, Turn,
+    TurnRecord, TurnStep,
 };
 use futures_util::future::{BoxFuture, FutureExt};
 use futures_util::stream::{BoxStream, FuturesUnordered, Stream};
@@ -79,7 +80,7 @@ pub enum ToolExecutionMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolExecutionKind {
     Standard,
-    Subagent { task: String },
+    Subagent { task: String, agent_name: String },
 }
 
 #[derive(Debug, Clone)]
@@ -398,6 +399,10 @@ impl AgentTurnStream<'_> {
         &self.turn
     }
 
+    pub fn set_model_invocation(&mut self, model: ModelInvocation) {
+        self.turn.model = Some(model);
+    }
+
     pub fn into_turn(mut self) -> Turn {
         if !self.finished {
             self.cancel();
@@ -587,9 +592,10 @@ impl AgentTurnStream<'_> {
                     name: name.clone(),
                 });
             }
-            ToolExecutionKind::Subagent { task } => {
+            ToolExecutionKind::Subagent { task, agent_name } => {
                 self.pending.push_back(AgentEvent::SubagentStarted {
                     id: id.clone(),
+                    agent_name: Some(agent_name),
                     task,
                 });
             }
@@ -715,18 +721,23 @@ impl AgentTurnStream<'_> {
                     summary,
                 });
             }
-            ToolExecutionKind::Subagent { task } => {
-                let summary = summary
-                    .and_then(|summary| summary.subagent)
-                    .unwrap_or_else(|| SubagentExecutionSummary {
-                        task,
-                        result: None,
-                        error: error
-                            .or_else(|| (!ok).then(|| "subagent execution failed".to_string())),
-                        model_calls: 0,
-                        tool_calls: 0,
-                        truncated: false,
-                    });
+            ToolExecutionKind::Subagent { task, agent_name } => {
+                let mut summary =
+                    summary
+                        .and_then(|summary| summary.subagent)
+                        .unwrap_or_else(|| SubagentExecutionSummary {
+                            agent_name: Some(agent_name.clone()),
+                            task,
+                            result: None,
+                            error: error
+                                .or_else(|| (!ok).then(|| "subagent execution failed".to_string())),
+                            model_calls: 0,
+                            tool_calls: 0,
+                            truncated: false,
+                        });
+                if summary.agent_name.is_none() {
+                    summary.agent_name = Some(agent_name);
+                }
                 self.pending
                     .push_back(AgentEvent::SubagentFinished { id, ok, summary });
             }
@@ -1190,6 +1201,7 @@ mod tests {
         fn execution_kind(&self, _call: &ToolCall) -> ToolExecutionKind {
             ToolExecutionKind::Subagent {
                 task: "Inspect runtime".to_string(),
+                agent_name: "后藤一里".to_string(),
             }
         }
 
@@ -1206,7 +1218,8 @@ mod tests {
                     2,
                     1,
                     false,
-                );
+                )
+                .with_agent_name("后藤一里");
                 ToolExecution::Completed(ToolResult {
                     ok: true,
                     content: serde_json::to_string(&json!({
@@ -1490,6 +1503,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn turn_stream_records_model_invocation_before_execution() {
+        let model = ScriptedModel::new(Vec::new());
+        let agent = Agent::new(&model, "system");
+        let invocation = ModelInvocation {
+            provider_id: "provider".to_string(),
+            provider_name: "Provider".to_string(),
+            model_id: "model".to_string(),
+            model_name: "Model".to_string(),
+            reasoning: agent_protocol::ReasoningLevel::High,
+        };
+        let mut stream = agent
+            .run_turn(&Thread::new(), "hello")
+            .await
+            .expect("create turn stream");
+
+        stream.set_model_invocation(invocation.clone());
+
+        assert_eq!(stream.turn().model.as_ref(), Some(&invocation));
+        stream.cancel();
+    }
+
+    #[tokio::test]
     async fn run_turn_emits_events_and_updates_thread() {
         let body = concat!(
             "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n",
@@ -1554,14 +1589,20 @@ mod tests {
             events.as_slice(),
             [
                 AgentEvent::TurnStarted,
-                AgentEvent::SubagentStarted { id: start_id, task },
+                AgentEvent::SubagentStarted {
+                    id: start_id,
+                    agent_name: Some(start_name),
+                    task,
+                },
                 AgentEvent::SubagentFinished { id: finish_id, ok: true, summary },
                 AgentEvent::TextDelta(_),
                 AgentEvent::AgentMessage(_),
                 AgentEvent::TurnCompleted,
             ] if start_id == "call-1"
                 && finish_id == "call-1"
+                && start_name == "后藤一里"
                 && task == "Inspect runtime"
+                && summary.agent_name.as_deref() == Some("后藤一里")
                 && summary.result.as_deref() == Some("Runtime uses a reusable turn helper.")
         ));
         assert_eq!(turn.status, TurnStatus::Completed);

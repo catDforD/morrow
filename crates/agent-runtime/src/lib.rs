@@ -5,9 +5,9 @@ use agent_core::{
     Agent, AgentError, Model, ModelEvent, ModelFailure, ModelRequest, ToolExecutionContext,
 };
 use agent_protocol::{
-    AgentEvent, ApprovalDecision, ApprovalRequest, Conversation, Message, PermissionProfile,
-    Session, SubagentExecutionSummary, Thread, ToolDefinition, TurnRecord, TurnStatus,
-    TurnStepKind,
+    AgentEvent, ApprovalDecision, ApprovalRequest, Conversation, Message, ModelInvocation,
+    PermissionProfile, Session, SubagentExecutionSummary, Thread, ToolDefinition, TurnRecord,
+    TurnStatus, TurnStepKind,
 };
 use agent_tools::{SubagentExecutor, ToolRegistry, ToolRegistryError};
 use futures_util::StreamExt;
@@ -25,7 +25,7 @@ pub use agent_core::CancellationToken;
 pub use agent_tools::McpToolCache;
 pub use session_store::{SessionEntry, SessionListingEntry, SessionStore, SessionStoreError};
 
-pub const EVENT_SCHEMA_VERSION: u32 = 3;
+pub const EVENT_SCHEMA_VERSION: u32 = 4;
 const MESSAGE_BASE_TOKENS: usize = 6;
 const TOOL_CALL_BASE_TOKENS: usize = 12;
 const REQUEST_PADDING_NUMERATOR: usize = 4;
@@ -87,6 +87,7 @@ pub struct AgentEventEnvelope {
 #[derive(Clone, Copy)]
 pub struct RunAgentTurnContext<'a> {
     pub client: &'a dyn Model,
+    pub model: &'a ModelInvocation,
     pub system_prompt: &'a str,
     pub context_config: ContextConfig,
     pub model_limits: ModelContextLimits,
@@ -393,7 +394,7 @@ async fn run_agent_turn_inner(
         ) => Some(result),
     };
     let Some(build) = build else {
-        return Ok(record_cancelled_turn(session, prompt));
+        return Ok(record_cancelled_turn(session, prompt, context.model));
     };
     let build = build?;
     let mut tools = build.registry;
@@ -424,11 +425,15 @@ async fn run_agent_turn_inner(
         ) => Some(result),
     };
     let Some(compaction) = compaction else {
-        return Ok(record_cancelled_turn(session, prompt));
+        return Ok(record_cancelled_turn(session, prompt, context.model));
     };
     if let Err(error) = compaction {
         let message = format!("context compaction failed: {error}");
-        session.apply_turn(TurnRecord::failed_user_prompt(prompt, message.clone()));
+        apply_turn_with_model(
+            session,
+            TurnRecord::failed_user_prompt(prompt, message.clone()),
+            context.model,
+        );
         return Ok(RunAgentTurnOutcome {
             session_changed: true,
             error: Some(message),
@@ -451,7 +456,12 @@ async fn run_agent_turn_inner(
         );
         event_index += 1;
         if let Err(error) = handler.on_event(&envelope) {
-            return Ok(record_failed_turn(session, prompt, error.to_string()));
+            return Ok(record_failed_turn(
+                session,
+                prompt,
+                context.model,
+                error.to_string(),
+            ));
         }
     }
 
@@ -465,6 +475,7 @@ async fn run_agent_turn_inner(
                 },
             )
             .await?;
+        stream.set_model_invocation(context.model.clone());
 
         let mut cancellation_observed = false;
         loop {
@@ -550,7 +561,7 @@ async fn run_agent_turn_inner(
             }
         }
 
-        session.apply_turn(stream.into_turn_record());
+        apply_turn_with_model(session, stream.into_turn_record(), context.model);
     }
 
     Ok(RunAgentTurnOutcome {
@@ -559,17 +570,33 @@ async fn run_agent_turn_inner(
     })
 }
 
-fn record_cancelled_turn(session: &mut Session, prompt: &str) -> RunAgentTurnOutcome {
-    record_failed_turn(session, prompt, "turn cancelled")
+fn apply_turn_with_model(session: &mut Session, mut record: TurnRecord, model: &ModelInvocation) {
+    if record.turn.model.is_none() {
+        record.turn.model = Some(model.clone());
+    }
+    session.apply_turn(record);
+}
+
+fn record_cancelled_turn(
+    session: &mut Session,
+    prompt: &str,
+    model: &ModelInvocation,
+) -> RunAgentTurnOutcome {
+    record_failed_turn(session, prompt, model, "turn cancelled")
 }
 
 fn record_failed_turn(
     session: &mut Session,
     prompt: &str,
+    model: &ModelInvocation,
     message: impl Into<String>,
 ) -> RunAgentTurnOutcome {
     let message = message.into();
-    session.apply_turn(TurnRecord::failed_user_prompt(prompt, message.clone()));
+    apply_turn_with_model(
+        session,
+        TurnRecord::failed_user_prompt(prompt, message.clone()),
+        model,
+    );
     RunAgentTurnOutcome {
         session_changed: true,
         error: Some(message),
@@ -1190,13 +1217,25 @@ fn manifest_has_workspace_header(path: &Path) -> bool {
 mod tests {
     use super::*;
     use agent_model::{OpenAiCompatClient, OpenAiCompatConfig};
-    use agent_protocol::{FileChangeOperation, SessionContext, Thread, Turn};
+    use agent_protocol::{FileChangeOperation, ReasoningLevel, SessionContext, Thread, Turn};
     use futures_util::future::BoxFuture;
     use serde_json::json;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, OnceLock};
     use std::time::Duration;
+
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    fn test_model_invocation() -> &'static ModelInvocation {
+        static MODEL: OnceLock<ModelInvocation> = OnceLock::new();
+        MODEL.get_or_init(|| ModelInvocation {
+            provider_id: "test-provider".to_string(),
+            provider_name: "Test Provider".to_string(),
+            model_id: "test-model".to_string(),
+            model_name: "Test Model".to_string(),
+            reasoning: ReasoningLevel::Off,
+        })
+    }
 
     async fn spawn_recording_sse_server(
         bodies: Vec<&'static str>,
@@ -1755,6 +1794,7 @@ compact test
         let outcome = run_agent_turn(
             RunAgentTurnContext {
                 client: &client,
+                model: test_model_invocation(),
                 system_prompt: "system",
                 context_config: context_config(2),
                 model_limits: model_limits(10_000),
@@ -1785,6 +1825,10 @@ compact test
         );
         assert_eq!(session.turns.len(), 1);
         assert_eq!(session.turns[0].turn.status, TurnStatus::Completed);
+        assert_eq!(
+            session.turns[0].turn.model.as_ref(),
+            Some(test_model_invocation())
+        );
         assert_eq!(session.turns[0].messages, session.active_thread.messages);
         assert_eq!(requests.lock().expect("requests lock poisoned").len(), 1);
         assert_eq!(
@@ -1828,6 +1872,7 @@ compact test
         let outcome = run_agent_turn(
             RunAgentTurnContext {
                 client: &client,
+                model: test_model_invocation(),
                 system_prompt: "project policy",
                 context_config: context_config(2),
                 model_limits: model_limits(100_000),
@@ -1865,13 +1910,28 @@ compact test
         }));
         assert!(handler.events.iter().any(|event| matches!(
             &event.event,
-            AgentEvent::SubagentStarted { id, task }
-                if id == "delegate-1" && task == "Read note.txt and report the evidence"
+            AgentEvent::SubagentStarted {
+                id,
+                agent_name: Some(agent_name),
+                task,
+            }
+                if id == "delegate-1"
+                    && !agent_name.is_empty()
+                    && task == "Read note.txt and report the evidence"
         )));
+        let started_name = handler
+            .events
+            .iter()
+            .find_map(|event| match &event.event {
+                AgentEvent::SubagentStarted { agent_name, .. } => agent_name.as_deref(),
+                _ => None,
+            })
+            .expect("subagent start name");
         assert!(handler.events.iter().any(|event| matches!(
             &event.event,
             AgentEvent::SubagentFinished { id, ok: true, summary }
                 if id == "delegate-1"
+                    && summary.agent_name.as_deref() == Some(started_name)
                     && summary.model_calls == 2
                     && summary.tool_calls == 1
                     && summary.result.as_deref() == Some("The file contains workspace evidence.")
@@ -1908,6 +1968,7 @@ compact test
         let outcome = run_agent_turn(
             RunAgentTurnContext {
                 client: &client,
+                model: test_model_invocation(),
                 system_prompt: "system",
                 context_config: context_config(2),
                 model_limits: model_limits(10_000),
@@ -1960,6 +2021,7 @@ compact test
         let outcome = run_agent_turn(
             RunAgentTurnContext {
                 client: &client,
+                model: test_model_invocation(),
                 system_prompt: "system",
                 context_config: context_config(2),
                 model_limits: model_limits(10_000),
@@ -1986,6 +2048,10 @@ compact test
         assert_eq!(session.active_thread, original_thread);
         assert_eq!(session.turns.len(), 1);
         assert_eq!(session.turns[0].turn.status, TurnStatus::Failed);
+        assert_eq!(
+            session.turns[0].turn.model.as_ref(),
+            Some(test_model_invocation())
+        );
         assert!(
             session.turns[0]
                 .turn
@@ -2013,6 +2079,7 @@ compact test
         let outcome = run_agent_turn_with_cancellation(
             RunAgentTurnContext {
                 client: &model,
+                model: test_model_invocation(),
                 system_prompt: "system",
                 context_config: context_config(2),
                 model_limits: model_limits(1_000_000),
@@ -2041,6 +2108,10 @@ compact test
         assert_eq!(session.active_thread, original_thread);
         assert_eq!(session.turns.len(), 1);
         assert_eq!(session.turns[0].turn.status, TurnStatus::Failed);
+        assert_eq!(
+            session.turns[0].turn.model.as_ref(),
+            Some(test_model_invocation())
+        );
         assert_eq!(
             session.turns[0].turn.error.as_deref(),
             Some("turn cancelled")
@@ -2138,6 +2209,7 @@ done
         let outcome = run_agent_turn(
             RunAgentTurnContext {
                 client: &client,
+                model: test_model_invocation(),
                 system_prompt: "system",
                 context_config: context_config(2),
                 model_limits: model_limits(10_000),
@@ -2187,6 +2259,7 @@ done
         let outcome = run_agent_turn(
             RunAgentTurnContext {
                 client: &client,
+                model: test_model_invocation(),
                 system_prompt: "system",
                 context_config: context_config(2),
                 model_limits: model_limits(10_000),
@@ -2270,6 +2343,7 @@ done
             let outcome = run_agent_turn(
                 RunAgentTurnContext {
                     client: &client,
+                    model: test_model_invocation(),
                     system_prompt: "system",
                     context_config: context_config(2),
                     model_limits: model_limits(10_000),
@@ -2322,6 +2396,7 @@ done
         let outcome = run_agent_turn(
             RunAgentTurnContext {
                 client: &client,
+                model: test_model_invocation(),
                 system_prompt: "system",
                 context_config: context_config(2),
                 model_limits: model_limits(10_000),
@@ -2373,6 +2448,7 @@ done
         let outcome = run_agent_turn(
             RunAgentTurnContext {
                 client: &client,
+                model: test_model_invocation(),
                 system_prompt: "system",
                 context_config: context_config(2),
                 model_limits: model_limits(2_000),

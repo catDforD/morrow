@@ -60,6 +60,7 @@ import {
   finishedSubagentStep,
   runningSubagentStep,
   subagentHistory,
+  subagentStepTitle,
 } from './subagentTrace'
 import SettingsView from './SettingsView'
 import type { SettingsSection, ThemePreference } from './SettingsView'
@@ -349,7 +350,7 @@ export default function App() {
   )
 
   const ensureRunTrace = useCallback(
-    (title = 'Model call started', detail?: string) => {
+    (title: string, detail?: string) => {
       if (runTraceIdRef.current) return runTraceIdRef.current
       return createRunTrace(title, detail)
     },
@@ -374,7 +375,11 @@ export default function App() {
 
   const ensureLiveModelStep = useCallback(
     (status: RunStep['status'] = 'running') => {
-      const id = ensureRunTrace('Model call started')
+      const modelStep = modelStepPresentation(
+        modelSettingsRef.current,
+        modelSelectionRef.current,
+      )
+      const id = ensureRunTrace(modelStep.title, modelStep.detail)
       updateRunTrace(id, (trace) => {
         if (
           trace.steps.some(
@@ -391,13 +396,8 @@ export default function App() {
               id: nextId('step'),
               kind: 'model',
               status,
-              title: 'Model call started',
-              detail: modelSelectionRef.current
-                ? modelSelectionLabel(
-                    modelSettingsRef.current,
-                    modelSelectionRef.current,
-                  )
-                : undefined,
+              title: modelStep.title,
+              detail: modelStep.detail,
             },
           ],
         }
@@ -468,7 +468,7 @@ export default function App() {
   )
 
   const startSubagentStep = useCallback(
-    (id: string, task: string) => {
+    (id: string, agentName: string | undefined, task: string) => {
       const runId = ensureLiveModelStep('ok')
       updateRunTrace(runId, (trace) => ({
         ...trace,
@@ -478,7 +478,7 @@ export default function App() {
             : step,
         ),
       }))
-      upsertRunStep(runId, runningSubagentStep(id, task))
+      upsertRunStep(runId, runningSubagentStep(id, agentName, task))
     },
     [ensureLiveModelStep, updateRunTrace, upsertRunStep],
   )
@@ -690,20 +690,17 @@ export default function App() {
   const handleAgentEvent = useCallback(
     (event: AgentEvent) => {
       switch (event.type) {
-        case 'turn_started':
+        case 'turn_started': {
+          const modelStep = modelStepPresentation(
+            modelSettingsRef.current,
+            modelSelectionRef.current,
+          )
           assistantMessageIdRef.current = null
           setTools([])
-          refreshCurrentModelStep(
-            'Model call started',
-            modelSelectionRef.current
-              ? modelSelectionLabel(
-                  modelSettingsRef.current,
-                  modelSelectionRef.current,
-                )
-              : selectedRef.current,
-          )
+          refreshCurrentModelStep(modelStep.title, modelStep.detail)
           recordActivity('Turn started', selectedRef.current, 'running')
           break
+        }
         case 'warning':
           recordActivity('Warning', event.data, 'error')
           break
@@ -720,14 +717,26 @@ export default function App() {
           assistantMessageIdRef.current = null
           break
         case 'subagent_started':
-          upsertTool(event.data.id, 'delegate_task', 'running')
-          startSubagentStep(event.data.id, event.data.task)
-          recordActivity('Subagent started', event.data.task, 'running')
+          upsertTool(
+            event.data.id,
+            subagentStepTitle(event.data.agent_name),
+            'running',
+          )
+          startSubagentStep(
+            event.data.id,
+            event.data.agent_name,
+            event.data.task,
+          )
+          recordActivity(
+            `${subagentStepTitle(event.data.agent_name)} 开始执行`,
+            event.data.task,
+            'running',
+          )
           break
         case 'subagent_finished':
           upsertTool(
             event.data.id,
-            'delegate_task',
+            subagentStepTitle(event.data.summary.agent_name),
             event.data.ok ? 'ok' : 'error',
             { subagent: event.data.summary },
           )
@@ -737,7 +746,9 @@ export default function App() {
             event.data.summary,
           )
           recordActivity(
-            event.data.ok ? 'Subagent finished' : 'Subagent failed',
+            `${subagentStepTitle(event.data.summary.agent_name)}${
+              event.data.ok ? ' 已完成' : ' 执行失败'
+            }`,
             event.data.summary.task,
             event.data.ok ? 'ok' : 'error',
           )
@@ -1212,14 +1223,10 @@ export default function App() {
         : { matched: false, prompt: trimmed }
       const resolvedPrompt = resolved.prompt.trim()
       if (!resolvedPrompt) throw new Error('resolved prompt must not be empty')
+      const modelStep = modelStepPresentation(modelSettings, modelSelection)
       followMessagesRef.current = true
       addTimelineMessage('user', resolvedPrompt)
-      createRunTrace(
-        'Request queued',
-        selectedModel
-          ? `${selectedModel.provider.name} · ${selectedModel.model.name} · ${reasoningLabel(modelSelection?.reasoning ?? 'off')}`
-          : compactText(resolvedPrompt, 90),
-      )
+      createRunTrace(modelStep.title, modelStep.detail)
       sendSocketMessage({
         type: 'start_turn',
         data: {
@@ -1252,7 +1259,13 @@ export default function App() {
   }
 
   const handlePromptKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
-    if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+    if (
+      shouldSubmitPromptOnEnter(
+        event.key,
+        event.ctrlKey,
+        event.nativeEvent.isComposing,
+      )
+    ) {
       event.preventDefault()
       event.currentTarget.form?.requestSubmit()
     }
@@ -2160,8 +2173,18 @@ function TimelineMessage({ message }: { message: TimelineMessageItem }) {
 }
 
 function MarkdownMessage({ content }: { content: string }) {
+  return <MarkdownContent content={content} className="message-bubble" />
+}
+
+function MarkdownContent({
+  content,
+  className = '',
+}: {
+  content: string
+  className?: string
+}) {
   return (
-    <div className="message-bubble markdown-message">
+    <div className={`markdown-message${className ? ` ${className}` : ''}`}>
       <ReactMarkdown
         remarkPlugins={markdownPlugins}
         skipHtml
@@ -2243,19 +2266,97 @@ function RunTraceCard({
 }
 
 function RunStepRow({ step }: { step: RunStep }) {
+  const isSubagent = step.kind === 'subagent'
   return (
     <article className={`run-step ${step.kind} ${step.status}`}>
       <div className="run-step-icon">{runStepIcon(step)}</div>
       <div className="run-step-main">
-        <div className="run-step-head">
-          <strong>{step.title}</strong>
-          <span>{step.status}</span>
-        </div>
-        {step.detail ? <p>{step.detail}</p> : null}
-        <RunStepDetails step={step} />
+        {isSubagent ? (
+          <SubagentStepDisclosure step={step} />
+        ) : (
+          <>
+            <div className="run-step-head">
+              <strong>{step.title}</strong>
+              <span>{step.status}</span>
+            </div>
+            {step.detail ? <p>{step.detail}</p> : null}
+            <RunStepDetails step={step} />
+          </>
+        )}
       </div>
     </article>
   )
+}
+
+export function SubagentStepDisclosure({ step }: { step: RunStep }) {
+  return (
+    <details className="subagent-step-disclosure">
+      <summary
+        className="run-step-head subagent-step-summary"
+        aria-label={`${step.title}，展开或折叠详情`}
+      >
+        <strong>{step.title}</strong>
+        <span className="subagent-step-state">
+          {step.status}
+          <ChevronRight size={14} aria-hidden="true" />
+        </span>
+      </summary>
+      <SubagentStepPanel step={step} />
+    </details>
+  )
+}
+
+export function SubagentStepPanel({ step }: { step: RunStep }) {
+  const summary = step.summary?.subagent
+  const task = summary?.task || step.detail || '未提供提示词'
+  const result = summary?.result?.trim()
+  const error = summary?.error?.trim()
+
+  return (
+    <div className="subagent-panel">
+      <section className="subagent-pane prompt-pane">
+        <header>
+          <strong>提示词</strong>
+        </header>
+        <div
+          className="subagent-pane-body subagent-prompt"
+          tabIndex={0}
+          aria-label={`${step.title}提示词`}
+        >
+          {task}
+        </div>
+      </section>
+      <section className={`subagent-pane output-pane${error ? ' failed' : ''}`}>
+        <header>
+          <strong>子智能体输出</strong>
+          {summary ? <span>{subagentExecutionMeta(summary)}</span> : null}
+        </header>
+        <div
+          className="subagent-pane-body subagent-output"
+          tabIndex={0}
+          aria-label={`${step.title}输出`}
+        >
+          {step.status === 'running' && !summary ? (
+            <div className="subagent-waiting" role="status">
+              <Clock3 size={16} />
+              <span>等待子智能体返回结果…</span>
+            </div>
+          ) : error ? (
+            <p className="subagent-error">{error}</p>
+          ) : result ? (
+            <MarkdownContent content={result} className="subagent-markdown" />
+          ) : (
+            <p className="subagent-empty">子智能体未返回内容。</p>
+          )}
+        </div>
+      </section>
+    </div>
+  )
+}
+
+function subagentExecutionMeta(summary: SubagentExecutionSummary): string {
+  const truncated = summary.truncated ? ' · 结果已截断' : ''
+  return `${summary.model_calls} 次模型调用 · ${summary.tool_calls} 次只读工具${truncated}`
 }
 
 function RunStepDetails({ step }: { step: RunStep }) {
@@ -2273,22 +2374,6 @@ function RunStepDetails({ step }: { step: RunStep }) {
       {summary ? (
         <details className="run-step-details">
           <summary>Details</summary>
-          {summary.subagent ? (
-            <div className="subagent-summary">
-              <strong>{summary.subagent.task}</strong>
-              <p>
-                {summary.subagent.model_calls} model calls ·{' '}
-                {summary.subagent.tool_calls} read-only tools
-                {summary.subagent.truncated ? ' · result truncated' : ''}
-              </p>
-              {summary.subagent.result ? (
-                <pre>{summary.subagent.result}</pre>
-              ) : null}
-              {summary.subagent.error ? (
-                <pre>{summary.subagent.error}</pre>
-              ) : null}
-            </div>
-          ) : null}
           {summary.shell ? (
         <pre>
           {[
@@ -2502,6 +2587,7 @@ function Composer({
             rows={variant === 'home' ? 3 : 2}
             disabled={isRunning || isResolvingCommand}
             placeholder="Ask Morrow to edit, inspect, or explain this workspace"
+            title="Enter 发送·Ctrl + Enter 换行"
             onChange={(event) => {
               setDismissedCommandPrompt('')
               setCommandIndex(0)
@@ -3318,7 +3404,7 @@ function historyRunTrace(
             : 'running',
       title:
         isSubagent
-          ? 'Subagent'
+          ? subagentStepTitle(subagent?.agentName)
           : step.kind === 'tool_call'
           ? step.tool_name || 'Tool call'
           : turn.model?.model_name || 'Model call',
@@ -3565,6 +3651,26 @@ function modelSelectionLabel(
   const selected = findSelectedModel(settings, selection)
   if (!selected || !selection) return '未配置模型'
   return `${selected.provider.name} · ${selected.model.name} · ${reasoningLabel(selection.reasoning)}`
+}
+
+export function modelStepPresentation(
+  settings: ModelSettingsResponse | null,
+  selection: ModelSelection | null,
+): { title: string; detail?: string } {
+  const selected = findSelectedModel(settings, selection)
+  if (!selected || !selection) return { title: 'Model call' }
+  return {
+    title: selected.model.name,
+    detail: `${selected.provider.name} · ${reasoningLabel(selection.reasoning)}`,
+  }
+}
+
+export function shouldSubmitPromptOnEnter(
+  key: string,
+  ctrlKey: boolean,
+  isComposing: boolean,
+): boolean {
+  return key === 'Enter' && !ctrlKey && !isComposing
 }
 
 function slashCommandQuery(prompt: string): string | null {

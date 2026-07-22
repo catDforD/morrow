@@ -1903,6 +1903,7 @@ async fn run_turn_task_inner(context: TurnTaskContext) -> Result<(), agent_runti
     let outcome = agent_runtime::run_agent_turn_with_cancellation(
         RunAgentTurnContext {
             client: &resolved_model.client,
+            model: &resolved_model.invocation,
             system_prompt: &options.system_prompt,
             context_config: options.context_config,
             model_limits: resolved_model.limits,
@@ -1919,10 +1920,6 @@ async fn run_turn_task_inner(context: TurnTaskContext) -> Result<(), agent_runti
         cancellation,
     )
     .await?;
-
-    if let Some(record) = session.turns.get_mut(turn_index) {
-        record.turn.model = Some(resolved_model.invocation);
-    }
 
     if outcome.session_changed {
         store.save(&session)?;

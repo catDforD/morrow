@@ -4,8 +4,8 @@ use agent_config::{
 use agent_model::{ModelError, OpenAiCompatClient, OpenAiCompatConfig};
 use agent_protocol::{
     AgentEvent, ApprovalAction, ApprovalDecision, ApprovalRequest, FileChangeSummary,
-    PermissionMode, PermissionProfile, Session, ShellCommandSummary, ShellPolicy,
-    ToolExecutionSummary,
+    ModelInvocation, PermissionMode, PermissionProfile, ReasoningLevel, Session,
+    ShellCommandSummary, ShellPolicy, ToolExecutionSummary,
 };
 use agent_runtime::{
     AgentEventEnvelope, CompactionOutcome, McpToolCache, RunAgentTurnOutcome, SessionStore,
@@ -27,6 +27,8 @@ const INIT_CONFIG_API_KEY_PLACEHOLDER: &str = "replace-with-your-openai-api-key"
 const INIT_CONFIG_TIMEOUT_SECS: u64 = 120;
 const INIT_CONFIG_CONTEXT_WINDOW_TOKENS: usize = 1_047_576;
 const INIT_CONFIG_RESERVED_OUTPUT_TOKENS: usize = 8_192;
+const CONFIG_PROVIDER_ID: &str = "current-config";
+const CONFIG_PROVIDER_NAME: &str = "默认配置";
 
 #[derive(Debug, Parser)]
 #[command(name = "morrow")]
@@ -204,6 +206,7 @@ async fn run() -> Result<(), CliError> {
     let reset_session = args.reset_session || args.reset_thread;
     let loaded = load_config(args.config.as_deref())?;
     let model_limits = loaded.config.model.context_limits();
+    let model_invocation = config_model_invocation(&loaded.config.model.model);
     let permissions =
         effective_permissions(loaded.config.permissions, args.permission, args.allow_shell);
     let client = OpenAiCompatClient::new(OpenAiCompatConfig {
@@ -225,6 +228,7 @@ async fn run() -> Result<(), CliError> {
         run_repl(
             ReplContext {
                 client: &client,
+                model: &model_invocation,
                 system_prompt: &loaded.config.agent.system_prompt,
                 context_config: loaded.config.context,
                 model_limits,
@@ -246,6 +250,7 @@ async fn run() -> Result<(), CliError> {
     let outcome = run_agent_turn(
         RunAgentTurnContext {
             client: &client,
+            model: &model_invocation,
             system_prompt: &loaded.config.agent.system_prompt,
             context_config: loaded.config.context,
             model_limits,
@@ -281,6 +286,7 @@ async fn run() -> Result<(), CliError> {
 
 struct ReplContext<'a> {
     client: &'a OpenAiCompatClient,
+    model: &'a ModelInvocation,
     system_prompt: &'a str,
     context_config: ContextConfig,
     model_limits: ModelContextLimits,
@@ -295,6 +301,7 @@ struct ReplContext<'a> {
 #[derive(Debug, Clone, Copy)]
 struct RunAgentTurnContext<'a> {
     client: &'a OpenAiCompatClient,
+    model: &'a ModelInvocation,
     system_prompt: &'a str,
     context_config: ContextConfig,
     model_limits: ModelContextLimits,
@@ -360,6 +367,7 @@ async fn run_repl(
         let outcome = run_agent_turn(
             RunAgentTurnContext {
                 client: context.client,
+                model: context.model,
                 system_prompt: context.system_prompt,
                 context_config: context.context_config,
                 model_limits: context.model_limits,
@@ -476,6 +484,7 @@ async fn run_agent_turn(
     agent_runtime::run_agent_turn(
         agent_runtime::RunAgentTurnContext {
             client: context.client,
+            model: context.model,
             system_prompt: context.system_prompt,
             context_config: context.context_config,
             model_limits: context.model_limits,
@@ -547,16 +556,23 @@ impl TurnEventHandler for CliTurnHandler<'_, '_> {
                 }
             }
             AgentEvent::AgentMessage(_) => {}
-            AgentEvent::SubagentStarted { task, .. } => {
+            AgentEvent::SubagentStarted {
+                agent_name, task, ..
+            } => {
                 if self.context.output == OutputMode::Human {
-                    eprintln!("subagent started: {}", compact_line(task, 120));
+                    eprintln!(
+                        "subagent {} started: {}",
+                        subagent_name(agent_name.as_deref()),
+                        compact_line(task, 120)
+                    );
                 }
             }
             AgentEvent::SubagentFinished { ok, summary, .. } => {
                 if self.context.output == OutputMode::Human {
                     let status = if *ok { "ok" } else { "error" };
                     eprintln!(
-                        "subagent {status}: {} (model_calls={}, tool_calls={})",
+                        "subagent {} {status}: {} (model_calls={}, tool_calls={})",
+                        subagent_name(summary.agent_name.as_deref()),
                         compact_line(&summary.task, 120),
                         summary.model_calls,
                         summary.tool_calls,
@@ -981,6 +997,11 @@ fn format_execution_summary(records: &[ExecutionRecord]) -> Option<String> {
                 let _ = writeln!(output, "  error: {error}");
             }
             if let Some(subagent) = summary.subagent.as_ref() {
+                let _ = writeln!(
+                    output,
+                    "  agent: {}",
+                    subagent_name(subagent.agent_name.as_deref())
+                );
                 let _ = writeln!(output, "  task: {}", compact_line(&subagent.task, 160));
                 let _ = writeln!(
                     output,
@@ -1008,6 +1029,22 @@ fn compact_line(value: &str, max_chars: usize) -> String {
         .collect::<String>();
     compact.push('…');
     compact
+}
+
+fn config_model_invocation(model_name: &str) -> ModelInvocation {
+    ModelInvocation {
+        provider_id: CONFIG_PROVIDER_ID.to_string(),
+        provider_name: CONFIG_PROVIDER_NAME.to_string(),
+        model_id: model_name.to_string(),
+        model_name: model_name.to_string(),
+        reasoning: ReasoningLevel::Off,
+    }
+}
+
+fn subagent_name(agent_name: Option<&str>) -> &str {
+    agent_name
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("Subagent")
 }
 
 fn append_file_list(output: &mut String, files: &[FileChangeSummary]) {
@@ -1093,10 +1130,15 @@ mod tests {
     use agent_protocol::{FileChangeOperation, Message, Thread, Turn, TurnRecord, TurnStatus};
     use agent_runtime::{compact_session, rebuild_active_thread};
     use serde_json::json;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    fn test_model_invocation() -> &'static ModelInvocation {
+        static MODEL: OnceLock<ModelInvocation> = OnceLock::new();
+        MODEL.get_or_init(|| config_model_invocation("test-model"))
+    }
 
     async fn spawn_recording_sse_server(
         bodies: Vec<&'static str>,
@@ -1503,7 +1545,7 @@ compact test
     }
 
     #[test]
-    fn formats_execution_summary_for_file_shell_and_error_results() {
+    fn formats_execution_summary_for_file_shell_subagent_and_error_results() {
         let records = vec![
             ExecutionRecord {
                 name: "write_file".to_string(),
@@ -1525,6 +1567,20 @@ compact test
                 })),
             },
             ExecutionRecord {
+                name: "delegate_task".to_string(),
+                ok: true,
+                summary: Some(ToolExecutionSummary::subagent(
+                    agent_protocol::SubagentExecutionSummary::success(
+                        "Inspect runtime",
+                        "Runtime is ready.",
+                        2,
+                        1,
+                        false,
+                    )
+                    .with_agent_name("后藤一里"),
+                )),
+            },
+            ExecutionRecord {
                 name: "edit_file".to_string(),
                 ok: false,
                 summary: Some(ToolExecutionSummary::error("approval denied")),
@@ -1537,6 +1593,8 @@ compact test
         assert!(text.contains("- write_file: ok"));
         assert!(text.contains("diff: available"));
         assert!(text.contains("shell: exit_code=0"));
+        assert!(text.contains("agent: 后藤一里"));
+        assert!(text.contains("task: Inspect runtime"));
         assert!(text.contains("- edit_file: error"));
         assert!(text.contains("error: approval denied"));
     }
@@ -1587,6 +1645,7 @@ compact test
         let outcome = run_agent_turn(
             RunAgentTurnContext {
                 client: &client,
+                model: test_model_invocation(),
                 system_prompt: "system",
                 context_config: context_config(2),
                 model_limits: model_limits(10_000),
@@ -1617,6 +1676,10 @@ compact test
         );
         assert_eq!(session.turns.len(), 1);
         assert_eq!(session.turns[0].turn.status, TurnStatus::Completed);
+        assert_eq!(
+            session.turns[0].turn.model.as_ref(),
+            Some(test_model_invocation())
+        );
         assert_eq!(session.turns[0].messages, session.active_thread.messages);
         assert_eq!(requests.lock().expect("requests lock poisoned").len(), 1);
     }
@@ -1633,6 +1696,7 @@ compact test
         let outcome = run_agent_turn(
             RunAgentTurnContext {
                 client: &client,
+                model: test_model_invocation(),
                 system_prompt: "system",
                 context_config: context_config(2),
                 model_limits: model_limits(10_000),
@@ -1660,7 +1724,7 @@ compact test
             .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json line"))
             .collect::<Vec<_>>();
         assert_eq!(lines.len(), 4);
-        assert_eq!(lines[0]["schema_version"], json!(3));
+        assert_eq!(lines[0]["schema_version"], json!(4));
         assert!(lines[0]["timestamp_ms"].as_u64().is_some());
         assert_eq!(lines[0]["session"], "default");
         assert_eq!(lines[0]["workspace_root"], root.display().to_string());
@@ -1676,6 +1740,39 @@ compact test
             json!({"type": "agent_message", "data": "ok"})
         );
         assert_eq!(lines[3]["event"], json!({"type": "turn_completed"}));
+    }
+
+    #[test]
+    fn jsonl_subagent_events_include_the_assigned_name() {
+        let root = unique_cli_dir("jsonl-subagent-name");
+        let envelope = agent_runtime::make_event_envelope(
+            "default",
+            &root,
+            2,
+            3,
+            AgentEvent::SubagentStarted {
+                id: "call-1".to_string(),
+                agent_name: Some("后藤一里".to_string()),
+                task: "Inspect runtime".to_string(),
+            },
+        );
+        let mut output = Vec::new();
+
+        write_jsonl_event(&mut output, &envelope).expect("write JSONL event");
+
+        let value: serde_json::Value = serde_json::from_slice(&output).expect("parse JSONL event");
+        assert_eq!(value["schema_version"], json!(4));
+        assert_eq!(
+            value["event"],
+            json!({
+                "type": "subagent_started",
+                "data": {
+                    "id": "call-1",
+                    "agent_name": "后藤一里",
+                    "task": "Inspect runtime"
+                }
+            })
+        );
     }
 
     #[tokio::test]
@@ -1703,6 +1800,7 @@ compact test
         let outcome = run_agent_turn(
             RunAgentTurnContext {
                 client: &client,
+                model: test_model_invocation(),
                 system_prompt: "system",
                 context_config: context_config(2),
                 model_limits: model_limits(10_000),
@@ -1762,6 +1860,7 @@ compact test
         let outcome = run_agent_turn(
             RunAgentTurnContext {
                 client: &client,
+                model: test_model_invocation(),
                 system_prompt: "system",
                 context_config: context_config(2),
                 model_limits: model_limits(10_000),
@@ -1811,6 +1910,7 @@ compact test
         let outcome = run_agent_turn(
             RunAgentTurnContext {
                 client: &client,
+                model: test_model_invocation(),
                 system_prompt: "system",
                 context_config: context_config(2),
                 model_limits: model_limits(1),
@@ -1841,6 +1941,16 @@ compact test
         assert_eq!(
             session.turns.last().expect("failed turn").turn.status,
             TurnStatus::Failed
+        );
+        assert_eq!(
+            session
+                .turns
+                .last()
+                .expect("failed turn")
+                .turn
+                .model
+                .as_ref(),
+            Some(test_model_invocation())
         );
         assert!(
             session
