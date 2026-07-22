@@ -726,20 +726,19 @@ impl AgentTurnStream<'_> {
                 });
             }
             ToolExecutionKind::Subagent { task, identity } => {
-                let mut summary =
-                    summary
-                        .and_then(|summary| summary.subagent)
-                        .unwrap_or_else(|| SubagentExecutionSummary {
-                            agent_id: Some(identity.id.clone()),
-                            agent_name: Some(identity.name.clone()),
-                            task,
-                            result: None,
-                            error: error
-                                .or_else(|| (!ok).then(|| "subagent execution failed".to_string())),
-                            model_calls: 0,
-                            tool_calls: 0,
-                            truncated: false,
-                        });
+                let mut summary = summary
+                    .and_then(|summary| summary.subagent.map(|subagent| *subagent))
+                    .unwrap_or_else(|| SubagentExecutionSummary {
+                        agent_id: Some(identity.id.clone()),
+                        agent_name: Some(identity.name.clone()),
+                        task,
+                        result: None,
+                        error: error
+                            .or_else(|| (!ok).then(|| "subagent execution failed".to_string())),
+                        model_calls: 0,
+                        tool_calls: 0,
+                        truncated: false,
+                    });
                 summary.agent_id.get_or_insert(identity.id);
                 summary.agent_name.get_or_insert(identity.name);
                 self.pending
@@ -1508,11 +1507,11 @@ mod tests {
     }
 
     #[test]
-    fn agent_defaults_to_two_hundred_tool_rounds() {
+    fn agent_defaults_to_ninety_nine_tool_rounds() {
         let model = ScriptedModel::new(Vec::new());
         let agent = Agent::new(&model, "system");
 
-        assert_eq!(agent.max_tool_rounds, 200);
+        assert_eq!(agent.max_tool_rounds, 99);
     }
 
     #[tokio::test]

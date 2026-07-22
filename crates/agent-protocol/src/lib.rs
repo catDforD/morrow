@@ -992,7 +992,7 @@ pub struct ToolExecutionSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub subagent: Option<SubagentExecutionSummary>,
+    pub subagent: Option<Box<SubagentExecutionSummary>>,
 }
 
 impl ToolExecutionSummary {
@@ -1032,7 +1032,7 @@ impl ToolExecutionSummary {
             diff: None,
             shell: None,
             error: None,
-            subagent: Some(subagent),
+            subagent: Some(Box::new(subagent)),
         }
     }
 }
