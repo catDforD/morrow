@@ -152,6 +152,8 @@ CLI commands continue to require a valid model and API key in the resolved TOML 
 
 The dashboard's **Settings → Models** page manages Web-only OpenAI Chat Completions compatible providers. These settings do not change the CLI model. Provider data is stored in `~/.morrow/web-models.json`; API keys are kept as local plaintext, never returned by the API, and the file is written with mode `0600` on Unix. A valid TOML model appears as a read-only provider and becomes the initial Web default until another default is selected.
 
+Every new turn persists its resolved model invocation in the shared runtime record. Live execution steps and restored session history therefore use the same model name across Web, CLI, Desktop, WSL, and remote workspaces.
+
 The built-in DeepSeek template adds `deepseek-v4-flash` and `deepseek-v4-pro` with 1,000,000-token context windows, tool support, and **Off / High / Max** reasoning choices. New browser sessions inherit the global default, while each existing session remembers its own model and reasoning level.
 
 ### MCP tools
@@ -182,6 +184,10 @@ Models with tool support automatically receive a `delegate_task` tool for self-c
 Each subagent uses the currently selected model and reasoning level plus the configured system prompt, but starts with an isolated conversation containing only its delegated task. It can use `read_file`, `list_files`, and `search_text`; it cannot modify files, run shell commands, call MCP tools, or delegate another subagent.
 
 A parent turn may start at most four subagents, with at most four running concurrently. Each task has a five-minute timeout and its returned report is capped at 12,000 characters. CLI, JSONL, Web, Desktop, and WSL surfaces expose subagent start/finish events. The parent session stores the delegated task and final tool result, not the subagent's full reasoning or internal transcript.
+
+Each delegated call receives a stable identity from the global subagent list. The default list contains 22 built-in profiles, and **Settings → Subagents** can rename, add, or delete profiles, restore the defaults, and upload an avatar for each name. The list is stored in `~/.morrow/subagents.json` with mode `0600` on Unix. It must contain 4–64 unique names; changes apply to the next turn, while an already-running turn keeps its starting snapshot. CLI, Web, Desktop, WSL, and remote turns all use this same identity pool (Desktop keeps the WSL list and avatars on the Windows host).
+
+Names are unique within one parent turn and may be reused by later turns. The execution-time profile ID and name are persisted with the final tool result, but avatar image data is never copied into a Session or sent to a remote runtime. Historical titles therefore keep their original names, while their avatar follows the profile's current image; deleting that profile falls back to the robot icon. Avatar files are normalized in the browser to a centered 256×256 PNG, JPEG, or preferably WebP image before the server validates and stores them. The dashboard keeps each subagent step collapsed by default; opening it reveals a fixed-height prompt/output card with independent scrolling and a final Markdown report rather than the subagent's internal transcript.
 
 ### Web custom commands
 

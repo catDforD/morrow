@@ -400,6 +400,10 @@ fn is_windows_owned_settings_path(path: &str) -> bool {
         || path.starts_with("/api/mcp-servers")
         || path == "/api/commands"
         || path.starts_with("/api/commands/")
+        || path == "/api/subagent-settings"
+        || path.starts_with("/api/subagent-settings/")
+        || path == "/api/subagents"
+        || path.starts_with("/api/subagents/")
         || (path.starts_with("/api/sessions/") && path.ends_with("/model-selection"))
 }
 
@@ -421,6 +425,7 @@ fn merge_remote_status(
         "model_store_path",
         "mcp_store_path",
         "command_store_path",
+        "subagent_store_path",
     ] {
         if let Some(value) = local.get(key) {
             remote_body.insert(key.to_string(), value.clone());
@@ -1203,6 +1208,7 @@ fn prepare_remote_settings(
         model_store_path: morrow_home.join("web-models.json"),
         mcp_store_path: morrow_home.join("web-mcp.json"),
         command_store_path: morrow_home.join("commands"),
+        subagent_store_path: morrow_home.join("subagents.json"),
         system_prompt: String::new(),
         context_config: ContextConfig {
             auto_compact: true,
@@ -2087,6 +2093,52 @@ mod tests {
                     "path": "/tmp/morrow"
                 }
             })
+        );
+    }
+
+    #[test]
+    fn desktop_keeps_subagent_settings_on_the_windows_host() {
+        for path in [
+            "/api/subagent-settings",
+            "/api/subagent-settings/reset",
+            "/api/subagents",
+            "/api/subagents/builtin-01",
+        ] {
+            assert!(is_windows_owned_settings_path(path), "{path}");
+        }
+        assert!(!is_windows_owned_settings_path("/api/sessions/default"));
+    }
+
+    #[test]
+    fn desktop_status_uses_the_windows_subagent_store_path() {
+        let remote = RemoteResponse::Http(agent_protocol::RemoteHttpResponse {
+            status: 200,
+            body: Some(serde_json::json!({
+                "workspace_root": "/home/morrow/project",
+                "subagent_store_path": "/home/morrow/.morrow/subagents.json"
+            })),
+        });
+        let local = agent_server::EmbeddedHttpResponse {
+            status: 200,
+            body: Some(serde_json::json!({
+                "model_ready": true,
+                "model_store_path": "C:/Users/morrow/.morrow/web-models.json",
+                "mcp_store_path": "C:/Users/morrow/.morrow/web-mcp.json",
+                "command_store_path": "C:/Users/morrow/.morrow/commands",
+                "subagent_store_path": "C:/Users/morrow/.morrow/subagents.json"
+            })),
+        };
+
+        let RemoteResponse::Http(merged) =
+            merge_remote_status(remote, local).expect("merge remote status")
+        else {
+            panic!("status response must remain HTTP");
+        };
+        let body = merged.body.expect("merged status body");
+        assert_eq!(body["workspace_root"], "/home/morrow/project");
+        assert_eq!(
+            body["subagent_store_path"],
+            "C:/Users/morrow/.morrow/subagents.json"
         );
     }
 

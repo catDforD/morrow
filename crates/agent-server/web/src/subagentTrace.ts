@@ -4,16 +4,25 @@ const delegateTaskTool = 'delegate_task'
 
 export interface SubagentHistoryEntry {
   task: string
+  agentId?: string
+  agentName?: string
   summary?: SubagentExecutionSummary
 }
 
-export function runningSubagentStep(id: string, task: string): RunStep {
+export function runningSubagentStep(
+  id: string,
+  agentId: string | undefined,
+  agentName: string | undefined,
+  task: string,
+): RunStep {
   return {
     id,
     kind: 'subagent',
     status: 'running',
-    title: 'Subagent',
+    title: subagentStepTitle(agentName),
     detail: task,
+    ...(agentId ? { agentId } : {}),
+    ...(agentName ? { agentName } : {}),
   }
 }
 
@@ -26,10 +35,17 @@ export function finishedSubagentStep(
     id,
     kind: 'subagent',
     status: ok ? 'ok' : 'error',
-    title: 'Subagent',
+    title: subagentStepTitle(summary.agent_name),
     detail: summary.task,
     summary: { subagent: summary },
+    ...(summary.agent_id ? { agentId: summary.agent_id } : {}),
+    ...(summary.agent_name ? { agentName: summary.agent_name } : {}),
   }
+}
+
+export function subagentStepTitle(agentName?: string): string {
+  const normalized = agentName?.trim()
+  return normalized ? `子智能体 · ${normalized}` : '子智能体'
 }
 
 export function subagentHistory(
@@ -50,7 +66,12 @@ export function subagentHistory(
     if (!entry) continue
     const summary = parseSubagentResult(message.content, entry.task)
     if (summary) {
-      entries.set(message.tool_call_id, { task: summary.task, summary })
+      entries.set(message.tool_call_id, {
+        task: summary.task,
+        ...(summary.agent_id ? { agentId: summary.agent_id } : {}),
+        ...(summary.agent_name ? { agentName: summary.agent_name } : {}),
+        summary,
+      })
     }
   }
 
@@ -78,12 +99,16 @@ function parseSubagentResult(
     const value: unknown = JSON.parse(content)
     if (!isRecord(value)) return undefined
     const task = typeof value.task === 'string' ? value.task : fallbackTask
+    const agentId = nonEmptyString(value.agent_id)
+    const agentName = nonEmptyString(value.agent_name)
     const modelCalls = numberOrZero(value.model_calls)
     const toolCalls = numberOrZero(value.tool_calls)
     const truncated = value.truncated === true
     const result = typeof value.result === 'string' ? value.result : undefined
     const error = typeof value.error === 'string' ? value.error : undefined
     return {
+      agent_id: agentId,
+      agent_name: agentName,
       task,
       result,
       error,
@@ -94,6 +119,10 @@ function parseSubagentResult(
   } catch {
     return undefined
   }
+}
+
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined
 }
 
 function numberOrZero(value: unknown): number {

@@ -7,8 +7,8 @@ pub use agent_core::{
 };
 use agent_protocol::{
     ApprovalDecision, ApprovalRequest, FileChangeOperation, FileChangeSummary, PermissionMode,
-    PermissionProfile, ShellCommandSummary, ShellPolicy, SubagentExecutionSummary, ToolCall,
-    ToolDefinition, ToolExecutionSummary,
+    PermissionProfile, ShellCommandSummary, ShellPolicy, SubagentExecutionSummary,
+    SubagentIdentity, ToolCall, ToolDefinition, ToolExecutionSummary, default_subagent_identities,
 };
 use agent_sandbox::{PermissionDecision, PermissionEvaluator, PermissionEvaluatorError};
 use async_trait::async_trait;
@@ -18,12 +18,14 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::borrow::Borrow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -51,6 +53,7 @@ const TOOL_CANCELLED_ERROR: &str = "tool execution cancelled";
 const SEARCH_SKIP_NAMES: &[&str] = &[".git", "node_modules", "dist", "build", "target"];
 pub const DELEGATE_TASK_TOOL_NAME: &str = "delegate_task";
 pub const MAX_SUBAGENT_TASK_CHARS: usize = 4_000;
+static SUBAGENT_NAME_SEED_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Error)]
 pub enum ToolRegistryError {
@@ -93,6 +96,71 @@ pub trait SubagentExecutor: Send + Sync {
 #[derive(Clone)]
 struct DelegateTaskTool {
     executor: Arc<dyn SubagentExecutor>,
+    identities: Arc<Mutex<SubagentIdentityAllocator>>,
+}
+
+struct SubagentIdentityAllocator {
+    seed: u64,
+    assigned: HashMap<String, SubagentIdentity>,
+    pool: Vec<SubagentIdentity>,
+    available: Vec<SubagentIdentity>,
+}
+
+impl SubagentIdentityAllocator {
+    fn new(identities: &[SubagentIdentity]) -> Self {
+        Self::with_seed(subagent_name_seed(), identities)
+    }
+
+    fn with_seed(seed: u64, identities: &[SubagentIdentity]) -> Self {
+        let available = if identities.is_empty() {
+            default_subagent_identities()
+        } else {
+            identities.to_vec()
+        };
+        Self {
+            seed,
+            assigned: HashMap::new(),
+            pool: available.clone(),
+            available,
+        }
+    }
+
+    fn identity_for(&mut self, call_id: &str) -> SubagentIdentity {
+        if let Some(identity) = self.assigned.get(call_id) {
+            return identity.clone();
+        }
+
+        let mut hasher = DefaultHasher::new();
+        self.seed.hash(&mut hasher);
+        call_id.hash(&mut hasher);
+        self.assigned.len().hash(&mut hasher);
+        let hash = hasher.finish() as usize;
+        let identity = if self.available.is_empty() {
+            self.pool[hash % self.pool.len()].clone()
+        } else {
+            let index = hash % self.available.len();
+            self.available.swap_remove(index)
+        };
+        self.assigned.insert(call_id.to_string(), identity.clone());
+        identity
+    }
+}
+
+impl DelegateTaskTool {
+    fn agent_identity(&self, call_id: &str) -> SubagentIdentity {
+        self.identities
+            .lock()
+            .expect("subagent identity allocator lock poisoned")
+            .identity_for(call_id)
+    }
+}
+
+fn subagent_name_seed() -> u64 {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    timestamp ^ SUBAGENT_NAME_SEED_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
 #[derive(Debug, Deserialize)]
@@ -104,6 +172,8 @@ struct DelegateTaskArgs {
 #[derive(Serialize)]
 struct DelegateTaskOutput<'a> {
     ok: bool,
+    agent_id: &'a str,
+    agent_name: &'a str,
     task: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     result: Option<&'a str>,
@@ -223,8 +293,12 @@ impl ToolRegistry {
     pub fn register_subagent(
         &mut self,
         executor: Arc<dyn SubagentExecutor>,
+        identities: &[SubagentIdentity],
     ) -> Result<(), ToolRegistryError> {
-        self.register(Arc::new(DelegateTaskTool { executor }))
+        self.register(Arc::new(DelegateTaskTool {
+            executor,
+            identities: Arc::new(Mutex::new(SubagentIdentityAllocator::new(identities))),
+        }))
     }
 
     pub fn definitions(&self) -> Vec<ToolDefinition> {
@@ -444,6 +518,7 @@ impl Tool for DelegateTaskTool {
     fn execution_kind(&self, call: &ToolCall) -> ToolExecutionKind {
         ToolExecutionKind::Subagent {
             task: delegate_task_label(call),
+            identity: self.agent_identity(&call.id),
         }
     }
 
@@ -453,6 +528,7 @@ impl Tool for DelegateTaskTool {
         _approval: Option<ToolApproval>,
         context: ToolExecutionContext,
     ) -> ToolExecution {
+        let identity = self.agent_identity(&call.id);
         let summary = match parse_delegate_task(&call) {
             Ok(task) if context.cancellation.is_cancelled() => {
                 SubagentExecutionSummary::failure(task, "subagent execution cancelled", 0, 0)
@@ -461,11 +537,14 @@ impl Tool for DelegateTaskTool {
             Err(error) => {
                 SubagentExecutionSummary::failure(delegate_task_label(&call), error, 0, 0)
             }
-        };
+        }
+        .with_agent_identity(&identity);
         let ok = summary.error.is_none();
         let error = summary.error.clone();
         let content = serde_json::to_string(&DelegateTaskOutput {
             ok,
+            agent_id: &identity.id,
+            agent_name: &identity.name,
             task: &summary.task,
             result: summary.result.as_deref(),
             error: summary.error.as_deref(),
@@ -2863,28 +2942,31 @@ mod tests {
     #[tokio::test]
     async fn delegate_task_returns_structured_subagent_result() {
         let mut registry = ToolRegistry::empty();
+        let identities = default_subagent_identities();
         registry
-            .register_subagent(Arc::new(TestSubagentExecutor))
+            .register_subagent(Arc::new(TestSubagentExecutor), &identities)
             .expect("register subagent");
         let call = call(
             DELEGATE_TASK_TOOL_NAME,
             json!({"task": "Inspect the runtime"}),
         );
 
-        assert_eq!(
-            registry.execution_kind(&call),
-            ToolExecutionKind::Subagent {
-                task: "Inspect the runtime".to_string()
-            }
-        );
+        let ToolExecutionKind::Subagent { task, identity } = registry.execution_kind(&call) else {
+            panic!("expected subagent execution kind");
+        };
+        assert_eq!(task, "Inspect the runtime");
+        assert!(identities.contains(&identity));
         let ToolExecution::Completed(result) = registry.execute(&call).await else {
             panic!("expected completed delegation");
         };
         assert!(result.ok);
+        let content = serde_json::from_str::<Value>(&result.content).expect("subagent JSON");
         assert_eq!(
-            serde_json::from_str::<Value>(&result.content).expect("subagent JSON"),
+            content,
             json!({
                 "ok": true,
+                "agent_id": identity.id,
+                "agent_name": identity.name,
                 "task": "Inspect the runtime",
                 "result": "research complete",
                 "model_calls": 2,
@@ -2892,12 +2974,33 @@ mod tests {
                 "truncated": false
             })
         );
+        let summary = result
+            .summary
+            .and_then(|summary| summary.subagent)
+            .expect("subagent summary");
+        assert_eq!(summary.agent_id.as_deref(), content["agent_id"].as_str());
         assert_eq!(
-            result
-                .summary
-                .and_then(|summary| summary.subagent)
-                .and_then(|summary| summary.result),
-            Some("research complete".to_string())
+            summary.agent_name.as_deref(),
+            content["agent_name"].as_str()
+        );
+        assert_eq!(summary.result.as_deref(), Some("research complete"));
+    }
+
+    #[test]
+    fn subagent_identities_are_stable_per_call_and_unique_within_a_turn() {
+        let identities = default_subagent_identities();
+        let mut allocator = SubagentIdentityAllocator::with_seed(7, &identities);
+        let first = allocator.identity_for("call-1");
+        let assigned = (1..=4)
+            .map(|index| allocator.identity_for(&format!("call-{index}")))
+            .collect::<HashSet<_>>();
+
+        assert_eq!(allocator.identity_for("call-1"), first);
+        assert_eq!(assigned.len(), 4);
+        assert!(
+            assigned
+                .iter()
+                .all(|identity| identities.contains(identity))
         );
     }
 

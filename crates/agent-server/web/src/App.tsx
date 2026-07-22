@@ -1,11 +1,13 @@
 import type { FormEvent, KeyboardEvent, ReactNode, UIEvent } from 'react'
 import {
+  createContext,
   useCallback,
   useEffect,
   useLayoutEffect,
   useMemo,
   useRef,
   useState,
+  useContext,
 } from 'react'
 import {
   Activity,
@@ -60,6 +62,7 @@ import {
   finishedSubagentStep,
   runningSubagentStep,
   subagentHistory,
+  subagentStepTitle,
 } from './subagentTrace'
 import SettingsView from './SettingsView'
 import type { SettingsSection, ThemePreference } from './SettingsView'
@@ -90,6 +93,8 @@ import type {
   SessionModelSelectionResponse,
   StatusResponse,
   SubagentExecutionSummary,
+  SubagentProfileResponse,
+  SubagentSettingsResponse,
   TimelineItem,
   TimelineMessageItem,
   TimelineNoticeItem,
@@ -105,6 +110,7 @@ type AppView = 'workspace' | 'settings'
 type ResolvedTheme = Exclude<ThemePreference, 'system'>
 
 const markdownPlugins = [remarkGfm]
+const SubagentProfilesContext = createContext<SubagentProfileResponse[]>([])
 
 const permissionOptions: Array<{
   id: PermissionMode | 'plan'
@@ -191,6 +197,8 @@ export default function App() {
     useState<ModelSettingsResponse | null>(null)
   const [commandSettings, setCommandSettings] =
     useState<CommandSettingsResponse | null>(null)
+  const [subagentSettings, setSubagentSettings] =
+    useState<SubagentSettingsResponse | null>(null)
   const [isResolvingCommand, setIsResolvingCommand] = useState(false)
   const [modelSelection, setModelSelection] = useState<ModelSelection | null>(
     null,
@@ -349,7 +357,7 @@ export default function App() {
   )
 
   const ensureRunTrace = useCallback(
-    (title = 'Model call started', detail?: string) => {
+    (title: string, detail?: string) => {
       if (runTraceIdRef.current) return runTraceIdRef.current
       return createRunTrace(title, detail)
     },
@@ -374,7 +382,11 @@ export default function App() {
 
   const ensureLiveModelStep = useCallback(
     (status: RunStep['status'] = 'running') => {
-      const id = ensureRunTrace('Model call started')
+      const modelStep = modelStepPresentation(
+        modelSettingsRef.current,
+        modelSelectionRef.current,
+      )
+      const id = ensureRunTrace(modelStep.title, modelStep.detail)
       updateRunTrace(id, (trace) => {
         if (
           trace.steps.some(
@@ -391,13 +403,8 @@ export default function App() {
               id: nextId('step'),
               kind: 'model',
               status,
-              title: 'Model call started',
-              detail: modelSelectionRef.current
-                ? modelSelectionLabel(
-                    modelSettingsRef.current,
-                    modelSelectionRef.current,
-                  )
-                : undefined,
+              title: modelStep.title,
+              detail: modelStep.detail,
             },
           ],
         }
@@ -406,6 +413,16 @@ export default function App() {
     },
     [ensureRunTrace, nextId, updateRunTrace],
   )
+
+  const completeLiveModelStep = useCallback(() => {
+    const modelStep = modelStepPresentation(
+      modelSettingsRef.current,
+      modelSelectionRef.current,
+    )
+    const id = ensureRunTrace(modelStep.title, modelStep.detail)
+    updateRunTrace(id, completeRunningModelStep)
+    return id
+  }, [ensureRunTrace, updateRunTrace])
 
   const appendReasoningDelta = useCallback(
     (text: string) => {
@@ -447,15 +464,7 @@ export default function App() {
 
   const startToolStep = useCallback(
     (id: string, name: string) => {
-      const runId = ensureLiveModelStep('ok')
-      updateRunTrace(runId, (trace) => ({
-        ...trace,
-        steps: trace.steps.map((step) =>
-          step.kind === 'model' && step.status === 'running'
-            ? { ...step, status: 'ok' }
-            : step,
-        ),
-      }))
+      const runId = completeLiveModelStep()
       upsertRunStep(runId, {
         id,
         kind: 'tool',
@@ -464,23 +473,20 @@ export default function App() {
         detail: 'Tool call started',
       })
     },
-    [ensureLiveModelStep, updateRunTrace, upsertRunStep],
+    [completeLiveModelStep, upsertRunStep],
   )
 
   const startSubagentStep = useCallback(
-    (id: string, task: string) => {
-      const runId = ensureLiveModelStep('ok')
-      updateRunTrace(runId, (trace) => ({
-        ...trace,
-        steps: trace.steps.map((step) =>
-          step.kind === 'model' && step.status === 'running'
-            ? { ...step, status: 'ok' }
-            : step,
-        ),
-      }))
-      upsertRunStep(runId, runningSubagentStep(id, task))
+    (
+      id: string,
+      agentId: string | undefined,
+      agentName: string | undefined,
+      task: string,
+    ) => {
+      const runId = completeLiveModelStep()
+      upsertRunStep(runId, runningSubagentStep(id, agentId, agentName, task))
     },
-    [ensureLiveModelStep, updateRunTrace, upsertRunStep],
+    [completeLiveModelStep, upsertRunStep],
   )
 
   const finishToolStep = useCallback(
@@ -672,6 +678,12 @@ export default function App() {
     return settings
   }, [])
 
+  const loadSubagentSettings = useCallback(async () => {
+    const settings = await fetchJson<SubagentSettingsResponse>('/api/subagent-settings')
+    setSubagentSettings(settings)
+    return settings
+  }, [])
+
   const loadSessionModelSelection = useCallback(async (name: string) => {
     const response = await fetchJson<SessionModelSelectionResponse>(
       `/api/sessions/${encodeURIComponent(name)}/model-selection`,
@@ -690,19 +702,19 @@ export default function App() {
   const handleAgentEvent = useCallback(
     (event: AgentEvent) => {
       switch (event.type) {
-        case 'turn_started':
+        case 'turn_started': {
+          const modelStep = modelStepPresentation(
+            modelSettingsRef.current,
+            modelSelectionRef.current,
+          )
           assistantMessageIdRef.current = null
           setTools([])
-          refreshCurrentModelStep(
-            'Model call started',
-            modelSelectionRef.current
-              ? modelSelectionLabel(
-                  modelSettingsRef.current,
-                  modelSelectionRef.current,
-                )
-              : selectedRef.current,
-          )
+          refreshCurrentModelStep(modelStep.title, modelStep.detail)
           recordActivity('Turn started', selectedRef.current, 'running')
+          break
+        }
+        case 'model_call_started':
+          ensureLiveModelStep()
           break
         case 'warning':
           recordActivity('Warning', event.data, 'error')
@@ -720,14 +732,27 @@ export default function App() {
           assistantMessageIdRef.current = null
           break
         case 'subagent_started':
-          upsertTool(event.data.id, 'delegate_task', 'running')
-          startSubagentStep(event.data.id, event.data.task)
-          recordActivity('Subagent started', event.data.task, 'running')
+          upsertTool(
+            event.data.id,
+            subagentStepTitle(event.data.agent_name),
+            'running',
+          )
+          startSubagentStep(
+            event.data.id,
+            event.data.agent_id,
+            event.data.agent_name,
+            event.data.task,
+          )
+          recordActivity(
+            `${subagentStepTitle(event.data.agent_name)} 开始执行`,
+            event.data.task,
+            'running',
+          )
           break
         case 'subagent_finished':
           upsertTool(
             event.data.id,
-            'delegate_task',
+            subagentStepTitle(event.data.summary.agent_name),
             event.data.ok ? 'ok' : 'error',
             { subagent: event.data.summary },
           )
@@ -737,7 +762,9 @@ export default function App() {
             event.data.summary,
           )
           recordActivity(
-            event.data.ok ? 'Subagent finished' : 'Subagent failed',
+            `${subagentStepTitle(event.data.summary.agent_name)}${
+              event.data.ok ? ' 已完成' : ' 执行失败'
+            }`,
             event.data.summary.task,
             event.data.ok ? 'ok' : 'error',
           )
@@ -804,6 +831,7 @@ export default function App() {
       completeCurrentRun,
       finishSubagentStep,
       finishToolStep,
+      ensureLiveModelStep,
       recordActivity,
       refreshCurrentModelStep,
       setApprovalStep,
@@ -1058,7 +1086,11 @@ export default function App() {
         setStatus(loadedStatus)
         const savedMode = savedPermissionModeRef.current
         setPermissionMode(savedMode ?? loadedStatus.permissions.mode)
-        await Promise.all([loadModelSettings(), loadCommandSettings()])
+        await Promise.all([
+          loadModelSettings(),
+          loadCommandSettings(),
+          loadSubagentSettings(),
+        ])
         const requestedName = initialLocationRef.current.session
         const entries = await loadSessions()
         const requestedEntry = entries.find(
@@ -1084,6 +1116,7 @@ export default function App() {
     closeSocket,
     loadCommandSettings,
     loadModelSettings,
+    loadSubagentSettings,
     loadSessions,
     selectSession,
     showError,
@@ -1212,14 +1245,10 @@ export default function App() {
         : { matched: false, prompt: trimmed }
       const resolvedPrompt = resolved.prompt.trim()
       if (!resolvedPrompt) throw new Error('resolved prompt must not be empty')
+      const modelStep = modelStepPresentation(modelSettings, modelSelection)
       followMessagesRef.current = true
       addTimelineMessage('user', resolvedPrompt)
-      createRunTrace(
-        'Request queued',
-        selectedModel
-          ? `${selectedModel.provider.name} · ${selectedModel.model.name} · ${reasoningLabel(modelSelection?.reasoning ?? 'off')}`
-          : compactText(resolvedPrompt, 90),
-      )
+      createRunTrace(modelStep.title, modelStep.detail)
       sendSocketMessage({
         type: 'start_turn',
         data: {
@@ -1252,7 +1281,13 @@ export default function App() {
   }
 
   const handlePromptKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
-    if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+    if (
+      shouldSubmitPromptOnEnter(
+        event.key,
+        event.ctrlKey,
+        event.nativeEvent.isComposing,
+      )
+    ) {
       event.preventDefault()
       event.currentTarget.form?.requestSubmit()
     }
@@ -1413,7 +1448,8 @@ export default function App() {
   }
 
   return (
-    <>
+    <SubagentProfilesContext.Provider value={subagentSettings?.profiles ?? []}>
+      <>
       <DesktopShell onOpenAbout={() => openSettings('about')}>
         {appView === 'settings' ? (
           <SettingsView
@@ -1423,6 +1459,7 @@ export default function App() {
             permissionMode={permissionMode}
             modelSettings={modelSettings}
             commandSettings={commandSettings}
+            subagentSettings={subagentSettings}
             isSidebarOpen={isSidebarOpen}
             isSidebarHidden={isNarrowViewport && !isSidebarOpen}
             onSectionChange={changeSettingsSection}
@@ -1440,6 +1477,9 @@ export default function App() {
             }}
             onCommandSettingsChange={async () => {
               await loadCommandSettings()
+            }}
+            onSubagentSettingsChange={async () => {
+              await loadSubagentSettings()
             }}
           />
         ) : (
@@ -1593,7 +1633,8 @@ export default function App() {
           />
         </>
       ) : null}
-    </>
+      </>
+    </SubagentProfilesContext.Provider>
   )
 }
 
@@ -2160,8 +2201,18 @@ function TimelineMessage({ message }: { message: TimelineMessageItem }) {
 }
 
 function MarkdownMessage({ content }: { content: string }) {
+  return <MarkdownContent content={content} className="message-bubble" />
+}
+
+function MarkdownContent({
+  content,
+  className = '',
+}: {
+  content: string
+  className?: string
+}) {
   return (
-    <div className="message-bubble markdown-message">
+    <div className={`markdown-message${className ? ` ${className}` : ''}`}>
       <ReactMarkdown
         remarkPlugins={markdownPlugins}
         skipHtml
@@ -2243,19 +2294,97 @@ function RunTraceCard({
 }
 
 function RunStepRow({ step }: { step: RunStep }) {
+  const isSubagent = step.kind === 'subagent'
   return (
     <article className={`run-step ${step.kind} ${step.status}`}>
-      <div className="run-step-icon">{runStepIcon(step)}</div>
+      <div className="run-step-icon"><RunStepIcon step={step} /></div>
       <div className="run-step-main">
-        <div className="run-step-head">
-          <strong>{step.title}</strong>
-          <span>{step.status}</span>
-        </div>
-        {step.detail ? <p>{step.detail}</p> : null}
-        <RunStepDetails step={step} />
+        {isSubagent ? (
+          <SubagentStepDisclosure step={step} />
+        ) : (
+          <>
+            <div className="run-step-head">
+              <strong>{step.title}</strong>
+              <span>{step.status}</span>
+            </div>
+            {step.detail ? <p>{step.detail}</p> : null}
+            <RunStepDetails step={step} />
+          </>
+        )}
       </div>
     </article>
   )
+}
+
+export function SubagentStepDisclosure({ step }: { step: RunStep }) {
+  return (
+    <details className="subagent-step-disclosure">
+      <summary
+        className="run-step-head subagent-step-summary"
+        aria-label={`${step.title}，展开或折叠详情`}
+      >
+        <strong>{step.title}</strong>
+        <span className="subagent-step-state">
+          {step.status}
+          <ChevronRight size={14} aria-hidden="true" />
+        </span>
+      </summary>
+      <SubagentStepPanel step={step} />
+    </details>
+  )
+}
+
+export function SubagentStepPanel({ step }: { step: RunStep }) {
+  const summary = step.summary?.subagent
+  const task = summary?.task || step.detail || '未提供提示词'
+  const result = summary?.result?.trim()
+  const error = summary?.error?.trim()
+
+  return (
+    <div className="subagent-panel">
+      <section className="subagent-pane prompt-pane">
+        <header>
+          <strong>提示词</strong>
+        </header>
+        <div
+          className="subagent-pane-body subagent-prompt"
+          tabIndex={0}
+          aria-label={`${step.title}提示词`}
+        >
+          {task}
+        </div>
+      </section>
+      <section className={`subagent-pane output-pane${error ? ' failed' : ''}`}>
+        <header>
+          <strong>子智能体输出</strong>
+          {summary ? <span>{subagentExecutionMeta(summary)}</span> : null}
+        </header>
+        <div
+          className="subagent-pane-body subagent-output"
+          tabIndex={0}
+          aria-label={`${step.title}输出`}
+        >
+          {step.status === 'running' && !summary ? (
+            <div className="subagent-waiting" role="status">
+              <Clock3 size={16} />
+              <span>等待子智能体返回结果…</span>
+            </div>
+          ) : error ? (
+            <p className="subagent-error">{error}</p>
+          ) : result ? (
+            <MarkdownContent content={result} className="subagent-markdown" />
+          ) : (
+            <p className="subagent-empty">子智能体未返回内容。</p>
+          )}
+        </div>
+      </section>
+    </div>
+  )
+}
+
+function subagentExecutionMeta(summary: SubagentExecutionSummary): string {
+  const truncated = summary.truncated ? ' · 结果已截断' : ''
+  return `${summary.model_calls} 次模型调用 · ${summary.tool_calls} 次只读工具${truncated}`
 }
 
 function RunStepDetails({ step }: { step: RunStep }) {
@@ -2273,22 +2402,6 @@ function RunStepDetails({ step }: { step: RunStep }) {
       {summary ? (
         <details className="run-step-details">
           <summary>Details</summary>
-          {summary.subagent ? (
-            <div className="subagent-summary">
-              <strong>{summary.subagent.task}</strong>
-              <p>
-                {summary.subagent.model_calls} model calls ·{' '}
-                {summary.subagent.tool_calls} read-only tools
-                {summary.subagent.truncated ? ' · result truncated' : ''}
-              </p>
-              {summary.subagent.result ? (
-                <pre>{summary.subagent.result}</pre>
-              ) : null}
-              {summary.subagent.error ? (
-                <pre>{summary.subagent.error}</pre>
-              ) : null}
-            </div>
-          ) : null}
           {summary.shell ? (
         <pre>
           {[
@@ -2502,6 +2615,7 @@ function Composer({
             rows={variant === 'home' ? 3 : 2}
             disabled={isRunning || isResolvingCommand}
             placeholder="Ask Morrow to edit, inspect, or explain this workspace"
+            title="Enter 发送·Ctrl + Enter 换行"
             onChange={(event) => {
               setDismissedCommandPrompt('')
               setCommandIndex(0)
@@ -3318,7 +3432,7 @@ function historyRunTrace(
             : 'running',
       title:
         isSubagent
-          ? 'Subagent'
+          ? subagentStepTitle(subagent?.agentName)
           : step.kind === 'tool_call'
           ? step.tool_name || 'Tool call'
           : turn.model?.model_name || 'Model call',
@@ -3333,6 +3447,8 @@ function historyRunTrace(
       summary: subagent?.summary
         ? { subagent: subagent.summary }
         : undefined,
+      agentId: subagent?.agentId,
+      agentName: subagent?.agentName,
     }
   })
 
@@ -3490,7 +3606,48 @@ function noticeIcon(tone: TimelineNoticeItem['tone']): ReactNode {
   }
 }
 
+function RunStepIcon({ step }: { step: RunStep }) {
+  const profiles = useContext(SubagentProfilesContext)
+  if (step.kind === 'subagent') {
+    return <SubagentRunStepIcon step={step} profiles={profiles} />
+  }
+  return runStepIcon(step)
+}
+
+export function SubagentRunStepIcon({
+  step,
+  profiles,
+}: {
+  step: RunStep
+  profiles: SubagentProfileResponse[]
+}) {
+  const profile = findSubagentProfile(profiles, step.agentId, step.agentName)
+  const avatar = profile?.avatar_data_url
+  const [imageFailed, setImageFailed] = useState(false)
+
+  useEffect(() => setImageFailed(false), [avatar])
+
+  if (avatar && !imageFailed) {
+    return <img src={avatar} alt="" onError={() => setImageFailed(true)} />
+  }
+  return <Bot size={18} />
+}
+
+export function findSubagentProfile(
+  profiles: SubagentProfileResponse[],
+  agentId?: string,
+  agentName?: string,
+): SubagentProfileResponse | undefined {
+  if (agentId) return profiles.find((profile) => profile.id === agentId)
+  const normalizedName = agentName?.trim().toLocaleLowerCase()
+  if (!normalizedName) return undefined
+  return profiles.find(
+    (profile) => profile.name.trim().toLocaleLowerCase() === normalizedName,
+  )
+}
+
 function runStepIcon(step: RunStep): ReactNode {
+  if (step.kind === 'subagent') return <Bot size={18} />
   if (step.status === 'running') return <Clock3 size={18} />
   if (step.status === 'error') return <CircleAlert size={18} />
 
@@ -3502,8 +3659,6 @@ function runStepIcon(step: RunStep): ReactNode {
     case 'final':
       return <CheckCircle2 size={18} />
     case 'model':
-      return <Bot size={18} />
-    case 'subagent':
       return <Bot size={18} />
     case 'tool':
       return step.summary?.files?.length ? (
@@ -3567,6 +3722,36 @@ function modelSelectionLabel(
   return `${selected.provider.name} · ${selected.model.name} · ${reasoningLabel(selection.reasoning)}`
 }
 
+export function completeRunningModelStep(trace: RunTrace): RunTrace {
+  let changed = false
+  const steps = trace.steps.map((step) => {
+    if (step.kind !== 'model' || step.status !== 'running') return step
+    changed = true
+    return { ...step, status: 'ok' as const }
+  })
+  return changed ? { ...trace, steps } : trace
+}
+
+export function modelStepPresentation(
+  settings: ModelSettingsResponse | null,
+  selection: ModelSelection | null,
+): { title: string; detail?: string } {
+  const selected = findSelectedModel(settings, selection)
+  if (!selected || !selection) return { title: 'Model call' }
+  return {
+    title: selected.model.name,
+    detail: `${selected.provider.name} · ${reasoningLabel(selection.reasoning)}`,
+  }
+}
+
+export function shouldSubmitPromptOnEnter(
+  key: string,
+  ctrlKey: boolean,
+  isComposing: boolean,
+): boolean {
+  return key === 'Enter' && !ctrlKey && !isComposing
+}
+
 function slashCommandQuery(prompt: string): string | null {
   if (!prompt.startsWith('/') || prompt.startsWith('//')) return null
   const firstLine = prompt.split(/\r?\n/, 1)[0]
@@ -3616,6 +3801,7 @@ function readAppLocation(): AppLocation {
     view === 'settings' &&
     (requestedSection === 'about' ||
       requestedSection === 'models' ||
+      requestedSection === 'subagents' ||
       requestedSection === 'mcp' ||
       requestedSection === 'commands')
       ? requestedSection

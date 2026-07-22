@@ -24,6 +24,7 @@ export interface StatusResponse {
   model_store_path: string
   mcp_store_path: string
   command_store_path: string
+  subagent_store_path: string
   config_diagnostics: string[]
 }
 
@@ -166,6 +167,26 @@ export interface CommandWriteRequest {
   prompt: string
 }
 
+export interface SubagentProfileResponse {
+  id: string
+  name: string
+  avatar_data_url?: string | null
+}
+
+export interface SubagentSettingsResponse {
+  profiles: SubagentProfileResponse[]
+  store_path: string
+  min_profiles: number
+  max_profiles: number
+  max_avatar_bytes: number
+  accepted_avatar_types: string[]
+}
+
+export interface SubagentProfileWriteRequest {
+  name: string
+  avatar_data_url?: string | null
+}
+
 export interface ResolveCommandResponse {
   matched: boolean
   command_name?: string
@@ -270,6 +291,8 @@ export interface ShellCommandSummary {
 }
 
 export interface SubagentExecutionSummary {
+  agent_id?: string
+  agent_name?: string
   task: string
   result?: string
   error?: string
@@ -312,11 +335,15 @@ export interface ApprovalDecision {
 
 export type AgentEvent =
   | { type: 'turn_started' }
+  | { type: 'model_call_started' }
   | { type: 'warning'; data: string }
   | { type: 'reasoning_delta'; data: string }
   | { type: 'text_delta'; data: string }
   | { type: 'agent_message'; data: string }
-  | { type: 'subagent_started'; data: { id: string; task: string } }
+  | {
+      type: 'subagent_started'
+      data: { id: string; agent_id?: string; agent_name?: string; task: string }
+    }
   | {
       type: 'subagent_finished'
       data: {
@@ -436,6 +463,8 @@ export interface RunStep {
   detail?: string
   reasoning?: string
   summary?: ToolExecutionSummary
+  agentId?: string
+  agentName?: string
 }
 
 export interface RunTrace {

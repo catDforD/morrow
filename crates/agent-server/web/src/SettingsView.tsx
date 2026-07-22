@@ -25,12 +25,17 @@ import {
   X,
 } from 'lucide-react'
 import type { PermissionMode, StatusResponse } from './types'
-import type { CommandSettingsResponse, ModelSettingsResponse } from './types'
+import type {
+  CommandSettingsResponse,
+  ModelSettingsResponse,
+  SubagentSettingsResponse,
+} from './types'
 import CommandSettingsPanel from './CommandSettingsPanel'
 import McpSettingsPanel from './McpSettingsPanel'
 import ModelSettingsPanel from './ModelSettingsPanel'
+import SubagentSettingsPanel from './SubagentSettingsPanel'
 
-export type SettingsSection = 'general' | 'models' | 'mcp' | 'commands' | 'about'
+export type SettingsSection = 'general' | 'models' | 'subagents' | 'mcp' | 'commands' | 'about'
 export type ThemePreference = 'system' | 'light' | 'dark'
 
 type SettingsSelectOption<T extends string> = {
@@ -75,7 +80,7 @@ const navigationItems: SettingsNavigationItem[] = [
   },
   { label: '模型设置', icon: <Bot size={18} />, section: 'models' },
   { label: '技能', icon: <Sparkles size={18} />, section: null },
-  { label: '子智能体', icon: <Network size={18} />, section: null },
+  { label: '子智能体', icon: <Network size={18} />, section: 'subagents' },
   { label: 'MCP 服务器', icon: <Server size={18} />, section: 'mcp' },
   { label: '插件管理', icon: <Plug size={18} />, section: null },
   { label: '命令', icon: <Terminal size={18} />, section: 'commands' },
@@ -91,6 +96,7 @@ export default function SettingsView({
   permissionMode,
   modelSettings,
   commandSettings,
+  subagentSettings,
   isSidebarOpen,
   isSidebarHidden,
   onSectionChange,
@@ -101,6 +107,7 @@ export default function SettingsView({
   onPermissionModeChange,
   onModelSettingsChange,
   onCommandSettingsChange,
+  onSubagentSettingsChange,
 }: {
   section: SettingsSection
   status: StatusResponse | null
@@ -108,6 +115,7 @@ export default function SettingsView({
   permissionMode: PermissionMode
   modelSettings: ModelSettingsResponse | null
   commandSettings: CommandSettingsResponse | null
+  subagentSettings: SubagentSettingsResponse | null
   isSidebarOpen: boolean
   isSidebarHidden: boolean
   onSectionChange: (section: SettingsSection) => void
@@ -118,12 +126,15 @@ export default function SettingsView({
   onPermissionModeChange: (mode: PermissionMode) => void
   onModelSettingsChange: () => Promise<void>
   onCommandSettingsChange: () => Promise<void>
+  onSubagentSettingsChange: () => Promise<void>
 }) {
   const title =
     section === 'about'
       ? '关于'
       : section === 'models'
         ? '模型设置'
+        : section === 'subagents'
+          ? '子智能体'
         : section === 'mcp'
           ? 'MCP 服务器'
           : section === 'commands'
@@ -235,6 +246,11 @@ export default function SettingsView({
             />
           ) : section === 'mcp' ? (
             <McpSettingsPanel />
+          ) : section === 'subagents' ? (
+            <SubagentSettingsPanel
+              settings={subagentSettings}
+              onChanged={onSubagentSettingsChange}
+            />
           ) : section === 'commands' ? (
             <CommandSettingsPanel
               settings={commandSettings}

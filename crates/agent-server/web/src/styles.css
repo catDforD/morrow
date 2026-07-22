@@ -1927,9 +1927,19 @@ a:focus-visible {
   border: 2px solid var(--border);
   border-radius: 50%;
   background: var(--surface-panel-muted);
+  overflow: hidden;
+}
+
+.run-step-icon img {
+  width: 100%;
+  height: 100%;
+  display: block;
+  border-radius: inherit;
+  object-fit: cover;
 }
 
 .run-step.subagent .run-step-icon {
+  border-color: var(--border);
   border-radius: 7px;
 }
 
@@ -1970,6 +1980,40 @@ a:focus-visible {
   font-size: 9px;
   font-weight: 850;
   text-transform: uppercase;
+}
+
+.subagent-step-disclosure {
+  min-width: 0;
+}
+
+.subagent-step-summary {
+  align-items: center;
+  border-radius: 4px;
+  cursor: pointer;
+  list-style: none;
+  outline: none;
+}
+
+.subagent-step-summary::-webkit-details-marker {
+  display: none;
+}
+
+.subagent-step-summary:focus-visible {
+  box-shadow: 0 0 0 2px var(--main);
+}
+
+.subagent-step-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.subagent-step-state svg {
+  transition: transform 160ms ease;
+}
+
+.subagent-step-disclosure[open] .subagent-step-state svg {
+  transform: rotate(90deg);
 }
 
 .run-step-main > p {
@@ -2013,19 +2057,143 @@ a:focus-visible {
   white-space: pre;
 }
 
-.subagent-summary {
-  margin-top: 9px;
+.subagent-panel {
+  height: 420px;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: 112px minmax(0, 1fr);
+  gap: 10px;
+  margin-top: 10px;
 }
 
-.subagent-summary > strong {
-  display: block;
+.subagent-pane {
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  overflow: hidden;
+  border: 2px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-panel-muted);
+}
+
+.subagent-pane > header {
+  min-width: 0;
+  min-height: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  border-bottom: 1.5px solid var(--border);
+  background: var(--surface-panel);
+  padding: 7px 10px;
+}
+
+.subagent-pane > header strong {
+  font-size: 11px;
+}
+
+.subagent-pane > header span {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 750;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.subagent-pane.failed > header {
+  background: var(--surface-danger);
+}
+
+.subagent-pane-body {
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  padding: 10px 12px;
+  outline: none;
+}
+
+.subagent-pane-body:focus-visible {
+  box-shadow: inset 0 0 0 2px var(--main);
+}
+
+.subagent-prompt {
+  color: var(--foreground);
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.subagent-output {
+  background: var(--surface-panel);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.subagent-waiting {
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: var(--muted);
+  font-weight: 750;
+}
+
+.subagent-waiting svg {
+  animation: subagent-pulse 1.4s ease-in-out infinite;
+}
+
+.subagent-error,
+.subagent-empty {
+  margin: 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.subagent-error {
+  color: color-mix(in srgb, var(--danger), var(--foreground) 45%);
+  font-weight: 750;
+}
+
+.subagent-empty {
+  color: var(--muted);
+}
+
+.subagent-markdown {
+  min-width: 0;
   overflow-wrap: anywhere;
 }
 
-.subagent-summary > p {
-  margin: 5px 0 0;
-  color: var(--muted);
-  font-size: 11px;
+.subagent-markdown h1 {
+  font-size: 20px;
+}
+
+.subagent-markdown h2 {
+  font-size: 17px;
+}
+
+.subagent-markdown h3 {
+  font-size: 15px;
+}
+
+.subagent-markdown h4 {
+  font-size: 14px;
+}
+
+@keyframes subagent-pulse {
+  0%,
+  100% {
+    opacity: 0.45;
+    transform: scale(0.92);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1);
+  }
 }
 
 .run-file-list,
@@ -3957,6 +4125,82 @@ a:focus-visible {
   box-shadow: none;
 }
 
+.subagent-profile-row {
+  grid-template-columns: 38px minmax(0, 1fr) auto;
+}
+
+.subagent-profile-avatar {
+  width: 36px;
+  height: 36px;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  border: 1.5px solid color-mix(in srgb, var(--border), transparent 32%);
+  border-radius: 7px;
+  background: var(--surface-panel-muted);
+}
+
+.subagent-profile-avatar.large {
+  width: 96px;
+  height: 96px;
+  flex: 0 0 auto;
+  border-width: 2px;
+  border-radius: 12px;
+}
+
+.subagent-profile-avatar img {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: cover;
+}
+
+.subagent-avatar-editor {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  border: 1.5px solid color-mix(in srgb, var(--border), transparent 58%);
+  border-radius: var(--radius);
+  background: var(--surface-panel-muted);
+  padding: 16px;
+}
+
+.subagent-avatar-actions {
+  min-width: 0;
+  display: grid;
+  gap: 7px;
+}
+
+.subagent-avatar-actions > strong {
+  font-size: 12px;
+}
+
+.subagent-avatar-actions > p,
+.subagent-store-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.subagent-avatar-actions > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.subagent-avatar-actions button {
+  min-height: 34px;
+  padding: 0 10px;
+  font-size: 10px;
+  font-weight: 800;
+}
+
+.subagent-store-note {
+  padding: 0 3px;
+}
+
 .command-name-input {
   height: 39px;
   display: grid;
@@ -4003,6 +4247,7 @@ a:focus-visible {
 .approval-files,
 .approval-body,
 .run-step-details pre,
+.subagent-pane-body,
 .markdown-message pre,
 .markdown-table-scroll {
   scrollbar-color: var(--border) var(--surface-panel);
@@ -4017,6 +4262,7 @@ a:focus-visible {
 .approval-files::-webkit-scrollbar,
 .approval-body::-webkit-scrollbar,
 .run-step-details pre::-webkit-scrollbar,
+.subagent-pane-body::-webkit-scrollbar,
 .markdown-message pre::-webkit-scrollbar,
 .markdown-table-scroll::-webkit-scrollbar {
   width: 11px;
@@ -4031,6 +4277,7 @@ a:focus-visible {
 .approval-files::-webkit-scrollbar-track,
 .approval-body::-webkit-scrollbar-track,
 .run-step-details pre::-webkit-scrollbar-track,
+.subagent-pane-body::-webkit-scrollbar-track,
 .markdown-message pre::-webkit-scrollbar-track,
 .markdown-table-scroll::-webkit-scrollbar-track {
   background: var(--surface-panel);
@@ -4044,6 +4291,7 @@ a:focus-visible {
 .approval-files::-webkit-scrollbar-thumb,
 .approval-body::-webkit-scrollbar-thumb,
 .run-step-details pre::-webkit-scrollbar-thumb,
+.subagent-pane-body::-webkit-scrollbar-thumb,
 .markdown-message pre::-webkit-scrollbar-thumb,
 .markdown-table-scroll::-webkit-scrollbar-thumb {
   border: 2px solid var(--surface-panel);
@@ -4295,6 +4543,15 @@ a:focus-visible {
 
   .resource-list-row {
     grid-template-columns: 36px minmax(0, 1fr);
+  }
+
+  .subagent-profile-row {
+    grid-template-columns: 36px minmax(0, 1fr) auto;
+  }
+
+  .subagent-avatar-editor {
+    align-items: flex-start;
+    flex-direction: column;
   }
 
   .resource-list-row > .resource-status {

@@ -1,6 +1,7 @@
 use agent_protocol::{
-    AgentEvent, ApprovalDecision, ApprovalRequest, Conversation, Message, SubagentExecutionSummary,
-    Thread, ToolCall, ToolDefinition, ToolExecutionSummary, Turn, TurnRecord, TurnStep,
+    AgentEvent, ApprovalDecision, ApprovalRequest, Conversation, Message, ModelInvocation,
+    SubagentExecutionSummary, SubagentIdentity, Thread, ToolCall, ToolDefinition,
+    ToolExecutionSummary, Turn, TurnRecord, TurnStep,
 };
 use futures_util::future::{BoxFuture, FutureExt};
 use futures_util::stream::{BoxStream, FuturesUnordered, Stream};
@@ -79,7 +80,10 @@ pub enum ToolExecutionMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolExecutionKind {
     Standard,
-    Subagent { task: String },
+    Subagent {
+        task: String,
+        identity: SubagentIdentity,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -344,7 +348,7 @@ impl<'a> Agent<'a> {
             turn_messages: vec![user_message.clone()],
             assistant_reasoning: String::new(),
             assistant_text: String::new(),
-            pending: VecDeque::from([AgentEvent::TurnStarted]),
+            pending: VecDeque::from([AgentEvent::TurnStarted, AgentEvent::ModelCallStarted]),
             finished: false,
             tool_rounds: 0,
         })
@@ -396,6 +400,10 @@ pub struct AgentTurnStream<'a> {
 impl AgentTurnStream<'_> {
     pub fn turn(&self) -> &Turn {
         &self.turn
+    }
+
+    pub fn set_model_invocation(&mut self, model: ModelInvocation) {
+        self.turn.model = Some(model);
     }
 
     pub fn into_turn(mut self) -> Turn {
@@ -587,9 +595,11 @@ impl AgentTurnStream<'_> {
                     name: name.clone(),
                 });
             }
-            ToolExecutionKind::Subagent { task } => {
+            ToolExecutionKind::Subagent { task, identity } => {
                 self.pending.push_back(AgentEvent::SubagentStarted {
                     id: id.clone(),
+                    agent_id: Some(identity.id),
+                    agent_name: Some(identity.name),
                     task,
                 });
             }
@@ -715,10 +725,12 @@ impl AgentTurnStream<'_> {
                     summary,
                 });
             }
-            ToolExecutionKind::Subagent { task } => {
-                let summary = summary
-                    .and_then(|summary| summary.subagent)
+            ToolExecutionKind::Subagent { task, identity } => {
+                let mut summary = summary
+                    .and_then(|summary| summary.subagent.map(|subagent| *subagent))
                     .unwrap_or_else(|| SubagentExecutionSummary {
+                        agent_id: Some(identity.id.clone()),
+                        agent_name: Some(identity.name.clone()),
                         task,
                         result: None,
                         error: error
@@ -727,6 +739,8 @@ impl AgentTurnStream<'_> {
                         tool_calls: 0,
                         truncated: false,
                     });
+                summary.agent_id.get_or_insert(identity.id);
+                summary.agent_name.get_or_insert(identity.name);
                 self.pending
                     .push_back(AgentEvent::SubagentFinished { id, ok, summary });
             }
@@ -755,6 +769,7 @@ impl AgentTurnStream<'_> {
 
     fn start_next_model_call(&mut self) {
         self.turn.steps.push(TurnStep::running_model_call());
+        self.pending.push_back(AgentEvent::ModelCallStarted);
         self.model_start = Some(self.model.stream(ModelRequest {
             conversation: self.conversation.clone(),
             tools: self.tool_definitions.clone(),
@@ -1190,6 +1205,10 @@ mod tests {
         fn execution_kind(&self, _call: &ToolCall) -> ToolExecutionKind {
             ToolExecutionKind::Subagent {
                 task: "Inspect runtime".to_string(),
+                identity: SubagentIdentity {
+                    id: "builtin-01".to_string(),
+                    name: "后藤一里".to_string(),
+                },
             }
         }
 
@@ -1206,11 +1225,17 @@ mod tests {
                     2,
                     1,
                     false,
-                );
+                )
+                .with_agent_identity(&SubagentIdentity {
+                    id: "builtin-01".to_string(),
+                    name: "后藤一里".to_string(),
+                });
                 ToolExecution::Completed(ToolResult {
                     ok: true,
                     content: serde_json::to_string(&json!({
                         "ok": true,
+                        "agent_id": &subagent.agent_id,
+                        "agent_name": &subagent.agent_name,
                         "task": &subagent.task,
                         "result": &subagent.result,
                         "model_calls": subagent.model_calls,
@@ -1482,11 +1507,33 @@ mod tests {
     }
 
     #[test]
-    fn agent_defaults_to_two_hundred_tool_rounds() {
+    fn agent_defaults_to_ninety_nine_tool_rounds() {
         let model = ScriptedModel::new(Vec::new());
         let agent = Agent::new(&model, "system");
 
-        assert_eq!(agent.max_tool_rounds, 200);
+        assert_eq!(agent.max_tool_rounds, 99);
+    }
+
+    #[tokio::test]
+    async fn turn_stream_records_model_invocation_before_execution() {
+        let model = ScriptedModel::new(Vec::new());
+        let agent = Agent::new(&model, "system");
+        let invocation = ModelInvocation {
+            provider_id: "provider".to_string(),
+            provider_name: "Provider".to_string(),
+            model_id: "model".to_string(),
+            model_name: "Model".to_string(),
+            reasoning: agent_protocol::ReasoningLevel::High,
+        };
+        let mut stream = agent
+            .run_turn(&Thread::new(), "hello")
+            .await
+            .expect("create turn stream");
+
+        stream.set_model_invocation(invocation.clone());
+
+        assert_eq!(stream.turn().model.as_ref(), Some(&invocation));
+        stream.cancel();
     }
 
     #[tokio::test]
@@ -1508,6 +1555,7 @@ mod tests {
             events,
             vec![
                 AgentEvent::TurnStarted,
+                AgentEvent::ModelCallStarted,
                 AgentEvent::TextDelta("Hello".to_string()),
                 AgentEvent::TextDelta(" world".to_string()),
                 AgentEvent::AgentMessage("Hello world".to_string()),
@@ -1554,14 +1602,25 @@ mod tests {
             events.as_slice(),
             [
                 AgentEvent::TurnStarted,
-                AgentEvent::SubagentStarted { id: start_id, task },
+                AgentEvent::ModelCallStarted,
+                AgentEvent::SubagentStarted {
+                    id: start_id,
+                    agent_id: Some(start_agent_id),
+                    agent_name: Some(start_name),
+                    task,
+                },
                 AgentEvent::SubagentFinished { id: finish_id, ok: true, summary },
+                AgentEvent::ModelCallStarted,
                 AgentEvent::TextDelta(_),
                 AgentEvent::AgentMessage(_),
                 AgentEvent::TurnCompleted,
             ] if start_id == "call-1"
                 && finish_id == "call-1"
+                && start_agent_id == "builtin-01"
+                && start_name == "后藤一里"
                 && task == "Inspect runtime"
+                && summary.agent_name.as_deref() == Some("后藤一里")
+                && summary.agent_id.as_deref() == Some("builtin-01")
                 && summary.result.as_deref() == Some("Runtime uses a reusable turn helper.")
         ));
         assert_eq!(turn.status, TurnStatus::Completed);
@@ -1582,6 +1641,7 @@ mod tests {
         let mut stream = agent.run_turn(&thread, "Say hi").await.expect("run turn");
 
         assert_eq!(next_event(&mut stream).await, AgentEvent::TurnStarted);
+        assert_eq!(next_event(&mut stream).await, AgentEvent::ModelCallStarted);
         let delta = tokio::time::timeout(Duration::from_secs(1), stream.next())
             .await
             .expect("text delta before done")
@@ -1609,6 +1669,7 @@ mod tests {
         let mut stream = agent.run_turn(&thread, "Say hi").await.expect("run turn");
 
         assert_eq!(next_event(&mut stream).await, AgentEvent::TurnStarted);
+        assert_eq!(next_event(&mut stream).await, AgentEvent::ModelCallStarted);
         assert_eq!(
             next_event(&mut stream).await,
             AgentEvent::TextDelta("Hello".to_string())
@@ -1683,6 +1744,7 @@ mod tests {
             .expect("turn");
 
         assert_eq!(next_event(&mut stream).await, AgentEvent::TurnStarted);
+        assert_eq!(next_event(&mut stream).await, AgentEvent::ModelCallStarted);
         assert!(matches!(
             next_event(&mut stream).await,
             AgentEvent::ToolCallStarted { .. }
@@ -1750,6 +1812,7 @@ mod tests {
             .expect("turn");
 
         assert_eq!(next_event(&mut stream).await, AgentEvent::TurnStarted);
+        assert_eq!(next_event(&mut stream).await, AgentEvent::ModelCallStarted);
         assert!(matches!(
             next_event(&mut stream).await,
             AgentEvent::ToolCallStarted { .. }
@@ -1851,9 +1914,10 @@ mod tests {
             .expect("run turn");
         let (events, turn) = collect_events(stream, &mut thread).await;
 
-        assert_eq!(events.len(), 2);
+        assert_eq!(events.len(), 3);
         assert_eq!(events[0], AgentEvent::TurnStarted);
-        assert!(matches!(events[1], AgentEvent::Error(_)));
+        assert_eq!(events[1], AgentEvent::ModelCallStarted);
+        assert!(matches!(events[2], AgentEvent::Error(_)));
         assert_eq!(turn.status, TurnStatus::Failed);
         assert!(turn.error.is_some());
         assert_eq!(turn.steps[0].status, TurnStatus::Failed);
@@ -1895,6 +1959,7 @@ mod tests {
             events,
             vec![
                 AgentEvent::TurnStarted,
+                AgentEvent::ModelCallStarted,
                 AgentEvent::ToolCallStarted {
                     id: "call_1".to_string(),
                     name: "read_file".to_string()
@@ -1905,6 +1970,7 @@ mod tests {
                     ok: true,
                     summary: None
                 },
+                AgentEvent::ModelCallStarted,
                 AgentEvent::TextDelta("Read it".to_string()),
                 AgentEvent::AgentMessage("Read it".to_string()),
                 AgentEvent::TurnCompleted,
@@ -2008,8 +2074,10 @@ mod tests {
             events.as_slice(),
             [
                 AgentEvent::TurnStarted,
+                AgentEvent::ModelCallStarted,
                 AgentEvent::ToolCallStarted { .. },
                 AgentEvent::ToolCallFinished { ok: false, .. },
+                AgentEvent::ModelCallStarted,
                 AgentEvent::TextDelta(_),
                 AgentEvent::AgentMessage(_),
                 AgentEvent::TurnCompleted,
@@ -2076,6 +2144,7 @@ mod tests {
             events.as_slice(),
             [
                 AgentEvent::TurnStarted,
+                AgentEvent::ModelCallStarted,
                 AgentEvent::ToolCallStarted { id: first_id, .. },
                 AgentEvent::ToolCallStarted { id: second_id, .. },
                 AgentEvent::ToolCallFinished {
@@ -2088,6 +2157,7 @@ mod tests {
                     ok: true,
                     ..
                 },
+                AgentEvent::ModelCallStarted,
                 AgentEvent::TextDelta(_),
                 AgentEvent::AgentMessage(_),
                 AgentEvent::TurnCompleted,
@@ -2152,6 +2222,7 @@ mod tests {
             events.as_slice(),
             [
                 AgentEvent::TurnStarted,
+                AgentEvent::ModelCallStarted,
                 AgentEvent::ToolCallStarted { id: first_start, .. },
                 AgentEvent::ToolCallFinished {
                     id: first_finish,
@@ -2170,6 +2241,7 @@ mod tests {
                     ok: true,
                     ..
                 },
+                AgentEvent::ModelCallStarted,
                 AgentEvent::TextDelta(_),
                 AgentEvent::AgentMessage(_),
                 AgentEvent::TurnCompleted,
@@ -2227,9 +2299,11 @@ mod tests {
             events.as_slice(),
             [
                 AgentEvent::TurnStarted,
+                AgentEvent::ModelCallStarted,
                 AgentEvent::TextDelta(prefix),
                 AgentEvent::ToolCallStarted { .. },
                 AgentEvent::ToolCallFinished { ok: true, .. },
+                AgentEvent::ModelCallStarted,
                 AgentEvent::TextDelta(done),
                 AgentEvent::AgentMessage(_),
                 AgentEvent::TurnCompleted,
@@ -2275,6 +2349,7 @@ mod tests {
         let mut stream = agent.run_turn(&thread, "Run pwd").await.expect("run turn");
 
         assert_eq!(next_event(&mut stream).await, AgentEvent::TurnStarted);
+        assert_eq!(next_event(&mut stream).await, AgentEvent::ModelCallStarted);
         assert_eq!(
             next_event(&mut stream).await,
             AgentEvent::ToolCallStarted {
@@ -2305,6 +2380,7 @@ mod tests {
                 )),
             }
         );
+        assert_eq!(next_event(&mut stream).await, AgentEvent::ModelCallStarted);
         assert_eq!(
             next_event(&mut stream).await,
             AgentEvent::TextDelta("Denied".to_string())
@@ -2349,6 +2425,7 @@ mod tests {
             .expect("run turn");
 
         assert_eq!(next_event(&mut stream).await, AgentEvent::TurnStarted);
+        assert_eq!(next_event(&mut stream).await, AgentEvent::ModelCallStarted);
         assert!(matches!(
             next_event(&mut stream).await,
             AgentEvent::ToolCallStarted { .. }
@@ -2373,6 +2450,7 @@ mod tests {
             next_event(&mut stream).await,
             AgentEvent::ToolCallFinished { ok: false, .. }
         ));
+        assert_eq!(next_event(&mut stream).await, AgentEvent::ModelCallStarted);
         assert_eq!(
             next_event(&mut stream).await,
             AgentEvent::TextDelta("Denied".to_string())
@@ -2411,6 +2489,7 @@ mod tests {
             .expect("run turn");
 
         assert_eq!(next_event(&mut stream).await, AgentEvent::TurnStarted);
+        assert_eq!(next_event(&mut stream).await, AgentEvent::ModelCallStarted);
         assert_eq!(
             next_event(&mut stream).await,
             AgentEvent::ToolCallStarted {
@@ -2448,6 +2527,7 @@ mod tests {
         assert!(ok);
         assert_eq!(summary.files.len(), 1);
         assert!(summary.diff.as_deref().expect("diff").contains("+created"));
+        assert_eq!(next_event(&mut stream).await, AgentEvent::ModelCallStarted);
         assert_eq!(
             next_event(&mut stream).await,
             AgentEvent::TextDelta("Wrote it".to_string())
@@ -2492,6 +2572,7 @@ mod tests {
             .expect("run turn");
 
         assert_eq!(next_event(&mut stream).await, AgentEvent::TurnStarted);
+        assert_eq!(next_event(&mut stream).await, AgentEvent::ModelCallStarted);
         assert!(matches!(
             next_event(&mut stream).await,
             AgentEvent::ToolCallStarted { .. }
@@ -2515,6 +2596,7 @@ mod tests {
                 ..
             } if name == "write_file"
         ));
+        assert_eq!(next_event(&mut stream).await, AgentEvent::ModelCallStarted);
         assert_eq!(
             next_event(&mut stream).await,
             AgentEvent::TextDelta("Denied".to_string())

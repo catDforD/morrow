@@ -188,7 +188,7 @@ TurnRecord + AgentEvent
     │ 10. Session::apply_turn
     ▼
 agent-runtime / SessionStore
-    │ 11. 保存 Session v3
+    │ 11. 保存 Session v4
     ▼
 CLI 输出或 WebSocket 广播
 ```
@@ -213,7 +213,7 @@ CLI 输出或 WebSocket 广播
 
 ### 7.1 Session 的三个部分
 
-Session v3 保持下面的 JSON 结构：
+Session v4 保持下面的 JSON 结构：
 
 ```text
 Session
@@ -230,7 +230,7 @@ Session
 - `turns` 保存所有完成或失败的 turn，供恢复、展示和排查错误。
 - `context` 记录压缩摘要，以及历史中已经被摘要覆盖的前缀长度。
 
-当前为了保持 Session v3 JSON 兼容，这些字段仍然公开。业务代码不应分别手动 `push`，而应使用 `Session::apply_turn(record)`。
+当前为了保持 Session v4 JSON 兼容，这些字段仍然公开。业务代码不应分别手动 `push`，而应使用 `Session::apply_turn(record)`。
 
 `apply_turn` 的规则是：
 
@@ -350,9 +350,11 @@ CLI 没有独立的 turn cancellation 协议；进程级中断仍属于入口层
 
 ## 12. Session 持久化与事件协议
 
-`agent-runtime::SessionStore` 把 Session 保存为版本化 JSON 文档。当前写出 schema v3，并兼容读取旧的 v1/v2 Thread 文档。旧文档加载后会转换为 Session，再在下一次保存时写成 v3。
+`agent-runtime::SessionStore` 把 Session 保存为版本化 JSON 文档。当前写出 schema v4，并兼容读取旧的 v3 Session 与 v1/v2 Thread 文档。旧文档加载后会转换为当前 Session，再在下一次保存时写成 v4。
 
-实时事件使用 `AgentEventEnvelope` 包装，包含：
+每次 turn 的 runtime 上下文必须携带解析后的 `ModelInvocation`，并在 Turn 创建时写入记录；Web、CLI、Desktop、WSL 与远端入口不得在持久化后各自补写模型信息。这样实时展示和历史恢复都以同一份模型元数据为准。
+
+实时事件使用当前 schema v6 的 `AgentEventEnvelope` 包装，包含：
 
 - 事件 schema version。
 - Session 名称和 workspace root。
@@ -360,6 +362,10 @@ CLI 没有独立的 turn cancellation 协议；进程级中断仍属于入口层
 - 时间戳与具体 `AgentEvent`。
 
 CLI 的 JSONL 和 server 的 WebSocket 共用该事件结构。修改事件 JSON 形状时需要把它当作外部协议变更，而不是普通内部重构。
+
+父模型每次真实开始请求时都会发送 `model_call_started`。Web 以该事件创建模型步骤，工具和 Subagent 的开始事件只结束当前模型步骤，不再自行推断新的模型调用；因此同一批并发工具不会产生重复的模型行。
+
+Subagent 身份遵守同样的单一来源规则：父 turn 启动时把 `SubagentIdentity { id, name }` 名单快照写入 `RunAgentTurnContext`，`ToolRegistry` 再按 tool-call ID 缓存随机分配结果，保证开始事件、结束事件和持久化工具结果使用同一身份。完整的姓名与头像配置由 `agent-server` 保存在全局 `~/.morrow/subagents.json`；协议和 Session 只携带 ID/姓名，不携带 Base64 头像。Desktop/WSL 通过 remote protocol v2 只把身份池发送给远端 runtime，头像始终留在 Windows 展示端。
 
 当前 SessionStore 是本地文件存储。server 会在单个进程内阻止同一 Session 同时启动两个 turn，但不要假设多个独立进程同时写同一个 Session 文件也是安全的。
 
@@ -391,6 +397,6 @@ CLI 的 JSONL 和 server 的 WebSocket 共用该事件结构。修改事件 JSON
 - `agent-tools`：验证参数、路径、权限、副作用前审批和结构化结果。
 - `agent-runtime`：验证压缩、事件 envelope、`Session::apply_turn` 和持久化时机。
 - `agent-server`：验证同 Session 的运行限制、审批 request id、取消和 WebSocket 消息。
-- `agent-protocol`：锁定 Session v3、事件和消息的 JSON 契约。
+- `agent-protocol`：锁定 Session v4、事件和消息的 JSON 契约。
 
 端口架构的直接收益是：core 测试不需要启动 HTTP server、真实 MCP 进程或写入用户 Session，就可以覆盖绝大多数 agent 循环行为。
