@@ -375,6 +375,22 @@ async fn route_active_remote_request(
                 .await
                 .map_err(|error| error.to_string())
         }
+        RemoteRequest::SessionMessage { session, message }
+            if matches!(
+                message.get("type").and_then(serde_json::Value::as_str),
+                Some("spawn_subagent" | "send_subagent")
+            ) =>
+        {
+            let command = settings
+                .prepare_remote_subagent_message(&session, message)
+                .await?;
+            client
+                .request(RemoteRequest::SubagentMessage {
+                    command: Box::new(command),
+                })
+                .await
+                .map_err(|error| error.to_string())
+        }
         request => client
             .request(request)
             .await

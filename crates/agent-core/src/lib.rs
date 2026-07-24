@@ -302,6 +302,11 @@ impl<'a> Agent<'a> {
         }
     }
 
+    pub fn with_max_tool_rounds(mut self, max_tool_rounds: usize) -> Self {
+        self.max_tool_rounds = max_tool_rounds.max(1);
+        self
+    }
+
     pub async fn run_turn<'b>(
         &'b self,
         thread: &Thread,
