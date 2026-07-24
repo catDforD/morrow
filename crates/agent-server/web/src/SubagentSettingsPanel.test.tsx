@@ -25,6 +25,7 @@ const profiles: SubagentProfileResponse[] = [
 
 const settings: SubagentSettingsResponse = {
   profiles,
+  roles: [],
   store_path: '/home/test/.morrow/subagents.json',
   min_profiles: 4,
   max_profiles: 64,
@@ -93,6 +94,100 @@ describe('SubagentSettingsPanel', () => {
     expect(onChanged).toHaveBeenCalledOnce()
   })
 
+  it('edits role runtime settings while keeping tools and permission ceilings read-only', async () => {
+    const roleSettings: SubagentSettingsResponse = {
+      ...settings,
+      roles: [{
+        role: 'worker',
+        display_name: 'Worker',
+        description: 'Approval-controlled workspace implementation',
+        tools: ['read_file', 'write_file', 'shell_command'],
+        permission_mode: 'workspace_write',
+        shell_policy: 'prompt',
+        model_selection: null,
+        prompt_suffix: '',
+        timeout_secs: 300,
+        max_tool_rounds: 99,
+      }],
+    }
+    const fetchMock = vi.fn(async () => new Response(
+      JSON.stringify(roleSettings.roles[0]),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    ))
+    vi.stubGlobal('fetch', fetchMock)
+    const onChanged = vi.fn(async () => {})
+    await render(
+      <SubagentSettingsPanel
+        settings={roleSettings}
+        modelSettings={{
+          providers: [{
+            id: 'provider-1',
+            name: 'Provider',
+            base_url: 'https://models.example/v1',
+            api_format: 'openai_chat_completions',
+            enabled: true,
+            read_only: false,
+            api_key_configured: true,
+            timeout_secs: 30,
+            models: [{
+              id: 'model-1',
+              name: 'Model',
+              context_window_tokens: 32_000,
+              reserved_output_tokens: 4_000,
+              supports_tools: true,
+              reasoning_profile: 'none',
+            }],
+          }],
+          default_selection: null,
+          model_ready: true,
+          store_path: '/home/test/.morrow/models.json',
+        }}
+        onChanged={onChanged}
+      />,
+    )
+
+    expect(document.body.textContent).toContain('Workspace write · Shell prompt')
+    expect(document.body.textContent).toContain('write_file')
+    expect(document.querySelector('.subagent-role-ceiling input')).toBeNull()
+
+    const selection = {
+      provider_id: 'provider-1',
+      model_id: 'model-1',
+      reasoning: 'off',
+    }
+    await act(async () => {
+      const select = document.querySelector<HTMLSelectElement>('.subagent-role-card select')
+      if (select) {
+        select.value = JSON.stringify(selection)
+        select.dispatchEvent(new Event('change', { bubbles: true }))
+      }
+    })
+    await setInput(
+      document.querySelector<HTMLTextAreaElement>('.subagent-role-card textarea'),
+      'Focus on the requested files.',
+    )
+    const limits = document.querySelectorAll<HTMLInputElement>('.subagent-role-limits input')
+    await setInput(limits[0] ?? null, '600')
+    await setInput(limits[1] ?? null, '12')
+    await act(async () => {
+      findButton('保存角色')?.click()
+    })
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/subagent-settings/roles/worker',
+      expect.objectContaining({
+        method: 'PUT',
+        body: JSON.stringify({
+          model_selection: selection,
+          prompt_suffix: 'Focus on the requested files.',
+          timeout_secs: 600,
+          max_tool_rounds: 12,
+        }),
+      }),
+    )
+    expect(onChanged).toHaveBeenCalledOnce()
+  })
+
   it('requires confirmation before restoring defaults', async () => {
     vi.spyOn(window, 'confirm').mockReturnValue(true)
     const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => new Response(
@@ -104,7 +199,7 @@ describe('SubagentSettingsPanel', () => {
     await render(<SubagentSettingsPanel settings={settings} onChanged={onChanged} />)
 
     await act(async () => {
-      findButton('恢复默认名单')?.click()
+      findButton('恢复默认身份')?.click()
     })
 
     expect(window.confirm).toHaveBeenCalledOnce()
@@ -232,12 +327,19 @@ async function render(element: React.ReactNode): Promise<void> {
   })
 }
 
-async function setInput(input: HTMLInputElement | null, value: string): Promise<void> {
+async function setInput(
+  input: HTMLInputElement | HTMLTextAreaElement | null,
+  value: string,
+): Promise<void> {
   if (!input) throw new Error('input not found')
   await act(async () => {
-    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set
+    const prototype = input instanceof HTMLTextAreaElement
+      ? HTMLTextAreaElement.prototype
+      : HTMLInputElement.prototype
+    const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set
     setter?.call(input, value)
     input.dispatchEvent(new Event('input', { bubbles: true }))
+    input.dispatchEvent(new Event('change', { bubbles: true }))
   })
 }
 

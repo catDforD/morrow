@@ -517,6 +517,12 @@ async fn handle_workspace_request(
             Ok(()) => RemoteResponse::Ack,
             Err(error) => remote_error("start_turn", error),
         },
+        RemoteRequest::SubagentMessage { command } => {
+            match server.send_remote_subagent_message(*command).await {
+                Ok(()) => RemoteResponse::Ack,
+                Err(error) => remote_error("subagent_message", error),
+            }
+        }
         RemoteRequest::InspectMcp { server: mcp_server } => {
             let inspection = server.inspect_remote_mcp(*mcp_server).await;
             match serde_json::to_value(inspection) {

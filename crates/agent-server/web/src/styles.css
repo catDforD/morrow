@@ -4882,6 +4882,266 @@ a:focus-visible {
   .connection-targets { grid-template-columns: 1fr; }
 }
 
+.subagent-role-settings {
+  display: grid;
+  gap: 14px;
+  margin-bottom: 28px;
+}
+
+.subagent-role-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.subagent-role-card {
+  display: grid;
+  gap: 14px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface-panel);
+  padding: 18px;
+}
+
+.subagent-role-card > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.subagent-role-card > header small,
+.subagent-role-ceiling {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.subagent-role-badge,
+.subagent-status-badge {
+  width: fit-content;
+  border: 1px solid color-mix(in srgb, var(--border), transparent 25%);
+  border-radius: 999px;
+  background: var(--surface-panel-muted);
+  padding: 4px 8px;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.subagent-role-badge.worker,
+.subagent-status-badge.running {
+  color: #238a4b;
+}
+
+.subagent-status-badge.waiting_approval {
+  color: #aa6f00;
+}
+
+.subagent-status-badge.failed,
+.subagent-status-badge.cancelled {
+  color: var(--danger);
+}
+
+.subagent-tool-chips,
+.subagent-runtime-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.subagent-tool-chips code,
+.subagent-runtime-meta span {
+  border-radius: 6px;
+  background: var(--surface-panel-muted);
+  padding: 4px 6px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.subagent-role-limits {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.subagent-identity-heading {
+  margin-top: 4px;
+}
+
+.persistent-subagent-panel,
+.subagent-spawn-form,
+.subagent-transcript {
+  display: grid;
+  gap: 12px;
+}
+
+.subagent-spawn-form select,
+.subagent-spawn-form textarea,
+.subagent-followup-form textarea {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-panel);
+  padding: 9px 10px;
+  color: var(--foreground);
+  font: inherit;
+}
+
+.subagent-spawn-form textarea,
+.subagent-followup-form textarea {
+  min-height: 78px;
+  resize: vertical;
+}
+
+.subagent-instance-list,
+.subagent-run-list,
+.subagent-message-transcript {
+  display: grid;
+  gap: 8px;
+}
+
+.subagent-instance-card {
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-panel);
+  padding: 10px;
+  color: var(--foreground);
+  text-align: left;
+  cursor: pointer;
+}
+
+.subagent-instance-card.selected {
+  border-color: var(--foreground);
+}
+
+.subagent-instance-card > span:nth-child(2) {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.subagent-instance-card small,
+.subagent-instance-card em {
+  color: var(--muted);
+  font-size: 10px;
+  font-style: normal;
+}
+
+.subagent-instance-card em {
+  grid-column: 2 / -1;
+}
+
+.subagent-instance-avatar {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--surface-panel-muted);
+}
+
+.subagent-transcript {
+  border-top: 1px solid var(--border);
+  padding-top: 14px;
+}
+
+.subagent-transcript > header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.subagent-transcript h3 {
+  margin: 2px 0;
+}
+
+.subagent-run-list article,
+.subagent-message {
+  border-radius: 8px;
+  background: var(--surface-panel-muted);
+  padding: 10px;
+}
+
+.subagent-run-list article {
+  display: grid;
+  gap: 5px;
+}
+
+.subagent-run-list pre,
+.subagent-message pre {
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.subagent-event-log-controls {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.subagent-event-log {
+  max-height: 24rem;
+  margin: 0;
+  padding: 0.75rem;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 0.65rem;
+  background: var(--surface-panel-muted);
+  font-size: 0.72rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.subagent-message strong {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--muted);
+  font-size: 10px;
+  text-transform: uppercase;
+}
+
+.subagent-log-warning,
+.approval-source {
+  color: #aa6f00;
+  font-size: 12px;
+}
+
+.subagent-instance-actions,
+.subagent-followup-form {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+.subagent-followup-form textarea {
+  flex: 1;
+}
+
+.approval-queue-card {
+  display: grid;
+  gap: 7px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px;
+}
+
+.approval-queue-card > span {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11px;
+}
+
+@media (max-width: 760px) {
+  .subagent-role-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
 .workspace-startup-page {
   width: 100%;
   height: 100%;

@@ -173,8 +173,29 @@ export interface SubagentProfileResponse {
   avatar_data_url?: string | null
 }
 
+export type SubagentRole = 'explore' | 'plan' | 'worker' | 'reviewer'
+
+export interface SubagentRoleOverride {
+  model_selection?: ModelSelection | null
+  prompt_suffix: string
+  timeout_secs: number
+  max_tool_rounds: number
+}
+
+export interface SubagentRoleSettingsResponse extends SubagentRoleOverride {
+  role: SubagentRole
+  display_name: string
+  description: string
+  tools: string[]
+  permission_mode: PermissionMode
+  shell_policy: ShellPolicy
+}
+
+export interface SubagentRoleWriteRequest extends SubagentRoleOverride {}
+
 export interface SubagentSettingsResponse {
   profiles: SubagentProfileResponse[]
+  roles: SubagentRoleSettingsResponse[]
   store_path: string
   min_profiles: number
   max_profiles: number
@@ -301,6 +322,65 @@ export interface SubagentExecutionSummary {
   truncated: boolean
 }
 
+export type SubagentInstanceStatus =
+  | 'idle'
+  | 'queued'
+  | 'running'
+  | 'waiting_approval'
+  | 'interrupted'
+  | 'failed'
+  | 'cancelled'
+
+export type SubagentRunStatus =
+  | 'queued'
+  | 'running'
+  | 'waiting_approval'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+  | 'interrupted'
+
+export interface SubagentRunSummary {
+  instance_id: string
+  run_id: string
+  role: SubagentRole
+  status: SubagentRunStatus
+  task: string
+  result?: string
+  error?: string
+  model_calls: number
+  tool_calls: number
+  file_changes: FileChangeSummary[]
+  shell_commands: ShellCommandSummary[]
+  started_at_ms: number
+  completed_at_ms?: number | null
+  truncated: boolean
+}
+
+export interface SubagentRunRecord {
+  id: string
+  task: string
+  status: SubagentRunStatus
+  turn_index: number
+  started_at_ms: number
+  completed_at_ms?: number | null
+  summary?: SubagentRunSummary | null
+}
+
+export interface SubagentInstanceSnapshot {
+  id: string
+  role: SubagentRole
+  identity: { id: string; name: string }
+  status: SubagentInstanceStatus
+  created_at_ms: number
+  updated_at_ms: number
+  latest_run_id?: string | null
+  latest_task?: string | null
+  queue_reason?: string | null
+  latest_summary?: SubagentRunSummary | null
+  event_log_truncated: boolean
+}
+
 export interface ToolExecutionSummary {
   files?: FileChangeSummary[]
   diff?: string
@@ -326,7 +406,21 @@ export interface ApprovalRequest {
   id: string
   action: ApprovalAction
   reason: string
+  origin?: ApprovalOrigin
 }
+
+export type ApprovalOrigin =
+  | { kind: 'unknown' }
+  | { kind: 'parent_turn'; turn_id?: string | null; tool_call_id?: string | null }
+  | {
+      kind: 'subagent_run'
+      instance_id: string
+      run_id: string
+      role: SubagentRole
+      identity_id?: string | null
+      identity_name?: string | null
+      tool_call_id?: string | null
+    }
 
 export interface ApprovalDecision {
   request_id: string
@@ -352,6 +446,7 @@ export type AgentEvent =
         summary: SubagentExecutionSummary
       }
     }
+  | { type: 'subagent_updated'; data: SubagentInstanceSnapshot }
   | { type: 'tool_call_started'; data: { id: string; name: string } }
   | {
       type: 'tool_call_finished'
@@ -372,9 +467,33 @@ export interface AgentEventEnvelope {
   timestamp_ms: number
   session: string
   workspace_root: string
+  origin?: AgentEventOrigin
   turn_index: number
   event_index: number
   event: AgentEvent
+}
+
+export type AgentEventOrigin =
+  | { kind: 'session' }
+  | { kind: 'parent_turn'; turn_id?: string | null; turn_index: number }
+  | {
+      kind: 'subagent_run'
+      instance_id: string
+      run_id: string
+      role: SubagentRole
+      identity_id?: string | null
+      identity_name?: string | null
+      turn_index: number
+    }
+
+export interface SubagentTranscriptSnapshot {
+  instance: SubagentInstanceSnapshot
+  model: ModelInvocation
+  permission_ceiling: PermissionProfile
+  role_config: SubagentRoleOverride
+  session: Session
+  runs: SubagentRunRecord[]
+  events: AgentEventEnvelope[]
 }
 
 export interface RunningTurnSnapshot {
@@ -389,11 +508,20 @@ export type ServerMessage =
         session: Session
         running_turn?: RunningTurnSnapshot | null
         permissions: PermissionProfile
+        subagents: SubagentInstanceSnapshot[]
+        approvals: ApprovalRequest[]
       }
     }
   | { type: 'agent_event'; data: AgentEventEnvelope }
   | { type: 'turn_saved'; data: { session: string; turn_index: number } }
   | { type: 'turn_rejected'; data: { request_id: string; reason: string } }
+  | { type: 'approval_queue_updated'; data: { approvals: ApprovalRequest[] } }
+  | {
+      type: 'subagent_transcript'
+      data: { transcript: SubagentTranscriptSnapshot }
+    }
+  | { type: 'subagent_deleted'; data: { instance_id: string } }
+  | { type: 'subagent_rejected'; data: { request_id: string; reason: string } }
   | { type: 'error'; data: { message: string } }
 
 export type ClientMessage =
@@ -412,6 +540,22 @@ export type ClientMessage =
       data: { request_id: string; approved: boolean }
     }
   | { type: 'cancel_turn'; data: { turn_id: string } }
+  | {
+      type: 'spawn_subagent'
+      data: { request_id: string; role: SubagentRole; task: string }
+    }
+  | {
+      type: 'send_subagent'
+      data: {
+        request_id: string
+        instance_id: string
+        message: string
+        model_selection?: ModelSelection | null
+      }
+    }
+  | { type: 'inspect_subagent'; data: { instance_id: string } }
+  | { type: 'cancel_subagent'; data: { instance_id: string } }
+  | { type: 'delete_subagent'; data: { instance_id: string } }
 
 export interface ToolRun {
   id: string

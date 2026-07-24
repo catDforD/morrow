@@ -7,19 +7,25 @@ mod subagent_settings;
 pub use models::{FallbackModel, discover_models as discover_remote_models};
 pub use subagent_settings::{
     SubagentProfileResponse, SubagentProfileWriteRequest, SubagentRegistryError,
-    SubagentSettingsResponse, load_subagent_identities,
+    SubagentRoleSettingsResponse, SubagentRoleWriteRequest, SubagentSettingsResponse,
+    load_subagent_identities,
 };
 
 use agent_config::{ContextConfig, LoadedServerConfig, McpServerConfig};
 use agent_model::{ModelError, OpenAiCompatClient, OpenAiCompatConfig};
 use agent_protocol::{
-    ApprovalDecision, ModelSelection, PermissionMode, PermissionProfile, ReasoningProfile,
-    RemoteMcpServerSpec, RemoteModelConnectionSpec, RemoteModelSpec, RemoteTurnModel,
-    RemoteTurnSpec, Session, SessionDocument, SubagentIdentity, WorkspaceLocation,
+    AgentEvent, AgentEventOrigin, ApprovalDecision, ApprovalOrigin, ApprovalRequest,
+    ModelSelection, PermissionMode, PermissionProfile, ReasoningProfile, RemoteMcpServerSpec,
+    RemoteModelConnectionSpec, RemoteModelSpec, RemoteSubagentMessageSpec, RemoteSubagentRoleSpec,
+    RemoteTurnModel, RemoteTurnSpec, Session, SessionDocument, SubagentIdentity,
+    SubagentInstanceSnapshot, SubagentRole, SubagentRoleOverride, SubagentRunRecord,
+    WorkspaceLocation,
 };
 use agent_runtime::{
-    AgentEventEnvelope, CancellationToken, McpInspection, McpToolCache, RunAgentTurnContext,
-    SessionListingEntry, SessionStore, TurnEventHandler, inspect_mcp_servers,
+    AgentEventEnvelope, CancellationToken, McpInspection, McpToolCache, Model, RunAgentTurnContext,
+    SessionListingEntry, SessionStore, SubagentController, SubagentInstanceDocument,
+    SubagentObserver, SubagentRoleRuntime, SubagentSupervisor, TurnEventHandler,
+    inspect_mcp_servers, subagent_store_for_session,
 };
 use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -47,16 +53,16 @@ use models::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 use subagent_settings::SubagentRegistry;
 use thiserror::Error;
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, RwLock, broadcast, oneshot};
+use tokio::sync::{Mutex, RwLock, Semaphore, broadcast, oneshot};
 use tokio::task::{AbortHandle, JoinHandle};
 use tower::ServiceExt;
 
@@ -358,6 +364,9 @@ impl EmbeddedServer {
             .map(remote_spec_from_config)
             .collect();
         let subagent_identities = self.service.inner.subagent_registry.identities().await;
+        let subagent_roles = self
+            .remote_subagent_role_specs(session_name, &model)
+            .await?;
         Ok(RemoteTurnSpec {
             session: session_name.to_string(),
             request_id,
@@ -366,7 +375,85 @@ impl EmbeddedServer {
             model,
             managed_mcp_servers,
             subagent_identities,
+            subagent_roles,
         })
+    }
+
+    pub async fn prepare_remote_subagent_message(
+        &self,
+        session_name: &str,
+        message: serde_json::Value,
+    ) -> Result<RemoteSubagentMessageSpec, String> {
+        let resume_selection = match serde_json::from_value::<ClientMessage>(message.clone())
+            .map_err(|error| format!("invalid subagent session message: {error}"))?
+        {
+            ClientMessage::SendSubagent {
+                model_selection, ..
+            } => model_selection,
+            ClientMessage::SpawnSubagent { .. } => None,
+            _ => {
+                return Err(
+                    "remote subagent message must create or continue an instance".to_string(),
+                );
+            }
+        };
+        let inherited_model = self
+            .service
+            .inner
+            .model_registry
+            .resolve_remote_for_turn(session_name, None)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(RemoteSubagentMessageSpec {
+            session: session_name.to_string(),
+            message,
+            permission_mode: Some(self.service.inner.options.permissions.mode),
+            subagent_identities: self.service.inner.subagent_registry.identities().await,
+            subagent_roles: self
+                .remote_subagent_role_specs(session_name, &inherited_model)
+                .await?,
+            resume_model: match resume_selection {
+                Some(selection) => Some(
+                    self.service
+                        .inner
+                        .model_registry
+                        .resolve_remote_for_turn(session_name, Some(selection))
+                        .await
+                        .map_err(|error| error.to_string())?,
+                ),
+                None => None,
+            },
+        })
+    }
+
+    async fn remote_subagent_role_specs(
+        &self,
+        session_name: &str,
+        inherited_model: &RemoteTurnModel,
+    ) -> Result<Vec<RemoteSubagentRoleSpec>, String> {
+        let overrides = self.service.inner.subagent_registry.role_overrides().await;
+        let mut roles = Vec::with_capacity(SubagentRole::ALL.len());
+        for role in SubagentRole::ALL {
+            let role_override = overrides.get(&role).cloned().unwrap_or_default();
+            let model = match role_override.model_selection.clone() {
+                Some(selection) => self
+                    .service
+                    .inner
+                    .model_registry
+                    .resolve_remote_for_turn(session_name, Some(selection))
+                    .await
+                    .map_err(|error| {
+                        format!("{} subagent model is unavailable: {error}", role.as_str())
+                    })?,
+                None => inherited_model.clone(),
+            };
+            roles.push(RemoteSubagentRoleSpec {
+                role,
+                overrides: role_override,
+                model,
+            });
+        }
+        Ok(roles)
     }
 
     pub async fn start_remote_turn(&self, turn: RemoteTurnSpec) -> Result<(), String> {
@@ -378,6 +465,7 @@ impl EmbeddedServer {
             model,
             managed_mcp_servers,
             subagent_identities,
+            subagent_roles,
         } = turn;
         let resolved_model = match model {
             RemoteTurnModel::WorkspaceFallback { selection } => self
@@ -401,6 +489,9 @@ impl EmbeddedServer {
             mcp_servers.push(config_from_remote_spec(server));
         }
         let tx = session_sender(&self.service, &session).await;
+        let (subagent_role_overrides, subagent_role_models) = self
+            .resolve_remote_subagent_roles(&session, subagent_roles)
+            .await?;
         start_turn(
             self.service.clone(),
             session,
@@ -413,11 +504,137 @@ impl EmbeddedServer {
                 resolved_model: Some(resolved_model),
                 mcp_servers: Some(mcp_servers),
                 subagent_identities: Some(subagent_identities),
+                subagent_role_overrides: Some(subagent_role_overrides),
+                subagent_role_models: Some(subagent_role_models),
             },
             tx,
         )
         .await;
         Ok(())
+    }
+
+    pub async fn send_remote_subagent_message(
+        &self,
+        command: RemoteSubagentMessageSpec,
+    ) -> Result<(), String> {
+        let RemoteSubagentMessageSpec {
+            session,
+            message,
+            permission_mode,
+            subagent_identities,
+            subagent_roles,
+            resume_model,
+        } = command;
+        let (overrides, models) = self
+            .resolve_remote_subagent_roles(&session, subagent_roles)
+            .await?;
+        let parent_model = models
+            .get(&SubagentRole::Explore)
+            .cloned()
+            .or_else(|| models.values().next().cloned())
+            .ok_or_else(|| "remote subagent runtime contains no models".to_string())?;
+        let permissions =
+            requested_permissions(self.service.inner.options.permissions, permission_mode);
+        let supervisor = prepare_subagent_supervisor_with_runtime(
+            &self.service,
+            &session,
+            &parent_model,
+            permissions,
+            &subagent_identities,
+            overrides,
+            Some(models),
+        )
+        .await?;
+        if let Some(model) = resume_model {
+            let resolved = match model {
+                RemoteTurnModel::WorkspaceFallback { selection } => self
+                    .service
+                    .inner
+                    .model_registry
+                    .resolve_for_turn(&session, Some(selection))
+                    .await
+                    .map_err(|error| error.to_string())?,
+                RemoteTurnModel::Managed(spec) => resolved_model_from_remote(spec)?,
+            };
+            let client: Arc<dyn Model> = Arc::new(resolved.client.clone());
+            supervisor
+                .register_model_runtime(client, resolved.invocation, resolved.limits)
+                .await;
+        }
+        let parsed = serde_json::from_value::<ClientMessage>(message)
+            .map_err(|error| format!("invalid subagent session message: {error}"))?;
+        let tx = session_sender(&self.service, &session).await;
+        match parsed {
+            ClientMessage::SpawnSubagent {
+                request_id,
+                role,
+                task,
+            } => {
+                if let Err(reason) = supervisor.spawn(role, task).await {
+                    broadcast_message(&tx, ServerMessage::SubagentRejected { request_id, reason });
+                }
+            }
+            ClientMessage::SendSubagent {
+                request_id,
+                instance_id,
+                message,
+                ..
+            } => {
+                if let Err(reason) = supervisor.send(instance_id, message).await {
+                    broadcast_message(&tx, ServerMessage::SubagentRejected { request_id, reason });
+                }
+            }
+            _ => {
+                return Err(
+                    "remote subagent message must create or continue an instance".to_string(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn resolve_remote_subagent_roles(
+        &self,
+        session: &str,
+        roles: Vec<RemoteSubagentRoleSpec>,
+    ) -> Result<
+        (
+            BTreeMap<SubagentRole, SubagentRoleOverride>,
+            BTreeMap<SubagentRole, ResolvedModel>,
+        ),
+        String,
+    > {
+        if roles.len() != SubagentRole::ALL.len() {
+            return Err("remote subagent runtime must contain all four roles".to_string());
+        }
+        let mut overrides = BTreeMap::new();
+        let mut models = BTreeMap::new();
+        for role in roles {
+            if overrides.insert(role.role, role.overrides).is_some() {
+                return Err(format!(
+                    "duplicate remote subagent role {}",
+                    role.role.as_str()
+                ));
+            }
+            let model = match role.model {
+                RemoteTurnModel::WorkspaceFallback { selection } => self
+                    .service
+                    .inner
+                    .model_registry
+                    .resolve_for_turn(session, Some(selection))
+                    .await
+                    .map_err(|error| error.to_string())?,
+                RemoteTurnModel::Managed(spec) => resolved_model_from_remote(spec)?,
+            };
+            models.insert(role.role, model);
+        }
+        if SubagentRole::ALL
+            .into_iter()
+            .any(|role| !overrides.contains_key(&role))
+        {
+            return Err("remote subagent runtime is missing a built-in role".to_string());
+        }
+        Ok((overrides, models))
     }
 
     pub async fn prepare_remote_model_discovery(
@@ -774,6 +991,14 @@ fn build_router_with_settings(
                 put(update_command).delete(delete_command),
             )
             .route("/api/subagent-settings", get(subagent_settings))
+            .route(
+                "/api/subagent-settings/roles/{role}",
+                put(update_subagent_role),
+            )
+            .route(
+                "/api/subagent-settings/roles/reset",
+                post(reset_subagent_roles),
+            )
             .route("/api/subagents", post(create_subagent))
             .route(
                 "/api/subagents/{id}",
@@ -936,14 +1161,24 @@ fn with_security_headers(mut response: Response) -> Response {
 }
 
 async fn server_activity(state: &AppState) -> ServerActivity {
-    let sessions = state.inner.sessions.lock().await;
-    let mut running_turns = 0;
-    let mut pending_approvals = 0;
-    for runtime in sessions.values() {
-        if let Some(running) = runtime.running.as_ref() {
-            running_turns += 1;
-            pending_approvals += usize::from(running.pending_approval.is_some());
-        }
+    let (mut running_turns, pending_approvals, supervisors) = {
+        let sessions = state.inner.sessions.lock().await;
+        let running_turns = sessions
+            .values()
+            .filter(|runtime| runtime.running.is_some())
+            .count();
+        let pending_approvals = sessions
+            .values()
+            .map(|runtime| runtime.approvals.len())
+            .sum();
+        let supervisors = sessions
+            .values()
+            .filter_map(|runtime| runtime.supervisor.clone())
+            .collect::<Vec<_>>();
+        (running_turns, pending_approvals, supervisors)
+    };
+    for supervisor in supervisors {
+        running_turns += supervisor.active_run_count().await;
     }
     ServerActivity {
         running_turns,
@@ -952,22 +1187,49 @@ async fn server_activity(state: &AppState) -> ServerActivity {
 }
 
 async fn cancel_all_turns(state: &AppState, timeout: Duration) {
-    let handles = {
-        let sessions = state.inner.sessions.lock().await;
-        sessions
+    let (handles, supervisors, approvals) = {
+        let mut sessions = state.inner.sessions.lock().await;
+        let handles = sessions
             .values()
             .filter_map(|runtime| runtime.running.as_ref())
             .map(|running| {
                 running.cancellation.cancel();
                 running.handle.clone()
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        let supervisors = sessions
+            .values()
+            .filter_map(|runtime| runtime.supervisor.clone())
+            .collect::<Vec<_>>();
+        let approvals = sessions
+            .values_mut()
+            .flat_map(|runtime| runtime.approvals.drain(..))
+            .collect::<Vec<_>>();
+        (handles, supervisors, approvals)
     };
+    for pending in approvals {
+        let _ = pending
+            .sender
+            .send(ApprovalDecision::deny(pending.request.id));
+    }
+    for supervisor in &supervisors {
+        for snapshot in supervisor.snapshots().await {
+            if snapshot.status.is_active() {
+                let _ = supervisor.cancel(snapshot.id).await;
+            }
+        }
+    }
 
     let deadline = tokio::time::Instant::now() + timeout;
-    while handles.iter().any(|handle| !handle.is_finished())
-        && tokio::time::Instant::now() < deadline
-    {
+    loop {
+        let parent_active = handles.iter().any(|handle| !handle.is_finished());
+        let mut subagent_active = false;
+        for supervisor in &supervisors {
+            subagent_active |= supervisor.has_active_runs().await;
+        }
+        if (!parent_active && !subagent_active) || tokio::time::Instant::now() >= deadline {
+            break;
+        }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     for handle in handles.iter().filter(|handle| !handle.is_finished()) {
@@ -988,17 +1250,19 @@ async fn cancel_all_turns(state: &AppState, timeout: Duration) {
 struct SessionRuntime {
     tx: broadcast::Sender<ServerMessage>,
     running: Option<RunningTurn>,
+    approvals: VecDeque<PendingApproval>,
+    supervisor: Option<Arc<SubagentSupervisor>>,
+    writer_lease: Arc<Semaphore>,
 }
 
 struct RunningTurn {
     turn_id: String,
-    pending_approval: Option<PendingApproval>,
     cancellation: CancellationToken,
     handle: AbortHandle,
 }
 
 struct PendingApproval {
-    request_id: String,
+    request: ApprovalRequest,
     sender: oneshot::Sender<ApprovalDecision>,
 }
 
@@ -1041,12 +1305,39 @@ pub struct RunningTurnSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct SubagentTranscriptSnapshot {
+    instance: SubagentInstanceSnapshot,
+    model: agent_protocol::ModelInvocation,
+    permission_ceiling: PermissionProfile,
+    role_config: SubagentRoleOverride,
+    session: Session,
+    runs: Vec<SubagentRunRecord>,
+    events: Vec<AgentEventEnvelope>,
+}
+
+impl SubagentTranscriptSnapshot {
+    fn from_document(document: SubagentInstanceDocument, events: Vec<AgentEventEnvelope>) -> Self {
+        Self {
+            instance: document.snapshot,
+            model: document.model,
+            permission_ceiling: document.permission_ceiling,
+            role_config: document.role_config,
+            session: document.session,
+            runs: document.runs,
+            events,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum ServerMessage {
     Snapshot {
         session: Session,
         running_turn: Option<RunningTurnSnapshot>,
         permissions: PermissionProfile,
+        subagents: Vec<SubagentInstanceSnapshot>,
+        approvals: Vec<ApprovalRequest>,
     },
     AgentEvent(Box<AgentEventEnvelope>),
     TurnSaved {
@@ -1054,6 +1345,19 @@ pub enum ServerMessage {
         turn_index: usize,
     },
     TurnRejected {
+        request_id: String,
+        reason: String,
+    },
+    ApprovalQueueUpdated {
+        approvals: Vec<ApprovalRequest>,
+    },
+    SubagentTranscript {
+        transcript: Box<SubagentTranscriptSnapshot>,
+    },
+    SubagentDeleted {
+        instance_id: String,
+    },
+    SubagentRejected {
         request_id: String,
         reason: String,
     },
@@ -1081,6 +1385,27 @@ pub enum ClientMessage {
     },
     CancelTurn {
         turn_id: String,
+    },
+    SpawnSubagent {
+        request_id: String,
+        role: SubagentRole,
+        task: String,
+    },
+    SendSubagent {
+        request_id: String,
+        instance_id: String,
+        message: String,
+        #[serde(default)]
+        model_selection: Option<ModelSelection>,
+    },
+    InspectSubagent {
+        instance_id: String,
+    },
+    CancelSubagent {
+        instance_id: String,
+    },
+    DeleteSubagent {
+        instance_id: String,
     },
 }
 
@@ -1356,6 +1681,32 @@ async fn subagent_settings(State(state): State<AppState>) -> Json<SubagentSettin
     Json(state.inner.subagent_registry.settings().await)
 }
 
+async fn update_subagent_role(
+    State(state): State<AppState>,
+    Path(role): Path<agent_protocol::SubagentRole>,
+    Json(request): Json<SubagentRoleWriteRequest>,
+) -> Result<Json<SubagentRoleSettingsResponse>, ApiError> {
+    state
+        .inner
+        .subagent_registry
+        .update_role(role, request)
+        .await
+        .map(Json)
+        .map_err(subagent_registry_error)
+}
+
+async fn reset_subagent_roles(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<SubagentRoleSettingsResponse>>, ApiError> {
+    state
+        .inner
+        .subagent_registry
+        .reset_roles()
+        .await
+        .map(Json)
+        .map_err(subagent_registry_error)
+}
+
 async fn create_subagent(
     State(state): State<AppState>,
     Json(request): Json<SubagentProfileWriteRequest>,
@@ -1516,8 +1867,8 @@ async fn create_session(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<Json<SessionDocument>, ApiError> {
-    if running_snapshot(&state, &name).await.is_some() {
-        return Err(ApiError::conflict("session has a running turn"));
+    if session_has_active_work(&state, &name).await {
+        return Err(ApiError::conflict("session has active agent work"));
     }
 
     let store = session_store(&state, &name)?;
@@ -1547,8 +1898,8 @@ async fn reset_session(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<Json<SessionDocument>, ApiError> {
-    if running_snapshot(&state, &name).await.is_some() {
-        return Err(ApiError::conflict("session has a running turn"));
+    if session_has_active_work(&state, &name).await {
+        return Err(ApiError::conflict("session has active agent work"));
     }
 
     let store = session_store(&state, &name)?;
@@ -1557,6 +1908,15 @@ async fn reset_session(
     store
         .save(&session)
         .map_err(|error| ApiError::internal(error.to_string()))?;
+    let subagents = subagent_store_for_session(&state.inner.options.workspace_root, &name)
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    subagents
+        .reset()
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    if let Some(runtime) = state.inner.sessions.lock().await.get_mut(&name) {
+        runtime.supervisor = None;
+        runtime.approvals.clear();
+    }
     Ok(Json(SessionDocument::new(session)))
 }
 
@@ -1564,12 +1924,21 @@ async fn archive_session(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<Json<SessionArchiveResponse>, ApiError> {
-    if running_snapshot(&state, &name).await.is_some() {
-        return Err(ApiError::conflict("session has a running turn"));
+    if session_has_active_work(&state, &name).await {
+        return Err(ApiError::conflict("session has active agent work"));
     }
 
     let store = session_store(&state, &name)?;
-    store.archive().map_err(session_mutation_error)?;
+    let subagents = subagent_store_for_session(&state.inner.options.workspace_root, &name)
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    subagents
+        .archive()
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    if let Err(error) = store.archive().map_err(session_mutation_error) {
+        let _ = subagents.restore();
+        return Err(error);
+    }
+    state.inner.sessions.lock().await.remove(&name);
     Ok(Json(SessionArchiveResponse {
         name,
         archived: true,
@@ -1580,12 +1949,18 @@ async fn restore_session(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<Json<SessionArchiveResponse>, ApiError> {
-    if running_snapshot(&state, &name).await.is_some() {
-        return Err(ApiError::conflict("session has a running turn"));
+    if session_has_active_work(&state, &name).await {
+        return Err(ApiError::conflict("session has active agent work"));
     }
 
     let store = session_store(&state, &name)?;
     store.restore().map_err(session_mutation_error)?;
+    let subagents = subagent_store_for_session(&state.inner.options.workspace_root, &name)
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    if let Err(error) = subagents.restore() {
+        let _ = store.archive();
+        return Err(ApiError::internal(error.to_string()));
+    }
     Ok(Json(SessionArchiveResponse {
         name,
         archived: false,
@@ -1707,6 +2082,8 @@ async fn dispatch_client_message(
                     resolved_model: None,
                     mcp_servers: None,
                     subagent_identities: None,
+                    subagent_role_overrides: None,
+                    subagent_role_models: None,
                 },
                 tx.clone(),
             )
@@ -1721,6 +2098,77 @@ async fn dispatch_client_message(
         ClientMessage::CancelTurn { turn_id } => {
             cancel_turn(state, session_name, turn_id, tx).await;
         }
+        ClientMessage::SpawnSubagent {
+            request_id,
+            role,
+            task,
+        } => {
+            let result = async {
+                let supervisor = prepare_direct_subagent_supervisor(state, session_name).await?;
+                supervisor.spawn(role, task).await
+            }
+            .await;
+            if let Err(reason) = result {
+                broadcast_message(tx, ServerMessage::SubagentRejected { request_id, reason });
+            }
+        }
+        ClientMessage::SendSubagent {
+            request_id,
+            instance_id,
+            message,
+            ..
+        } => {
+            let result = async {
+                let supervisor = prepare_direct_subagent_supervisor(state, session_name).await?;
+                supervisor.send(instance_id, message).await
+            }
+            .await;
+            if let Err(reason) = result {
+                broadcast_message(tx, ServerMessage::SubagentRejected { request_id, reason });
+            }
+        }
+        ClientMessage::InspectSubagent { instance_id } => {
+            let result = async {
+                let resources = ensure_session_resources(state, session_name).await?;
+                let document = resources.supervisor.document(&instance_id).await?;
+                let events = resources
+                    .supervisor
+                    .events(&instance_id)
+                    .map_err(|error| error.to_string())?;
+                Ok::<_, String>(SubagentTranscriptSnapshot::from_document(document, events))
+            }
+            .await;
+            match result {
+                Ok(transcript) => broadcast_message(
+                    tx,
+                    ServerMessage::SubagentTranscript {
+                        transcript: Box::new(transcript),
+                    },
+                ),
+                Err(error) => broadcast_error(tx, error),
+            }
+        }
+        ClientMessage::CancelSubagent { instance_id } => {
+            let result = async {
+                let resources = ensure_session_resources(state, session_name).await?;
+                resources.supervisor.cancel(instance_id).await
+            }
+            .await;
+            if let Err(error) = result {
+                broadcast_error(tx, error);
+            }
+        }
+        ClientMessage::DeleteSubagent { instance_id } => {
+            let result = async {
+                let resources = ensure_session_resources(state, session_name).await?;
+                resources.supervisor.delete(&instance_id).await
+            }
+            .await;
+            match result {
+                Ok(()) => broadcast_message(tx, ServerMessage::SubagentDeleted { instance_id }),
+                Err(error) => broadcast_error(tx, error),
+            }
+        }
     }
 }
 
@@ -1733,6 +2181,8 @@ struct StartTurnRequest {
     resolved_model: Option<ResolvedModel>,
     mcp_servers: Option<Vec<McpServerConfig>>,
     subagent_identities: Option<Vec<SubagentIdentity>>,
+    subagent_role_overrides: Option<BTreeMap<SubagentRole, SubagentRoleOverride>>,
+    subagent_role_models: Option<BTreeMap<SubagentRole, ResolvedModel>>,
 }
 
 async fn start_turn(
@@ -1750,6 +2200,8 @@ async fn start_turn(
         resolved_model,
         mcp_servers,
         subagent_identities,
+        subagent_role_overrides,
+        subagent_role_models,
     } = request;
     if state.inner.shutting_down.load(Ordering::Acquire) {
         broadcast_message(
@@ -1888,6 +2340,33 @@ async fn start_turn(
         }
         None => state.inner.subagent_registry.identities().await,
     };
+    let subagent_role_overrides = match subagent_role_overrides {
+        Some(overrides) => overrides,
+        None => state.inner.subagent_registry.role_overrides().await,
+    };
+    let supervisor = match prepare_subagent_supervisor_with_runtime(
+        &state,
+        &session_name,
+        &resolved_model,
+        permissions,
+        &subagent_identities,
+        subagent_role_overrides,
+        subagent_role_models,
+    )
+    .await
+    {
+        Ok(supervisor) => supervisor,
+        Err(error) => {
+            broadcast_message(
+                &tx,
+                ServerMessage::TurnRejected {
+                    request_id,
+                    reason: error,
+                },
+            );
+            return;
+        }
+    };
     {
         let mut sessions = state.inner.sessions.lock().await;
         let runtime = sessions
@@ -1918,6 +2397,7 @@ async fn start_turn(
                 resolved_model,
                 mcp_servers,
                 subagent_identities,
+                supervisor,
                 tx: tx_for_task,
                 cancellation: cancellation_for_task,
             })
@@ -1937,7 +2417,6 @@ async fn start_turn(
         ));
         runtime.running = Some(RunningTurn {
             turn_id: turn_id.clone(),
-            pending_approval: None,
             cancellation,
             handle,
         });
@@ -1957,6 +2436,7 @@ struct TurnTaskContext {
     resolved_model: ResolvedModel,
     mcp_servers: Option<Vec<McpServerConfig>>,
     subagent_identities: Vec<SubagentIdentity>,
+    supervisor: Arc<SubagentSupervisor>,
     tx: broadcast::Sender<ServerMessage>,
     cancellation: CancellationToken,
 }
@@ -1979,6 +2459,16 @@ async fn supervise_turn_worker(
     if worker.await.is_err_and(|error| error.is_panic()) {
         broadcast_error(&tx, format!("turn {turn_id} worker panicked"));
     }
+    cancel_matching_approvals(&state, &session_name, &tx, |request| {
+        matches!(
+            &request.origin,
+            ApprovalOrigin::ParentTurn {
+                turn_id: Some(pending_turn),
+                ..
+            } if pending_turn == &turn_id
+        )
+    })
+    .await;
     // 无论正常返回、panic 还是 abort，JoinHandle 完成都表示 worker future 已被 drop。
     clear_running_turn(&state, &session_name, &turn_id).await;
 }
@@ -1993,6 +2483,7 @@ async fn run_turn_task_inner(context: TurnTaskContext) -> Result<(), agent_runti
         resolved_model,
         mcp_servers,
         subagent_identities,
+        supervisor,
         tx,
         cancellation,
     } = context;
@@ -2012,7 +2503,7 @@ async fn run_turn_task_inner(context: TurnTaskContext) -> Result<(), agent_runti
         tx: tx.clone(),
     };
 
-    let outcome = agent_runtime::run_agent_turn_with_cancellation(
+    let outcome = agent_runtime::run_agent_turn_with_subagent_controller(
         RunAgentTurnContext {
             client: &resolved_model.client,
             model: &resolved_model.invocation,
@@ -2031,6 +2522,7 @@ async fn run_turn_task_inner(context: TurnTaskContext) -> Result<(), agent_runti
         &prompt,
         &mut handler,
         cancellation,
+        supervisor,
     )
     .await?;
 
@@ -2061,29 +2553,35 @@ async fn resolve_approval(
     let pending = {
         let mut sessions = state.inner.sessions.lock().await;
         let Some(runtime) = sessions.get_mut(session_name) else {
-            broadcast_error(tx, "session has no running turn");
-            return;
-        };
-        let Some(running) = runtime.running.as_mut() else {
-            broadcast_error(tx, "session has no running turn");
-            return;
-        };
-        let Some(pending) = running.pending_approval.take() else {
             broadcast_error(tx, "session has no pending approval");
             return;
         };
-        if pending.request_id != request_id {
-            let expected = pending.request_id.clone();
-            running.pending_approval = Some(pending);
+        let Some(front) = runtime.approvals.front() else {
+            broadcast_error(tx, "session has no pending approval");
+            return;
+        };
+        if front.request.id != request_id {
+            let expected = front.request.id.clone();
+            let queued = runtime
+                .approvals
+                .iter()
+                .any(|approval| approval.request.id == request_id);
             broadcast_error(
                 tx,
-                format!(
-                    "approval decision {request_id} does not match pending approval {expected}"
-                ),
+                if queued {
+                    format!("approval {request_id} is queued behind current approval {expected}")
+                } else {
+                    format!(
+                        "approval decision {request_id} does not match pending approval {expected}"
+                    )
+                },
             );
             return;
         }
-        pending
+        runtime
+            .approvals
+            .pop_front()
+            .expect("approval queue front checked")
     };
 
     let _ = pending.sender.send(if approved {
@@ -2091,6 +2589,85 @@ async fn resolve_approval(
     } else {
         ApprovalDecision::deny(request_id)
     });
+    broadcast_approval_queue(state, session_name, tx).await;
+}
+
+async fn enqueue_approval(
+    state: &AppState,
+    session_name: &str,
+    request: ApprovalRequest,
+    tx: &broadcast::Sender<ServerMessage>,
+) -> Result<ApprovalDecision, String> {
+    let request_id = request.id.clone();
+    let (sender, receiver) = oneshot::channel();
+    {
+        let mut sessions = state.inner.sessions.lock().await;
+        let runtime = sessions
+            .get_mut(session_name)
+            .ok_or_else(|| "session state disappeared".to_string())?;
+        if runtime
+            .approvals
+            .iter()
+            .any(|approval| approval.request.id == request_id)
+        {
+            return Err(format!("approval request {request_id:?} is already queued"));
+        }
+        runtime
+            .approvals
+            .push_back(PendingApproval { request, sender });
+    }
+    broadcast_approval_queue(state, session_name, tx).await;
+    match receiver.await {
+        Ok(decision) => Ok(decision),
+        Err(_) => Ok(ApprovalDecision::deny(request_id)),
+    }
+}
+
+async fn cancel_matching_approvals(
+    state: &AppState,
+    session_name: &str,
+    tx: &broadcast::Sender<ServerMessage>,
+    matches: impl Fn(&ApprovalRequest) -> bool,
+) {
+    let removed = {
+        let mut sessions = state.inner.sessions.lock().await;
+        let Some(runtime) = sessions.get_mut(session_name) else {
+            return;
+        };
+        let mut kept = VecDeque::with_capacity(runtime.approvals.len());
+        let mut removed = Vec::new();
+        while let Some(approval) = runtime.approvals.pop_front() {
+            if matches(&approval.request) {
+                removed.push(approval);
+            } else {
+                kept.push_back(approval);
+            }
+        }
+        runtime.approvals = kept;
+        removed
+    };
+    if removed.is_empty() {
+        return;
+    }
+    for pending in removed {
+        let _ = pending
+            .sender
+            .send(ApprovalDecision::deny(pending.request.id));
+    }
+    broadcast_approval_queue(state, session_name, tx).await;
+}
+
+async fn broadcast_approval_queue(
+    state: &AppState,
+    session_name: &str,
+    tx: &broadcast::Sender<ServerMessage>,
+) {
+    broadcast_message(
+        tx,
+        ServerMessage::ApprovalQueueUpdated {
+            approvals: approval_snapshots(state, session_name).await,
+        },
+    );
 }
 
 async fn cancel_turn(
@@ -2117,6 +2694,16 @@ async fn cancel_turn(
     };
 
     cancellation.cancel();
+    cancel_matching_approvals(state, session_name, tx, |request| {
+        matches!(
+            &request.origin,
+            ApprovalOrigin::ParentTurn {
+                turn_id: Some(pending_turn),
+                ..
+            } if pending_turn == &turn_id
+        )
+    })
+    .await;
 
     // 正常路径由 runtime 收束失败 Turn。只有长期不退出时才使用 abort 兜底。
     let state = state.clone();
@@ -2177,10 +2764,15 @@ impl TurnEventHandler for ServerTurnHandler {
         &mut self,
         envelope: &AgentEventEnvelope,
     ) -> Result<(), agent_runtime::RuntimeError> {
-        broadcast_message(
-            &self.tx,
-            ServerMessage::AgentEvent(Box::new(envelope.clone())),
-        );
+        let mut envelope = envelope.clone();
+        envelope.origin = AgentEventOrigin::ParentTurn {
+            turn_id: Some(self.turn_id.clone()),
+            turn_index: envelope.turn_index,
+        };
+        if let AgentEvent::ApprovalRequested(request) = &mut envelope.event {
+            *request = parent_approval_request(request, &self.turn_id);
+        }
+        broadcast_message(&self.tx, ServerMessage::AgentEvent(Box::new(envelope)));
         Ok(())
     }
 
@@ -2191,16 +2783,16 @@ impl TurnEventHandler for ServerTurnHandler {
         let state = self.state.clone();
         let session_name = self.session_name.clone();
         let turn_id = self.turn_id.clone();
-        let request_id = request.id.clone();
+        let request = parent_approval_request(request, &turn_id);
+        let tx = self.tx.clone();
 
         async move {
-            let (sender, receiver) = oneshot::channel();
             {
-                let mut sessions = state.inner.sessions.lock().await;
-                let runtime = sessions.get_mut(&session_name).ok_or_else(|| {
+                let sessions = state.inner.sessions.lock().await;
+                let runtime = sessions.get(&session_name).ok_or_else(|| {
                     agent_runtime::RuntimeError::event_handler("session state disappeared")
                 })?;
-                let running = runtime.running.as_mut().ok_or_else(|| {
+                let running = runtime.running.as_ref().ok_or_else(|| {
                     agent_runtime::RuntimeError::event_handler("running turn disappeared")
                 })?;
                 if running.turn_id != turn_id {
@@ -2208,16 +2800,77 @@ impl TurnEventHandler for ServerTurnHandler {
                         "running turn changed while waiting for approval",
                     ));
                 }
-                running.pending_approval = Some(PendingApproval {
-                    request_id: request_id.clone(),
-                    sender,
-                });
             }
+            enqueue_approval(&state, &session_name, request, &tx)
+                .await
+                .map_err(agent_runtime::RuntimeError::event_handler)
+        }
+        .boxed()
+    }
+}
 
-            match receiver.await {
-                Ok(decision) => Ok(decision),
-                Err(_) => Ok(ApprovalDecision::deny(request_id)),
-            }
+fn parent_approval_request(request: &ApprovalRequest, turn_id: &str) -> ApprovalRequest {
+    let mut request = request.clone();
+    request.origin = ApprovalOrigin::ParentTurn {
+        turn_id: Some(turn_id.to_string()),
+        tool_call_id: request.id.strip_prefix("approval-").map(str::to_string),
+    };
+    request
+}
+
+struct ServerSubagentObserver {
+    state: Weak<ServerState>,
+    session_name: String,
+    tx: broadcast::Sender<ServerMessage>,
+}
+
+impl SubagentObserver for ServerSubagentObserver {
+    fn on_event(&self, event: &AgentEventEnvelope) {
+        broadcast_message(&self.tx, ServerMessage::AgentEvent(Box::new(event.clone())));
+    }
+
+    fn resolve_approval(
+        &self,
+        request: ApprovalRequest,
+    ) -> BoxFuture<'static, Result<ApprovalDecision, String>> {
+        let state = self.state.clone();
+        let session_name = self.session_name.clone();
+        let tx = self.tx.clone();
+        async move {
+            let Some(inner) = state.upgrade() else {
+                return Ok(ApprovalDecision::deny(request.id));
+            };
+            enqueue_approval(&WorkspaceService { inner }, &session_name, request, &tx).await
+        }
+        .boxed()
+    }
+
+    fn cancel_approvals(
+        &self,
+        instance_id: String,
+        run_id: Option<String>,
+    ) -> BoxFuture<'static, ()> {
+        let state = self.state.clone();
+        let session_name = self.session_name.clone();
+        let tx = self.tx.clone();
+        async move {
+            let Some(inner) = state.upgrade() else {
+                return;
+            };
+            cancel_matching_approvals(&WorkspaceService { inner }, &session_name, &tx, |request| {
+                match &request.origin {
+                    ApprovalOrigin::SubagentRun {
+                        instance_id: pending_instance,
+                        run_id: pending_run,
+                        ..
+                    } => {
+                        pending_instance == &instance_id
+                            && run_id.as_ref().is_none_or(|run_id| pending_run == run_id)
+                    }
+                    _ => false,
+                }
+            })
+            .await;
         }
         .boxed()
     }
@@ -2226,17 +2879,75 @@ impl TurnEventHandler for ServerTurnHandler {
 impl SessionRuntime {
     fn new() -> Self {
         let (tx, _) = broadcast::channel(256);
-        Self { tx, running: None }
+        Self {
+            tx,
+            running: None,
+            approvals: VecDeque::new(),
+            supervisor: None,
+            writer_lease: Arc::new(Semaphore::new(1)),
+        }
     }
 }
 
-async fn session_sender(state: &AppState, session_name: &str) -> broadcast::Sender<ServerMessage> {
+#[derive(Clone)]
+struct SessionResources {
+    tx: broadcast::Sender<ServerMessage>,
+    supervisor: Arc<SubagentSupervisor>,
+}
+
+async fn ensure_session_resources(
+    state: &AppState,
+    session_name: &str,
+) -> Result<SessionResources, String> {
+    let identities = state.inner.subagent_registry.identities().await;
     let mut sessions = state.inner.sessions.lock().await;
-    sessions
+    let runtime = sessions
         .entry(session_name.to_string())
-        .or_insert_with(SessionRuntime::new)
-        .tx
-        .clone()
+        .or_insert_with(SessionRuntime::new);
+    if runtime.supervisor.is_none() {
+        let observer = Arc::new(ServerSubagentObserver {
+            state: Arc::downgrade(&state.inner),
+            session_name: session_name.to_string(),
+            tx: runtime.tx.clone(),
+        });
+        let supervisor = SubagentSupervisor::new_with_writer_lease(
+            state.inner.options.workspace_root.clone(),
+            session_name.to_string(),
+            state.inner.options.context_config,
+            BTreeMap::new(),
+            identities,
+            observer,
+            runtime.writer_lease.clone(),
+        )
+        .map_err(|error| error.to_string())?;
+        runtime.supervisor = Some(Arc::new(supervisor));
+    }
+    Ok(SessionResources {
+        tx: runtime.tx.clone(),
+        supervisor: runtime
+            .supervisor
+            .as_ref()
+            .expect("subagent supervisor initialized")
+            .clone(),
+    })
+}
+
+async fn session_sender(state: &AppState, session_name: &str) -> broadcast::Sender<ServerMessage> {
+    match ensure_session_resources(state, session_name).await {
+        Ok(resources) => resources.tx,
+        Err(error) => {
+            let tx = {
+                let mut sessions = state.inner.sessions.lock().await;
+                sessions
+                    .entry(session_name.to_string())
+                    .or_insert_with(SessionRuntime::new)
+                    .tx
+                    .clone()
+            };
+            broadcast_error(&tx, error);
+            tx
+        }
+    }
 }
 
 async fn snapshot_message(state: &AppState, session_name: &str) -> Result<ServerMessage, ApiError> {
@@ -2245,10 +2956,17 @@ async fn snapshot_message(state: &AppState, session_name: &str) -> Result<Server
     let session = store
         .load()
         .map_err(|error| ApiError::internal(error.to_string()))?;
+    let resources = ensure_session_resources(state, session_name)
+        .await
+        .map_err(ApiError::internal)?;
+    let subagents = resources.supervisor.snapshots().await;
+    let approvals = approval_snapshots(state, session_name).await;
     Ok(ServerMessage::Snapshot {
         session,
         running_turn: running_snapshot(state, session_name).await,
         permissions: state.inner.options.permissions,
+        subagents,
+        approvals,
     })
 }
 
@@ -2259,11 +2977,45 @@ async fn running_snapshot(state: &AppState, session_name: &str) -> Option<Runnin
         .and_then(|runtime| runtime.running.as_ref())
         .map(|running| RunningTurnSnapshot {
             turn_id: running.turn_id.clone(),
-            pending_approval: running
-                .pending_approval
-                .as_ref()
-                .map(|approval| approval.request_id.clone()),
+            pending_approval: sessions
+                .get(session_name)
+                .and_then(|runtime| runtime.approvals.front())
+                .map(|approval| approval.request.id.clone()),
         })
+}
+
+async fn session_has_active_work(state: &AppState, session_name: &str) -> bool {
+    let supervisor = {
+        let sessions = state.inner.sessions.lock().await;
+        let Some(runtime) = sessions.get(session_name) else {
+            return false;
+        };
+        if runtime.running.is_some() || !runtime.approvals.is_empty() {
+            return true;
+        }
+        runtime.supervisor.clone()
+    };
+    match supervisor {
+        Some(supervisor) => supervisor.has_active_runs().await,
+        None => false,
+    }
+}
+
+async fn approval_snapshots(state: &AppState, session_name: &str) -> Vec<ApprovalRequest> {
+    state
+        .inner
+        .sessions
+        .lock()
+        .await
+        .get(session_name)
+        .map(|runtime| {
+            runtime
+                .approvals
+                .iter()
+                .map(|approval| approval.request.clone())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn session_store(state: &AppState, name: &str) -> Result<SessionStore, ApiError> {
@@ -2278,6 +3030,116 @@ fn requested_permissions(
     requested_mode
         .map(PermissionProfile::for_mode)
         .unwrap_or(default)
+}
+
+async fn prepare_subagent_supervisor(
+    state: &AppState,
+    session_name: &str,
+    parent_model: &ResolvedModel,
+    parent_permissions: PermissionProfile,
+    identities: &[SubagentIdentity],
+) -> Result<Arc<SubagentSupervisor>, String> {
+    let overrides = state.inner.subagent_registry.role_overrides().await;
+    prepare_subagent_supervisor_with_runtime(
+        state,
+        session_name,
+        parent_model,
+        parent_permissions,
+        identities,
+        overrides,
+        None,
+    )
+    .await
+}
+
+async fn prepare_subagent_supervisor_with_runtime(
+    state: &AppState,
+    session_name: &str,
+    parent_model: &ResolvedModel,
+    parent_permissions: PermissionProfile,
+    identities: &[SubagentIdentity],
+    overrides: BTreeMap<SubagentRole, SubagentRoleOverride>,
+    mut supplied_models: Option<BTreeMap<SubagentRole, ResolvedModel>>,
+) -> Result<Arc<SubagentSupervisor>, String> {
+    let resources = ensure_session_resources(state, session_name).await?;
+    let mut roles = BTreeMap::new();
+    for role in SubagentRole::ALL {
+        let role_config = overrides.get(&role).cloned().unwrap_or_default();
+        let resolved = match supplied_models
+            .as_mut()
+            .and_then(|models| models.remove(&role))
+        {
+            Some(resolved) => resolved,
+            None => match role_config.model_selection.clone() {
+                Some(selection) if selection != parent_model.selection => state
+                    .inner
+                    .model_registry
+                    .resolve_for_turn(session_name, Some(selection))
+                    .await
+                    .map_err(|error| {
+                        format!("{} subagent model is unavailable: {error}", role.as_str())
+                    })?,
+                _ => parent_model.clone(),
+            },
+        };
+        let model: Arc<dyn Model> = Arc::new(resolved.client.clone());
+        roles.insert(
+            role,
+            SubagentRoleRuntime {
+                model,
+                invocation: resolved.invocation,
+                limits: resolved.limits,
+                role_config,
+                base_system_prompt: Arc::from(state.inner.options.system_prompt.clone()),
+                parent_permissions,
+            },
+        );
+    }
+    resources
+        .supervisor
+        .update_runtime(roles, identities.to_vec())
+        .await;
+    for invocation in resources.supervisor.required_models().await {
+        let selection = ModelSelection {
+            provider_id: invocation.provider_id.clone(),
+            model_id: invocation.model_id.clone(),
+            reasoning: invocation.reasoning,
+        };
+        if let Ok(resolved) = state
+            .inner
+            .model_registry
+            .resolve_for_turn(session_name, Some(selection))
+            .await
+        {
+            let model: Arc<dyn Model> = Arc::new(resolved.client.clone());
+            resources
+                .supervisor
+                .register_model_runtime(model, resolved.invocation, resolved.limits)
+                .await;
+        }
+    }
+    Ok(resources.supervisor)
+}
+
+async fn prepare_direct_subagent_supervisor(
+    state: &AppState,
+    session_name: &str,
+) -> Result<Arc<SubagentSupervisor>, String> {
+    let parent_model = state
+        .inner
+        .model_registry
+        .resolve_for_turn(session_name, None)
+        .await
+        .map_err(|error| error.to_string())?;
+    let identities = state.inner.subagent_registry.identities().await;
+    prepare_subagent_supervisor(
+        state,
+        session_name,
+        &parent_model,
+        state.inner.options.permissions,
+        &identities,
+    )
+    .await
 }
 
 fn reject_archived_session(store: &SessionStore, name: &str) -> Result<(), ApiError> {
@@ -2677,6 +3539,32 @@ mod tests {
                 .map(String::as_str),
             Some("managed-mcp-secret")
         );
+
+        let command = server
+            .prepare_remote_subagent_message(
+                "default",
+                serde_json::json!({
+                    "type": "send_subagent",
+                    "data": {
+                        "request_id": "request-2",
+                        "instance_id": "subagent-1",
+                        "message": "continue",
+                        "model_selection": {
+                            "provider_id": provider_id,
+                            "model_id": "managed-model",
+                            "reasoning": "off"
+                        }
+                    }
+                }),
+            )
+            .await
+            .expect("prepare remote subagent follow-up");
+        assert_eq!(command.subagent_roles.len(), SubagentRole::ALL.len());
+        let Some(RemoteTurnModel::Managed(resume_model)) = command.resume_model else {
+            panic!("managed resume model expected");
+        };
+        assert_eq!(resume_model.api_key, "managed-model-secret");
+        assert!(!format!("{resume_model:?}").contains("managed-model-secret"));
     }
 
     #[tokio::test]
@@ -2691,6 +3579,34 @@ mod tests {
             .subscribe_session("remote")
             .await
             .expect("subscribe session");
+        let remote_model = RemoteModelSpec {
+            base_url: format!(
+                "http://{}/v1",
+                listener.local_addr().expect("model address")
+            ),
+            model: "deepseek-v4-pro".to_string(),
+            api_key: "remote-model-secret".to_string(),
+            timeout_secs: 30,
+            context_window_tokens: 65_536,
+            reserved_output_tokens: 8_192,
+            reasoning_profile: ReasoningProfile::Deepseek,
+            supports_tools: true,
+            invocation: ModelInvocation {
+                provider_id: "opencode".to_string(),
+                provider_name: "opencode".to_string(),
+                model_id: "deepseek-v4-pro".to_string(),
+                model_name: "DeepSeek V4 Pro".to_string(),
+                reasoning: ReasoningLevel::High,
+            },
+        };
+        let subagent_roles = SubagentRole::ALL
+            .into_iter()
+            .map(|role| RemoteSubagentRoleSpec {
+                role,
+                overrides: SubagentRoleOverride::default(),
+                model: RemoteTurnModel::Managed(remote_model.clone()),
+            })
+            .collect();
 
         server
             .start_remote_turn(RemoteTurnSpec {
@@ -2698,28 +3614,10 @@ mod tests {
                 request_id: "request-remote-model".to_string(),
                 prompt: "hello".to_string(),
                 permission_mode: Some(PermissionMode::WorkspaceWrite),
-                model: RemoteTurnModel::Managed(RemoteModelSpec {
-                    base_url: format!(
-                        "http://{}/v1",
-                        listener.local_addr().expect("model address")
-                    ),
-                    model: "deepseek-v4-pro".to_string(),
-                    api_key: "remote-model-secret".to_string(),
-                    timeout_secs: 30,
-                    context_window_tokens: 65_536,
-                    reserved_output_tokens: 8_192,
-                    reasoning_profile: ReasoningProfile::Deepseek,
-                    supports_tools: true,
-                    invocation: ModelInvocation {
-                        provider_id: "opencode".to_string(),
-                        provider_name: "opencode".to_string(),
-                        model_id: "deepseek-v4-pro".to_string(),
-                        model_name: "DeepSeek V4 Pro".to_string(),
-                        reasoning: ReasoningLevel::High,
-                    },
-                }),
+                model: RemoteTurnModel::Managed(remote_model),
                 managed_mcp_servers: Vec::new(),
                 subagent_identities: agent_protocol::default_subagent_identities(),
+                subagent_roles,
             })
             .await
             .expect("start remote turn");
@@ -2915,7 +3813,6 @@ mod tests {
                 .or_insert_with(SessionRuntime::new);
             runtime.running = Some(RunningTurn {
                 turn_id: "turn-1".to_string(),
-                pending_approval: None,
                 cancellation: CancellationToken::new(),
                 handle: worker.abort_handle(),
             });
@@ -2944,7 +3841,6 @@ mod tests {
                 .or_insert_with(SessionRuntime::new);
             runtime.running = Some(RunningTurn {
                 turn_id: "turn-1".to_string(),
-                pending_approval: None,
                 cancellation: CancellationToken::new(),
                 handle: worker.abort_handle(),
             });
@@ -2975,7 +3871,6 @@ mod tests {
                 .or_insert_with(SessionRuntime::new);
             runtime.running = Some(RunningTurn {
                 turn_id: "turn-1".to_string(),
-                pending_approval: None,
                 cancellation: CancellationToken::new(),
                 handle: worker.abort_handle(),
             });
@@ -3016,7 +3911,6 @@ mod tests {
                 .or_insert_with(SessionRuntime::new);
             runtime.running = Some(RunningTurn {
                 turn_id: "turn-panic".to_string(),
-                pending_approval: None,
                 cancellation: CancellationToken::new(),
                 handle: worker.abort_handle(),
             });
@@ -3236,12 +4130,12 @@ mod tests {
                 .or_insert_with(SessionRuntime::new);
             runtime.running = Some(RunningTurn {
                 turn_id: "turn-1".to_string(),
-                pending_approval: Some(PendingApproval {
-                    request_id: "approval-call_1".to_string(),
-                    sender,
-                }),
                 cancellation: CancellationToken::new(),
                 handle: worker.abort_handle(),
+            });
+            runtime.approvals.push_back(PendingApproval {
+                request: ApprovalRequest::shell_command("approval-call_1", "pwd", ".", 30, "test"),
+                sender,
             });
         }
 
@@ -3259,5 +4153,158 @@ mod tests {
         clear_running_turn(&state, "default", "turn-1").await;
         worker.abort();
         let _ = worker.await;
+    }
+
+    #[tokio::test]
+    async fn approval_queue_is_fifo_across_parent_and_subagent_sources() {
+        let state = test_state();
+        let tx = session_sender(&state, "default").await;
+        let mut rx = tx.subscribe();
+        let parent = ApprovalRequest::shell_command(
+            "approval-parent",
+            "cargo test",
+            ".",
+            30,
+            "verify parent changes",
+        )
+        .with_origin(ApprovalOrigin::ParentTurn {
+            turn_id: Some("turn-1".to_string()),
+            tool_call_id: Some("parent-call".to_string()),
+        });
+        let child = ApprovalRequest::shell_command(
+            "approval-child",
+            "cargo clippy",
+            ".",
+            30,
+            "verify child changes",
+        )
+        .with_origin(ApprovalOrigin::SubagentRun {
+            instance_id: "subagent-1".to_string(),
+            run_id: "subrun-1".to_string(),
+            role: SubagentRole::Reviewer,
+            identity_id: Some("builtin-01".to_string()),
+            identity_name: Some("Reviewer".to_string()),
+            tool_call_id: Some("child-call".to_string()),
+        });
+
+        let first = tokio::spawn({
+            let state = state.clone();
+            let tx = tx.clone();
+            async move { enqueue_approval(&state, "default", parent, &tx).await }
+        });
+        wait_for_approval_count(&state, "default", 1).await;
+        let second = tokio::spawn({
+            let state = state.clone();
+            let tx = tx.clone();
+            async move { enqueue_approval(&state, "default", child, &tx).await }
+        });
+        wait_for_approval_count(&state, "default", 2).await;
+
+        let snapshot = snapshot_message(&state, "default")
+            .await
+            .expect("reconnect snapshot");
+        let ServerMessage::Snapshot { approvals, .. } = snapshot else {
+            panic!("snapshot expected");
+        };
+        assert_eq!(
+            approvals
+                .iter()
+                .map(|request| request.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["approval-parent", "approval-child"]
+        );
+        assert!(matches!(
+            approvals[1].origin,
+            ApprovalOrigin::SubagentRun { .. }
+        ));
+
+        resolve_approval(&state, "default", "approval-child".to_string(), true, &tx).await;
+        let queued_error = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let ServerMessage::Error { message } = rx.recv().await.expect("queue event")
+                    && message.contains("queued behind")
+                {
+                    break message;
+                }
+            }
+        })
+        .await
+        .expect("queued decision rejected");
+        assert!(queued_error.contains("approval-parent"));
+
+        resolve_approval(&state, "default", "approval-parent".to_string(), true, &tx).await;
+        assert!(
+            first
+                .await
+                .expect("first task")
+                .expect("first decision")
+                .approved
+        );
+        resolve_approval(&state, "default", "approval-child".to_string(), false, &tx).await;
+        assert!(
+            !second
+                .await
+                .expect("second task")
+                .expect("second decision")
+                .approved
+        );
+        assert!(approval_snapshots(&state, "default").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_subagent_run_denies_only_its_queued_approvals() {
+        let state = test_state();
+        let tx = session_sender(&state, "default").await;
+        let child = ApprovalRequest::shell_command(
+            "approval-child-cancel",
+            "pwd",
+            ".",
+            30,
+            "child request",
+        )
+        .with_origin(ApprovalOrigin::SubagentRun {
+            instance_id: "subagent-cancel".to_string(),
+            run_id: "subrun-cancel".to_string(),
+            role: SubagentRole::Worker,
+            identity_id: None,
+            identity_name: None,
+            tool_call_id: None,
+        });
+        let pending = tokio::spawn({
+            let state = state.clone();
+            let tx = tx.clone();
+            async move { enqueue_approval(&state, "default", child, &tx).await }
+        });
+        wait_for_approval_count(&state, "default", 1).await;
+
+        cancel_matching_approvals(&state, "default", &tx, |request| {
+            matches!(
+                &request.origin,
+                ApprovalOrigin::SubagentRun { instance_id, run_id, .. }
+                    if instance_id == "subagent-cancel" && run_id == "subrun-cancel"
+            )
+        })
+        .await;
+
+        let decision = pending
+            .await
+            .expect("approval task")
+            .expect("cancel decision");
+        assert!(!decision.approved);
+        assert_eq!(decision.request_id, "approval-child-cancel");
+        assert!(approval_snapshots(&state, "default").await.is_empty());
+    }
+
+    async fn wait_for_approval_count(state: &AppState, session: &str, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if approval_snapshots(state, session).await.len() == expected {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("approval queue reached expected length");
     }
 }

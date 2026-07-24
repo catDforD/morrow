@@ -249,6 +249,7 @@ export default function SettingsView({
           ) : section === 'subagents' ? (
             <SubagentSettingsPanel
               settings={subagentSettings}
+              modelSettings={modelSettings}
               onChanged={onSubagentSettingsChange}
             />
           ) : section === 'commands' ? (

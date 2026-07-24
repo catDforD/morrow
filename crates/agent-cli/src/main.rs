@@ -9,7 +9,7 @@ use agent_protocol::{
 };
 use agent_runtime::{
     AgentEventEnvelope, CompactionOutcome, McpToolCache, RunAgentTurnOutcome, SessionStore,
-    TurnEventHandler,
+    SubagentSessionStore, TurnEventHandler,
 };
 use clap::{Parser, Subcommand};
 use futures_util::future::{BoxFuture, FutureExt};
@@ -116,6 +116,8 @@ enum CliError {
     #[error(transparent)]
     SessionStore(#[from] agent_runtime::SessionStoreError),
     #[error(transparent)]
+    SubagentStore(#[from] agent_runtime::SubagentStoreError),
+    #[error(transparent)]
     Server(#[from] agent_server::ServerError),
     #[error(transparent)]
     SubagentSettings(#[from] agent_server::SubagentRegistryError),
@@ -219,9 +221,14 @@ async fn run() -> Result<(), CliError> {
         api_key: loaded.api_key,
         timeout: Duration::from_secs(loaded.config.model.timeout_secs),
     })?;
+    let session_scope_root =
+        std::env::current_dir().map_err(agent_runtime::SessionStoreError::CurrentDir)?;
     let session_store = SessionStore::for_current_dir(&session_name)?;
     let mut session = if reset_session {
-        Session::new()
+        let session = Session::new();
+        session_store.save(&session)?;
+        SubagentSessionStore::for_workspace(&session_scope_root, &session_name)?.reset()?;
+        session
     } else {
         session_store.load()?
     };
@@ -239,6 +246,7 @@ async fn run() -> Result<(), CliError> {
                 session_store: &session_store,
                 session_name: &session_name,
                 workspace_root: &workspace_root,
+                session_scope_root: &session_scope_root,
                 config_path: &loaded.path,
                 mcp_servers: &loaded.config.mcp_servers,
                 mcp_cache: &mcp_cache,
@@ -300,6 +308,7 @@ struct ReplContext<'a> {
     session_store: &'a SessionStore,
     session_name: &'a str,
     workspace_root: &'a Path,
+    session_scope_root: &'a Path,
     config_path: &'a Path,
     mcp_servers: &'a [McpServerConfig],
     mcp_cache: &'a McpToolCache,
@@ -439,6 +448,8 @@ async fn handle_repl_command(
         "/reset" => {
             *session = Session::new();
             context.session_store.save(session)?;
+            SubagentSessionStore::for_workspace(context.session_scope_root, context.session_name)?
+                .reset()?;
             eprintln!("session reset");
             Ok(false)
         }
@@ -598,6 +609,7 @@ impl TurnEventHandler for CliTurnHandler<'_, '_> {
                     summary: Some(ToolExecutionSummary::subagent(summary.clone())),
                 });
             }
+            AgentEvent::SubagentUpdated(_) => {}
             AgentEvent::ToolCallStarted { name, .. } => {
                 if self.context.output == OutputMode::Human {
                     eprintln!("tool {name} started");
@@ -839,11 +851,24 @@ fn handle_session_command(
         SessionCommand::Delete { name } => {
             let store = SessionStore::for_current_dir(name)?;
             store.delete()?;
+            let workspace =
+                std::env::current_dir().map_err(agent_runtime::SessionStoreError::CurrentDir)?;
+            SubagentSessionStore::for_workspace(&workspace, name)?.reset()?;
             writeln!(stdout, "deleted session: {name}").map_err(CliError::Stdout)?;
         }
         SessionCommand::Rename { old, new } => {
             let store = SessionStore::for_current_dir(old)?;
-            let target = store.rename(new)?;
+            let workspace =
+                std::env::current_dir().map_err(agent_runtime::SessionStoreError::CurrentDir)?;
+            let subagents = SubagentSessionStore::for_workspace(&workspace, old)?;
+            let renamed_subagents = subagents.rename(new)?;
+            let target = match store.rename(new) {
+                Ok(target) => target,
+                Err(error) => {
+                    let _ = renamed_subagents.rename(old);
+                    return Err(error.into());
+                }
+            };
             writeln!(
                 stdout,
                 "renamed session: {old} -> {new} ({})",
@@ -1740,7 +1765,7 @@ compact test
             .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json line"))
             .collect::<Vec<_>>();
         assert_eq!(lines.len(), 5);
-        assert_eq!(lines[0]["schema_version"], json!(6));
+        assert_eq!(lines[0]["schema_version"], json!(7));
         assert!(lines[0]["timestamp_ms"].as_u64().is_some());
         assert_eq!(lines[0]["session"], "default");
         assert_eq!(lines[0]["workspace_root"], root.display().to_string());
@@ -1779,7 +1804,7 @@ compact test
         write_jsonl_event(&mut output, &envelope).expect("write JSONL event");
 
         let value: serde_json::Value = serde_json::from_slice(&output).expect("parse JSONL event");
-        assert_eq!(value["schema_version"], json!(6));
+        assert_eq!(value["schema_version"], json!(7));
         assert_eq!(
             value["event"],
             json!({

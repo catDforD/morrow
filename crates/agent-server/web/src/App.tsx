@@ -93,8 +93,11 @@ import type {
   SessionModelSelectionResponse,
   StatusResponse,
   SubagentExecutionSummary,
+  SubagentInstanceSnapshot,
   SubagentProfileResponse,
+  SubagentRole,
   SubagentSettingsResponse,
+  SubagentTranscriptSnapshot,
   TimelineItem,
   TimelineMessageItem,
   TimelineNoticeItem,
@@ -104,7 +107,7 @@ import type {
   ToolRun,
 } from './types'
 
-type InspectorPanel = 'run' | 'tools' | 'recent'
+type InspectorPanel = 'run' | 'subagents' | 'tools' | 'recent'
 type ConnectionStatus = 'connecting' | 'connected' | 'disconnected'
 type AppView = 'workspace' | 'settings'
 type ResolvedTheme = Exclude<ThemePreference, 'system'>
@@ -190,6 +193,10 @@ export default function App() {
   )
   const [pendingApproval, setPendingApproval] =
     useState<ApprovalRequest | null>(null)
+  const [approvalQueue, setApprovalQueue] = useState<ApprovalRequest[]>([])
+  const [subagents, setSubagents] = useState<SubagentInstanceSnapshot[]>([])
+  const [subagentTranscript, setSubagentTranscript] =
+    useState<SubagentTranscriptSnapshot | null>(null)
   const [connection, setConnection] =
     useState<ConnectionStatus>('disconnected')
   const [prompt, setPrompt] = useState('')
@@ -769,6 +776,16 @@ export default function App() {
             event.data.ok ? 'ok' : 'error',
           )
           break
+        case 'subagent_updated':
+          setSubagents((current) => {
+            const next = current.filter((instance) => instance.id !== event.data.id)
+            next.push(event.data)
+            return next.sort((left, right) => left.created_at_ms - right.created_at_ms)
+          })
+          setSubagentTranscript((current) => current?.instance.id === event.data.id
+            ? { ...current, instance: event.data }
+            : current)
+          break
         case 'tool_call_started':
           upsertTool(event.data.id, event.data.name, 'running')
           startToolStep(event.data.id, event.data.name)
@@ -794,12 +811,19 @@ export default function App() {
           )
           break
         case 'approval_requested':
+          setApprovalQueue((current) => current.some((request) => request.id === event.data.id)
+            ? current
+            : [...current, event.data])
           setPendingApproval(event.data)
           setApprovalStep(event.data.id, 'Approval requested', event.data.reason)
           recordActivity('Approval requested', event.data.reason, 'approval')
           break
         case 'approval_resolved':
-          setPendingApproval(null)
+          setApprovalQueue((current) => {
+            const next = current.filter((request) => request.id !== event.data.request_id)
+            setPendingApproval(next[0] ?? null)
+            return next
+          })
           setApprovalStep(
             event.data.request_id,
             event.data.approved ? 'Approval granted' : 'Approval denied',
@@ -847,10 +871,25 @@ export default function App() {
       switch (message.type) {
         case 'snapshot':
           setRunningTurn(message.data.running_turn ?? null)
+          setSubagents(message.data.subagents ?? [])
+          setApprovalQueue(message.data.approvals ?? [])
+          setPendingApproval(message.data.approvals?.[0] ?? null)
           break
-        case 'agent_event':
-          handleAgentEvent(message.data.event)
+        case 'agent_event': {
+          const origin = message.data.origin
+          const event = message.data.event
+          const isChildEvent = origin?.kind === 'subagent_run'
+          if (!isChildEvent || event.type === 'approval_requested' || event.type === 'approval_resolved') {
+            handleAgentEvent(event)
+          } else if (event.type === 'error') {
+            recordActivity(
+              `${origin.identity_name ?? origin.role} failed`,
+              event.data,
+              'error',
+            )
+          }
           break
+        }
         case 'turn_saved':
           void loadSessions().catch(showError)
           setRunningTurn(null)
@@ -860,8 +899,25 @@ export default function App() {
           setRunningTurn(null)
           showError(message.data.reason)
           break
+        case 'approval_queue_updated':
+          setApprovalQueue(message.data.approvals)
+          setPendingApproval(message.data.approvals[0] ?? null)
+          break
+        case 'subagent_transcript':
+          setSubagentTranscript(message.data.transcript)
+          break
+        case 'subagent_deleted':
+          setSubagents((current) => current.filter(
+            (instance) => instance.id !== message.data.instance_id,
+          ))
+          setSubagentTranscript((current) => current?.instance.id === message.data.instance_id
+            ? null
+            : current)
+          break
+        case 'subagent_rejected':
+          showError(message.data.reason)
+          break
         case 'error':
-          setRunningTurn(null)
           showError(message.data.message)
           break
       }
@@ -1447,6 +1503,73 @@ export default function App() {
     }
   }
 
+  const spawnSubagent = (role: SubagentRole, task: string) => {
+    try {
+      sendSocketMessage({
+        type: 'spawn_subagent',
+        data: { request_id: nextId('subagent-request'), role, task },
+      })
+    } catch (error) {
+      showError(error)
+    }
+  }
+
+  const sendSubagent = (instanceId: string, message: string) => {
+    try {
+      const invocation = subagentTranscript?.instance.id === instanceId
+        ? subagentTranscript.model
+        : null
+      sendSocketMessage({
+        type: 'send_subagent',
+        data: {
+          request_id: nextId('subagent-request'),
+          instance_id: instanceId,
+          message,
+          model_selection: invocation ? {
+            provider_id: invocation.provider_id,
+            model_id: invocation.model_id,
+            reasoning: invocation.reasoning,
+          } : null,
+        },
+      })
+    } catch (error) {
+      showError(error)
+    }
+  }
+
+  const inspectSubagent = (instanceId: string) => {
+    try {
+      sendSocketMessage({
+        type: 'inspect_subagent',
+        data: { instance_id: instanceId },
+      })
+    } catch (error) {
+      showError(error)
+    }
+  }
+
+  const cancelSubagent = (instanceId: string) => {
+    try {
+      sendSocketMessage({
+        type: 'cancel_subagent',
+        data: { instance_id: instanceId },
+      })
+    } catch (error) {
+      showError(error)
+    }
+  }
+
+  const deleteSubagent = (instanceId: string) => {
+    try {
+      sendSocketMessage({
+        type: 'delete_subagent',
+        data: { instance_id: instanceId },
+      })
+    } catch (error) {
+      showError(error)
+    }
+  }
+
   return (
     <SubagentProfilesContext.Provider value={subagentSettings?.profiles ?? []}>
       <>
@@ -1604,8 +1727,16 @@ export default function App() {
               selectedEntry={selectedEntry}
               runningTurn={runningTurn}
               pendingApproval={pendingApproval}
+              approvalQueue={approvalQueue}
+              subagents={subagents}
+              subagentTranscript={subagentTranscript}
               onClose={() => setIsInspectorOpen(false)}
               onPanelChange={setInspectorPanel}
+              onSpawnSubagent={spawnSubagent}
+              onSendSubagent={sendSubagent}
+              onInspectSubagent={inspectSubagent}
+              onCancelSubagent={cancelSubagent}
+              onDeleteSubagent={deleteSubagent}
             />
           </div>
         )}
@@ -2134,6 +2265,9 @@ function ConversationHeader({
         </span>
         <MiniIconButton title="Open run status" onClick={() => onOpenInspector('run')}>
           <Shield size={16} />
+        </MiniIconButton>
+        <MiniIconButton title="Open subagents" onClick={() => onOpenInspector('subagents')}>
+          <Bot size={16} />
         </MiniIconButton>
         <MiniIconButton title="Open tools" onClick={() => onOpenInspector('tools')}>
           <Wrench size={16} />
@@ -2968,8 +3102,16 @@ function InspectorDrawer({
   selectedEntry,
   runningTurn,
   pendingApproval,
+  approvalQueue,
+  subagents,
+  subagentTranscript,
   onClose,
   onPanelChange,
+  onSpawnSubagent,
+  onSendSubagent,
+  onInspectSubagent,
+  onCancelSubagent,
+  onDeleteSubagent,
 }: {
   open: boolean
   panel: InspectorPanel
@@ -2978,8 +3120,16 @@ function InspectorDrawer({
   selectedEntry?: SessionEntryResponse
   runningTurn: RunningTurnSnapshot | null
   pendingApproval: ApprovalRequest | null
+  approvalQueue: ApprovalRequest[]
+  subagents: SubagentInstanceSnapshot[]
+  subagentTranscript: SubagentTranscriptSnapshot | null
   onClose: () => void
   onPanelChange: (panel: InspectorPanel) => void
+  onSpawnSubagent: (role: SubagentRole, task: string) => void
+  onSendSubagent: (instanceId: string, message: string) => void
+  onInspectSubagent: (instanceId: string) => void
+  onCancelSubagent: (instanceId: string) => void
+  onDeleteSubagent: (instanceId: string) => void
 }) {
   return (
     <aside
@@ -3011,6 +3161,12 @@ function InspectorDrawer({
             onClick={() => onPanelChange('run')}
           />
           <DrawerTab
+            active={panel === 'subagents'}
+            icon={<Bot size={16} />}
+            label="Agents"
+            onClick={() => onPanelChange('subagents')}
+          />
+          <DrawerTab
             active={panel === 'tools'}
             icon={<Wrench size={16} />}
             label="Tools"
@@ -3030,6 +3186,14 @@ function InspectorDrawer({
           selectedEntry={selectedEntry}
           runningTurn={runningTurn}
           pendingApproval={pendingApproval}
+          approvalQueue={approvalQueue}
+          subagents={subagents}
+          subagentTranscript={subagentTranscript}
+          onSpawnSubagent={onSpawnSubagent}
+          onSendSubagent={onSendSubagent}
+          onInspectSubagent={onInspectSubagent}
+          onCancelSubagent={onCancelSubagent}
+          onDeleteSubagent={onDeleteSubagent}
         />
       </section>
     </aside>
@@ -3066,6 +3230,14 @@ function InspectorPanelContent({
   selectedEntry,
   runningTurn,
   pendingApproval,
+  approvalQueue,
+  subagents,
+  subagentTranscript,
+  onSpawnSubagent,
+  onSendSubagent,
+  onInspectSubagent,
+  onCancelSubagent,
+  onDeleteSubagent,
 }: {
   panel: InspectorPanel
   tools: ToolRun[]
@@ -3073,7 +3245,29 @@ function InspectorPanelContent({
   selectedEntry?: SessionEntryResponse
   runningTurn: RunningTurnSnapshot | null
   pendingApproval: ApprovalRequest | null
+  approvalQueue: ApprovalRequest[]
+  subagents: SubagentInstanceSnapshot[]
+  subagentTranscript: SubagentTranscriptSnapshot | null
+  onSpawnSubagent: (role: SubagentRole, task: string) => void
+  onSendSubagent: (instanceId: string, message: string) => void
+  onInspectSubagent: (instanceId: string) => void
+  onCancelSubagent: (instanceId: string) => void
+  onDeleteSubagent: (instanceId: string) => void
 }) {
+  if (panel === 'subagents') {
+    return (
+      <PersistentSubagentPanel
+        instances={subagents}
+        transcript={subagentTranscript}
+        onSpawn={onSpawnSubagent}
+        onSend={onSendSubagent}
+        onInspect={onInspectSubagent}
+        onCancel={onCancelSubagent}
+        onDelete={onDeleteSubagent}
+      />
+    )
+  }
+
   if (panel === 'tools') {
     return <ToolList tools={tools} />
   }
@@ -3103,6 +3297,17 @@ function InspectorPanelContent({
           <span className="notice-pill approval">approval pending</span>
         ) : null}
       </div>
+      {approvalQueue.length > 0 ? (
+        <div className="approval-queue-card">
+          <p className="eyebrow">Approval queue</p>
+          {approvalQueue.map((request, index) => (
+            <span key={request.id}>
+              <strong>{index === 0 ? 'Current' : `Queued ${index}`}</strong>
+              <small>{approvalSource(request)}</small>
+            </span>
+          ))}
+        </div>
+      ) : null}
       <div className="panel-title compact">
         <Wrench size={18} />
         <span>Tools</span>
@@ -3124,6 +3329,210 @@ function InspectorMetric({ label, value }: { label: string; value: string }) {
       <span>{label}</span>
     </span>
   )
+}
+
+export function PersistentSubagentPanel({
+  instances,
+  transcript,
+  onSpawn,
+  onSend,
+  onInspect,
+  onCancel,
+  onDelete,
+}: {
+  instances: SubagentInstanceSnapshot[]
+  transcript: SubagentTranscriptSnapshot | null
+  onSpawn: (role: SubagentRole, task: string) => void
+  onSend: (instanceId: string, message: string) => void
+  onInspect: (instanceId: string) => void
+  onCancel: (instanceId: string) => void
+  onDelete: (instanceId: string) => void
+}) {
+  const profiles = useContext(SubagentProfilesContext)
+  const [role, setRole] = useState<SubagentRole>('explore')
+  const [task, setTask] = useState('')
+  const [followup, setFollowup] = useState('')
+  const [showEvents, setShowEvents] = useState(false)
+  const selected = transcript?.instance
+  useEffect(() => setShowEvents(false), [transcript?.instance.id])
+  const spawn = (event: FormEvent) => {
+    event.preventDefault()
+    const value = task.trim()
+    if (!value) return
+    onSpawn(role, value)
+    setTask('')
+  }
+  const send = (event: FormEvent) => {
+    event.preventDefault()
+    const value = followup.trim()
+    if (!selected || !value) return
+    onSend(selected.id, value)
+    setFollowup('')
+  }
+
+  return (
+    <div className="persistent-subagent-panel">
+      <form className="subagent-spawn-form" onSubmit={spawn}>
+        <div className="panel-title compact">
+          <Plus size={17} />
+          <span>New instance</span>
+        </div>
+        <select value={role} onChange={(event) => setRole(event.target.value as SubagentRole)}>
+          <option value="explore">Explore · read-only research</option>
+          <option value="plan">Plan · read-only planning</option>
+          <option value="worker">Worker · workspace changes</option>
+          <option value="reviewer">Reviewer · review + approved shell</option>
+        </select>
+        <textarea
+          value={task}
+          maxLength={4000}
+          placeholder="Give this instance a self-contained task…"
+          onChange={(event) => setTask(event.target.value)}
+        />
+        <button className="approve-button" type="submit" disabled={!task.trim()}>
+          <Send size={15} /> Start in background
+        </button>
+      </form>
+
+      <div className="subagent-instance-list">
+        {instances.length === 0 ? <p className="muted-line">No persistent subagents.</p> : null}
+        {instances.map((instance) => {
+          const profile = findSubagentProfile(
+            profiles,
+            instance.identity.id,
+            instance.identity.name,
+          )
+          return (
+            <button
+              className={`subagent-instance-card${selected?.id === instance.id ? ' selected' : ''}`}
+              type="button"
+              key={instance.id}
+              onClick={() => onInspect(instance.id)}
+            >
+              <span className="subagent-instance-avatar">
+                <SubagentIdentityAvatar avatar={profile?.avatar_data_url} />
+              </span>
+              <span>
+                <strong>{instance.identity.name}</strong>
+                <small>{compactText(instance.latest_task ?? 'No task', 72)}</small>
+              </span>
+              <span className={`subagent-status-badge ${instance.status}`}>
+                {instance.role} · {instance.status.replace('_', ' ')}
+              </span>
+              {instance.queue_reason ? <em>{instance.queue_reason}</em> : null}
+            </button>
+          )
+        })}
+      </div>
+
+      {transcript ? (
+        <section className="subagent-transcript">
+          <header>
+            <div>
+              <p className="eyebrow">Instance transcript</p>
+              <h3>{transcript.instance.identity.name}</h3>
+              <small>
+                {transcript.model.provider_name} / {transcript.model.model_name} · {transcript.model.reasoning}
+              </small>
+            </div>
+            <span className={`subagent-status-badge ${transcript.instance.status}`}>
+              {transcript.instance.status.replace('_', ' ')}
+            </span>
+          </header>
+          <div className="subagent-runtime-meta">
+            <span>{transcript.instance.role}</span>
+            <span>{transcript.permission_ceiling.mode}</span>
+            <span>shell {transcript.permission_ceiling.shell}</span>
+            <span>{transcript.role_config.timeout_secs}s</span>
+            <span>{transcript.role_config.max_tool_rounds} rounds</span>
+          </div>
+          {transcript.instance.event_log_truncated ? (
+            <p className="subagent-log-warning">Streaming deltas were truncated after the 16 MiB log budget.</p>
+          ) : null}
+          <div className="subagent-run-list">
+            {transcript.runs.map((run) => (
+              <article key={run.id}>
+                <strong>{run.status}</strong>
+                <small>{new Date(run.started_at_ms).toLocaleString()}</small>
+                <p>{run.task}</p>
+                {run.summary?.result ? <pre>{run.summary.result}</pre> : null}
+                {run.summary?.error ? <pre className="error-copy">{run.summary.error}</pre> : null}
+              </article>
+            ))}
+          </div>
+          <div className="subagent-message-transcript">
+            {subagentTranscriptMessages(transcript.session).map((message, index) => (
+              <article className={`subagent-message ${message.role}`} key={`${message.role}-${index}`}>
+                <strong>{message.role}</strong>
+                {message.reasoning_content ? <pre>{message.reasoning_content}</pre> : null}
+                {message.content ? <pre>{message.content}</pre> : null}
+                {message.tool_calls?.map((call) => (
+                  <pre key={call.id}>{call.function.name} {call.function.arguments}</pre>
+                ))}
+              </article>
+            ))}
+          </div>
+          <div className="subagent-event-log-controls">
+            <button
+              className="secondary-button"
+              type="button"
+              onClick={() => setShowEvents((current) => !current)}
+            >
+              <ListTree size={14} /> {showEvents ? 'Hide' : 'Show'} event log ({transcript.events.length})
+            </button>
+          </div>
+          {showEvents ? (
+            <pre className="subagent-event-log">
+              {transcript.events.map((event) => JSON.stringify(event)).join('\n')}
+            </pre>
+          ) : null}
+          <div className="subagent-instance-actions">
+            {isActiveSubagentStatus(transcript.instance.status) ? (
+              <button className="danger-button subtle" type="button" onClick={() => onCancel(transcript.instance.id)}>
+                <Square size={14} /> Cancel
+              </button>
+            ) : (
+              <button
+                className="danger-button subtle"
+                type="button"
+                onClick={() => {
+                  if (window.confirm(`Delete ${transcript.instance.identity.name} and its transcript?`)) {
+                    onDelete(transcript.instance.id)
+                  }
+                }}
+              >
+                <X size={14} /> Delete
+              </button>
+            )}
+          </div>
+          {!isActiveSubagentStatus(transcript.instance.status) ? (
+            <form className="subagent-followup-form" onSubmit={send}>
+              <textarea
+                value={followup}
+                maxLength={4000}
+                placeholder="Continue this instance with preserved context…"
+                onChange={(event) => setFollowup(event.target.value)}
+              />
+              <button className="approve-button" type="submit" disabled={!followup.trim()}>
+                <Send size={14} /> Continue
+              </button>
+            </form>
+          ) : null}
+        </section>
+      ) : null}
+    </div>
+  )
+}
+
+export function subagentTranscriptMessages(session: Session): Message[] {
+  if (session.turns.length > 0) {
+    return session.turns.flatMap((record) => record.messages)
+  }
+  return session.active_thread.messages
+}
+
+function isActiveSubagentStatus(status: SubagentInstanceSnapshot['status']): boolean {
+  return status === 'queued' || status === 'running' || status === 'waiting_approval'
 }
 
 function ToolList({
@@ -3253,6 +3662,7 @@ function ApprovalDialog({
             <X size={20} />
           </IconButton>
         </header>
+        <p className="approval-source">Source: {approvalSource(request)}</p>
         <p className="approval-reason">{request.reason}</p>
         <ApprovalBody request={request} />
         <footer>
@@ -3622,7 +4032,10 @@ export function SubagentRunStepIcon({
   profiles: SubagentProfileResponse[]
 }) {
   const profile = findSubagentProfile(profiles, step.agentId, step.agentName)
-  const avatar = profile?.avatar_data_url
+  return <SubagentIdentityAvatar avatar={profile?.avatar_data_url} />
+}
+
+function SubagentIdentityAvatar({ avatar }: { avatar?: string | null }) {
   const [imageFailed, setImageFailed] = useState(false)
 
   useEffect(() => setImageFailed(false), [avatar])
@@ -3681,11 +4094,20 @@ function inspectorPanelTitle(panel: InspectorPanel): string {
   switch (panel) {
     case 'run':
       return 'Run'
+    case 'subagents':
+      return 'Subagents'
     case 'tools':
       return 'Tools'
     case 'recent':
       return 'Recent'
   }
+}
+
+function approvalSource(request: ApprovalRequest): string {
+  const origin = request.origin
+  if (!origin || origin.kind === 'unknown') return 'parent agent'
+  if (origin.kind === 'parent_turn') return origin.turn_id ?? 'parent turn'
+  return `${origin.identity_name ?? origin.role} · ${origin.role} · ${origin.run_id}`
 }
 
 function approvalTitle(request: ApprovalRequest): string {
