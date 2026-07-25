@@ -5,8 +5,12 @@ import type { ReactNode } from 'react'
 import { createRoot } from 'react-dom/client'
 import type { Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { SubagentStepDisclosure, SubagentStepPanel } from './App'
-import type { RunStep } from './types'
+import {
+  PersistentSubagentStepCard,
+  SubagentStepDisclosure,
+  SubagentStepPanel,
+} from './App'
+import type { RunStep, SubagentInstanceSnapshot } from './types'
 
 let roots: Root[] = []
 
@@ -140,7 +144,201 @@ describe('SubagentStepPanel', () => {
       'timed out',
     )
   })
+
+  it('renders a compact child Agent with identity, input and output', async () => {
+    const step: RunStep = {
+      id: 'spawn-1',
+      kind: 'persistent_subagent',
+      status: 'ok',
+      title: '子 Agent · 后藤一里',
+      detail: 'Locate the session coordinator',
+      agentId: 'builtin-01',
+      agentName: '后藤一里',
+      agentRole: 'explore',
+      agentStatus: 'running',
+      instanceId: 'subagent-1',
+    }
+    const runningInstance = persistentInstance({
+      status: 'running',
+      latest_task: 'Locate the session coordinator',
+    })
+    await render(
+      <PersistentSubagentStepCard
+        profiles={[{
+          id: 'builtin-01',
+          name: '后藤一里',
+          avatar_data_url: 'data:image/png;base64,avatar',
+        }]}
+        instances={[runningInstance]}
+        step={step}
+      />,
+    )
+
+    const details = document.querySelector<HTMLDetailsElement>('.persistent-agent-card')
+    const summary = document.querySelector<HTMLElement>('.persistent-agent-summary')
+    expect(details?.open).toBe(false)
+    expect(document.querySelector('.persistent-agent-handoff')).toBeNull()
+    expect(summary?.textContent).not.toContain('委派给子 Agent')
+    expect(document.querySelector<HTMLImageElement>('.persistent-agent-avatar img')?.src)
+      .toBe('data:image/png;base64,avatar')
+    expect(document.querySelector('.persistent-agent-name')?.textContent).toContain('后藤一里')
+    expect(document.querySelector('.persistent-agent-name')?.textContent).toContain('Explore')
+    expect(document.querySelector('.persistent-agent-name')?.textContent).toContain(
+      '职责：只读检索与代码探索',
+    )
+    expect(document.querySelector('.persistent-agent-status')?.textContent).toBe('执行中')
+    expect(document.querySelector('.prompt-pane')?.textContent).toContain(
+      'Locate the session coordinator',
+    )
+    expect(document.querySelector('.output-pane')?.textContent).toContain(
+      '子 Agent 正在执行任务…',
+    )
+    expect(document.body.textContent).not.toContain('spawn_subagent')
+
+    await act(async () => {
+      summary?.click()
+    })
+    expect(details?.open).toBe(true)
+
+    await act(async () => {
+      roots[0]?.render(
+        <PersistentSubagentStepCard
+          profiles={[{
+            id: 'builtin-01',
+            name: '后藤一里',
+            avatar_data_url: 'data:image/png;base64,avatar',
+          }]}
+          instances={[persistentInstance({
+            status: 'idle',
+            latest_task: 'Locate the session coordinator',
+            latest_summary: {
+              instance_id: 'subagent-1',
+              run_id: 'subrun-1',
+              role: 'explore',
+              status: 'completed',
+              task: 'Locate the session coordinator',
+              result: '## Result\n\n- Coordinator located.',
+              model_calls: 2,
+              tool_calls: 3,
+              file_changes: [],
+              shell_commands: [],
+              started_at_ms: 1,
+              completed_at_ms: 2,
+              truncated: false,
+            },
+          })]}
+          step={step}
+        />,
+      )
+    })
+
+    expect(details?.open).toBe(true)
+    expect(document.querySelector('.persistent-agent-status')?.textContent).toBe('已完成')
+    expect(document.querySelector('.output-pane h2')?.textContent).toBe('Result')
+    expect(document.querySelector('.output-pane')?.textContent).toContain(
+      '2 次模型调用 · 3 次工具调用',
+    )
+  })
+
+  it('does not attach a later follow-up result to an older spawn row', async () => {
+    await render(
+      <PersistentSubagentStepCard
+        instances={[persistentInstance({
+          status: 'idle',
+          latest_task: 'Review the coordinator',
+          latest_summary: {
+            instance_id: 'subagent-1',
+            run_id: 'subrun-2',
+            role: 'explore',
+            status: 'completed',
+            task: 'Review the coordinator',
+            result: 'This belongs to the follow-up run.',
+            model_calls: 1,
+            tool_calls: 1,
+            file_changes: [],
+            shell_commands: [],
+            started_at_ms: 3,
+            completed_at_ms: 4,
+            truncated: false,
+          },
+        })]}
+        step={{
+          id: 'spawn-old',
+          kind: 'persistent_subagent',
+          status: 'ok',
+          title: '子 Agent · 后藤一里',
+          detail: 'Locate the session coordinator',
+          agentName: '后藤一里',
+          agentRole: 'explore',
+          instanceId: 'subagent-1',
+        }}
+      />,
+    )
+
+    expect(document.querySelector('.output-pane')?.textContent).not.toContain(
+      'This belongs to the follow-up run.',
+    )
+    expect(document.querySelector('.output-pane')?.textContent).toContain(
+      '可在 AGENTS 中查看完整记录',
+    )
+  })
+
+  it('shows a persistent run failure in the output pane', async () => {
+    await render(
+      <PersistentSubagentStepCard
+        instances={[persistentInstance({
+          status: 'failed',
+          latest_task: 'Inspect failures',
+          latest_summary: {
+            instance_id: 'subagent-1',
+            run_id: 'subrun-failed',
+            role: 'explore',
+            status: 'failed',
+            task: 'Inspect failures',
+            error: 'subagent timed out after 300 seconds',
+            model_calls: 1,
+            tool_calls: 0,
+            file_changes: [],
+            shell_commands: [],
+            started_at_ms: 1,
+            completed_at_ms: 2,
+            truncated: false,
+          },
+        })]}
+        step={{
+          id: 'spawn-failed',
+          kind: 'persistent_subagent',
+          status: 'error',
+          title: '子 Agent · 后藤一里',
+          detail: 'Inspect failures',
+          agentName: '后藤一里',
+          agentRole: 'explore',
+          instanceId: 'subagent-1',
+        }}
+      />,
+    )
+
+    expect(document.querySelector('.output-pane.failed')).not.toBeNull()
+    expect(document.querySelector('.subagent-error')?.textContent).toContain('timed out')
+  })
 })
+
+function persistentInstance(
+  overrides: Partial<SubagentInstanceSnapshot> = {},
+): SubagentInstanceSnapshot {
+  return {
+    id: 'subagent-1',
+    role: 'explore',
+    identity: { id: 'builtin-01', name: '后藤一里' },
+    status: 'running',
+    created_at_ms: 1,
+    updated_at_ms: 2,
+    latest_run_id: 'subrun-1',
+    latest_task: 'Locate the session coordinator',
+    event_log_truncated: false,
+    ...overrides,
+  }
+}
 
 async function renderPanel(step: RunStep): Promise<void> {
   await render(<SubagentStepPanel step={step} />)

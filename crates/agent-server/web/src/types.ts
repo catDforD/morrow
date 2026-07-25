@@ -593,6 +593,7 @@ export type RunTraceStatus = 'running' | 'completed' | 'failed' | 'approval'
 export type RunStepKind =
   | 'model'
   | 'subagent'
+  | 'persistent_subagent'
   | 'tool'
   | 'approval'
   | 'error'
@@ -609,6 +610,9 @@ export interface RunStep {
   summary?: ToolExecutionSummary
   agentId?: string
   agentName?: string
+  agentRole?: SubagentRole
+  agentStatus?: SubagentInstanceStatus
+  instanceId?: string
 }
 
 export interface RunTrace {

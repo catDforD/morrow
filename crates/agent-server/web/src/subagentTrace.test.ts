@@ -1,7 +1,10 @@
 import { describe, expect, it } from 'vitest'
 import {
+  persistentSubagentHistory,
+  persistentSubagentSnapshotStep,
   finishedSubagentStep,
   runningSubagentStep,
+  startingPersistentSubagentStep,
   subagentHistory,
 } from './subagentTrace'
 import type { Message } from './types'
@@ -165,5 +168,67 @@ describe('subagentHistory', () => {
         truncated: false,
       }).title,
     ).toBe('子智能体')
+  })
+
+  it('reconstructs a persistent spawn with its identity, role and status', () => {
+    const messages: Message[] = [
+      {
+        role: 'assistant',
+        tool_calls: [{
+          id: 'spawn-1',
+          type: 'function',
+          function: {
+            name: 'spawn_subagent',
+            arguments: JSON.stringify({
+              role: 'explore',
+              task: 'Locate the session coordinator',
+            }),
+          },
+        }],
+      },
+      {
+        role: 'tool',
+        tool_call_id: 'spawn-1',
+        content: JSON.stringify({
+          instance: {
+            id: 'subagent-1',
+            role: 'explore',
+            identity: { id: 'builtin-01', name: '后藤一里' },
+            status: 'running',
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            latest_run_id: 'subrun-1',
+            latest_task: 'Locate the session coordinator',
+            queue_reason: null,
+            event_log_truncated: false,
+          },
+        }),
+      },
+    ]
+
+    const entry = persistentSubagentHistory(messages).get('spawn-1')
+    expect(entry?.role).toBe('explore')
+    expect(entry?.task).toBe('Locate the session coordinator')
+    expect(entry?.snapshot?.identity.name).toBe('后藤一里')
+    expect(entry?.snapshot?.status).toBe('running')
+    expect(
+      persistentSubagentSnapshotStep('spawn-1', entry!.snapshot!),
+    ).toMatchObject({
+      kind: 'persistent_subagent',
+      title: '子 Agent · 后藤一里',
+      detail: 'Locate the session coordinator',
+      agentId: 'builtin-01',
+      agentName: '后藤一里',
+      agentRole: 'explore',
+      agentStatus: 'running',
+      instanceId: 'subagent-1',
+    })
+  })
+
+  it('uses a child-Agent placeholder instead of exposing the lifecycle tool name', () => {
+    const step = startingPersistentSubagentStep('spawn-2')
+    expect(step.kind).toBe('persistent_subagent')
+    expect(step.title).toBe('正在启动子 Agent')
+    expect(JSON.stringify(step)).not.toContain('spawn_subagent')
   })
 })

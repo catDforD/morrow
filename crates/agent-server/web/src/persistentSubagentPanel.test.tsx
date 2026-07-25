@@ -6,6 +6,7 @@ import { createRoot } from 'react-dom/client'
 import type { Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
+  InspectorDrawer,
   PersistentSubagentPanel,
   subagentTranscriptMessages,
 } from './App'
@@ -28,13 +29,12 @@ describe('PersistentSubagentPanel', () => {
     vi.restoreAllMocks()
   })
 
-  it('shows complete turn history and reveals the persisted event log on demand', async () => {
+  it('shows concise agent details without rendering the complete transcript', async () => {
     const transcript = buildTranscript()
     await render(
       <PersistentSubagentPanel
         instances={[transcript.instance]}
         transcript={transcript}
-        onSpawn={() => {}}
         onSend={() => {}}
         onInspect={() => {}}
         onCancel={() => {}}
@@ -42,25 +42,45 @@ describe('PersistentSubagentPanel', () => {
       />,
     )
 
-    expect(document.body.textContent).toContain('first question')
-    expect(document.body.textContent).toContain('first answer')
-    expect(document.body.textContent).not.toContain('compacted-only active thread')
+    expect(document.querySelector('.subagent-detail-card')).not.toBeNull()
+    expect(document.body.textContent).toContain('Agent details')
+    expect(document.body.textContent).toContain('Reviewer')
+    expect(document.body.textContent).toContain('独立审查与审批后检查')
+    expect(document.body.textContent).toContain('review the workspace')
+    expect(document.body.textContent).toContain('Review completed with three findings.')
+    expect(document.body.textContent).not.toContain('SHOULD_NOT_APPEAR')
+    expect(document.body.textContent).not.toContain('first question')
+    expect(document.body.textContent).not.toContain('first answer')
+    expect(document.querySelector('.subagent-message-transcript')).toBeNull()
     expect(document.querySelector('.subagent-event-log')).toBeNull()
-
-    await act(async () => {
-      findButton('Show event log')?.click()
-    })
-
-    expect(document.querySelector('.subagent-event-log')?.textContent).toContain(
-      'approval_requested',
-    )
-    expect(document.body.textContent).toContain('Streaming deltas were truncated')
+    expect(document.body.textContent).not.toContain('Show event log')
+    expect(document.body.textContent).toContain('event log reached its 16 MiB limit')
+    expect(document.querySelector<HTMLDetailsElement>('.subagent-followup-disclosure')?.open)
+      .toBe(false)
   })
 
-  it('wires create, inspect, continue and delete controls to instance actions', async () => {
+  it('does not expose manual creation controls and explains the empty state', async () => {
+    await render(
+      <PersistentSubagentPanel
+        instances={[]}
+        transcript={null}
+        onSend={() => {}}
+        onInspect={() => {}}
+        onCancel={() => {}}
+        onDelete={() => {}}
+      />,
+    )
+
+    expect(document.querySelector('.subagent-spawn-form')).toBeNull()
+    expect(document.querySelector('select')).toBeNull()
+    expect(document.querySelector('.subagent-instance-section')?.textContent).toContain('Current agents')
+    expect(document.querySelector('.subagent-empty-state')?.textContent).toContain('No agents yet')
+    expect(document.querySelector('.subagent-empty-state')?.textContent).toContain('主 Agent')
+  })
+
+  it('wires inspect, continue and delete controls to existing instance actions', async () => {
     vi.spyOn(window, 'confirm').mockReturnValue(true)
     const transcript = buildTranscript()
-    const onSpawn = vi.fn()
     const onSend = vi.fn()
     const onInspect = vi.fn()
     const onDelete = vi.fn()
@@ -68,7 +88,6 @@ describe('PersistentSubagentPanel', () => {
       <PersistentSubagentPanel
         instances={[transcript.instance]}
         transcript={transcript}
-        onSpawn={onSpawn}
         onSend={onSend}
         onInspect={onInspect}
         onCancel={() => {}}
@@ -81,19 +100,13 @@ describe('PersistentSubagentPanel', () => {
     })
     expect(onInspect).toHaveBeenCalledWith('subagent-1')
 
-    await setInput(
-      document.querySelector<HTMLTextAreaElement>('.subagent-spawn-form textarea'),
-      'implement the change',
+    const followupDisclosure = document.querySelector<HTMLDetailsElement>(
+      '.subagent-followup-disclosure',
     )
     await act(async () => {
-      const select = document.querySelector<HTMLSelectElement>('.subagent-spawn-form select')
-      if (select) {
-        select.value = 'worker'
-        select.dispatchEvent(new Event('change', { bubbles: true }))
-      }
-      document.querySelector<HTMLFormElement>('.subagent-spawn-form')?.requestSubmit()
+      followupDisclosure?.querySelector('summary')?.click()
     })
-    expect(onSpawn).toHaveBeenCalledWith('worker', 'implement the change')
+    expect(followupDisclosure?.open).toBe(true)
 
     await setInput(
       document.querySelector<HTMLTextAreaElement>('.subagent-followup-form textarea'),
@@ -112,6 +125,35 @@ describe('PersistentSubagentPanel', () => {
   })
 })
 
+describe('InspectorDrawer', () => {
+  it('only exposes the Run and Agents panels', async () => {
+    await render(
+      <InspectorDrawer
+        open
+        panel="run"
+        selectedEntry={undefined}
+        runningTurn={null}
+        pendingApproval={null}
+        approvalQueue={[]}
+        subagents={[]}
+        subagentTranscript={null}
+        onClose={() => {}}
+        onPanelChange={() => {}}
+        onSendSubagent={() => {}}
+        onInspectSubagent={() => {}}
+        onCancelSubagent={() => {}}
+        onDeleteSubagent={() => {}}
+      />,
+    )
+
+    const tabs = [...document.querySelectorAll<HTMLButtonElement>('.drawer-tab')]
+      .map((button) => button.textContent?.trim())
+    expect(tabs).toEqual(['Run', 'Agents'])
+    expect(document.body.textContent).not.toContain('Recent')
+    expect(document.body.textContent).not.toContain('Tools')
+  })
+})
+
 describe('subagentTranscriptMessages', () => {
   it('uses immutable turn records instead of a compacted active thread', () => {
     const session = buildTranscript().session
@@ -123,6 +165,7 @@ describe('subagentTranscriptMessages', () => {
 })
 
 function buildTranscript(): SubagentTranscriptSnapshot {
+  const result = `Review completed with three findings. ${'Supporting detail. '.repeat(40)}SHOULD_NOT_APPEAR`
   const session: Session = {
     active_thread: {
       messages: [{ role: 'system', content: 'compacted-only active thread' }],
@@ -176,6 +219,34 @@ function buildTranscript(): SubagentTranscriptSnapshot {
       turn_index: 0,
       started_at_ms: 1,
       completed_at_ms: 2,
+      summary: {
+        instance_id: 'subagent-1',
+        run_id: 'subrun-1',
+        role: 'reviewer',
+        status: 'completed',
+        task: 'review the workspace',
+        result,
+        model_calls: 2,
+        tool_calls: 3,
+        file_changes: [{
+          path: 'src/lib.rs',
+          operation: 'update',
+          replacements: 1,
+          created: false,
+          overwritten: false,
+          deleted: false,
+        }],
+        shell_commands: [{
+          command: 'cargo test',
+          exit_code: 0,
+          timed_out: false,
+          stdout_truncated: false,
+          stderr_truncated: false,
+        }],
+        started_at_ms: 1,
+        completed_at_ms: 2,
+        truncated: false,
+      },
     }],
     events: [{
       schema_version: 7,
