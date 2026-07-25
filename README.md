@@ -24,7 +24,7 @@ Morrow streams model output, persists project-scoped sessions, reads and edits f
 - **Real tools** — file reads/edits, patches, search, directory listing, and shell commands.
 - **Permission profiles** — read-only, workspace-write, and full-access modes, with shell controlled separately.
 - **MCP support** — stdio and Streamable HTTP MCP servers from TOML or the dashboard.
-- **Read-only subagents** — delegate isolated workspace investigations and run independent tasks in parallel.
+- **Session-scoped subagents** — run persistent `explore`, `plan`, `worker`, and `reviewer` instances in the background, then inspect, continue, cancel, or delete them from Web/Desktop.
 - **Long-session friendly** — automatic context compaction.
 - **Scriptable** — JSONL event output for automation and integrations.
 
@@ -118,7 +118,7 @@ shell = "deny"
 
 Inline `[model].OPENAI_API_KEY` wins when present; otherwise Morrow reads `api_key_env` (default `OPENAI_API_KEY`). CLI requires a valid model and API key. Without `--config`, `morrow server` can start with no config so the first provider can be set up in the browser.
 
-Web-only models, MCP servers, and custom commands are managed under **Settings → Models / MCP Servers / Commands** and stored under `~/.morrow/`; they do not change the CLI TOML config. See [`morrow.example.toml`](morrow.example.toml) for more examples.
+Web-only models, MCP servers, custom commands, and subagent settings are managed under **Settings → Models / MCP Servers / Commands / Subagents** and stored under `~/.morrow/`; they do not change the CLI TOML config. See [`morrow.example.toml`](morrow.example.toml) for more examples.
 
 ### MCP tools
 
@@ -137,9 +137,24 @@ tool_timeout_sec = 60
 
 MCP tools are treated as explicitly trusted — review server commands and remote endpoints before enabling them.
 
-### Read-only subagents
+### Subagents
 
-Tool-capable models get `delegate_task` for isolated workspace investigations. Subagents can only read/search/list files — no writes, shell, MCP, or further delegation. At most four run in parallel per parent turn, with a five-minute timeout each. Manage identities under **Settings → Subagents** (`~/.morrow/subagents.json`).
+Web/Desktop sessions support persistent, background subagents through `spawn_subagent`, `send_subagent`, `inspect_subagent`, `wait_subagents`, and `cancel_subagent`. A parent turn can end while its subagents keep running. Users can inspect the complete transcript and event log, continue an idle or interrupted instance with preserved context, cancel active work, or delete a terminal instance from the Subagents inspector.
+
+| Role | Built-in tools | Permission ceiling |
+| --- | --- | --- |
+| `explore` | Read, list, search | Read-only; shell denied |
+| `plan` | Read, list, search | Read-only; shell denied |
+| `worker` | File reads/writes, patches, shell | Workspace-write; shell always prompts |
+| `reviewer` | Read, list, search, shell | No file-write tools; every shell command prompts |
+
+Effective access is the intersection of the parent permission profile, the role ceiling, and the role's explicit tool allowlist. Tools that are not permitted are omitted from the model request. Subagents never receive MCP or delegation tools. Role settings can override the model/reasoning level, append up to 4,000 prompt characters, set a 30–1,800 second timeout, and set 1–99 tool rounds. Changes affect new instances only; each instance snapshots its identity name, effective prompt, model, and permission ceiling when created.
+
+Each session retains at most eight persistent instances and runs at most four subagent runs concurrently. One workspace writer lease serializes parent file writes/shell commands, `worker` runs, and approved `reviewer` shell commands; reads remain parallel. Approval requests from parent and child runs share one FIFO queue and display their source. Approved file changes are revalidated immediately before commit, so a stale preview is rejected if the workspace changed.
+
+Persistent instances live under `~/.morrow/subagent-sessions/<workspace-scope>/<session>/`. Their event log stops storing streaming deltas after 16 MiB but keeps messages, tools, approvals, and terminal events. On restart, queued/running/waiting-for-approval runs become `interrupted`; approvals and leases are cleared, and unfinished operations are never replayed automatically. Remote model credentials are transmitted only when starting or continuing work and remain in memory; they are not written to the instance sidecar.
+
+The compatibility `delegate_task({task})` tool remains synchronous and strictly read-only. It creates a temporary `explore` agent, follows parent-turn cancellation, and does not consume persistent-instance capacity. CLI exposes this compatibility tool only; persistent lifecycle controls are currently Web/Desktop and remote-workspace features. Names and avatars remain separately configurable under **Settings → Subagents** (`~/.morrow/subagents.json`).
 
 ### Web custom commands
 
@@ -158,6 +173,8 @@ Tool-capable models get `delegate_task` for isolated workspace investigations. S
 | `deny` | Shell denied |
 | `prompt` | Shell needs approval |
 | `allow` | Shell runs without a prompt |
+
+Shell policy is an agent-level approval boundary, not an OS-level read-only sandbox. An approved command runs with the Morrow process user's operating-system permissions and may modify files on its own; inspect commands before approval and use an external sandbox when stronger isolation is required.
 
 Default from `morrow init`: `read_only` + `shell = "deny"`. Override for one run:
 

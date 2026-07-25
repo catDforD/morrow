@@ -23,6 +23,7 @@ import {
   Clock3,
   FileText,
   Folder,
+  GitBranch,
   Eye,
   ListTree,
   Moon,
@@ -40,7 +41,6 @@ import {
   Square,
   Sun,
   Terminal,
-  Wrench,
   X,
 } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
@@ -59,8 +59,12 @@ import {
   scrollMessageListToBottom,
 } from './messageScroll'
 import {
+  failedPersistentSubagentStep,
   finishedSubagentStep,
+  persistentSubagentHistory,
+  persistentSubagentSnapshotStep,
   runningSubagentStep,
+  startingPersistentSubagentStep,
   subagentHistory,
   subagentStepTitle,
 } from './subagentTrace'
@@ -93,8 +97,13 @@ import type {
   SessionModelSelectionResponse,
   StatusResponse,
   SubagentExecutionSummary,
+  SubagentInstanceSnapshot,
   SubagentProfileResponse,
+  SubagentRole,
+  SubagentRunSummary,
+  SubagentRunStatus,
   SubagentSettingsResponse,
+  SubagentTranscriptSnapshot,
   TimelineItem,
   TimelineMessageItem,
   TimelineNoticeItem,
@@ -104,13 +113,22 @@ import type {
   ToolRun,
 } from './types'
 
-type InspectorPanel = 'run' | 'tools' | 'recent'
+type InspectorPanel = 'run' | 'subagents'
 type ConnectionStatus = 'connecting' | 'connected' | 'disconnected'
 type AppView = 'workspace' | 'settings'
 type ResolvedTheme = Exclude<ThemePreference, 'system'>
 
 const markdownPlugins = [remarkGfm]
 const SubagentProfilesContext = createContext<SubagentProfileResponse[]>([])
+const PersistentSubagentsContext = createContext<SubagentInstanceSnapshot[]>([])
+const spawnSubagentToolName = 'spawn_subagent'
+
+interface PersistentSpawnBinding {
+  instanceId: string
+  runId: string
+  stepId: string
+  task: string
+}
 
 const permissionOptions: Array<{
   id: PermissionMode | 'plan'
@@ -190,6 +208,10 @@ export default function App() {
   )
   const [pendingApproval, setPendingApproval] =
     useState<ApprovalRequest | null>(null)
+  const [approvalQueue, setApprovalQueue] = useState<ApprovalRequest[]>([])
+  const [subagents, setSubagents] = useState<SubagentInstanceSnapshot[]>([])
+  const [subagentTranscript, setSubagentTranscript] =
+    useState<SubagentTranscriptSnapshot | null>(null)
   const [connection, setConnection] =
     useState<ConnectionStatus>('disconnected')
   const [prompt, setPrompt] = useState('')
@@ -227,6 +249,11 @@ export default function App() {
   const settingsSectionRef = useRef(settingsSection)
   const assistantMessageIdRef = useRef<string | null>(null)
   const runTraceIdRef = useRef<string | null>(null)
+  const pendingPersistentSpawnsRef = useRef(new Map<string, string>())
+  const persistentSpawnBindingsRef = useRef(
+    new Map<string, PersistentSpawnBinding>(),
+  )
+  const knownSubagentIdsRef = useRef(new Set<string>())
   const idRef = useRef(0)
   const selectionRef = useRef(0)
   const modelSelectionRequestRef = useRef(0)
@@ -474,6 +501,70 @@ export default function App() {
       })
     },
     [completeLiveModelStep, upsertRunStep],
+  )
+
+  const startPersistentSpawnStep = useCallback(
+    (id: string) => {
+      const runId = completeLiveModelStep()
+      pendingPersistentSpawnsRef.current.set(id, runId)
+    },
+    [completeLiveModelStep],
+  )
+
+  const applyPersistentSubagentSnapshot = useCallback(
+    (snapshot: SubagentInstanceSnapshot) => {
+      const existing = persistentSpawnBindingsRef.current.get(snapshot.id)
+      if (existing) {
+        upsertRunStep(
+          existing.runId,
+          persistentSubagentSnapshotStep(existing.stepId, snapshot, existing.task),
+        )
+        return
+      }
+
+      const wasKnown = knownSubagentIdsRef.current.has(snapshot.id)
+      knownSubagentIdsRef.current.add(snapshot.id)
+      if (wasKnown) return
+
+      const pendingRunId = pendingPersistentSpawnsRef.current
+        .values()
+        .next().value
+      const runId = runTraceIdRef.current ?? pendingRunId
+      if (!runId) return
+      const stepId = `persistent-subagent-${snapshot.id}`
+      const task = snapshot.latest_task || '等待主 Agent 分配任务'
+      persistentSpawnBindingsRef.current.set(snapshot.id, {
+        instanceId: snapshot.id,
+        runId,
+        stepId,
+        task,
+      })
+      upsertRunStep(
+        runId,
+        persistentSubagentSnapshotStep(stepId, snapshot, task),
+      )
+    },
+    [upsertRunStep],
+  )
+
+  const finishPersistentSpawnStep = useCallback(
+    (
+      id: string,
+      ok: boolean,
+      summary?: ToolExecutionSummary,
+    ) => {
+      const runId = pendingPersistentSpawnsRef.current.get(id)
+      pendingPersistentSpawnsRef.current.delete(id)
+      if (!runId) return
+
+      if (!ok) {
+        upsertRunStep(
+          runId,
+          failedPersistentSubagentStep(id, summary?.error),
+        )
+      }
+    },
+    [upsertRunStep],
   )
 
   const startSubagentStep = useCallback(
@@ -769,10 +860,26 @@ export default function App() {
             event.data.ok ? 'ok' : 'error',
           )
           break
+        case 'subagent_updated':
+          applyPersistentSubagentSnapshot(event.data)
+          setSubagents((current) => {
+            const next = current.filter((instance) => instance.id !== event.data.id)
+            next.push(event.data)
+            return next.sort((left, right) => left.created_at_ms - right.created_at_ms)
+          })
+          setSubagentTranscript((current) => current?.instance.id === event.data.id
+            ? { ...current, instance: event.data }
+            : current)
+          break
         case 'tool_call_started':
           upsertTool(event.data.id, event.data.name, 'running')
-          startToolStep(event.data.id, event.data.name)
-          recordActivity('Tool started', event.data.name, 'running')
+          if (event.data.name === spawnSubagentToolName) {
+            startPersistentSpawnStep(event.data.id)
+            recordActivity('子 Agent 启动中', undefined, 'running')
+          } else {
+            startToolStep(event.data.id, event.data.name)
+            recordActivity('Tool started', event.data.name, 'running')
+          }
           break
         case 'tool_call_finished':
           upsertTool(
@@ -781,25 +888,45 @@ export default function App() {
             event.data.ok ? 'ok' : 'error',
             event.data.summary,
           )
-          finishToolStep(
-            event.data.id,
-            event.data.name,
-            event.data.ok,
-            event.data.summary,
-          )
-          recordActivity(
-            event.data.ok ? 'Tool finished' : 'Tool failed',
-            event.data.name,
-            event.data.ok ? 'ok' : 'error',
-          )
+          if (event.data.name === spawnSubagentToolName) {
+            finishPersistentSpawnStep(
+              event.data.id,
+              event.data.ok,
+              event.data.summary,
+            )
+            recordActivity(
+              event.data.ok ? '子 Agent 已启动' : '子 Agent 启动失败',
+              event.data.summary?.error,
+              event.data.ok ? 'ok' : 'error',
+            )
+          } else {
+            finishToolStep(
+              event.data.id,
+              event.data.name,
+              event.data.ok,
+              event.data.summary,
+            )
+            recordActivity(
+              event.data.ok ? 'Tool finished' : 'Tool failed',
+              event.data.name,
+              event.data.ok ? 'ok' : 'error',
+            )
+          }
           break
         case 'approval_requested':
+          setApprovalQueue((current) => current.some((request) => request.id === event.data.id)
+            ? current
+            : [...current, event.data])
           setPendingApproval(event.data)
           setApprovalStep(event.data.id, 'Approval requested', event.data.reason)
           recordActivity('Approval requested', event.data.reason, 'approval')
           break
         case 'approval_resolved':
-          setPendingApproval(null)
+          setApprovalQueue((current) => {
+            const next = current.filter((request) => request.id !== event.data.request_id)
+            setPendingApproval(next[0] ?? null)
+            return next
+          })
           setApprovalStep(
             event.data.request_id,
             event.data.approved ? 'Approval granted' : 'Approval denied',
@@ -826,9 +953,11 @@ export default function App() {
     },
     [
       addTimelineMessage,
+      applyPersistentSubagentSnapshot,
       appendReasoningDelta,
       appendAssistantDelta,
       completeCurrentRun,
+      finishPersistentSpawnStep,
       finishSubagentStep,
       finishToolStep,
       ensureLiveModelStep,
@@ -836,6 +965,7 @@ export default function App() {
       refreshCurrentModelStep,
       setApprovalStep,
       showError,
+      startPersistentSpawnStep,
       startSubagentStep,
       startToolStep,
       upsertTool,
@@ -847,10 +977,28 @@ export default function App() {
       switch (message.type) {
         case 'snapshot':
           setRunningTurn(message.data.running_turn ?? null)
+          setSubagents(message.data.subagents ?? [])
+          knownSubagentIdsRef.current = new Set(
+            (message.data.subagents ?? []).map((instance) => instance.id),
+          )
+          setApprovalQueue(message.data.approvals ?? [])
+          setPendingApproval(message.data.approvals?.[0] ?? null)
           break
-        case 'agent_event':
-          handleAgentEvent(message.data.event)
+        case 'agent_event': {
+          const origin = message.data.origin
+          const event = message.data.event
+          const isChildEvent = origin?.kind === 'subagent_run'
+          if (!isChildEvent || event.type === 'approval_requested' || event.type === 'approval_resolved') {
+            handleAgentEvent(event)
+          } else if (event.type === 'error') {
+            recordActivity(
+              `${origin.identity_name ?? origin.role} failed`,
+              event.data,
+              'error',
+            )
+          }
           break
+        }
         case 'turn_saved':
           void loadSessions().catch(showError)
           setRunningTurn(null)
@@ -860,8 +1008,27 @@ export default function App() {
           setRunningTurn(null)
           showError(message.data.reason)
           break
+        case 'approval_queue_updated':
+          setApprovalQueue(message.data.approvals)
+          setPendingApproval(message.data.approvals[0] ?? null)
+          break
+        case 'subagent_transcript':
+          setSubagentTranscript(message.data.transcript)
+          break
+        case 'subagent_deleted':
+          knownSubagentIdsRef.current.delete(message.data.instance_id)
+          persistentSpawnBindingsRef.current.delete(message.data.instance_id)
+          setSubagents((current) => current.filter(
+            (instance) => instance.id !== message.data.instance_id,
+          ))
+          setSubagentTranscript((current) => current?.instance.id === message.data.instance_id
+            ? null
+            : current)
+          break
+        case 'subagent_rejected':
+          showError(message.data.reason)
+          break
         case 'error':
-          setRunningTurn(null)
           showError(message.data.message)
           break
       }
@@ -927,6 +1094,9 @@ export default function App() {
       setActivity([])
       assistantMessageIdRef.current = null
       runTraceIdRef.current = null
+      pendingPersistentSpawnsRef.current.clear()
+      persistentSpawnBindingsRef.current.clear()
+      knownSubagentIdsRef.current.clear()
       setTimeline([])
       modelSelectionRef.current = null
       setModelSelection(null)
@@ -1447,8 +1617,65 @@ export default function App() {
     }
   }
 
+  const sendSubagent = (instanceId: string, message: string) => {
+    try {
+      const invocation = subagentTranscript?.instance.id === instanceId
+        ? subagentTranscript.model
+        : null
+      sendSocketMessage({
+        type: 'send_subagent',
+        data: {
+          request_id: nextId('subagent-request'),
+          instance_id: instanceId,
+          message,
+          model_selection: invocation ? {
+            provider_id: invocation.provider_id,
+            model_id: invocation.model_id,
+            reasoning: invocation.reasoning,
+          } : null,
+        },
+      })
+    } catch (error) {
+      showError(error)
+    }
+  }
+
+  const inspectSubagent = (instanceId: string) => {
+    try {
+      sendSocketMessage({
+        type: 'inspect_subagent',
+        data: { instance_id: instanceId },
+      })
+    } catch (error) {
+      showError(error)
+    }
+  }
+
+  const cancelSubagent = (instanceId: string) => {
+    try {
+      sendSocketMessage({
+        type: 'cancel_subagent',
+        data: { instance_id: instanceId },
+      })
+    } catch (error) {
+      showError(error)
+    }
+  }
+
+  const deleteSubagent = (instanceId: string) => {
+    try {
+      sendSocketMessage({
+        type: 'delete_subagent',
+        data: { instance_id: instanceId },
+      })
+    } catch (error) {
+      showError(error)
+    }
+  }
+
   return (
     <SubagentProfilesContext.Provider value={subagentSettings?.profiles ?? []}>
+      <PersistentSubagentsContext.Provider value={subagents}>
       <>
       <DesktopShell onOpenAbout={() => openSettings('about')}>
         {appView === 'settings' ? (
@@ -1599,13 +1826,18 @@ export default function App() {
             <InspectorDrawer
               open={isInspectorOpen}
               panel={inspectorPanel}
-              tools={tools}
-              activity={activity}
               selectedEntry={selectedEntry}
               runningTurn={runningTurn}
               pendingApproval={pendingApproval}
+              approvalQueue={approvalQueue}
+              subagents={subagents}
+              subagentTranscript={subagentTranscript}
               onClose={() => setIsInspectorOpen(false)}
               onPanelChange={setInspectorPanel}
+              onSendSubagent={sendSubagent}
+              onInspectSubagent={inspectSubagent}
+              onCancelSubagent={cancelSubagent}
+              onDeleteSubagent={deleteSubagent}
             />
           </div>
         )}
@@ -1634,6 +1866,7 @@ export default function App() {
         </>
       ) : null}
       </>
+      </PersistentSubagentsContext.Provider>
     </SubagentProfilesContext.Provider>
   )
 }
@@ -2135,14 +2368,8 @@ function ConversationHeader({
         <MiniIconButton title="Open run status" onClick={() => onOpenInspector('run')}>
           <Shield size={16} />
         </MiniIconButton>
-        <MiniIconButton title="Open tools" onClick={() => onOpenInspector('tools')}>
-          <Wrench size={16} />
-        </MiniIconButton>
-        <MiniIconButton
-          title="Open recent activity"
-          onClick={() => onOpenInspector('recent')}
-        >
-          <Clock3 size={16} />
+        <MiniIconButton title="Open subagents" onClick={() => onOpenInspector('subagents')}>
+          <Bot size={16} />
         </MiniIconButton>
       </div>
     </header>
@@ -2295,6 +2522,19 @@ function RunTraceCard({
 
 function RunStepRow({ step }: { step: RunStep }) {
   const isSubagent = step.kind === 'subagent'
+  if (step.kind === 'persistent_subagent') {
+    return (
+      <article className={`run-step persistent-subagent ${step.status}`}>
+        <span className="persistent-agent-branch" aria-hidden="true">
+          <GitBranch size={13} />
+        </span>
+        <div className="run-step-main">
+          <PersistentSubagentStepCard step={step} />
+        </div>
+      </article>
+    )
+  }
+
   return (
     <article className={`run-step ${step.kind} ${step.status}`}>
       <div className="run-step-icon"><RunStepIcon step={step} /></div>
@@ -2313,6 +2553,127 @@ function RunStepRow({ step }: { step: RunStep }) {
         )}
       </div>
     </article>
+  )
+}
+
+export function PersistentSubagentStepCard({
+  step,
+  profiles: providedProfiles,
+  instances: providedInstances,
+}: {
+  step: RunStep
+  profiles?: SubagentProfileResponse[]
+  instances?: SubagentInstanceSnapshot[]
+}) {
+  const contextProfiles = useContext(SubagentProfilesContext)
+  const contextInstances = useContext(PersistentSubagentsContext)
+  const profiles = providedProfiles ?? contextProfiles
+  const instances = providedInstances ?? contextInstances
+  const profile = findSubagentProfile(profiles, step.agentId, step.agentName)
+  const currentInstance = step.instanceId
+    ? instances.find((instance) => instance.id === step.instanceId)
+    : undefined
+  const name = step.agentName || (step.status === 'error'
+    ? '子 Agent 启动失败'
+    : '正在分配子 Agent')
+  const role = currentInstance?.role ?? step.agentRole
+  const agentStatus = currentInstance?.status ?? step.agentStatus
+  const task = step.detail?.trim()
+    || currentInstance?.latest_task?.trim()
+    || '等待主 Agent 分配任务'
+  const summary = matchingPersistentSubagentSummary(
+    currentInstance?.latest_summary,
+    task,
+  )
+  const status = persistentSubagentStatusLabel(
+    summary?.status,
+    agentStatus,
+    step.status,
+  )
+  const statusTone = summary?.status ?? agentStatus ?? step.status
+  const error = summary?.error?.trim()
+    || (step.status === 'error' && !currentInstance ? step.detail?.trim() : undefined)
+  const result = summary?.result?.trim()
+
+  return (
+    <details className={`persistent-agent-card ${statusTone}`}>
+      <summary
+        className="persistent-agent-summary"
+        aria-label={`${name}，展开或折叠任务输入与输出`}
+      >
+        <span className="persistent-agent-identity">
+          <span className="persistent-agent-avatar">
+            <SubagentIdentityAvatar avatar={profile?.avatar_data_url} />
+          </span>
+          <span className="persistent-agent-name">
+            <strong>{name}</strong>
+            <small>
+              {role ? (
+                <>
+                  <b>{subagentRoleLabel(role)}</b>
+                  <span>职责：{subagentRoleResponsibility(role)}</span>
+                </>
+              ) : (
+                '正在同步身份与职责'
+              )}
+            </small>
+          </span>
+          <span className="persistent-agent-state">
+            <span className={`persistent-agent-status ${statusTone}`}>
+              {status}
+            </span>
+            <ChevronRight
+              className="persistent-agent-chevron"
+              size={16}
+              aria-hidden="true"
+            />
+          </span>
+        </span>
+      </summary>
+      <div className="subagent-panel persistent-agent-panel">
+        <section className="subagent-pane prompt-pane">
+          <header>
+            <strong>任务输入</strong>
+            <span>主 Agent 指令</span>
+          </header>
+          <div
+            className="subagent-pane-body subagent-prompt"
+            tabIndex={0}
+            aria-label={`${name}任务输入`}
+          >
+            {task}
+          </div>
+        </section>
+        <section className={`subagent-pane output-pane${error ? ' failed' : ''}`}>
+          <header>
+            <strong>子 Agent 输出</strong>
+            {summary ? (
+              <span>{persistentSubagentExecutionMeta(summary)}</span>
+            ) : null}
+          </header>
+          <div
+            className="subagent-pane-body subagent-output"
+            tabIndex={0}
+            aria-label={`${name}输出`}
+          >
+            {error ? (
+              <p className="subagent-error">{error}</p>
+            ) : result ? (
+              <MarkdownContent content={result} className="subagent-markdown" />
+            ) : persistentSubagentIsWaiting(summary?.status, agentStatus, step.status) ? (
+              <div className="subagent-waiting" role="status">
+                <Clock3 size={16} />
+                <span>{persistentSubagentWaitingMessage(currentInstance)}</span>
+              </div>
+            ) : (
+              <p className="subagent-empty">
+                此阶段暂未同步输出，可在 AGENTS 中查看完整记录。
+              </p>
+            )}
+          </div>
+        </section>
+      </div>
+    </details>
   )
 }
 
@@ -2385,6 +2746,126 @@ export function SubagentStepPanel({ step }: { step: RunStep }) {
 function subagentExecutionMeta(summary: SubagentExecutionSummary): string {
   const truncated = summary.truncated ? ' · 结果已截断' : ''
   return `${summary.model_calls} 次模型调用 · ${summary.tool_calls} 次只读工具${truncated}`
+}
+
+function subagentRoleLabel(role: SubagentRole): string {
+  switch (role) {
+    case 'explore':
+      return 'Explore'
+    case 'plan':
+      return 'Plan'
+    case 'worker':
+      return 'Worker'
+    case 'reviewer':
+      return 'Reviewer'
+  }
+}
+
+function subagentRoleResponsibility(role: SubagentRole): string {
+  switch (role) {
+    case 'explore':
+      return '只读检索与代码探索'
+    case 'plan':
+      return '只读分析与实施规划'
+    case 'worker':
+      return '工作区实现与受控命令执行'
+    case 'reviewer':
+      return '独立审查与审批后检查'
+  }
+}
+
+function persistentSubagentStatusLabel(
+  runStatus: SubagentRunStatus | undefined,
+  status: RunStep['agentStatus'],
+  fallback: RunStep['status'],
+): string {
+  switch (runStatus) {
+    case 'completed':
+      return '已完成'
+    case 'failed':
+      return '失败'
+    case 'cancelled':
+      return '已取消'
+    case 'interrupted':
+      return '已中断'
+    case 'queued':
+      return '排队中'
+    case 'running':
+      return '执行中'
+    case 'waiting_approval':
+      return '等待审批'
+    case undefined:
+      break
+  }
+
+  switch (status) {
+    case 'idle':
+      return '空闲'
+    case 'queued':
+      return '排队中'
+    case 'running':
+      return '执行中'
+    case 'waiting_approval':
+      return '等待审批'
+    case 'interrupted':
+      return '已中断'
+    case 'failed':
+      return '失败'
+    case 'cancelled':
+      return '已取消'
+    case undefined:
+      return fallback === 'running'
+        ? '启动中'
+        : fallback === 'error'
+          ? '失败'
+          : '已启动'
+  }
+}
+
+function matchingPersistentSubagentSummary(
+  summary: SubagentRunSummary | null | undefined,
+  task: string,
+): SubagentRunSummary | undefined {
+  if (!summary) return undefined
+  return summary.task.trim() === task.trim() ? summary : undefined
+}
+
+function persistentSubagentExecutionMeta(summary: SubagentRunSummary): string {
+  const fileChangeCount = summary.file_changes?.length ?? 0
+  const fileChanges = fileChangeCount
+    ? ` · ${fileChangeCount} 个文件变更`
+    : ''
+  const truncated = summary.truncated ? ' · 输出已截断' : ''
+  return `${summary.model_calls} 次模型调用 · ${summary.tool_calls} 次工具调用${fileChanges}${truncated}`
+}
+
+function persistentSubagentIsWaiting(
+  runStatus: SubagentRunStatus | undefined,
+  status: RunStep['agentStatus'],
+  fallback: RunStep['status'],
+): boolean {
+  if (runStatus) {
+    return ['queued', 'running', 'waiting_approval'].includes(runStatus)
+  }
+  if (status) {
+    return ['queued', 'running', 'waiting_approval'].includes(status)
+  }
+  return fallback === 'running'
+}
+
+function persistentSubagentWaitingMessage(
+  instance: SubagentInstanceSnapshot | undefined,
+): string {
+  switch (instance?.status) {
+    case 'queued':
+      return instance.queue_reason?.trim()
+        ? `任务排队中：${instance.queue_reason.trim()}`
+        : '任务正在等待执行…'
+    case 'waiting_approval':
+      return '子 Agent 正在等待审批…'
+    default:
+      return '子 Agent 正在执行任务…'
+  }
 }
 
 function RunStepDetails({ step }: { step: RunStep }) {
@@ -2960,26 +3441,36 @@ function permissionModeIcon(mode: PermissionMode, size: number): ReactNode {
   return permissionOptionIcon(mode, size)
 }
 
-function InspectorDrawer({
+export function InspectorDrawer({
   open,
   panel,
-  tools,
-  activity,
   selectedEntry,
   runningTurn,
   pendingApproval,
+  approvalQueue,
+  subagents,
+  subagentTranscript,
   onClose,
   onPanelChange,
+  onSendSubagent,
+  onInspectSubagent,
+  onCancelSubagent,
+  onDeleteSubagent,
 }: {
   open: boolean
   panel: InspectorPanel
-  tools: ToolRun[]
-  activity: ActivityItem[]
   selectedEntry?: SessionEntryResponse
   runningTurn: RunningTurnSnapshot | null
   pendingApproval: ApprovalRequest | null
+  approvalQueue: ApprovalRequest[]
+  subagents: SubagentInstanceSnapshot[]
+  subagentTranscript: SubagentTranscriptSnapshot | null
   onClose: () => void
   onPanelChange: (panel: InspectorPanel) => void
+  onSendSubagent: (instanceId: string, message: string) => void
+  onInspectSubagent: (instanceId: string) => void
+  onCancelSubagent: (instanceId: string) => void
+  onDeleteSubagent: (instanceId: string) => void
 }) {
   return (
     <aside
@@ -3011,25 +3502,24 @@ function InspectorDrawer({
             onClick={() => onPanelChange('run')}
           />
           <DrawerTab
-            active={panel === 'tools'}
-            icon={<Wrench size={16} />}
-            label="Tools"
-            onClick={() => onPanelChange('tools')}
-          />
-          <DrawerTab
-            active={panel === 'recent'}
-            icon={<Clock3 size={16} />}
-            label="Recent"
-            onClick={() => onPanelChange('recent')}
+            active={panel === 'subagents'}
+            icon={<Bot size={16} />}
+            label="Agents"
+            onClick={() => onPanelChange('subagents')}
           />
         </nav>
         <InspectorPanelContent
           panel={panel}
-          tools={tools}
-          activity={activity}
           selectedEntry={selectedEntry}
           runningTurn={runningTurn}
           pendingApproval={pendingApproval}
+          approvalQueue={approvalQueue}
+          subagents={subagents}
+          subagentTranscript={subagentTranscript}
+          onSendSubagent={onSendSubagent}
+          onInspectSubagent={onInspectSubagent}
+          onCancelSubagent={onCancelSubagent}
+          onDeleteSubagent={onDeleteSubagent}
         />
       </section>
     </aside>
@@ -3061,25 +3551,40 @@ function DrawerTab({
 
 function InspectorPanelContent({
   panel,
-  tools,
-  activity,
   selectedEntry,
   runningTurn,
   pendingApproval,
+  approvalQueue,
+  subagents,
+  subagentTranscript,
+  onSendSubagent,
+  onInspectSubagent,
+  onCancelSubagent,
+  onDeleteSubagent,
 }: {
   panel: InspectorPanel
-  tools: ToolRun[]
-  activity: ActivityItem[]
   selectedEntry?: SessionEntryResponse
   runningTurn: RunningTurnSnapshot | null
   pendingApproval: ApprovalRequest | null
+  approvalQueue: ApprovalRequest[]
+  subagents: SubagentInstanceSnapshot[]
+  subagentTranscript: SubagentTranscriptSnapshot | null
+  onSendSubagent: (instanceId: string, message: string) => void
+  onInspectSubagent: (instanceId: string) => void
+  onCancelSubagent: (instanceId: string) => void
+  onDeleteSubagent: (instanceId: string) => void
 }) {
-  if (panel === 'tools') {
-    return <ToolList tools={tools} />
-  }
-
-  if (panel === 'recent') {
-    return <ActivityList items={[...activity].reverse()} />
+  if (panel === 'subagents') {
+    return (
+      <PersistentSubagentPanel
+        instances={subagents}
+        transcript={subagentTranscript}
+        onSend={onSendSubagent}
+        onInspect={onInspectSubagent}
+        onCancel={onCancelSubagent}
+        onDelete={onDeleteSubagent}
+      />
+    )
   }
 
   return (
@@ -3103,16 +3608,17 @@ function InspectorPanelContent({
           <span className="notice-pill approval">approval pending</span>
         ) : null}
       </div>
-      <div className="panel-title compact">
-        <Wrench size={18} />
-        <span>Tools</span>
-      </div>
-      <ToolList tools={tools} compact />
-      <div className="panel-title compact">
-        <Clock3 size={18} />
-        <span>Recent</span>
-      </div>
-      <ActivityList items={activity.slice(-5).reverse()} compact />
+      {approvalQueue.length > 0 ? (
+        <div className="approval-queue-card">
+          <p className="eyebrow">Approval queue</p>
+          {approvalQueue.map((request, index) => (
+            <span key={request.id}>
+              <strong>{index === 0 ? 'Current' : `Queued ${index}`}</strong>
+              <small>{approvalSource(request)}</small>
+            </span>
+          ))}
+        </div>
+      ) : null}
     </div>
   )
 }
@@ -3124,6 +3630,247 @@ function InspectorMetric({ label, value }: { label: string; value: string }) {
       <span>{label}</span>
     </span>
   )
+}
+
+export function PersistentSubagentPanel({
+  instances,
+  transcript,
+  onSend,
+  onInspect,
+  onCancel,
+  onDelete,
+}: {
+  instances: SubagentInstanceSnapshot[]
+  transcript: SubagentTranscriptSnapshot | null
+  onSend: (instanceId: string, message: string) => void
+  onInspect: (instanceId: string) => void
+  onCancel: (instanceId: string) => void
+  onDelete: (instanceId: string) => void
+}) {
+  const profiles = useContext(SubagentProfilesContext)
+  const [followup, setFollowup] = useState('')
+  const selected = transcript?.instance
+  const selectedProfile = selected
+    ? findSubagentProfile(profiles, selected.identity.id, selected.identity.name)
+    : undefined
+  const latestRun = transcript?.runs.at(-1)
+  const latestSummary =
+    latestRun?.summary ?? transcript?.instance.latest_summary
+  const latestTask = latestRun?.task
+    ?? transcript?.instance.latest_task
+    ?? 'No task assigned.'
+  const latestResult = latestSummary?.result?.trim()
+  const resultPreview = latestResult
+    ? compactText(
+        latestResult.replace(/[`*_#>]/g, '').replace(/\s+/g, ' '),
+        160,
+      )
+    : undefined
+  const send = (event: FormEvent) => {
+    event.preventDefault()
+    const value = followup.trim()
+    if (!selected || !value) return
+    onSend(selected.id, value)
+    setFollowup('')
+  }
+
+  return (
+    <div className="persistent-subagent-panel">
+      <section className="subagent-instance-section">
+        <header className="subagent-section-heading">
+          <span>
+            <strong>Current agents</strong>
+            <small>由主 Agent 创建的会话级后台实例</small>
+          </span>
+          <span className="subagent-instance-count">{instances.length}</span>
+        </header>
+        <div className="subagent-instance-list">
+          {instances.length === 0 ? (
+            <div className="subagent-empty-state">
+              <Bot size={20} />
+              <span>
+                <strong>No agents yet</strong>
+                <small>主 Agent 启动后台任务后，子 Agent 会显示在这里。</small>
+              </span>
+            </div>
+          ) : null}
+          {instances.map((instance) => {
+            const profile = findSubagentProfile(
+              profiles,
+              instance.identity.id,
+              instance.identity.name,
+            )
+            return (
+              <button
+                className={`subagent-instance-card${selected?.id === instance.id ? ' selected' : ''}`}
+                type="button"
+                key={instance.id}
+                onClick={() => onInspect(instance.id)}
+              >
+                <span className="subagent-instance-avatar">
+                  <SubagentIdentityAvatar avatar={profile?.avatar_data_url} />
+                </span>
+                <span className="subagent-instance-content">
+                  <span className="subagent-instance-heading">
+                    <strong>{instance.identity.name}</strong>
+                    <span className={`subagent-status-badge ${instance.status}`}>
+                      {instance.role} · {instance.status.replace('_', ' ')}
+                    </span>
+                  </span>
+                  <small>{compactText(instance.latest_task ?? 'No task', 72)}</small>
+                  {instance.queue_reason ? <em>{instance.queue_reason}</em> : null}
+                </span>
+              </button>
+            )
+          })}
+        </div>
+      </section>
+
+      {transcript ? (
+        <section className="subagent-detail-card">
+          <header className="subagent-detail-header">
+            <span className="subagent-detail-avatar">
+              <SubagentIdentityAvatar avatar={selectedProfile?.avatar_data_url} />
+            </span>
+            <div>
+              <p className="eyebrow">Agent details</p>
+              <h3>{transcript.instance.identity.name}</h3>
+              <small>
+                {subagentRoleLabel(transcript.instance.role)} ·{' '}
+                {subagentRoleResponsibility(transcript.instance.role)}
+              </small>
+            </div>
+            <span className={`subagent-status-badge ${transcript.instance.status}`}>
+              {transcript.instance.status.replace('_', ' ')}
+            </span>
+          </header>
+          <div className="subagent-runtime-meta">
+            <span>{transcript.instance.role}</span>
+            <span>{transcript.permission_ceiling.mode.replace('_', ' ')}</span>
+            <span>shell {transcript.permission_ceiling.shell}</span>
+            <span>{transcript.role_config.timeout_secs}s</span>
+            <span>{transcript.role_config.max_tool_rounds} rounds</span>
+          </div>
+          <div className="subagent-detail-grid">
+            <span>
+              <small>Model</small>
+              <strong>{transcript.model.model_name}</strong>
+              <em>{transcript.model.provider_name} · {transcript.model.reasoning}</em>
+            </span>
+            <span>
+              <small>Instance</small>
+              <strong>
+                {transcript.runs.length} run
+                {transcript.runs.length === 1 ? '' : 's'}
+              </strong>
+              <em>{compactText(transcript.instance.id, 30)}</em>
+            </span>
+          </div>
+          <section className="subagent-latest-task">
+            <header>
+              <strong>Latest task</strong>
+              {latestRun ? (
+                <span className={`subagent-status-badge ${latestRun.status}`}>
+                  {latestRun.status.replace('_', ' ')}
+                </span>
+              ) : null}
+            </header>
+            <p>{compactText(latestTask.replace(/\s+/g, ' '), 160)}</p>
+            {latestRun ? (
+              <small>{new Date(latestRun.started_at_ms).toLocaleString()}</small>
+            ) : null}
+          </section>
+          {latestSummary ? (
+            <div className="subagent-summary-metrics">
+              <span>
+                <strong>{latestSummary.model_calls}</strong>
+                <small>model calls</small>
+              </span>
+              <span>
+                <strong>{latestSummary.tool_calls}</strong>
+                <small>tool calls</small>
+              </span>
+              <span>
+                <strong>{latestSummary.file_changes?.length ?? 0}</strong>
+                <small>files</small>
+              </span>
+              <span>
+                <strong>{latestSummary.shell_commands?.length ?? 0}</strong>
+                <small>commands</small>
+              </span>
+            </div>
+          ) : null}
+          <section
+            className={`subagent-result-preview${latestSummary?.error ? ' failed' : ''}`}
+          >
+            <header>
+              <strong>{latestSummary?.error ? 'Latest error' : 'Latest result'}</strong>
+              {latestSummary?.truncated ? <span>truncated</span> : null}
+            </header>
+            <p>
+              {latestSummary?.error?.trim()
+                || resultPreview
+                || (isActiveSubagentStatus(transcript.instance.status)
+                  ? 'The agent is still working on this task.'
+                  : 'No result summary is available for the latest run.')}
+            </p>
+          </section>
+          {transcript.instance.event_log_truncated ? (
+            <p className="subagent-log-warning">
+              The event log reached its 16 MiB limit; streaming deltas were
+              truncated.
+            </p>
+          ) : null}
+          <div className="subagent-instance-actions">
+            {isActiveSubagentStatus(transcript.instance.status) ? (
+              <button className="danger-button subtle" type="button" onClick={() => onCancel(transcript.instance.id)}>
+                <Square size={14} /> Cancel
+              </button>
+            ) : (
+              <button
+                className="danger-button subtle"
+                type="button"
+                onClick={() => {
+                  if (window.confirm(`Delete ${transcript.instance.identity.name} and its transcript?`)) {
+                    onDelete(transcript.instance.id)
+                  }
+                }}
+              >
+                <X size={14} /> Delete
+              </button>
+            )}
+          </div>
+          {!isActiveSubagentStatus(transcript.instance.status) ? (
+            <details className="subagent-followup-disclosure">
+              <summary><Send size={14} /> Continue this agent</summary>
+              <form className="subagent-followup-form" onSubmit={send}>
+                <textarea
+                  value={followup}
+                  maxLength={4000}
+                  placeholder="Continue this instance with preserved context…"
+                  onChange={(event) => setFollowup(event.target.value)}
+                />
+                <button className="approve-button" type="submit" disabled={!followup.trim()}>
+                  <Send size={14} /> Continue
+                </button>
+              </form>
+            </details>
+          ) : null}
+        </section>
+      ) : null}
+    </div>
+  )
+}
+
+export function subagentTranscriptMessages(session: Session): Message[] {
+  if (session.turns.length > 0) {
+    return session.turns.flatMap((record) => record.messages)
+  }
+  return session.active_thread.messages
+}
+
+function isActiveSubagentStatus(status: SubagentInstanceSnapshot['status']): boolean {
+  return status === 'queued' || status === 'running' || status === 'waiting_approval'
 }
 
 function ToolList({
@@ -3253,6 +4000,7 @@ function ApprovalDialog({
             <X size={20} />
           </IconButton>
         </header>
+        <p className="approval-source">Source: {approvalSource(request)}</p>
         <p className="approval-reason">{request.reason}</p>
         <ApprovalBody request={request} />
         <footer>
@@ -3397,28 +4145,66 @@ function turnRecordTimeline(
   return items
 }
 
-function historyRunTrace(
+export function historyRunTrace(
   record: Session['turns'][number],
   turnIndex: number,
 ): RunTrace {
   const turn = record.turn
   const subagents = subagentHistory(record.messages)
+  const persistentSubagents = persistentSubagentHistory(record.messages)
   const modelMessages = record.messages.filter(
     (message) => message.role === 'assistant',
   )
   let modelMessageIndex = 0
   const steps: RunStep[] = turn.steps.map((step, stepIndex) => {
+    const stepId = `history-${turnIndex}-step-${stepIndex}`
     const isSubagent =
       step.kind === 'tool_call' && step.tool_name === 'delegate_task'
+    const isPersistentSubagent =
+      step.kind === 'tool_call' && step.tool_name === spawnSubagentToolName
     const subagent = step.tool_call_id
       ? subagents.get(step.tool_call_id)
+      : undefined
+    const persistentSubagent = step.tool_call_id
+      ? persistentSubagents.get(step.tool_call_id)
       : undefined
     const modelMessage =
       step.kind === 'model_call'
         ? modelMessages[modelMessageIndex++]
         : undefined
+
+    if (isPersistentSubagent) {
+      if (persistentSubagent?.snapshot) {
+        const snapshotStep = persistentSubagentSnapshotStep(
+          stepId,
+          persistentSubagent.snapshot,
+        )
+        return {
+          ...snapshotStep,
+          status: step.status === 'failed' ? 'error' : snapshotStep.status,
+          detail: step.error || snapshotStep.detail,
+        }
+      }
+      if (step.status === 'failed') {
+        return failedPersistentSubagentStep(
+          stepId,
+          step.error || undefined,
+          persistentSubagent,
+        )
+      }
+      return {
+        ...startingPersistentSubagentStep(stepId),
+        status: step.status === 'completed' ? 'ok' : 'running',
+        title: step.status === 'completed' ? '子 Agent 已启动' : '正在启动子 Agent',
+        detail: persistentSubagent?.task || '正在同步身份、职责和任务状态…',
+        ...(persistentSubagent?.role
+          ? { agentRole: persistentSubagent.role }
+          : {}),
+      }
+    }
+
     return {
-      id: `history-${turnIndex}-step-${stepIndex}`,
+      id: stepId,
       kind: isSubagent
         ? 'subagent'
         : step.kind === 'tool_call'
@@ -3622,7 +4408,10 @@ export function SubagentRunStepIcon({
   profiles: SubagentProfileResponse[]
 }) {
   const profile = findSubagentProfile(profiles, step.agentId, step.agentName)
-  const avatar = profile?.avatar_data_url
+  return <SubagentIdentityAvatar avatar={profile?.avatar_data_url} />
+}
+
+function SubagentIdentityAvatar({ avatar }: { avatar?: string | null }) {
   const [imageFailed, setImageFailed] = useState(false)
 
   useEffect(() => setImageFailed(false), [avatar])
@@ -3660,6 +4449,8 @@ function runStepIcon(step: RunStep): ReactNode {
       return <CheckCircle2 size={18} />
     case 'model':
       return <Bot size={18} />
+    case 'persistent_subagent':
+      return <GitBranch size={18} />
     case 'tool':
       return step.summary?.files?.length ? (
         <FileText size={18} />
@@ -3681,11 +4472,16 @@ function inspectorPanelTitle(panel: InspectorPanel): string {
   switch (panel) {
     case 'run':
       return 'Run'
-    case 'tools':
-      return 'Tools'
-    case 'recent':
-      return 'Recent'
+    case 'subagents':
+      return 'Agents'
   }
+}
+
+function approvalSource(request: ApprovalRequest): string {
+  const origin = request.origin
+  if (!origin || origin.kind === 'unknown') return 'parent agent'
+  if (origin.kind === 'parent_turn') return origin.turn_id ?? 'parent turn'
+  return `${origin.identity_name ?? origin.role} · ${origin.role} · ${origin.run_id}`
 }
 
 function approvalTitle(request: ApprovalRequest): string {

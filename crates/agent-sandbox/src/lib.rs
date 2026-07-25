@@ -14,6 +14,9 @@ pub enum PermissionEvaluatorError {
     },
 }
 
+// Decisions are short-lived boundary values; keeping the request inline avoids a public API
+// allocation solely because approval origins make one variant larger than the others.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PermissionDecision {
     Allow,

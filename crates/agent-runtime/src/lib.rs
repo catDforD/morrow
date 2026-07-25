@@ -1,13 +1,13 @@
 pub mod session_store;
+pub mod subagent_store;
+pub mod subagent_supervisor;
 
 use agent_config::{ContextConfig, McpServerConfig, ModelContextLimits};
-use agent_core::{
-    Agent, AgentError, Model, ModelEvent, ModelFailure, ModelRequest, ToolExecutionContext,
-};
+use agent_core::{Agent, AgentError, ModelEvent, ModelFailure, ModelRequest, ToolExecutionContext};
 use agent_protocol::{
-    AgentEvent, ApprovalDecision, ApprovalRequest, Conversation, Message, ModelInvocation,
-    PermissionProfile, Session, SubagentExecutionSummary, SubagentIdentity, Thread, ToolDefinition,
-    TurnRecord, TurnStatus, TurnStepKind,
+    AgentEvent, AgentEventOrigin, ApprovalDecision, ApprovalRequest, Conversation, Message,
+    ModelInvocation, PermissionProfile, Session, SubagentExecutionSummary, SubagentIdentity,
+    Thread, ToolDefinition, TurnRecord, TurnStatus, TurnStepKind,
 };
 use agent_tools::{SubagentExecutor, ToolRegistry, ToolRegistryError};
 use futures_util::StreamExt;
@@ -21,11 +21,17 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
-pub use agent_core::CancellationToken;
-pub use agent_tools::McpToolCache;
+pub use agent_core::{CancellationToken, Model};
+pub use agent_tools::{McpToolCache, SubagentController};
 pub use session_store::{SessionEntry, SessionListingEntry, SessionStore, SessionStoreError};
+pub use subagent_store::{SubagentInstanceDocument, SubagentSessionStore, SubagentStoreError};
+pub use subagent_supervisor::{
+    DenySubagentObserver, MAX_CONCURRENT_SUBAGENT_RUNS, MAX_PERSISTENT_SUBAGENTS_PER_SESSION,
+    SubagentObserver, SubagentRoleRuntime, SubagentSupervisor, build_role_runtimes,
+    subagent_store_for_session,
+};
 
-pub const EVENT_SCHEMA_VERSION: u32 = 6;
+pub const EVENT_SCHEMA_VERSION: u32 = 7;
 const MESSAGE_BASE_TOKENS: usize = 6;
 const TOOL_CALL_BASE_TOKENS: usize = 12;
 const REQUEST_PADDING_NUMERATOR: usize = 4;
@@ -43,6 +49,7 @@ const MAX_SUBAGENTS_PER_TURN: usize = 4;
 const SUBAGENT_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_SUBAGENT_RESULT_CHARS: usize = 12_000;
 const PARENT_SUBAGENT_GUIDANCE: &str = "You may delegate up to four independent, read-only workspace investigations with delegate_task. Each delegated task must be self-contained. Issue multiple delegate_task calls in the same response when the investigations can run in parallel, and use direct tools for simple lookups.";
+const PERSISTENT_SUBAGENT_GUIDANCE: &str = "You can create persistent role-based subagents with spawn_subagent, continue them with send_subagent, inspect bounded summaries, wait without cancelling, and cancel them explicitly. Use explore for investigation, plan for implementation planning, worker for approval-controlled changes, and reviewer for review. Persistent runs continue after this parent turn ends. Only one worker can write at a time. Do not poll repeatedly; use wait_subagents when you need a result. delegate_task remains available only for temporary synchronous read-only investigations.";
 const CHILD_SUBAGENT_GUIDANCE: &str = "You are a read-only research subagent working for another coding agent. Complete only the delegated task. Inspect the workspace with read_file, list_files, and search_text. Do not modify files, run commands, call external services, or delegate further. Return a concise, evidence-based report with relevant file paths or symbols and any unresolved uncertainty.";
 
 #[derive(Debug, Error)]
@@ -55,6 +62,8 @@ pub enum RuntimeError {
     Tools(#[from] ToolRegistryError),
     #[error(transparent)]
     SessionStore(#[from] SessionStoreError),
+    #[error(transparent)]
+    SubagentStore(#[from] SubagentStoreError),
     #[error("agent run failed: {0}")]
     AgentRun(String),
     #[error("turn event handler failed: {0}")]
@@ -79,6 +88,8 @@ pub struct AgentEventEnvelope {
     pub timestamp_ms: u64,
     pub session: String,
     pub workspace_root: String,
+    #[serde(default)]
+    pub origin: AgentEventOrigin,
     pub turn_index: usize,
     pub event_index: usize,
     pub event: AgentEvent,
@@ -370,9 +381,48 @@ pub async fn run_agent_turn_with_cancellation(
     handler: &mut impl TurnEventHandler,
     cancellation: CancellationToken,
 ) -> Result<RunAgentTurnOutcome, RuntimeError> {
+    run_agent_turn_with_optional_controller(context, session, prompt, handler, cancellation, None)
+        .await
+}
+
+pub async fn run_agent_turn_with_subagent_controller(
+    context: RunAgentTurnContext<'_>,
+    session: &mut Session,
+    prompt: &str,
+    handler: &mut impl TurnEventHandler,
+    cancellation: CancellationToken,
+    controller: Arc<dyn SubagentController>,
+) -> Result<RunAgentTurnOutcome, RuntimeError> {
+    run_agent_turn_with_optional_controller(
+        context,
+        session,
+        prompt,
+        handler,
+        cancellation,
+        Some(controller),
+    )
+    .await
+}
+
+async fn run_agent_turn_with_optional_controller(
+    context: RunAgentTurnContext<'_>,
+    session: &mut Session,
+    prompt: &str,
+    handler: &mut impl TurnEventHandler,
+    cancellation: CancellationToken,
+    controller: Option<Arc<dyn SubagentController>>,
+) -> Result<RunAgentTurnOutcome, RuntimeError> {
     // 所有状态先写入草稿；只有整个用例正常收束后才替换调用方持有的 Session。
     let mut draft = session.clone();
-    let outcome = run_agent_turn_inner(context, &mut draft, prompt, handler, &cancellation).await?;
+    let outcome = run_agent_turn_inner(
+        context,
+        &mut draft,
+        prompt,
+        handler,
+        &cancellation,
+        controller,
+    )
+    .await?;
     *session = draft;
     Ok(outcome)
 }
@@ -383,15 +433,20 @@ async fn run_agent_turn_inner(
     prompt: &str,
     handler: &mut impl TurnEventHandler,
     cancellation: &CancellationToken,
+    controller: Option<Arc<dyn SubagentController>>,
 ) -> Result<RunAgentTurnOutcome, RuntimeError> {
+    let writer_lease = controller
+        .as_ref()
+        .and_then(|controller| controller.writer_lease());
     let build = tokio::select! {
         biased;
         _ = cancellation.cancelled() => None,
-        result = ToolRegistry::with_mcp_cache_async(
+        result = ToolRegistry::with_mcp_cache_and_writer_lease_async(
             context.workspace_root,
             context.permissions,
             context.mcp_servers,
             context.mcp_cache,
+            writer_lease,
         ) => Some(result),
     };
     let Some(build) = build else {
@@ -400,6 +455,7 @@ async fn run_agent_turn_inner(
     let build = build?;
     let mut tools = build.registry;
     let diagnostics = build.diagnostics;
+    let mut persistent_controller_registered = false;
     let effective_system_prompt = if let Some(model) = context.client.shared_clone() {
         tools.register_subagent(
             Arc::new(RuntimeSubagentExecutor::new(
@@ -409,7 +465,16 @@ async fn run_agent_turn_inner(
             )),
             context.subagent_identities,
         )?;
-        format!("{}\n\n{PARENT_SUBAGENT_GUIDANCE}", context.system_prompt)
+        if let Some(controller) = controller {
+            tools.register_subagent_controller(controller)?;
+            persistent_controller_registered = true;
+        }
+        let guidance = if persistent_controller_registered {
+            format!("{PARENT_SUBAGENT_GUIDANCE}\n\n{PERSISTENT_SUBAGENT_GUIDANCE}")
+        } else {
+            PARENT_SUBAGENT_GUIDANCE.to_string()
+        };
+        format!("{}\n\n{guidance}", context.system_prompt)
     } else {
         context.system_prompt.to_string()
     };
@@ -522,6 +587,7 @@ async fn run_agent_turn_inner(
                 | AgentEvent::AgentMessage(_)
                 | AgentEvent::SubagentStarted { .. }
                 | AgentEvent::SubagentFinished { .. }
+                | AgentEvent::SubagentUpdated(_)
                 | AgentEvent::ToolCallStarted { .. }
                 | AgentEvent::ToolCallFinished { .. }
                 | AgentEvent::ApprovalRequested(_)
@@ -620,6 +686,10 @@ pub fn make_event_envelope(
         timestamp_ms: timestamp_ms(),
         session: session_name.to_string(),
         workspace_root: workspace_root.display().to_string(),
+        origin: AgentEventOrigin::ParentTurn {
+            turn_id: None,
+            turn_index,
+        },
         turn_index,
         event_index,
         event,

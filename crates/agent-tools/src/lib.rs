@@ -8,7 +8,8 @@ pub use agent_core::{
 use agent_protocol::{
     ApprovalDecision, ApprovalRequest, FileChangeOperation, FileChangeSummary, PermissionMode,
     PermissionProfile, ShellCommandSummary, ShellPolicy, SubagentExecutionSummary,
-    SubagentIdentity, ToolCall, ToolDefinition, ToolExecutionSummary, default_subagent_identities,
+    SubagentIdentity, SubagentInstanceSnapshot, SubagentRole, ToolCall, ToolDefinition,
+    ToolExecutionSummary, default_subagent_identities,
 };
 use agent_sandbox::{PermissionDecision, PermissionEvaluator, PermissionEvaluatorError};
 use async_trait::async_trait;
@@ -31,6 +32,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command as TokioCommand};
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
 pub use mcp::McpToolCache;
@@ -52,8 +54,125 @@ const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 const TOOL_CANCELLED_ERROR: &str = "tool execution cancelled";
 const SEARCH_SKIP_NAMES: &[&str] = &[".git", "node_modules", "dist", "build", "target"];
 pub const DELEGATE_TASK_TOOL_NAME: &str = "delegate_task";
+pub const SPAWN_SUBAGENT_TOOL_NAME: &str = "spawn_subagent";
+pub const SEND_SUBAGENT_TOOL_NAME: &str = "send_subagent";
+pub const INSPECT_SUBAGENT_TOOL_NAME: &str = "inspect_subagent";
+pub const WAIT_SUBAGENTS_TOOL_NAME: &str = "wait_subagents";
+pub const CANCEL_SUBAGENT_TOOL_NAME: &str = "cancel_subagent";
 pub const MAX_SUBAGENT_TASK_CHARS: usize = 4_000;
+pub const MAX_SUBAGENT_WAIT_SECS: u64 = 300;
+pub const READ_FILE_TOOL_NAME: &str = "read_file";
+pub const LIST_FILES_TOOL_NAME: &str = "list_files";
+pub const SEARCH_TEXT_TOOL_NAME: &str = "search_text";
+pub const EDIT_FILE_TOOL_NAME: &str = "edit_file";
+pub const WRITE_FILE_TOOL_NAME: &str = "write_file";
+pub const APPLY_PATCH_TOOL_NAME: &str = "apply_patch";
+pub const SHELL_COMMAND_TOOL_NAME: &str = "shell_command";
 static SUBAGENT_NAME_SEED_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuiltInToolAllowlist {
+    names: HashSet<String>,
+}
+
+impl BuiltInToolAllowlist {
+    pub fn all() -> Self {
+        Self::new([
+            READ_FILE_TOOL_NAME,
+            LIST_FILES_TOOL_NAME,
+            SEARCH_TEXT_TOOL_NAME,
+            EDIT_FILE_TOOL_NAME,
+            WRITE_FILE_TOOL_NAME,
+            APPLY_PATCH_TOOL_NAME,
+            SHELL_COMMAND_TOOL_NAME,
+        ])
+    }
+
+    pub fn research() -> Self {
+        Self::new([
+            READ_FILE_TOOL_NAME,
+            LIST_FILES_TOOL_NAME,
+            SEARCH_TEXT_TOOL_NAME,
+        ])
+    }
+
+    pub fn for_subagent(role: SubagentRole, permissions: PermissionProfile) -> Self {
+        let mut names = match role {
+            SubagentRole::Explore | SubagentRole::Plan => Self::research().names,
+            SubagentRole::Worker => Self::all().names,
+            SubagentRole::Reviewer => {
+                Self::new([
+                    READ_FILE_TOOL_NAME,
+                    LIST_FILES_TOOL_NAME,
+                    SEARCH_TEXT_TOOL_NAME,
+                    SHELL_COMMAND_TOOL_NAME,
+                ])
+                .names
+            }
+        };
+        if permissions.mode == PermissionMode::ReadOnly {
+            names.remove(EDIT_FILE_TOOL_NAME);
+            names.remove(WRITE_FILE_TOOL_NAME);
+            names.remove(APPLY_PATCH_TOOL_NAME);
+        }
+        if permissions.shell == ShellPolicy::Deny {
+            names.remove(SHELL_COMMAND_TOOL_NAME);
+        }
+        Self { names }
+    }
+
+    pub fn new(names: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self {
+            names: names.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        self.names.contains(name)
+    }
+}
+
+pub fn effective_subagent_permissions(
+    parent: PermissionProfile,
+    role: SubagentRole,
+) -> PermissionProfile {
+    let ceiling = match role {
+        SubagentRole::Explore | SubagentRole::Plan => PermissionProfile {
+            mode: PermissionMode::ReadOnly,
+            shell: ShellPolicy::Deny,
+        },
+        SubagentRole::Worker => PermissionProfile {
+            mode: PermissionMode::WorkspaceWrite,
+            shell: ShellPolicy::Prompt,
+        },
+        SubagentRole::Reviewer => PermissionProfile {
+            mode: PermissionMode::ReadOnly,
+            shell: ShellPolicy::Prompt,
+        },
+    };
+    PermissionProfile {
+        mode: minimum_permission_mode(parent.mode, ceiling.mode),
+        shell: minimum_shell_policy(parent.shell, ceiling.shell),
+    }
+}
+
+fn minimum_permission_mode(left: PermissionMode, right: PermissionMode) -> PermissionMode {
+    use PermissionMode::{DangerFullAccess, ReadOnly, WorkspaceWrite};
+    match (left, right) {
+        (ReadOnly, _) | (_, ReadOnly) => ReadOnly,
+        (WorkspaceWrite, _) | (_, WorkspaceWrite) => WorkspaceWrite,
+        (DangerFullAccess, DangerFullAccess) => DangerFullAccess,
+    }
+}
+
+fn minimum_shell_policy(left: ShellPolicy, right: ShellPolicy) -> ShellPolicy {
+    use ShellPolicy::{Allow, Deny, Prompt};
+    match (left, right) {
+        (Deny, _) | (_, Deny) => Deny,
+        (Prompt, _) | (_, Prompt) => Prompt,
+        (Allow, Allow) => Allow,
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum ToolRegistryError {
@@ -91,6 +210,80 @@ pub trait SubagentExecutor: Send + Sync {
         task: String,
         cancellation: CancellationToken,
     ) -> BoxFuture<'static, SubagentExecutionSummary>;
+}
+
+pub trait SubagentController: Send + Sync {
+    fn writer_lease(&self) -> Option<Arc<Semaphore>> {
+        None
+    }
+
+    fn spawn(
+        &self,
+        role: SubagentRole,
+        task: String,
+    ) -> BoxFuture<'static, Result<SubagentInstanceSnapshot, String>>;
+
+    fn send(
+        &self,
+        instance_id: String,
+        message: String,
+    ) -> BoxFuture<'static, Result<SubagentInstanceSnapshot, String>>;
+
+    fn inspect(
+        &self,
+        instance_id: Option<String>,
+    ) -> BoxFuture<'static, Result<Vec<SubagentInstanceSnapshot>, String>>;
+
+    fn wait(
+        &self,
+        instance_ids: Vec<String>,
+        timeout: Duration,
+    ) -> BoxFuture<'static, Result<Vec<SubagentInstanceSnapshot>, String>>;
+
+    fn cancel(
+        &self,
+        instance_id: String,
+    ) -> BoxFuture<'static, Result<SubagentInstanceSnapshot, String>>;
+}
+
+#[derive(Clone)]
+struct SubagentLifecycleTools {
+    controller: Arc<dyn SubagentController>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpawnSubagentArgs {
+    role: SubagentRole,
+    task: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SendSubagentArgs {
+    instance_id: String,
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InspectSubagentArgs {
+    #[serde(default)]
+    instance_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WaitSubagentsArgs {
+    instance_ids: Vec<String>,
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CancelSubagentArgs {
+    instance_id: String,
 }
 
 #[derive(Clone)]
@@ -224,29 +417,42 @@ impl ToolRegistry {
         root: impl Into<PathBuf>,
         permissions: PermissionProfile,
     ) -> Result<Self, ToolRegistryError> {
+        Self::built_in_with_allowlist(root, permissions, BuiltInToolAllowlist::all())
+    }
+
+    pub fn built_in_with_allowlist(
+        root: impl Into<PathBuf>,
+        permissions: PermissionProfile,
+        allowed: BuiltInToolAllowlist,
+    ) -> Result<Self, ToolRegistryError> {
+        Self::built_in_with_allowlist_and_writer_lease(root, permissions, allowed, None)
+    }
+
+    pub fn built_in_with_allowlist_and_writer_lease(
+        root: impl Into<PathBuf>,
+        permissions: PermissionProfile,
+        allowed: BuiltInToolAllowlist,
+        writer_lease: Option<Arc<Semaphore>>,
+    ) -> Result<Self, ToolRegistryError> {
         let evaluator = PermissionEvaluator::new(root, permissions)?;
         let mut registry = Self::empty();
         registry.register(Arc::new(BuiltInTools {
             evaluator,
-            scope: BuiltInToolScope::All,
+            allowed,
+            writer_lease,
         }))?;
         Ok(registry)
     }
 
     pub fn research(root: impl Into<PathBuf>) -> Result<Self, ToolRegistryError> {
-        let evaluator = PermissionEvaluator::new(
+        Self::built_in_with_allowlist(
             root,
             PermissionProfile {
                 mode: PermissionMode::ReadOnly,
                 shell: ShellPolicy::Deny,
             },
-        )?;
-        let mut registry = Self::empty();
-        registry.register(Arc::new(BuiltInTools {
-            evaluator,
-            scope: BuiltInToolScope::Research,
-        }))?;
-        Ok(registry)
+            BuiltInToolAllowlist::research(),
+        )
     }
 
     pub async fn with_mcp_cache_async(
@@ -255,8 +461,24 @@ impl ToolRegistry {
         mcp_servers: &[McpServerConfig],
         mcp_cache: &McpToolCache,
     ) -> Result<ToolRegistryBuild, ToolRegistryError> {
+        Self::with_mcp_cache_and_writer_lease_async(root, permissions, mcp_servers, mcp_cache, None)
+            .await
+    }
+
+    pub async fn with_mcp_cache_and_writer_lease_async(
+        root: impl Into<PathBuf>,
+        permissions: PermissionProfile,
+        mcp_servers: &[McpServerConfig],
+        mcp_cache: &McpToolCache,
+        writer_lease: Option<Arc<Semaphore>>,
+    ) -> Result<ToolRegistryBuild, ToolRegistryError> {
         let root = root.into();
-        let mut registry = Self::built_in(&root, permissions)?;
+        let mut registry = Self::built_in_with_allowlist_and_writer_lease(
+            &root,
+            permissions,
+            BuiltInToolAllowlist::all(),
+            writer_lease,
+        )?;
         let discovery = mcp::discover_tools(&root, mcp_servers, mcp_cache).await;
         for tool in discovery.tools {
             registry.register(tool)?;
@@ -299,6 +521,13 @@ impl ToolRegistry {
             executor,
             identities: Arc::new(Mutex::new(SubagentIdentityAllocator::new(identities))),
         }))
+    }
+
+    pub fn register_subagent_controller(
+        &mut self,
+        controller: Arc<dyn SubagentController>,
+    ) -> Result<(), ToolRegistryError> {
+        self.register(Arc::new(SubagentLifecycleTools { controller }))
     }
 
     pub fn definitions(&self) -> Vec<ToolDefinition> {
@@ -414,16 +643,11 @@ impl ToolRuntime for ToolRegistry {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BuiltInToolScope {
-    All,
-    Research,
-}
-
 #[derive(Debug, Clone)]
 struct BuiltInTools {
     evaluator: PermissionEvaluator,
-    scope: BuiltInToolScope,
+    allowed: BuiltInToolAllowlist,
+    writer_lease: Option<Arc<Semaphore>>,
 }
 
 #[async_trait]
@@ -431,9 +655,7 @@ impl Tool for BuiltInTools {
     fn definitions(&self) -> Vec<ToolDefinition> {
         built_in_definitions()
             .into_iter()
-            .filter(|definition| {
-                self.scope == BuiltInToolScope::All || is_research_tool(&definition.function.name)
-            })
+            .filter(|definition| self.allowed.contains(&definition.function.name))
             .collect()
     }
 
@@ -457,13 +679,52 @@ impl Tool for BuiltInTools {
             return ToolExecution::error(TOOL_CANCELLED_ERROR);
         }
 
-        if self.scope == BuiltInToolScope::Research && !is_research_tool(&call.function.name) {
+        if !self.allowed.contains(&call.function.name) {
             return ToolExecution::error(format!(
-                "tool {:?} is not available to read-only subagents",
+                "tool {:?} is not available in the active tool profile",
                 call.function.name
             ));
         }
 
+        let _writer_permit = if matches!(
+            call.function.name.as_str(),
+            EDIT_FILE_TOOL_NAME
+                | WRITE_FILE_TOOL_NAME
+                | APPLY_PATCH_TOOL_NAME
+                | SHELL_COMMAND_TOOL_NAME
+        ) {
+            let Some(lease) = self.writer_lease.clone() else {
+                return self
+                    .execute_without_writer_lease(call, approval, context)
+                    .await;
+            };
+            let permit = tokio::select! {
+                biased;
+                _ = context.cancellation.cancelled() => {
+                    return ToolExecution::error(TOOL_CANCELLED_ERROR);
+                }
+                permit = lease.acquire_owned() => permit,
+            };
+            match permit {
+                Ok(permit) => Some(permit),
+                Err(_) => return ToolExecution::error("workspace writer lease is unavailable"),
+            }
+        } else {
+            None
+        };
+
+        self.execute_without_writer_lease(call, approval, context)
+            .await
+    }
+}
+
+impl BuiltInTools {
+    async fn execute_without_writer_lease(
+        &self,
+        call: ToolCall,
+        approval: Option<ToolApproval>,
+        context: ToolExecutionContext,
+    ) -> ToolExecution {
         if call.function.name == "shell_command" {
             let approval = approval.as_ref().map(|approval| {
                 (
@@ -561,6 +822,214 @@ impl Tool for DelegateTaskTool {
             summary: Some(ToolExecutionSummary::subagent(summary)),
         })
     }
+}
+
+#[async_trait]
+impl Tool for SubagentLifecycleTools {
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        let role_schema = json!({
+            "type": "string",
+            "enum": ["explore", "plan", "worker", "reviewer"]
+        });
+        vec![
+            ToolDefinition::function(
+                SPAWN_SUBAGENT_TOOL_NAME,
+                "Start a persistent session-scoped subagent in the background. Returns immediately with its instance and run identifiers.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "role": role_schema,
+                        "task": {"type": "string", "minLength": 1, "maxLength": MAX_SUBAGENT_TASK_CHARS}
+                    },
+                    "required": ["role", "task"],
+                    "additionalProperties": false
+                }),
+            ),
+            ToolDefinition::function(
+                SEND_SUBAGENT_TOOL_NAME,
+                "Send a follow-up message to an existing persistent subagent and start its next background run.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "instance_id": {"type": "string", "minLength": 1},
+                        "message": {"type": "string", "minLength": 1, "maxLength": MAX_SUBAGENT_TASK_CHARS}
+                    },
+                    "required": ["instance_id", "message"],
+                    "additionalProperties": false
+                }),
+            ),
+            ToolDefinition::function(
+                INSPECT_SUBAGENT_TOOL_NAME,
+                "Inspect one persistent subagent or list all persistent subagents in the current session. Only bounded summaries are returned.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "instance_id": {"type": "string", "minLength": 1}
+                    },
+                    "additionalProperties": false
+                }),
+            ),
+            ToolDefinition::function(
+                WAIT_SUBAGENTS_TOOL_NAME,
+                "Wait for one or more persistent subagents to stop running. A timeout returns current statuses without cancelling them.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "instance_ids": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 8,
+                            "uniqueItems": true,
+                            "items": {"type": "string", "minLength": 1}
+                        },
+                        "timeout_secs": {"type": "integer", "minimum": 0, "maximum": MAX_SUBAGENT_WAIT_SECS}
+                    },
+                    "required": ["instance_ids"],
+                    "additionalProperties": false
+                }),
+            ),
+            ToolDefinition::function(
+                CANCEL_SUBAGENT_TOOL_NAME,
+                "Cancel a queued or running persistent subagent. Cancelling an already idle or terminal instance is a successful no-op.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "instance_id": {"type": "string", "minLength": 1}
+                    },
+                    "required": ["instance_id"],
+                    "additionalProperties": false
+                }),
+            ),
+        ]
+    }
+
+    fn execution_mode(&self, _call: &ToolCall) -> ToolExecutionMode {
+        ToolExecutionMode::Concurrent
+    }
+
+    async fn execute(
+        &self,
+        call: ToolCall,
+        _approval: Option<ToolApproval>,
+        context: ToolExecutionContext,
+    ) -> ToolExecution {
+        if context.cancellation.is_cancelled() {
+            return ToolExecution::error(TOOL_CANCELLED_ERROR);
+        }
+
+        let result = match call.function.name.as_str() {
+            SPAWN_SUBAGENT_TOOL_NAME => match parse_args::<SpawnSubagentArgs>(&call)
+                .and_then(|args| validate_subagent_message(args.task).map(|task| (args.role, task)))
+            {
+                Ok((role, task)) => self
+                    .controller
+                    .spawn(role, task)
+                    .await
+                    .map(|snapshot| json!({"instance": snapshot})),
+                Err(error) => Err(error),
+            },
+            SEND_SUBAGENT_TOOL_NAME => {
+                match parse_args::<SendSubagentArgs>(&call).and_then(|args| {
+                    let instance_id = validate_instance_id(args.instance_id)?;
+                    let message = validate_subagent_message(args.message)?;
+                    Ok((instance_id, message))
+                }) {
+                    Ok((instance_id, message)) => self
+                        .controller
+                        .send(instance_id, message)
+                        .await
+                        .map(|snapshot| json!({"instance": snapshot})),
+                    Err(error) => Err(error),
+                }
+            }
+            INSPECT_SUBAGENT_TOOL_NAME => match parse_args::<InspectSubagentArgs>(&call)
+                .and_then(|args| args.instance_id.map(validate_instance_id).transpose())
+            {
+                Ok(instance_id) => self
+                    .controller
+                    .inspect(instance_id)
+                    .await
+                    .map(|instances| json!({"instances": instances})),
+                Err(error) => Err(error),
+            },
+            WAIT_SUBAGENTS_TOOL_NAME => {
+                match parse_args::<WaitSubagentsArgs>(&call).and_then(|args| {
+                    if args.instance_ids.is_empty() || args.instance_ids.len() > 8 {
+                        return Err("instance_ids must contain between 1 and 8 values".to_string());
+                    }
+                    let mut seen = HashSet::new();
+                    let mut ids = Vec::with_capacity(args.instance_ids.len());
+                    for id in args.instance_ids {
+                        let id = validate_instance_id(id)?;
+                        if !seen.insert(id.clone()) {
+                            return Err(format!("duplicate instance id {id:?}"));
+                        }
+                        ids.push(id);
+                    }
+                    let timeout_secs = args.timeout_secs.unwrap_or(MAX_SUBAGENT_WAIT_SECS);
+                    if timeout_secs > MAX_SUBAGENT_WAIT_SECS {
+                        return Err(format!(
+                            "timeout_secs must not exceed {MAX_SUBAGENT_WAIT_SECS}"
+                        ));
+                    }
+                    Ok((ids, Duration::from_secs(timeout_secs)))
+                }) {
+                    Ok((ids, timeout)) => self
+                        .controller
+                        .wait(ids, timeout)
+                        .await
+                        .map(|instances| json!({"instances": instances})),
+                    Err(error) => Err(error),
+                }
+            }
+            CANCEL_SUBAGENT_TOOL_NAME => match parse_args::<CancelSubagentArgs>(&call)
+                .and_then(|args| validate_instance_id(args.instance_id))
+            {
+                Ok(instance_id) => self
+                    .controller
+                    .cancel(instance_id)
+                    .await
+                    .map(|snapshot| json!({"instance": snapshot})),
+                Err(error) => Err(error),
+            },
+            name => Err(format!("unknown subagent lifecycle tool {name:?}")),
+        };
+
+        match result {
+            Ok(value) => ToolExecution::Completed(ToolResult {
+                ok: true,
+                content: serde_json::to_string(&value)
+                    .expect("subagent lifecycle output must serialize"),
+                error: None,
+                summary: None,
+            }),
+            Err(error) => ToolExecution::Completed(ToolResult::error(error)),
+        }
+    }
+}
+
+fn validate_subagent_message(value: String) -> Result<String, String> {
+    let value = value.trim().to_string();
+    let chars = value.chars().count();
+    if chars == 0 || chars > MAX_SUBAGENT_TASK_CHARS {
+        return Err(format!(
+            "subagent message must contain between 1 and {MAX_SUBAGENT_TASK_CHARS} characters"
+        ));
+    }
+    Ok(value)
+}
+
+fn validate_instance_id(value: String) -> Result<String, String> {
+    let value = value.trim().to_string();
+    if value.is_empty()
+        || value.len() > 96
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(format!("invalid subagent instance id {value:?}"));
+    }
+    Ok(value)
 }
 
 impl BuiltInTools {
@@ -1503,10 +1972,6 @@ fn built_in_definitions() -> Vec<ToolDefinition> {
             }),
         ),
     ]
-}
-
-fn is_research_tool(name: &str) -> bool {
-    matches!(name, "read_file" | "list_files" | "search_text")
 }
 
 fn parse_delegate_task(call: &ToolCall) -> Result<String, String> {
@@ -2782,6 +3247,108 @@ mod tests {
 
     struct TestSubagentExecutor;
 
+    #[test]
+    fn subagent_role_tool_matrix_is_explicit_and_permission_filtered() {
+        let workspace_write = PermissionProfile {
+            mode: PermissionMode::WorkspaceWrite,
+            shell: ShellPolicy::Prompt,
+        };
+        let explore = BuiltInToolAllowlist::for_subagent(SubagentRole::Explore, workspace_write);
+        let plan = BuiltInToolAllowlist::for_subagent(SubagentRole::Plan, workspace_write);
+        for allowlist in [&explore, &plan] {
+            assert!(allowlist.contains(READ_FILE_TOOL_NAME));
+            assert!(allowlist.contains(LIST_FILES_TOOL_NAME));
+            assert!(allowlist.contains(SEARCH_TEXT_TOOL_NAME));
+            assert!(!allowlist.contains(EDIT_FILE_TOOL_NAME));
+            assert!(!allowlist.contains(WRITE_FILE_TOOL_NAME));
+            assert!(!allowlist.contains(APPLY_PATCH_TOOL_NAME));
+            assert!(!allowlist.contains(SHELL_COMMAND_TOOL_NAME));
+        }
+
+        let worker = BuiltInToolAllowlist::for_subagent(SubagentRole::Worker, workspace_write);
+        for name in [
+            READ_FILE_TOOL_NAME,
+            LIST_FILES_TOOL_NAME,
+            SEARCH_TEXT_TOOL_NAME,
+            EDIT_FILE_TOOL_NAME,
+            WRITE_FILE_TOOL_NAME,
+            APPLY_PATCH_TOOL_NAME,
+            SHELL_COMMAND_TOOL_NAME,
+        ] {
+            assert!(worker.contains(name), "worker should expose {name}");
+        }
+
+        let reviewer = BuiltInToolAllowlist::for_subagent(SubagentRole::Reviewer, workspace_write);
+        assert!(reviewer.contains(READ_FILE_TOOL_NAME));
+        assert!(reviewer.contains(LIST_FILES_TOOL_NAME));
+        assert!(reviewer.contains(SEARCH_TEXT_TOOL_NAME));
+        assert!(reviewer.contains(SHELL_COMMAND_TOOL_NAME));
+        assert!(!reviewer.contains(EDIT_FILE_TOOL_NAME));
+        assert!(!reviewer.contains(WRITE_FILE_TOOL_NAME));
+        assert!(!reviewer.contains(APPLY_PATCH_TOOL_NAME));
+
+        let denied = BuiltInToolAllowlist::for_subagent(
+            SubagentRole::Worker,
+            PermissionProfile {
+                mode: PermissionMode::ReadOnly,
+                shell: ShellPolicy::Deny,
+            },
+        );
+        assert!(!denied.contains(EDIT_FILE_TOOL_NAME));
+        assert!(!denied.contains(WRITE_FILE_TOOL_NAME));
+        assert!(!denied.contains(APPLY_PATCH_TOOL_NAME));
+        assert!(!denied.contains(SHELL_COMMAND_TOOL_NAME));
+    }
+
+    #[test]
+    fn subagent_permissions_are_the_intersection_of_parent_and_role_ceiling() {
+        let full = PermissionProfile {
+            mode: PermissionMode::DangerFullAccess,
+            shell: ShellPolicy::Allow,
+        };
+        assert_eq!(
+            effective_subagent_permissions(full, SubagentRole::Explore),
+            PermissionProfile {
+                mode: PermissionMode::ReadOnly,
+                shell: ShellPolicy::Deny,
+            }
+        );
+        assert_eq!(
+            effective_subagent_permissions(full, SubagentRole::Worker),
+            PermissionProfile {
+                mode: PermissionMode::WorkspaceWrite,
+                shell: ShellPolicy::Prompt,
+            }
+        );
+        assert_eq!(
+            effective_subagent_permissions(full, SubagentRole::Reviewer),
+            PermissionProfile {
+                mode: PermissionMode::ReadOnly,
+                shell: ShellPolicy::Prompt,
+            }
+        );
+
+        let parent_read_only = PermissionProfile {
+            mode: PermissionMode::ReadOnly,
+            shell: ShellPolicy::Deny,
+        };
+        assert_eq!(
+            effective_subagent_permissions(parent_read_only, SubagentRole::Worker),
+            parent_read_only
+        );
+        let parent_shell_denied = PermissionProfile {
+            mode: PermissionMode::WorkspaceWrite,
+            shell: ShellPolicy::Deny,
+        };
+        assert_eq!(
+            effective_subagent_permissions(parent_shell_denied, SubagentRole::Reviewer),
+            PermissionProfile {
+                mode: PermissionMode::ReadOnly,
+                shell: ShellPolicy::Deny,
+            }
+        );
+    }
+
     impl SubagentExecutor for TestSubagentExecutor {
         fn execute(
             &self,
@@ -3228,7 +3795,8 @@ mod tests {
                 PermissionProfile::for_mode(PermissionMode::WorkspaceWrite),
             )
             .expect("permission evaluator"),
-            scope: BuiltInToolScope::All,
+            allowed: BuiltInToolAllowlist::all(),
+            writer_lease: None,
         };
         let options = SearchOptions {
             query: "needle",
@@ -3983,7 +4551,8 @@ mod tests {
                 PermissionProfile::for_mode(PermissionMode::DangerFullAccess),
             )
             .expect("permission evaluator"),
-            scope: BuiltInToolScope::All,
+            allowed: BuiltInToolAllowlist::all(),
+            writer_lease: None,
         };
         let change = StagedPatchChange {
             path: path.clone(),

@@ -9,14 +9,19 @@ import {
   RotateCcw,
   Save,
   Search,
+  ShieldCheck,
   Trash2,
   Upload,
   X,
 } from 'lucide-react'
 import { fetchJson } from './api'
 import type {
+  ModelSelection,
+  ModelSettingsResponse,
   SubagentProfileResponse,
   SubagentProfileWriteRequest,
+  SubagentRoleSettingsResponse,
+  SubagentRoleWriteRequest,
   SubagentSettingsResponse,
 } from './types'
 
@@ -32,9 +37,11 @@ type SubagentDraft = {
 
 export default function SubagentSettingsPanel({
   settings,
+  modelSettings,
   onChanged,
 }: {
   settings: SubagentSettingsResponse | null
+  modelSettings?: ModelSettingsResponse | null
   onChanged: () => Promise<void>
 }) {
   const [query, setQuery] = useState('')
@@ -136,6 +143,22 @@ export default function SubagentSettingsPanel({
     }
   }
 
+  const resetRoles = async () => {
+    if (!window.confirm('恢复四个内置角色的默认模型、提示词和运行限制？')) return
+    setSaving(true)
+    setError(null)
+    try {
+      await fetchJson<SubagentRoleSettingsResponse[]>('/api/subagent-settings/roles/reset', {
+        method: 'POST',
+      })
+      await onChanged()
+    } catch (caught) {
+      setError(errorMessage(caught))
+    } finally {
+      setSaving(false)
+    }
+  }
+
   const chooseAvatar = async (file: File | undefined) => {
     if (!draft || !file) return
     setProcessingAvatar(true)
@@ -160,12 +183,15 @@ export default function SubagentSettingsPanel({
         <div>
           <p className="eyebrow">Settings</p>
           <h1 id="subagent-settings-title">子智能体</h1>
-          <p>管理每个 Turn 随机使用的姓名与头像。名单变更从下一个 Turn 生效。</p>
+          <p>角色能力决定工具与权限上限；身份只负责姓名和头像，两者互不耦合。</p>
         </div>
         {!draft ? (
           <div className="resource-header-actions">
+            <button className="secondary-button" type="button" disabled={saving} onClick={() => void resetRoles()}>
+              <RotateCcw size={15} /> 重置角色
+            </button>
             <button className="secondary-button" type="button" disabled={saving} onClick={() => void resetProfiles()}>
-              <RotateCcw size={15} /> 恢复默认名单
+              <RotateCcw size={15} /> 恢复默认身份
             </button>
             <button
               className="approve-button"
@@ -255,6 +281,26 @@ export default function SubagentSettingsPanel({
         </div>
       ) : (
         <div className="resource-list-view">
+          <section className="subagent-role-settings" aria-label="角色能力">
+            <div className="resource-list-heading">
+              <strong>角色能力</strong>
+              <span>仅影响新实例</span>
+            </div>
+            <div className="subagent-role-grid">
+              {(settings?.roles ?? []).map((role) => (
+                <SubagentRoleCard
+                  key={role.role}
+                  role={role}
+                  modelSettings={modelSettings ?? null}
+                  onChanged={onChanged}
+                />
+              ))}
+            </div>
+          </section>
+          <div className="resource-list-heading subagent-identity-heading">
+            <strong>身份外观</strong>
+            <span>不写入提示词</span>
+          </div>
           <label className="resource-search">
             <Search size={17} />
             <input value={query} placeholder="搜索子智能体…" onChange={(event) => setQuery(event.target.value)} />
@@ -298,6 +344,150 @@ export default function SubagentSettingsPanel({
       )}
     </section>
   )
+}
+
+function SubagentRoleCard({
+  role,
+  modelSettings,
+  onChanged,
+}: {
+  role: SubagentRoleSettingsResponse
+  modelSettings: ModelSettingsResponse | null
+  onChanged: () => Promise<void>
+}) {
+  const [draft, setDraft] = useState<SubagentRoleWriteRequest>(() => roleDraft(role))
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  useEffect(() => setDraft(roleDraft(role)), [role])
+
+  const save = async () => {
+    setSaving(true)
+    setError(null)
+    try {
+      await fetchJson<SubagentRoleSettingsResponse>(
+        `/api/subagent-settings/roles/${role.role}`,
+        {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(draft),
+        },
+      )
+      await onChanged()
+    } catch (caught) {
+      setError(errorMessage(caught))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <article className="subagent-role-card">
+      <header>
+        <span className={`subagent-role-badge ${role.role}`}>{role.display_name}</span>
+        <small>{role.description}</small>
+      </header>
+      <div className="subagent-role-ceiling">
+        <ShieldCheck size={15} />
+        <span>{permissionLabel(role.permission_mode)} · Shell {role.shell_policy}</span>
+      </div>
+      <div className="subagent-tool-chips" aria-label={`${role.display_name} tools`}>
+        {role.tools.map((tool) => <code key={tool}>{tool}</code>)}
+      </div>
+      <label className="resource-field full">
+        <span>模型</span>
+        <select
+          value={selectionValue(draft.model_selection)}
+          onChange={(event) => setDraft({
+            ...draft,
+            model_selection: parseSelectionValue(event.target.value),
+          })}
+        >
+          <option value="">继承创建实例时的会话模型</option>
+          {modelOptions(modelSettings).map((option) => (
+            <option key={option.value} value={option.value}>{option.label}</option>
+          ))}
+        </select>
+      </label>
+      <label className="resource-field full">
+        <span>提示词后缀</span>
+        <textarea
+          value={draft.prompt_suffix}
+          maxLength={4000}
+          placeholder="可选，最多 4,000 字符"
+          onChange={(event) => setDraft({ ...draft, prompt_suffix: event.target.value })}
+        />
+      </label>
+      <div className="resource-field-grid subagent-role-limits">
+        <label className="resource-field">
+          <span>超时（秒）</span>
+          <input
+            type="number"
+            min={30}
+            max={1800}
+            value={draft.timeout_secs}
+            onChange={(event) => setDraft({ ...draft, timeout_secs: Number(event.target.value) })}
+          />
+        </label>
+        <label className="resource-field">
+          <span>工具轮次</span>
+          <input
+            type="number"
+            min={1}
+            max={99}
+            value={draft.max_tool_rounds}
+            onChange={(event) => setDraft({ ...draft, max_tool_rounds: Number(event.target.value) })}
+          />
+        </label>
+      </div>
+      {error ? <SubagentSettingsError message={error} /> : null}
+      <button className="secondary-button" type="button" disabled={saving} onClick={() => void save()}>
+        <Save size={15} /> {saving ? '保存中…' : '保存角色'}
+      </button>
+    </article>
+  )
+}
+
+function roleDraft(role: SubagentRoleSettingsResponse): SubagentRoleWriteRequest {
+  return {
+    model_selection: role.model_selection ?? null,
+    prompt_suffix: role.prompt_suffix,
+    timeout_secs: role.timeout_secs,
+    max_tool_rounds: role.max_tool_rounds,
+  }
+}
+
+function selectionValue(selection?: ModelSelection | null): string {
+  return selection ? JSON.stringify(selection) : ''
+}
+
+function parseSelectionValue(value: string): ModelSelection | null {
+  return value ? JSON.parse(value) as ModelSelection : null
+}
+
+function modelOptions(settings: ModelSettingsResponse | null): Array<{ value: string; label: string }> {
+  if (!settings) return []
+  return settings.providers.flatMap((provider) => provider.enabled
+    ? provider.models.flatMap((model) => {
+        const reasoning = model.reasoning_profile === 'none' ? ['off'] : ['off', 'high', 'max']
+        return reasoning.map((level) => {
+          const selection: ModelSelection = {
+            provider_id: provider.id,
+            model_id: model.id,
+            reasoning: level as ModelSelection['reasoning'],
+          }
+          return {
+            value: JSON.stringify(selection),
+            label: `${provider.name} / ${model.name} · ${level}`,
+          }
+        })
+      })
+    : [])
+}
+
+function permissionLabel(mode: SubagentRoleSettingsResponse['permission_mode']): string {
+  if (mode === 'read_only') return 'Read only'
+  if (mode === 'workspace_write') return 'Workspace write'
+  return 'Full access'
 }
 
 export function SubagentAvatar({

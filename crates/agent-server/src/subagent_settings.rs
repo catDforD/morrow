@@ -1,9 +1,13 @@
 use crate::secrets::replace_file;
-use agent_protocol::{SubagentIdentity, default_subagent_identities};
+use agent_protocol::{
+    MAX_SUBAGENT_PROMPT_SUFFIX_CHARS, MAX_SUBAGENT_TIMEOUT_SECS, MAX_SUBAGENT_TOOL_ROUNDS,
+    MIN_SUBAGENT_TIMEOUT_SECS, MIN_SUBAGENT_TOOL_ROUNDS, ModelSelection, PermissionMode,
+    ShellPolicy, SubagentIdentity, SubagentRole, SubagentRoleOverride, default_subagent_identities,
+};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,7 +15,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::RwLock;
 
-const SUBAGENT_STORE_SCHEMA_VERSION: u32 = 1;
+const LEGACY_SUBAGENT_STORE_SCHEMA_VERSION: u32 = 1;
+const SUBAGENT_STORE_SCHEMA_VERSION: u32 = 2;
 const MAX_STORE_BYTES: u64 = 32 * 1024 * 1024;
 pub const MIN_SUBAGENT_PROFILES: usize = 4;
 pub const MAX_SUBAGENT_PROFILES: usize = 64;
@@ -39,11 +44,45 @@ impl SubagentProfileResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SubagentSettingsResponse {
     pub profiles: Vec<SubagentProfileResponse>,
+    pub roles: Vec<SubagentRoleSettingsResponse>,
     pub store_path: String,
     pub min_profiles: usize,
     pub max_profiles: usize,
     pub max_avatar_bytes: usize,
     pub accepted_avatar_types: Vec<&'static str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SubagentRoleSettingsResponse {
+    pub role: SubagentRole,
+    pub display_name: &'static str,
+    pub description: &'static str,
+    pub tools: Vec<&'static str>,
+    pub permission_mode: PermissionMode,
+    pub shell_policy: ShellPolicy,
+    #[serde(flatten)]
+    pub overrides: SubagentRoleOverride,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct SubagentRoleWriteRequest {
+    #[serde(default)]
+    pub model_selection: Option<ModelSelection>,
+    #[serde(default)]
+    pub prompt_suffix: String,
+    pub timeout_secs: u64,
+    pub max_tool_rounds: usize,
+}
+
+impl From<SubagentRoleWriteRequest> for SubagentRoleOverride {
+    fn from(value: SubagentRoleWriteRequest) -> Self {
+        Self {
+            model_selection: value.model_selection,
+            prompt_suffix: value.prompt_suffix,
+            timeout_secs: value.timeout_secs,
+            max_tool_rounds: value.max_tool_rounds,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -57,6 +96,13 @@ pub struct SubagentProfileWriteRequest {
 struct PersistedSubagentStore {
     schema_version: u32,
     profiles: Vec<SubagentProfileResponse>,
+    roles: BTreeMap<SubagentRole, SubagentRoleOverride>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyPersistedSubagentStore {
+    schema_version: u32,
+    profiles: Vec<SubagentProfileResponse>,
 }
 
 impl Default for PersistedSubagentStore {
@@ -64,6 +110,7 @@ impl Default for PersistedSubagentStore {
         Self {
             schema_version: SUBAGENT_STORE_SCHEMA_VERSION,
             profiles: default_profiles(),
+            roles: default_role_overrides(),
         }
     }
 }
@@ -148,7 +195,7 @@ impl SubagentRegistry {
 
     pub async fn settings(&self) -> SubagentSettingsResponse {
         let store = self.store.read().await;
-        settings_response(&self.path, store.profiles.clone())
+        settings_response(&self.path, store.profiles.clone(), &store.roles)
     }
 
     pub async fn identities(&self) -> Vec<SubagentIdentity> {
@@ -159,6 +206,39 @@ impl SubagentRegistry {
             .iter()
             .map(SubagentProfileResponse::identity)
             .collect()
+    }
+
+    pub async fn role_overrides(&self) -> BTreeMap<SubagentRole, SubagentRoleOverride> {
+        self.store.read().await.roles.clone()
+    }
+
+    pub async fn update_role(
+        &self,
+        role: SubagentRole,
+        request: SubagentRoleWriteRequest,
+    ) -> Result<SubagentRoleSettingsResponse, SubagentRegistryError> {
+        let overrides = SubagentRoleOverride::from(request);
+        validate_role_override(role, &overrides)?;
+        let mut guard = self.store.write().await;
+        let mut next = guard.clone();
+        next.roles.insert(role, overrides.clone());
+        validate_store(&next)?;
+        commit_store(&self.path, self.persistent, &next)?;
+        *guard = next;
+        Ok(role_settings_response(role, overrides))
+    }
+
+    pub async fn reset_roles(
+        &self,
+    ) -> Result<Vec<SubagentRoleSettingsResponse>, SubagentRegistryError> {
+        let mut guard = self.store.write().await;
+        let mut next = guard.clone();
+        next.roles = default_role_overrides();
+        validate_store(&next)?;
+        commit_store(&self.path, self.persistent, &next)?;
+        let roles = role_settings_responses(&next.roles);
+        *guard = next;
+        Ok(roles)
     }
 
     pub async fn create(
@@ -222,10 +302,11 @@ impl SubagentRegistry {
 
     pub async fn reset(&self) -> Result<SubagentSettingsResponse, SubagentRegistryError> {
         let mut guard = self.store.write().await;
-        let next = PersistedSubagentStore::default();
+        let mut next = guard.clone();
+        next.profiles = default_profiles();
         validate_store(&next)?;
         commit_store(&self.path, self.persistent, &next)?;
-        let response = settings_response(&self.path, next.profiles.clone());
+        let response = settings_response(&self.path, next.profiles.clone(), &next.roles);
         *guard = next;
         Ok(response)
     }
@@ -244,15 +325,86 @@ pub fn load_subagent_identities(
 fn settings_response(
     path: &Path,
     profiles: Vec<SubagentProfileResponse>,
+    roles: &BTreeMap<SubagentRole, SubagentRoleOverride>,
 ) -> SubagentSettingsResponse {
     SubagentSettingsResponse {
         profiles,
+        roles: role_settings_responses(roles),
         store_path: path.display().to_string(),
         min_profiles: MIN_SUBAGENT_PROFILES,
         max_profiles: MAX_SUBAGENT_PROFILES,
         max_avatar_bytes: MAX_SUBAGENT_AVATAR_BYTES,
         accepted_avatar_types: vec!["image/png", "image/jpeg", "image/webp"],
     }
+}
+
+fn role_settings_responses(
+    roles: &BTreeMap<SubagentRole, SubagentRoleOverride>,
+) -> Vec<SubagentRoleSettingsResponse> {
+    SubagentRole::ALL
+        .into_iter()
+        .map(|role| role_settings_response(role, roles.get(&role).cloned().unwrap_or_default()))
+        .collect()
+}
+
+fn role_settings_response(
+    role: SubagentRole,
+    overrides: SubagentRoleOverride,
+) -> SubagentRoleSettingsResponse {
+    let (display_name, description, tools, permission_mode, shell_policy) = match role {
+        SubagentRole::Explore => (
+            "Explore",
+            "Read-only workspace investigation",
+            vec!["read_file", "list_files", "search_text"],
+            PermissionMode::ReadOnly,
+            ShellPolicy::Deny,
+        ),
+        SubagentRole::Plan => (
+            "Plan",
+            "Read-only implementation planning",
+            vec!["read_file", "list_files", "search_text"],
+            PermissionMode::ReadOnly,
+            ShellPolicy::Deny,
+        ),
+        SubagentRole::Worker => (
+            "Worker",
+            "Approval-controlled workspace implementation",
+            vec![
+                "read_file",
+                "list_files",
+                "search_text",
+                "edit_file",
+                "write_file",
+                "apply_patch",
+                "shell_command",
+            ],
+            PermissionMode::WorkspaceWrite,
+            ShellPolicy::Prompt,
+        ),
+        SubagentRole::Reviewer => (
+            "Reviewer",
+            "Read-only review with approval-controlled shell commands",
+            vec!["read_file", "list_files", "search_text", "shell_command"],
+            PermissionMode::ReadOnly,
+            ShellPolicy::Prompt,
+        ),
+    };
+    SubagentRoleSettingsResponse {
+        role,
+        display_name,
+        description,
+        tools,
+        permission_mode,
+        shell_policy,
+        overrides,
+    }
+}
+
+fn default_role_overrides() -> BTreeMap<SubagentRole, SubagentRoleOverride> {
+    SubagentRole::ALL
+        .into_iter()
+        .map(|role| (role, SubagentRoleOverride::default()))
+        .collect()
 }
 
 fn default_profiles() -> Vec<SubagentProfileResponse> {
@@ -321,6 +473,44 @@ fn validate_store(store: &PersistedSubagentStore) -> Result<(), SubagentRegistry
         if let Some(avatar) = profile.avatar_data_url.as_deref() {
             validate_avatar_data_url(avatar)?;
         }
+    }
+    if store.roles.len() != SubagentRole::ALL.len()
+        || SubagentRole::ALL
+            .into_iter()
+            .any(|role| !store.roles.contains_key(&role))
+    {
+        return Err(SubagentRegistryError::Validation(
+            "subagent settings must contain all four built-in roles".to_string(),
+        ));
+    }
+    for (role, overrides) in &store.roles {
+        validate_role_override(*role, overrides)?;
+    }
+    Ok(())
+}
+
+fn validate_role_override(
+    role: SubagentRole,
+    overrides: &SubagentRoleOverride,
+) -> Result<(), SubagentRegistryError> {
+    let suffix_chars = overrides.prompt_suffix.chars().count();
+    if suffix_chars > MAX_SUBAGENT_PROMPT_SUFFIX_CHARS {
+        return Err(SubagentRegistryError::Validation(format!(
+            "{} prompt suffix must not exceed {MAX_SUBAGENT_PROMPT_SUFFIX_CHARS} characters",
+            role.as_str()
+        )));
+    }
+    if !(MIN_SUBAGENT_TIMEOUT_SECS..=MAX_SUBAGENT_TIMEOUT_SECS).contains(&overrides.timeout_secs) {
+        return Err(SubagentRegistryError::Validation(format!(
+            "{} timeout must be between {MIN_SUBAGENT_TIMEOUT_SECS} and {MAX_SUBAGENT_TIMEOUT_SECS} seconds",
+            role.as_str()
+        )));
+    }
+    if !(MIN_SUBAGENT_TOOL_ROUNDS..=MAX_SUBAGENT_TOOL_ROUNDS).contains(&overrides.max_tool_rounds) {
+        return Err(SubagentRegistryError::Validation(format!(
+            "{} max tool rounds must be between {MIN_SUBAGENT_TOOL_ROUNDS} and {MAX_SUBAGENT_TOOL_ROUNDS}",
+            role.as_str()
+        )));
     }
     Ok(())
 }
@@ -421,23 +611,57 @@ fn load_store(path: &Path) -> Result<PersistedSubagentStore, SubagentRegistryErr
         path: path.to_path_buf(),
         source,
     })?;
-    let store = serde_json::from_str::<PersistedSubagentStore>(&content).map_err(|source| {
+    let value = serde_json::from_str::<serde_json::Value>(&content).map_err(|source| {
         SubagentRegistryError::Parse {
             path: path.to_path_buf(),
             source,
         }
     })?;
-    if store.schema_version != SUBAGENT_STORE_SCHEMA_VERSION {
-        return Err(SubagentRegistryError::UnsupportedSchema {
-            path: path.to_path_buf(),
-            version: store.schema_version,
-            expected: SUBAGENT_STORE_SCHEMA_VERSION,
-        });
-    }
+    let version = value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default() as u32;
+    let (store, migrated) = match version {
+        SUBAGENT_STORE_SCHEMA_VERSION => (
+            serde_json::from_value::<PersistedSubagentStore>(value).map_err(|source| {
+                SubagentRegistryError::Parse {
+                    path: path.to_path_buf(),
+                    source,
+                }
+            })?,
+            false,
+        ),
+        LEGACY_SUBAGENT_STORE_SCHEMA_VERSION => {
+            let legacy = serde_json::from_value::<LegacyPersistedSubagentStore>(value).map_err(
+                |source| SubagentRegistryError::Parse {
+                    path: path.to_path_buf(),
+                    source,
+                },
+            )?;
+            (
+                PersistedSubagentStore {
+                    schema_version: SUBAGENT_STORE_SCHEMA_VERSION,
+                    profiles: legacy.profiles,
+                    roles: default_role_overrides(),
+                },
+                true,
+            )
+        }
+        _ => {
+            return Err(SubagentRegistryError::UnsupportedSchema {
+                path: path.to_path_buf(),
+                version,
+                expected: SUBAGENT_STORE_SCHEMA_VERSION,
+            });
+        }
+    };
     validate_store(&store).map_err(|error| SubagentRegistryError::InvalidStore {
         path: path.to_path_buf(),
         message: error.to_string(),
     })?;
+    if migrated {
+        save_store(path, &store)?;
+    }
     Ok(store)
 }
 
@@ -568,6 +792,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn schema_v1_store_migrates_to_v2_without_changing_identities() {
+        let path = unique_path("subagents-v1-migration");
+        let mut profiles = default_profiles();
+        profiles[0].name = "自定义波奇".to_string();
+        profiles[0].avatar_data_url = Some(tiny_png());
+        profiles[1].id = "custom-stable-id".to_string();
+        let legacy = LegacyPersistedSubagentStore {
+            schema_version: LEGACY_SUBAGENT_STORE_SCHEMA_VERSION,
+            profiles: profiles.clone(),
+        };
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&legacy).expect("serialize legacy store"),
+        )
+        .expect("write legacy store");
+
+        let registry = SubagentRegistry::load(path.clone()).expect("migrate legacy store");
+        let settings = registry.settings().await;
+
+        assert_eq!(settings.profiles, profiles);
+        assert_eq!(settings.roles.len(), SubagentRole::ALL.len());
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("read migrated store"))
+                .expect("parse migrated store");
+        assert_eq!(persisted["schema_version"], SUBAGENT_STORE_SCHEMA_VERSION);
+        assert_eq!(persisted["profiles"][0]["name"], "自定义波奇");
+        assert_eq!(persisted["profiles"][1]["id"], "custom-stable-id");
+        assert_eq!(
+            persisted["roles"].as_object().map(serde_json::Map::len),
+            Some(SubagentRole::ALL.len())
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn role_overrides_validate_and_persist_model_prompt_and_limits() {
+        let path = unique_path("subagent-role-overrides");
+        let registry = SubagentRegistry::load(path.clone()).expect("load defaults");
+        let model_selection = ModelSelection {
+            provider_id: "provider-1".to_string(),
+            model_id: "model-1".to_string(),
+            reasoning: agent_protocol::ReasoningLevel::High,
+        };
+
+        let updated = registry
+            .update_role(
+                SubagentRole::Worker,
+                SubagentRoleWriteRequest {
+                    model_selection: Some(model_selection.clone()),
+                    prompt_suffix: "Only touch the requested files.".to_string(),
+                    timeout_secs: 600,
+                    max_tool_rounds: 12,
+                },
+            )
+            .await
+            .expect("update worker role");
+        assert_eq!(
+            updated.overrides.model_selection,
+            Some(model_selection.clone())
+        );
+        assert_eq!(updated.overrides.timeout_secs, 600);
+        assert_eq!(updated.overrides.max_tool_rounds, 12);
+
+        let reloaded = SubagentRegistry::load(path.clone()).expect("reload role settings");
+        assert_eq!(
+            reloaded
+                .role_overrides()
+                .await
+                .get(&SubagentRole::Worker)
+                .and_then(|overrides| overrides.model_selection.clone()),
+            Some(model_selection)
+        );
+
+        let invalid = registry
+            .update_role(
+                SubagentRole::Explore,
+                SubagentRoleWriteRequest {
+                    model_selection: None,
+                    prompt_suffix: String::new(),
+                    timeout_secs: MIN_SUBAGENT_TIMEOUT_SECS - 1,
+                    max_tool_rounds: 1,
+                },
+            )
+            .await
+            .expect_err("short timeout must fail");
+        assert!(matches!(invalid, SubagentRegistryError::Validation(_)));
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
     async fn registry_enforces_unique_names_and_minimum_profiles() {
         let path = unique_path("subagents-validation");
         let registry = SubagentRegistry::load(path.clone()).expect("load defaults");
@@ -680,7 +994,7 @@ mod tests {
     #[test]
     fn invalid_stores_report_the_source_path_without_overwriting() {
         let path = unique_path("subagents-invalid-store");
-        fs::write(&path, r#"{"schema_version":2,"profiles":[]}"#).expect("write invalid store");
+        fs::write(&path, r#"{"schema_version":3,"profiles":[]}"#).expect("write invalid store");
         let error = match SubagentRegistry::load(path.clone()) {
             Ok(_) => panic!("schema must fail"),
             Err(error) => error,
@@ -692,7 +1006,7 @@ mod tests {
         assert!(error.to_string().contains(&path.display().to_string()));
         assert_eq!(
             fs::read_to_string(&path).expect("store remains"),
-            r#"{"schema_version":2,"profiles":[]}"#
+            r#"{"schema_version":3,"profiles":[]}"#
         );
         let _ = fs::remove_file(path);
     }
@@ -734,10 +1048,30 @@ mod tests {
             )
             .await
             .expect("update default");
+        registry
+            .update_role(
+                SubagentRole::Worker,
+                SubagentRoleWriteRequest {
+                    model_selection: None,
+                    prompt_suffix: "keep this role override".to_string(),
+                    timeout_secs: 600,
+                    max_tool_rounds: 12,
+                },
+            )
+            .await
+            .expect("update role before identity reset");
         let reset = registry.reset().await.expect("reset profiles");
         assert_eq!(reset.profiles[0].id, "builtin-01");
         assert_eq!(reset.profiles[0].name, "后藤一里");
         assert!(reset.profiles[0].avatar_data_url.is_none());
+        let worker = reset
+            .roles
+            .iter()
+            .find(|role| role.role == SubagentRole::Worker)
+            .expect("worker role");
+        assert_eq!(worker.overrides.prompt_suffix, "keep this role override");
+        assert_eq!(worker.overrides.timeout_secs, 600);
+        assert_eq!(worker.overrides.max_tool_rounds, 12);
         let _ = fs::remove_file(path);
     }
 }
