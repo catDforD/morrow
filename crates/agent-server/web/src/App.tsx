@@ -1949,6 +1949,9 @@ function AppSidebar({
       inert={isHidden}
     >
       <div className="sidebar-brand workspace-brand">
+        <span className="workspace-brand-mark" aria-hidden="true">
+          M
+        </span>
         <strong className="workspace-brand-name">Morrow</strong>
         <MiniIconButton title="Collapse task navigation" onClick={onClose}>
           <PanelLeftClose size={17} />
@@ -2276,7 +2279,9 @@ function ChatView({
           >
             <PanelLeft size={19} />
           </button>
-          <HomePrompt status={status}>{composer}</HomePrompt>
+          <HomePrompt status={status} onPickHint={onPromptChange}>
+            {composer}
+          </HomePrompt>
         </>
       ) : (
         <>
@@ -2302,11 +2307,36 @@ function ChatView({
   )
 }
 
+const homeHints: { icon: ReactNode; label: string; prompt: string }[] = [
+  {
+    icon: <Eye size={14} />,
+    label: '介绍这个项目',
+    prompt: '介绍一下这个项目：主要结构、核心模块和它们之间的关系。',
+  },
+  {
+    icon: <FileText size={14} />,
+    label: '解释一段代码',
+    prompt: '帮我解释这段代码的作用：',
+  },
+  {
+    icon: <PencilLine size={14} />,
+    label: '修一个 bug',
+    prompt: '帮我定位并修复一个 bug：',
+  },
+  {
+    icon: <Terminal size={14} />,
+    label: '跑一下测试',
+    prompt: '运行项目的测试，并总结失败原因。',
+  },
+]
+
 function HomePrompt({
   status,
+  onPickHint,
   children,
 }: {
   status: StatusResponse | null
+  onPickHint?: (prompt: string) => void
   children: ReactNode
 }) {
   const workspace = status ? workspaceName(status.workspace_root) : 'this workspace'
@@ -2322,6 +2352,28 @@ function HomePrompt({
         </h1>
       </div>
       {children}
+      {onPickHint ? (
+        <div className="home-hints" aria-label="快速开始">
+          {homeHints.map((hint) => (
+            <button
+              key={hint.label}
+              type="button"
+              className="home-hint"
+              onClick={() => {
+                onPickHint(hint.prompt)
+                requestAnimationFrame(() => {
+                  document
+                    .querySelector<HTMLTextAreaElement>('.composer textarea')
+                    ?.focus()
+                })
+              }}
+            >
+              {hint.icon}
+              {hint.label}
+            </button>
+          ))}
+        </div>
+      ) : null}
     </div>
   )
 }

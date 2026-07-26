@@ -32,6 +32,27 @@
   --radius: 6px;
   --conversation-width: 900px;
   --home-composer-width: 760px;
+  --font-body:
+    Arial,
+    Helvetica,
+    ui-sans-serif,
+    system-ui,
+    -apple-system,
+    BlinkMacSystemFont,
+    'Segoe UI',
+    'PingFang SC',
+    'Hiragino Sans GB',
+    'Microsoft YaHei',
+    'Noto Sans CJK SC',
+    sans-serif;
+  --font-mono:
+    ui-monospace,
+    'Cascadia Mono',
+    'SF Mono',
+    Consolas,
+    'Liberation Mono',
+    monospace;
+  --ease-snap: cubic-bezier(0.2, 0.9, 0.3, 1.05);
 }
 
 .dark {
@@ -44,6 +65,10 @@
   --border: #000000;
   --ring: #ffffff;
   --overlay: rgb(0 0 0 / 0.72);
+  --ok: #4ade80;
+  --warn: #fde047;
+  --danger: #f87171;
+  --info: #7dd3fc;
   --muted: #aaaabd;
   --surface-sidebar: #302f50;
   --surface-main: #232238;
@@ -101,16 +126,10 @@ body {
   overflow: hidden;
   background: var(--surface-main);
   color: var(--foreground);
-  font-family:
-    Arial,
-    Helvetica,
-    ui-sans-serif,
-    system-ui,
-    -apple-system,
-    BlinkMacSystemFont,
-    'Segoe UI',
-    sans-serif;
-  font-weight: 650;
+  font-family: var(--font-body);
+  font-weight: 550;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
 
 ::selection {
@@ -168,10 +187,11 @@ a:focus-visible {
 .eyebrow {
   margin: 0;
   color: var(--muted);
-  font-size: 10px;
-  font-weight: 800;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 700;
   line-height: 1.1;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.14em;
   text-transform: uppercase;
 }
 
@@ -234,13 +254,30 @@ a:focus-visible {
 
 .workspace-brand {
   min-height: 40px;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: 32px minmax(0, 1fr) auto;
+  gap: 9px;
+}
+
+.workspace-brand-mark {
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  border: 2px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 2px 2px 0 0 var(--border);
+  background: var(--main);
+  color: var(--main-foreground);
+  font-size: 17px;
+  font-weight: 900;
+  line-height: 1;
 }
 
 .workspace-brand-name {
   overflow: hidden;
-  font-size: 22px;
+  font-size: 21px;
   font-weight: 850;
+  letter-spacing: -0.02em;
   line-height: 1.05;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -328,15 +365,16 @@ a:focus-visible {
 
 .sidebar-action small,
 .sidebar-settings small {
-  border: 1.5px solid var(--border);
+  border: 1px solid color-mix(in srgb, var(--border), transparent 68%);
   border-radius: 999px;
-  background: var(--surface-panel);
-  padding: 2px 5px;
+  background: transparent;
+  padding: 2px 6px;
   color: var(--muted);
+  font-family: var(--font-mono);
   font-size: 8px;
-  font-weight: 800;
+  font-weight: 700;
   line-height: 1;
-  letter-spacing: 0.05em;
+  letter-spacing: 0.08em;
   text-transform: uppercase;
 }
 
@@ -367,11 +405,14 @@ a:focus-visible {
   min-width: 22px;
   display: inline-grid;
   place-items: center;
-  border: 1.5px solid var(--border);
+  border: 1px solid color-mix(in srgb, var(--border), transparent 68%);
   border-radius: 999px;
-  background: var(--surface-panel);
-  padding: 2px 5px;
+  background: transparent;
+  padding: 2px 6px;
+  color: var(--muted);
+  font-family: var(--font-mono);
   font-size: 9px;
+  font-weight: 700;
   line-height: 1;
 }
 
@@ -426,6 +467,7 @@ a:focus-visible {
   border-radius: var(--radius);
   background: transparent;
   overflow: hidden;
+  transition: background 120ms ease;
 }
 
 .sidebar-session {
@@ -471,11 +513,12 @@ a:focus-visible {
 .archived-session-copy > span:last-child {
   min-width: 0;
   overflow: hidden;
-  color: color-mix(in srgb, currentColor, transparent 32%);
-  font-size: 10px;
-  font-weight: 800;
+  color: color-mix(in srgb, currentColor, transparent 40%);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 600;
   line-height: 1.1;
-  letter-spacing: 0.03em;
+  letter-spacing: 0.05em;
   text-overflow: ellipsis;
   text-transform: uppercase;
   white-space: nowrap;
@@ -1403,11 +1446,7 @@ a:focus-visible {
 }
 
 .settings-info-row dd.path {
-  font-family:
-    'SFMono-Regular',
-    Consolas,
-    'Liberation Mono',
-    monospace;
+  font-family: var(--font-mono);
   font-size: 11px;
 }
 
@@ -1457,7 +1496,7 @@ a:focus-visible {
   width: min(800px, 100%);
   display: grid;
   justify-items: center;
-  gap: 32px;
+  gap: 30px;
   transform: translateY(2vh);
 }
 
@@ -1478,6 +1517,7 @@ a:focus-visible {
   box-shadow: var(--shadow);
   background: var(--main);
   color: var(--main-foreground);
+  animation: home-mark-drop 480ms var(--ease-snap) both;
 }
 
 .home-copy h1 {
@@ -1493,6 +1533,83 @@ a:focus-visible {
   text-decoration: underline;
   text-decoration-thickness: 3px;
   text-underline-offset: 5px;
+  text-decoration-color: var(--main);
+}
+
+.home-prompt > *:nth-child(2) {
+  animation: home-rise 420ms 60ms var(--ease-snap) both;
+}
+
+.home-hints {
+  display: flex;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  animation: home-rise 420ms 140ms var(--ease-snap) both;
+}
+
+.home-hint {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  border: 1.5px solid color-mix(in srgb, var(--border), transparent 52%);
+  border-radius: 999px;
+  background: var(--surface-panel);
+  padding: 8px 13px;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1;
+  white-space: nowrap;
+  transition:
+    border-color 120ms ease,
+    background 120ms ease,
+    color 120ms ease,
+    transform 120ms var(--ease-snap),
+    box-shadow 120ms var(--ease-snap);
+}
+
+.home-hint:hover {
+  border-color: var(--border);
+  background: color-mix(in srgb, var(--main), var(--surface-panel) 82%);
+  color: var(--foreground);
+  transform: translate(-1px, -1px);
+  box-shadow: 2px 2px 0 0 var(--border);
+}
+
+.home-hint svg {
+  color: color-mix(in srgb, var(--main), var(--foreground) 22%);
+}
+
+@keyframes home-mark-drop {
+  from {
+    opacity: 0;
+    transform: translateY(-14px) rotate(-8deg);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) rotate(0);
+  }
+}
+
+@keyframes home-rise {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .home-mark,
+  .home-prompt > *:nth-child(2),
+  .home-hints {
+    animation: none !important;
+  }
 }
 
 .conversation-header {
@@ -1535,20 +1652,22 @@ a:focus-visible {
   display: inline-flex;
   align-items: center;
   gap: 7px;
-  border: 2px solid var(--border);
-  border-radius: var(--radius);
+  border: 1.5px solid color-mix(in srgb, var(--border), transparent 62%);
+  border-radius: 999px;
   background: var(--surface-panel);
-  padding: 4px 8px;
-  font-size: 10px;
-  font-weight: 850;
+  padding: 4px 10px;
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
   line-height: 1;
   text-transform: uppercase;
 }
 
 .connection-badge > span {
-  width: 10px;
-  height: 10px;
-  border: 2px solid var(--border);
+  width: 8px;
+  height: 8px;
   border-radius: 999px;
   background: var(--danger);
 }
@@ -1558,8 +1677,29 @@ a:focus-visible {
   background: var(--ok);
 }
 
+.connection-badge.running > span {
+  animation: connection-pulse 1.3s ease-in-out infinite;
+}
+
 .connection-badge.connecting > span {
   background: var(--warn);
+  animation: connection-pulse 1.3s ease-in-out infinite;
+}
+
+@keyframes connection-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .connection-badge > span {
+    animation: none !important;
+  }
 }
 
 .message-scroll {
@@ -1567,7 +1707,7 @@ a:focus-visible {
   min-height: 0;
   justify-self: stretch;
   overflow: auto;
-  padding: 26px 24px 42px;
+  padding: 30px 24px 42px;
 }
 
 .message-column {
@@ -1578,17 +1718,22 @@ a:focus-visible {
 .message-row {
   min-width: 0;
   display: grid;
-  gap: 6px;
-  margin-bottom: 20px;
+  gap: 7px;
+  margin-bottom: 26px;
+}
+
+.message-row.user {
+  justify-items: end;
 }
 
 .message-role {
-  padding-left: 2px;
+  padding-inline: 2px;
   color: var(--muted);
-  font-size: 10px;
-  font-weight: 850;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 700;
   line-height: 1;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.14em;
   text-transform: uppercase;
 }
 
@@ -1608,8 +1753,21 @@ a:focus-visible {
 }
 
 .message-row.user .message-bubble {
+  max-width: min(82%, 640px);
+  border-radius: calc(var(--radius) + 4px);
+  border-end-end-radius: 2px;
   background: var(--main);
   color: var(--main-foreground);
+  font-weight: 600;
+}
+
+.message-row.assistant .message-bubble {
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  background: transparent;
+  padding: 1px 2px 0;
+  line-height: 1.62;
 }
 
 .message-row.tool .message-bubble {
@@ -1689,23 +1847,20 @@ a:focus-visible {
 }
 
 .markdown-message hr {
-  height: 3px;
-  margin: 18px 0;
+  height: 2px;
+  margin: 20px 0;
   border: 0;
-  background: var(--border);
+  background: color-mix(in srgb, var(--foreground), transparent 78%);
 }
 
 .markdown-message code {
-  border: 1.5px solid var(--border);
+  border: 1px solid color-mix(in srgb, var(--border), transparent 62%);
   border-radius: 4px;
   background: var(--surface-panel-muted);
   padding: 1px 4px;
-  font-family:
-    'SFMono-Regular',
-    Consolas,
-    'Liberation Mono',
-    monospace;
-  font-size: 0.9em;
+  font-family: var(--font-mono);
+  font-size: 0.88em;
+  font-weight: 600;
 }
 
 .markdown-message pre {
@@ -1766,34 +1921,60 @@ a:focus-visible {
 
 .timeline-notice,
 .run-card {
-  margin-bottom: 20px;
+  margin-bottom: 26px;
   border: 2px solid var(--border);
   border-radius: var(--radius);
   box-shadow: var(--shadow);
 }
 
 .timeline-notice {
+  position: relative;
   display: grid;
   grid-template-columns: 22px minmax(0, 1fr);
   gap: 10px;
-  background: var(--surface-panel-muted);
-  padding: 12px 14px;
+  overflow: hidden;
+  background: var(--surface-panel);
+  padding: 12px 14px 12px 17px;
+}
+
+.timeline-notice::before {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 5px;
+  background: var(--muted);
+  content: '';
 }
 
 .timeline-notice.running {
-  background: var(--surface-info);
+  background: color-mix(in srgb, var(--surface-info), var(--surface-panel) 55%);
+}
+
+.timeline-notice.running::before {
+  background: var(--info);
 }
 
 .timeline-notice.ok {
-  background: var(--surface-ok);
+  background: color-mix(in srgb, var(--surface-ok), var(--surface-panel) 55%);
+}
+
+.timeline-notice.ok::before {
+  background: var(--ok);
 }
 
 .timeline-notice.error {
-  background: var(--surface-danger);
+  background: color-mix(in srgb, var(--surface-danger), var(--surface-panel) 45%);
+}
+
+.timeline-notice.error::before {
+  background: var(--danger);
 }
 
 .timeline-notice.approval {
-  background: var(--surface-warn);
+  background: color-mix(in srgb, var(--surface-warn), var(--surface-panel) 45%);
+}
+
+.timeline-notice.approval::before {
+  background: var(--warn);
 }
 
 .timeline-notice strong,
@@ -1810,48 +1991,73 @@ a:focus-visible {
 }
 
 .run-card {
+  position: relative;
   overflow: hidden;
-  background: var(--surface-panel-muted);
+  background: var(--surface-panel);
 }
 
-.run-card.running,
-.run-card.approval {
-  background: var(--surface-warn);
+.run-card::before {
+  position: absolute;
+  inset: 0 auto 0 0;
+  z-index: 1;
+  width: 5px;
+  background: var(--muted);
+  content: '';
 }
 
-.run-card.completed {
-  background: var(--surface-ok);
+.run-card.running::before,
+.run-card.approval::before {
+  background: var(--warn);
 }
 
-.run-card.failed {
-  background: var(--surface-danger);
+.run-card.completed::before {
+  background: var(--ok);
+}
+
+.run-card.failed::before {
+  background: var(--danger);
+}
+
+.run-card.collapsed {
+  box-shadow: var(--shadow-small);
 }
 
 .run-card-head {
   min-width: 0;
   display: grid;
-  grid-template-columns: 40px minmax(0, 1fr) auto;
+  grid-template-columns: 36px minmax(0, 1fr) auto;
   align-items: center;
   gap: 11px;
-  padding: 12px 14px;
+  background: var(--surface-panel-muted);
+  padding: 11px 14px 11px 17px;
+}
+
+.run-card.running .run-card-head,
+.run-card.approval .run-card-head {
+  background: color-mix(in srgb, var(--surface-warn), var(--surface-panel) 45%);
 }
 
 .run-toggle {
-  width: 36px;
-  height: 36px;
+  width: 32px;
+  height: 32px;
   display: grid;
   place-items: center;
   border: 2px solid var(--border);
   border-radius: var(--radius);
-  box-shadow: var(--shadow-small);
-  background: var(--main);
-  color: var(--main-foreground);
+  box-shadow: 2px 2px 0 0 var(--border);
+  background: var(--surface-panel);
+  color: var(--foreground);
   cursor: pointer;
+  transition:
+    transform 120ms var(--ease-snap),
+    box-shadow 120ms var(--ease-snap),
+    background 120ms ease;
 }
 
 .run-toggle:hover {
-  transform: translate(3px, 3px);
+  transform: translate(2px, 2px);
   box-shadow: none;
+  background: color-mix(in srgb, var(--main), var(--surface-panel) 74%);
 }
 
 .run-heading {
@@ -1866,7 +2072,8 @@ a:focus-visible {
 .run-heading h2 {
   margin-top: 2px;
   overflow: hidden;
-  font-size: 17px;
+  font-size: 15px;
+  font-weight: 750;
   line-height: 1.2;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1877,6 +2084,7 @@ a:focus-visible {
   overflow: hidden;
   color: color-mix(in srgb, var(--foreground), transparent 30%);
   font-size: 11px;
+  font-weight: 550;
   line-height: 1.25;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1891,15 +2099,35 @@ a:focus-visible {
 }
 
 .run-meta span {
-  border: 1.5px solid var(--border);
-  border-radius: 4px;
+  border: 1.5px solid color-mix(in srgb, var(--border), transparent 62%);
+  border-radius: 999px;
   background: var(--surface-panel);
-  padding: 4px 6px;
-  color: var(--foreground);
-  font-size: 8px;
-  font-weight: 850;
+  padding: 4px 8px;
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 700;
   line-height: 1;
+  letter-spacing: 0.04em;
   text-transform: uppercase;
+}
+
+.run-meta span:last-child {
+  border-color: var(--border);
+  color: var(--foreground);
+}
+
+.run-card.completed .run-meta span:last-child {
+  background: var(--surface-ok);
+}
+
+.run-card.running .run-meta span:last-child,
+.run-card.approval .run-meta span:last-child {
+  background: var(--surface-warn);
+}
+
+.run-card.failed .run-meta span:last-child {
+  background: var(--surface-danger);
 }
 
 .run-step-list {
@@ -1911,8 +2139,8 @@ a:focus-visible {
   display: grid;
   grid-template-columns: 34px minmax(0, 1fr);
   gap: 10px;
-  border-top: 1.5px solid var(--border);
-  padding: 12px 14px;
+  border-top: 1.5px solid color-mix(in srgb, var(--border), transparent 62%);
+  padding: 12px 14px 12px 17px;
 }
 
 .run-step:first-child {
@@ -1977,8 +2205,10 @@ a:focus-visible {
 
 .run-step-head span {
   color: var(--muted);
+  font-family: var(--font-mono);
   font-size: 9px;
-  font-weight: 850;
+  font-weight: 700;
+  letter-spacing: 0.08em;
   text-transform: uppercase;
 }
 
@@ -2163,10 +2393,12 @@ a:focus-visible {
   border: 1.5px solid var(--border);
   border-radius: 999px;
   background: var(--surface-panel-muted);
-  padding: 4px 7px;
+  padding: 4px 8px;
   color: var(--foreground);
+  font-family: var(--font-mono);
   font-size: 9px;
-  font-weight: 850;
+  font-weight: 700;
+  letter-spacing: 0.04em;
   white-space: nowrap;
 }
 
@@ -2244,11 +2476,7 @@ a:focus-visible {
   background: var(--surface-code);
   padding: 11px;
   color: #f4f4f7;
-  font-family:
-    'SFMono-Regular',
-    Consolas,
-    'Liberation Mono',
-    monospace;
+  font-family: var(--font-mono);
   font-size: 11px;
   line-height: 1.45;
   white-space: pre;
@@ -2454,7 +2682,10 @@ a:focus-visible {
   gap: 6px;
   overflow: hidden;
   color: var(--muted);
-  font-size: 10px;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 650;
+  letter-spacing: 0.07em;
   line-height: 1;
   text-overflow: ellipsis;
   text-transform: uppercase;
@@ -2477,6 +2708,16 @@ a:focus-visible {
   box-shadow: 5px 5px 0 0 var(--border);
   background: var(--surface-panel);
   padding: 11px 12px 10px;
+  transition:
+    box-shadow 140ms var(--ease-snap),
+    transform 140ms var(--ease-snap);
+}
+
+.composer-card:focus-within {
+  transform: translate(-1px, -1px);
+  box-shadow:
+    6px 6px 0 0 var(--border),
+    0 0 0 3px color-mix(in srgb, var(--main), transparent 72%);
 }
 
 .command-suggestion-menu {
@@ -2744,13 +2985,15 @@ a:focus-visible {
 }
 
 .permission-option-badge {
-  border: 1.5px solid color-mix(in srgb, var(--border), transparent 54%);
+  border: 1px solid color-mix(in srgb, var(--border), transparent 62%);
   border-radius: 999px;
-  background: var(--surface-panel-muted);
-  padding: 3px 6px;
+  background: transparent;
+  padding: 3px 7px;
   color: var(--muted);
+  font-family: var(--font-mono);
   font-size: 8px;
-  font-weight: 800;
+  font-weight: 700;
+  letter-spacing: 0.06em;
   white-space: nowrap;
 }
 
@@ -2765,6 +3008,9 @@ a:focus-visible {
   border-radius: var(--radius);
   box-shadow: var(--shadow-small);
   cursor: pointer;
+  transition:
+    transform 120ms var(--ease-snap),
+    box-shadow 120ms var(--ease-snap);
 }
 
 .composer-primary-button {
@@ -2801,6 +3047,15 @@ a:focus-visible {
   background: var(--surface-panel);
   color: var(--foreground);
   cursor: pointer;
+  transition:
+    transform 120ms var(--ease-snap),
+    box-shadow 120ms var(--ease-snap),
+    background 120ms ease;
+}
+
+.icon-button:hover:not(:disabled),
+.mini-icon-button:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--main), var(--surface-panel) 78%);
 }
 
 .icon-button {
@@ -2957,8 +3212,10 @@ a:focus-visible {
 
 .inspector-metric span {
   color: var(--muted);
+  font-family: var(--font-mono);
   font-size: 8px;
-  font-weight: 850;
+  font-weight: 700;
+  letter-spacing: 0.08em;
   text-transform: uppercase;
 }
 
@@ -3072,8 +3329,10 @@ a:focus-visible {
 
 .tool-card-head span {
   color: var(--muted);
+  font-family: var(--font-mono);
   font-size: 8px;
-  font-weight: 850;
+  font-weight: 700;
+  letter-spacing: 0.08em;
   text-transform: uppercase;
 }
 
@@ -4170,7 +4429,7 @@ a:focus-visible {
   min-height: 330px;
   background: var(--surface-code);
   color: #f5f5f7;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 11px;
   line-height: 1.6;
 }
