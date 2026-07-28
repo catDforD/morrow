@@ -82,6 +82,13 @@ pub enum CompactionOutcome {
     Noop,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextEstimate {
+    pub estimated_tokens: usize,
+    pub input_limit_tokens: usize,
+    pub auto_compact_trigger_tokens: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentEventEnvelope {
     pub schema_version: u32,
@@ -364,6 +371,52 @@ pub trait TurnEventHandler {
     }
 }
 
+pub async fn estimate_context(
+    context: &RunAgentTurnContext<'_>,
+    session: &Session,
+    prompt: &str,
+) -> Result<ContextEstimate, RuntimeError> {
+    estimate_context_with_optional_controller(context, session, prompt, None).await
+}
+
+pub async fn estimate_context_with_subagent_controller(
+    context: &RunAgentTurnContext<'_>,
+    session: &Session,
+    prompt: &str,
+    controller: Arc<dyn SubagentController>,
+) -> Result<ContextEstimate, RuntimeError> {
+    estimate_context_with_optional_controller(context, session, prompt, Some(controller)).await
+}
+
+async fn estimate_context_with_optional_controller(
+    context: &RunAgentTurnContext<'_>,
+    session: &Session,
+    prompt: &str,
+    controller: Option<Arc<dyn SubagentController>>,
+) -> Result<ContextEstimate, RuntimeError> {
+    let writer_lease = controller
+        .as_ref()
+        .and_then(|controller| controller.writer_lease());
+    let build = ToolRegistry::with_mcp_cache_and_writer_lease_async(
+        context.workspace_root,
+        context.permissions,
+        context.mcp_servers,
+        context.mcp_cache,
+        writer_lease,
+    )
+    .await?;
+    let (tools, effective_system_prompt) = prepare_turn_tools(context, build.registry, controller)?;
+
+    Ok(build_context_estimate(
+        &effective_system_prompt,
+        session,
+        prompt,
+        &tools.definitions(),
+        context.context_config,
+        context.model_limits,
+    ))
+}
+
 pub async fn run_agent_turn(
     context: RunAgentTurnContext<'_>,
     session: &mut Session,
@@ -453,31 +506,9 @@ async fn run_agent_turn_inner(
         return Ok(record_cancelled_turn(session, prompt, context.model));
     };
     let build = build?;
-    let mut tools = build.registry;
     let diagnostics = build.diagnostics;
-    let mut persistent_controller_registered = false;
-    let effective_system_prompt = if let Some(model) = context.client.shared_clone() {
-        tools.register_subagent(
-            Arc::new(RuntimeSubagentExecutor::new(
-                model,
-                Arc::<str>::from(context.system_prompt),
-                Arc::new(context.workspace_root.to_path_buf()),
-            )),
-            context.subagent_identities,
-        )?;
-        if let Some(controller) = controller {
-            tools.register_subagent_controller(controller)?;
-            persistent_controller_registered = true;
-        }
-        let guidance = if persistent_controller_registered {
-            format!("{PARENT_SUBAGENT_GUIDANCE}\n\n{PERSISTENT_SUBAGENT_GUIDANCE}")
-        } else {
-            PARENT_SUBAGENT_GUIDANCE.to_string()
-        };
-        format!("{}\n\n{guidance}", context.system_prompt)
-    } else {
-        context.system_prompt.to_string()
-    };
+    let (tools, effective_system_prompt) =
+        prepare_turn_tools(&context, build.registry, controller)?;
     let tool_definitions = tools.definitions();
 
     let compaction = tokio::select! {
@@ -641,6 +672,38 @@ async fn run_agent_turn_inner(
     })
 }
 
+fn prepare_turn_tools(
+    context: &RunAgentTurnContext<'_>,
+    mut tools: ToolRegistry,
+    controller: Option<Arc<dyn SubagentController>>,
+) -> Result<(ToolRegistry, String), RuntimeError> {
+    let mut persistent_controller_registered = false;
+    let effective_system_prompt = if let Some(model) = context.client.shared_clone() {
+        tools.register_subagent(
+            Arc::new(RuntimeSubagentExecutor::new(
+                model,
+                Arc::<str>::from(context.system_prompt),
+                Arc::new(context.workspace_root.to_path_buf()),
+            )),
+            context.subagent_identities,
+        )?;
+        if let Some(controller) = controller {
+            tools.register_subagent_controller(controller)?;
+            persistent_controller_registered = true;
+        }
+        let guidance = if persistent_controller_registered {
+            format!("{PARENT_SUBAGENT_GUIDANCE}\n\n{PERSISTENT_SUBAGENT_GUIDANCE}")
+        } else {
+            PARENT_SUBAGENT_GUIDANCE.to_string()
+        };
+        format!("{}\n\n{guidance}", context.system_prompt)
+    } else {
+        context.system_prompt.to_string()
+    };
+
+    Ok((tools, effective_system_prompt))
+}
+
 fn apply_turn_with_model(session: &mut Session, mut record: TurnRecord, model: &ModelInvocation) {
     if record.turn.model.is_none() {
         record.turn.model = Some(model.clone());
@@ -759,10 +822,14 @@ fn auto_compact_trigger_tokens(
     model_limits: ModelContextLimits,
     context_config: ContextConfig,
 ) -> usize {
-    let input_window = model_limits
-        .context_window_tokens
-        .saturating_sub(model_limits.reserved_output_tokens);
+    let input_window = input_limit_tokens(model_limits);
     ((input_window as f64) * f64::from(context_config.auto_compact_threshold)).floor() as usize
+}
+
+fn input_limit_tokens(model_limits: ModelContextLimits) -> usize {
+    model_limits
+        .context_window_tokens
+        .saturating_sub(model_limits.reserved_output_tokens)
 }
 
 pub async fn compact_session(
@@ -1212,6 +1279,21 @@ fn estimate_context_tokens(
         .div_ceil(REQUEST_PADDING_DENOMINATOR)
 }
 
+fn build_context_estimate(
+    system_prompt: &str,
+    session: &Session,
+    prompt: &str,
+    tools: &[ToolDefinition],
+    context_config: ContextConfig,
+    model_limits: ModelContextLimits,
+) -> ContextEstimate {
+    ContextEstimate {
+        estimated_tokens: estimate_context_tokens(system_prompt, session, prompt, tools),
+        input_limit_tokens: input_limit_tokens(model_limits),
+        auto_compact_trigger_tokens: auto_compact_trigger_tokens(model_limits, context_config),
+    }
+}
+
 fn message_context_tokens(message: &Message) -> usize {
     let mut total = MESSAGE_BASE_TOKENS + estimate_text_tokens(message_role_label(message));
     if let Some(content) = message.content.as_ref() {
@@ -1531,6 +1613,25 @@ compact test
     }
 
     #[derive(Clone)]
+    struct ShareablePendingModel;
+
+    impl Model for ShareablePendingModel {
+        fn stream(&self, _request: ModelRequest) -> agent_core::ModelFuture {
+            async move {
+                let stream: agent_core::ModelStream = Box::pin(futures_util::stream::pending::<
+                    Result<ModelEvent, ModelFailure>,
+                >());
+                Ok(stream)
+            }
+            .boxed()
+        }
+
+        fn shared_clone(&self) -> Option<Arc<dyn Model>> {
+            Some(Arc::new(self.clone()))
+        }
+    }
+
+    #[derive(Clone)]
     struct ConstantModel {
         text: String,
     }
@@ -1768,6 +1869,100 @@ compact test
         let with = estimate_context_tokens("system", &with_reasoning, "hello", &[]);
 
         assert!(with > without + 1_000);
+    }
+
+    #[tokio::test]
+    async fn public_context_estimate_uses_turn_tools_limits_and_does_not_mutate_session() {
+        let root = unique_dir("context-estimate");
+        let cache = McpToolCache::new();
+        let model = PendingModel;
+        let session = Session::from_thread(Thread {
+            messages: vec![Message::user("existing context")],
+        });
+        let original = session.clone();
+        let config = ContextConfig {
+            auto_compact: true,
+            auto_compact_threshold: 0.75,
+            retain_recent_turns: 2,
+            summary_target_tokens: 256,
+            compact_max_retries: 2,
+        };
+        let limits = ModelContextLimits {
+            context_window_tokens: 10_000,
+            reserved_output_tokens: 2_000,
+        };
+        let context = RunAgentTurnContext {
+            client: &model,
+            model: test_model_invocation(),
+            subagent_identities: &[],
+            system_prompt: "system policy",
+            context_config: config,
+            model_limits: limits,
+            workspace_root: &root,
+            permissions: PermissionProfile::default(),
+            mcp_servers: &[],
+            mcp_cache: &cache,
+            session_name: "default",
+            turn_index: 0,
+        };
+
+        let build =
+            ToolRegistry::with_mcp_cache_async(&root, PermissionProfile::default(), &[], &cache)
+                .await
+                .expect("build turn tools");
+        let expected_tokens = estimate_context_tokens(
+            "system policy",
+            &session,
+            "draft prompt",
+            &build.registry.definitions(),
+        );
+
+        let estimate = estimate_context(&context, &session, "draft prompt")
+            .await
+            .expect("estimate context");
+
+        assert_eq!(estimate.estimated_tokens, expected_tokens);
+        assert_eq!(estimate.input_limit_tokens, 8_000);
+        assert_eq!(estimate.auto_compact_trigger_tokens, 6_000);
+        assert_eq!(session, original);
+    }
+
+    #[tokio::test]
+    async fn public_context_estimate_includes_effective_subagent_prompt_and_tools() {
+        let root = unique_dir("context-estimate-subagents");
+        let cache = McpToolCache::new();
+        let plain_model = PendingModel;
+        let shareable_model = ShareablePendingModel;
+        let session = Session::new();
+        let config = context_config(2);
+        let limits = model_limits(128_000);
+        let plain_context = RunAgentTurnContext {
+            client: &plain_model,
+            model: test_model_invocation(),
+            subagent_identities: &[],
+            system_prompt: "system policy",
+            context_config: config,
+            model_limits: limits,
+            workspace_root: &root,
+            permissions: PermissionProfile::default(),
+            mcp_servers: &[],
+            mcp_cache: &cache,
+            session_name: "default",
+            turn_index: 0,
+        };
+        let shareable_context = RunAgentTurnContext {
+            client: &shareable_model,
+            ..plain_context
+        };
+
+        let without_subagents = estimate_context(&plain_context, &session, "draft prompt")
+            .await
+            .expect("estimate without subagents");
+        let with_subagents = estimate_context(&shareable_context, &session, "draft prompt")
+            .await
+            .expect("estimate with subagents");
+
+        assert!(with_subagents.estimated_tokens > without_subagents.estimated_tokens);
     }
 
     #[test]

@@ -139,7 +139,7 @@ pub struct ModelProviderResponse {
     pub models: Vec<ManagedModel>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct ProviderWriteRequest {
     pub name: String,
     pub base_url: String,
@@ -160,7 +160,7 @@ pub struct DefaultModelRequest {
     pub reasoning: ReasoningLevel,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct DiscoverModelsRequest {
     #[serde(default)]
     pub provider_id: Option<String>,

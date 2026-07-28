@@ -38,15 +38,21 @@ trait 由核心层拥有，具体适配器依赖并实现它，这就是依赖�
 
 ```text
 ┌─────────────────────────────────────────────────────────────┐
-│ 入口层                                                      │
-│ agent-cli                 agent-server                      │
-│ 参数、REPL、JSONL          HTTP、WebSocket、Web UI           │
+│ 入口与适配器层                                                │
+│ agent-cli / agent-tui     agent-server / Desktop / Remote   │
+│ 参数、REPL、JSONL、TUI     HTTP、WebSocket、Web UI           │
 └──────────────────────────────┬──────────────────────────────┘
                                │
                                ▼
 ┌─────────────────────────────────────────────────────────────┐
-│ 应用编排层：agent-runtime                                   │
-│ 运行一次 turn、上下文压缩、事件封装、SessionStore、MCP 装配 │
+│ 强类型应用层：agent-app                                     │
+│ 工作区会话、设置 CRUD、审批、取消、持久 Subagent 编排       │
+└──────────────────────────────┬──────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 运行时编排层：agent-runtime                                 │
+│ 运行 turn、上下文估算/压缩、事件封装、SessionStore、MCP 装配│
 └──────────────────────────────┬──────────────────────────────┘
                                │ 注入端口实现
                                ▼
@@ -81,17 +87,21 @@ agent-config 负责把配置文件和环境变量转换成类型安全的配置�
 | `agent-tools` | 内置工具、工具注册、MCP 工具适配，实现 `ToolRuntime` | 决定一整个 turn 的状态流转 |
 | `agent-sandbox` | workspace 路径约束和权限决策 | 直接执行模型或管理 Session |
 | `agent-runtime` | 编排已注入的模型端口与工具系统、上下文压缩、turn 事件封装、Session 持久化 | 解析 CLI 参数、实现模型 HTTP 协议或渲染 Web UI |
+| `agent-app` | 工作区级会话与设置用例、审批和取消队列、持久 Subagent 编排、强类型命令与事件 | HTTP/WebSocket JSON、终端渲染和桌面窗口管理 |
 | `agent-config` | 加载并校验 `morrow.toml` 和环境变量 | 执行 agent turn |
-| `agent-cli` | CLI 参数、REPL、终端输出、交互式审批 | 复制核心状态机 |
-| `agent-server` | HTTP/WebSocket API、浏览器事件、远程审批和取消入口 | 实现模型协议或工具业务 |
+| `agent-cli` | CLI 参数分派、单次执行、纯文本 REPL 与 JSONL | 复制工作区应用编排 |
+| `agent-tui` | Ratatui reducer、响应式布局、输入、检查器与本地界面状态 | 直接读写模型/MCP/Session 存储 |
+| `agent-server` | Axum、HTTP/WebSocket JSON 映射、静态资源与安全中间件 | 实现工作区会话、设置或工具业务 |
 
 ## 4. 编译依赖方向
 
 箭头 `A -> B` 表示 A 的代码可以导入 B：
 
 ```text
-agent-cli    -> agent-runtime, agent-server, agent-model, agent-config, agent-protocol
-agent-server -> agent-runtime, agent-model, agent-config, agent-protocol
+agent-cli    -> agent-tui, agent-app, agent-runtime, agent-server, agent-model, agent-config
+agent-tui    -> agent-protocol
+agent-server -> agent-app, agent-model, agent-config, agent-protocol
+agent-app    -> agent-runtime, agent-model, agent-config, agent-protocol
 agent-runtime-> agent-core, agent-tools, agent-config, agent-protocol
 
 agent-model  -> agent-core, agent-protocol
@@ -106,9 +116,10 @@ agent-protocol -> serde / serde_json
 
 1. `agent-core` 定义端口，但不依赖 `agent-model` 或 `agent-tools` 的具体类型。
 2. `agent-model` 和 `agent-tools` 依赖 `agent-core`，分别实现端口。
-3. `agent-cli` 和 `agent-server` 是模型适配器的组合根；它们创建客户端，再以 `dyn Model` 注入 runtime。
-4. `agent-runtime` 负责用例编排和工具系统装配，但不知道具体模型供应商。
-5. `agent-protocol` 不反向依赖任何业务 crate。
+3. `agent-app` 是 Web/Desktop、TUI 与 Server 共用的强类型应用层；本地 TUI 通过 `agent-cli` 中的适配器调用它，传输层只负责映射输入输出。
+4. `agent-runtime` 负责单次 turn 与工具系统装配，但不知道 HTTP、WebSocket 或终端界面。
+5. `agent-server` 保持现有 JSON 协议，并把 `ClientMessage` 映射为 `SessionCommand`、把 `WorkspaceEvent` 映射回原事件结构。
+6. `agent-protocol` 不反向依赖任何业务 crate。
 
 以后增加模型供应商或工具运行时，通常不需要修改 turn 状态机。
 
@@ -365,7 +376,7 @@ CLI 的 JSONL 和 server 的 WebSocket 共用该事件结构。修改事件 JSON
 
 父模型每次真实开始请求时都会发送 `model_call_started`。Web 以该事件创建模型步骤，工具和 Subagent 的开始事件只结束当前模型步骤，不再自行推断新的模型调用；因此同一批并发工具不会产生重复的模型行。
 
-Subagent 身份遵守同样的单一来源规则：父 turn 启动时把 `SubagentIdentity { id, name }` 名单快照写入 `RunAgentTurnContext`，`ToolRegistry` 再按 tool-call ID 缓存随机分配结果，保证开始事件、结束事件和持久化工具结果使用同一身份。完整的姓名与头像配置由 `agent-server` 保存在全局 `~/.morrow/subagents.json`；协议和 Session 只携带 ID/姓名，不携带 Base64 头像。Desktop/WSL 通过 remote protocol v2 只把身份池发送给远端 runtime，头像始终留在 Windows 展示端。
+Subagent 身份遵守同样的单一来源规则：父 turn 启动时把 `SubagentIdentity { id, name }` 名单快照写入 `RunAgentTurnContext`，`ToolRegistry` 再按 tool-call ID 缓存随机分配结果，保证开始事件、结束事件和持久化工具结果使用同一身份。完整的姓名与头像配置由 `agent-app` 保存在全局 `~/.morrow/subagents.json`；协议和 Session 只携带 ID/姓名，不携带 Base64 头像。Desktop/WSL 通过 remote protocol v2 只把身份池发送给远端 runtime，头像始终留在 Windows 展示端。
 
 当前 SessionStore 是本地文件存储。server 会在单个进程内阻止同一 Session 同时启动两个 turn，但不要假设多个独立进程同时写同一个 Session 文件也是安全的。
 
@@ -380,8 +391,10 @@ Subagent 身份遵守同样的单一来源规则：父 turn 启动时把 `Subage
 | 修改路径约束和权限策略 | `agent-sandbox` |
 | 修改上下文压缩、SessionStore 或一次 turn 的应用编排 | `agent-runtime` |
 | 新增配置字段和校验 | `agent-config` |
-| 修改参数、REPL 或终端输出 | `agent-cli` |
-| 修改 HTTP、WebSocket 或 Web UI | `agent-server` |
+| 修改参数、纯文本 REPL 或 JSONL 输出 | `agent-cli` |
+| 修改终端界面、输入或布局 | `agent-tui` |
+| 修改工作区会话、审批、设置或持久 Subagent 用例 | `agent-app` |
+| 修改 HTTP、WebSocket 映射或 Web UI | `agent-server` |
 
 判断位置时可以问两个问题：
 
@@ -396,7 +409,9 @@ Subagent 身份遵守同样的单一来源规则：父 turn 启动时把 `Subage
 - `agent-model`：验证 HTTP 请求与 SSE 到 `ModelEvent` 的转换。
 - `agent-tools`：验证参数、路径、权限、副作用前审批和结构化结果。
 - `agent-runtime`：验证压缩、事件 envelope、`Session::apply_turn` 和持久化时机。
-- `agent-server`：验证同 Session 的运行限制、审批 request id、取消和 WebSocket 消息。
+- `agent-app`：验证同 Session 的运行限制、审批 request id、取消、设置 CRUD 与强类型事件。
+- `agent-server`：验证 HTTP/WebSocket JSON 与 `agent-app` 结果一致，并保持现有协议形状。
+- `agent-tui`：验证 reducer 事件顺序、响应式 TestBackend 布局、Unicode 输入、补全和终端恢复。
 - `agent-protocol`：锁定 Session v4、事件和消息的 JSON 契约。
 
 端口架构的直接收益是：core 测试不需要启动 HTTP server、真实 MCP 进程或写入用户 Session，就可以覆盖绝大多数 agent 循环行为。

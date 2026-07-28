@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/agent-app",
     "crates/agent-cli",
     "crates/agent-config",
     "crates/agent-core",
@@ -11,6 +12,7 @@ members = [
     "crates/agent-server",
     "crates/agent-sandbox",
     "crates/agent-tools",
+    "crates/agent-tui",
 ]
 resolver = "3"
 
@@ -19,6 +21,7 @@ version = "0.3.1"
 edition = "2024"
 
 [workspace.dependencies]
+agent-app = { path = "crates/agent-app" }
 agent-config = { path = "crates/agent-config" }
 agent-core = { path = "crates/agent-core" }
 agent-model = { path = "crates/agent-model" }
@@ -28,6 +31,7 @@ agent-runtime = { path = "crates/agent-runtime" }
 agent-server = { path = "crates/agent-server" }
 agent-sandbox = { path = "crates/agent-sandbox" }
 agent-tools = { path = "crates/agent-tools" }
+agent-tui = { path = "crates/agent-tui" }
 async-trait = "0.1"
 axum = { version = "0.8", features = ["ws"] }
 bytes = "1"

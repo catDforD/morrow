@@ -2,7 +2,7 @@
 
 # Morrow
 
-**本地优先的编码 Agent —— 集 CLI、交互式 REPL、Web 仪表盘和桌面应用于一体，兼容任意 OpenAI 风格 API。**
+**本地优先的编码 Agent —— 集终端 UI、CLI、Web 仪表盘和桌面应用于一体，兼容任意 OpenAI 风格 API。**
 
 [![Release](https://img.shields.io/github/v/release/catDforD/morrow?style=flat-square)](https://github.com/catDforD/morrow/releases)
 [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
@@ -18,13 +18,13 @@ Morrow 以流式方式输出模型结果，按项目持久化会话，可以读�
 
 ## 功能特性
 
-- **一个运行时，多种形态** —— CLI 单次执行、交互式 REPL、本地浏览器仪表盘，以及 Tauri 2 桌面应用。
-- **自带模型** —— 通过 `--config`、本地 `morrow.toml` 或 `~/.morrow/config.toml` 配置 OpenAI 兼容模型；Web 端可独立管理服务商，并按会话选择模型与推理档位。
+- **一个应用层，多种形态** —— 终端 UI、CLI 单次执行与纯文本 REPL、本地浏览器仪表盘，以及 Tauri 2 桌面应用。
+- **自带模型** —— 通过 `--config`、本地 `morrow.toml` 或 `~/.morrow/config.toml` 配置 OpenAI 兼容模型；Morrow 托管的服务商支持按会话选择模型与推理档位。
 - **持久化会话** —— 按项目划分的命名会话，支持列表、重命名、导出和续接。
 - **真实工具** —— 文件读写、补丁、搜索、目录列举与 shell 命令。
 - **权限档案** —— 只读、工作区写入、完全访问；shell 单独控制。
 - **MCP 支持** —— 通过 TOML 或仪表盘配置 stdio 与 Streamable HTTP MCP 服务器。
-- **会话级 Subagent** —— 在后台运行持久化的 `explore`、`plan`、`worker`、`reviewer` 实例，并可在 Web/Desktop 中查看、继续、取消或删除。
+- **会话级 Subagent** —— 在后台运行持久化的 `explore`、`plan`、`worker`、`reviewer` 实例，并可在 TUI 或 Web/Desktop 中查看、继续、取消或删除。
 - **长会话友好** —— 自动上下文压缩。
 - **可脚本化** —— JSONL 事件输出，便于自动化与集成。
 
@@ -52,8 +52,10 @@ macOS 和 Linux：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/catDforD/morrow/main/install.sh | sh
-morrow init
+morrow
 ```
+
+安装后直接运行 `morrow` 即可进入 TUI。`morrow init` 是可选配置方式；如果希望先准备 TOML 配置，而不是进入 TUI 后在设置页配置，可以再运行它。
 
 安装指定版本或自定义目录：
 
@@ -74,15 +76,18 @@ cargo install --git https://github.com/catDforD/morrow --locked -p agent-cli
 
 ```bash
 morrow "summarize this repository"   # 单次提示
-morrow                               # 交互模式
+morrow                               # 终端可用时启动 TUI
+morrow --plain                       # 纯文本 REPL
 morrow server                        # 本地 Web 仪表盘
 ```
+
+没有 prompt 时，Morrow 会在可用终端中打开 TUI，并为本次启动创建一个立即持久化的新会话；使用 `--session <名称>` 可恢复指定会话。stdin/stdout 被重定向、`TERM=dumb` 或全屏终端初始化失败时，会提示并回退到纯文本 REPL。单次 prompt、`--jsonl`、`--plain`、`server`、`init` 和 `session` 保持原行为。
 
 仪表盘默认监听 `127.0.0.1:3000`，使用当前工作区、配置、会话与权限。它是本地优先且无鉴权的，不要绑定到公网。可用 `morrow server --host 127.0.0.1 --port 3000` 自定义地址。
 
 仪表盘按 turn 独立选择权限（默认 `workspace_write`，并记住浏览器端最近一次选择）；`morrow.toml` 中的 `[permissions]` 仅作用于 CLI。
 
-## 配置
+## 可选配置
 
 ```bash
 morrow init
@@ -116,9 +121,9 @@ mode = "read_only"
 shell = "deny"
 ```
 
-内联的 `[model].OPENAI_API_KEY` 优先；否则读取 `api_key_env`（默认 `OPENAI_API_KEY`）。CLI 需要有效的模型与 API key；未传 `--config` 时，`morrow server` 即使没有配置也能启动，以便在浏览器中配置第一个服务商。
+内联的 `[model].OPENAI_API_KEY` 优先；否则读取 `api_key_env`（默认 `OPENAI_API_KEY`）。单次与纯文本 CLI 模式需要有效的模型和 API key；未传 `--config` 时，TUI 与 `morrow server` 即使没有模型也能启动，以便从设置页配置第一个服务商。
 
-Web 端的模型、MCP 服务器、自定义命令与 Subagent 设置分别在 **Settings → Models / MCP Servers / Commands / Subagents** 中管理，数据保存在 `~/.morrow/` 下，不影响 CLI 的 TOML 配置。更多示例见 [`morrow.example.toml`](morrow.example.toml)。
+Morrow 托管的模型、MCP 服务器、自定义命令与 Subagent 设置可在 TUI 和 Web/Desktop 设置页中管理，数据保存在 `~/.morrow/` 下，不影响 CLI 的 TOML 配置。更多示例见 [`morrow.example.toml`](morrow.example.toml)。
 
 ### MCP 工具
 
@@ -139,7 +144,7 @@ MCP 工具视为显式配置的受信工具，启用前请检查服务器命令�
 
 ### Subagent
 
-Web/Desktop 会话通过 `spawn_subagent`、`send_subagent`、`inspect_subagent`、`wait_subagents` 和 `cancel_subagent` 管理可后台运行的持久 Subagent。父 turn 结束后子任务仍可继续。用户可以在 Subagents 检查器中查看完整消息与事件日志、使用保留的上下文继续空闲或中断实例、取消活跃任务，或删除终态实例。
+TUI 与 Web/Desktop 会话通过 `spawn_subagent`、`send_subagent`、`inspect_subagent`、`wait_subagents` 和 `cancel_subagent` 管理可后台运行的持久 Subagent。父 turn 结束后子任务仍可继续。用户可以在 Subagents 检查器中查看完整消息与事件日志、使用保留的上下文继续空闲或中断实例、取消活跃任务，或删除终态实例。
 
 | 角色 | 内置工具 | 权限上限 |
 | --- | --- | --- |
@@ -154,11 +159,11 @@ Web/Desktop 会话通过 `spawn_subagent`、`send_subagent`、`inspect_subagent`
 
 持久实例保存在 `~/.morrow/subagent-sessions/<workspace-scope>/<session>/`。事件日志达到 16 MiB 后停止保存流式 delta，但继续保存消息、工具、审批和终态事件。应用重启时，排队中、运行中和等待审批的 run 会转为 `interrupted`，旧审批与锁被清除，未完成操作绝不会自动重放。远程模型凭据仅在创建或继续任务时临时传输并驻留内存，不会写入实例 sidecar。
 
-兼容工具 `delegate_task({task})` 仍保持同步、严格只读：它创建临时 `explore`，随父 turn 取消，且不占持久实例容量。CLI 目前只提供该兼容工具；持久生命周期控制面向 Web/Desktop 和远程 workspace。姓名与头像仍在 **Settings → Subagents** 中独立管理（`~/.morrow/subagents.json`）。
+兼容工具 `delegate_task({task})` 仍保持同步、严格只读：它创建临时 `explore`，随父 turn 取消，且不占持久实例容量。持久生命周期控制可在 TUI、Web/Desktop 和远程 workspace 中使用。姓名与头像仍在 **Settings → Subagents** 中独立管理（`~/.morrow/subagents.json`）。
 
-### Web 自定义命令
+### 自定义命令
 
-**Settings → Commands** 管理 `~/.morrow/commands/*.md` 中的斜杠命令（仅 Web 可用）。在输入框键入 `/` 可搜索；`$ARGUMENTS` 会被替换为传入参数。
+**Settings → Commands** 管理 `~/.morrow/commands/*.md` 中的斜杠命令。在 TUI 或 Web 输入框键入 `/` 可搜索；`$ARGUMENTS` 会被替换为传入参数。
 
 ## 权限
 
@@ -196,7 +201,7 @@ morrow session rename work backend-refactor
 morrow session delete backend-refactor
 ```
 
-REPL 常用命令：`/status`、`/permissions ...`、`/compact`、`/reset`、`/exit`。兼容别名 `--thread` / `--reset-thread` 仍可用，新用法请优先 `--session`。
+TUI 支持会话切换、归档/恢复、全页 Run 与 Subagent 检查器、审批模态框、多行输入、斜杠命令、工作区相对 `@` 路径补全和 context meter；按 `F1` 查看快捷键。`Ctrl+C` 会取消当前任务或清空草稿，1 秒内再次按下会取消全部任务并强制退出。`--plain` 模式的常用 REPL 命令为 `/status`、`/permissions ...`、`/compact`、`/reset` 和 `/exit`。兼容别名 `--thread` / `--reset-thread` 仍可用，新用法请优先 `--session`。
 
 ## 自动化
 
@@ -212,16 +217,18 @@ crate 边界、turn 生命周期与扩展点见 [`ARCHITECTURE.md`](ARCHITECTURE
 
 | Crate | 职责 |
 | --- | --- |
-| `agent-cli` | CLI、REPL、JSONL、server 与配置装配 |
+| `agent-app` | 强类型工作区应用服务、设置、会话、审批与 Subagent 编排 |
+| `agent-cli` | CLI 分派、纯文本 REPL、JSONL 与配置装配 |
 | `agent-desktop` | Tauri 2 桌面外壳与本地 server 生命周期 |
 | `agent-config` | 配置加载 |
 | `agent-core` | Turn 执行与事件流 |
 | `agent-model` | OpenAI 兼容客户端与流式解析 |
 | `agent-protocol` | 共享协议类型 |
 | `agent-runtime` | 会话、压缩、工作区与 turn 辅助 |
-| `agent-server` | HTTP/WebSocket 与内嵌仪表盘 |
+| `agent-server` | Axum HTTP/WebSocket 与内嵌仪表盘适配器 |
 | `agent-sandbox` | 权限判定 |
 | `agent-tools` | 内置文件与 shell 工具 |
+| `agent-tui` | Ratatui 终端界面与本地 TUI 状态 |
 
 ```bash
 cargo build --workspace

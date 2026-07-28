@@ -499,7 +499,8 @@ fn commit_store(
     Ok(())
 }
 
-pub(crate) fn remote_spec_from_config(server: &McpServerConfig) -> RemoteMcpServerSpec {
+#[doc(hidden)]
+pub fn remote_spec_from_config(server: &McpServerConfig) -> RemoteMcpServerSpec {
     RemoteMcpServerSpec {
         name: server.name.clone(),
         transport: match server.transport {
@@ -518,7 +519,8 @@ pub(crate) fn remote_spec_from_config(server: &McpServerConfig) -> RemoteMcpServ
     }
 }
 
-pub(crate) fn config_from_remote_spec(server: RemoteMcpServerSpec) -> McpServerConfig {
+#[doc(hidden)]
+pub fn config_from_remote_spec(server: RemoteMcpServerSpec) -> McpServerConfig {
     McpServerConfig {
         name: server.name,
         transport: match server.transport {
