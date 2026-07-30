@@ -7,12 +7,9 @@ use agent_protocol::{
     MAX_SUBAGENT_PROMPT_SUFFIX_CHARS, MAX_SUBAGENT_TIMEOUT_SECS, MAX_SUBAGENT_TOOL_ROUNDS,
     MIN_SUBAGENT_TIMEOUT_SECS, MIN_SUBAGENT_TOOL_ROUNDS, ModelSelection, PermissionProfile,
     ReasoningLevel, SubagentIdentity, SubagentInstanceSnapshot, SubagentRole, SubagentRoleOverride,
-    TurnStatus,
+    ToolExecutionSummary, TurnStatus,
 };
-use crossterm::event::{
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-};
-use ratatui::layout::Rect;
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::backend::{
     BackendCommand, BackendError, CommandResult, ContextEstimate, DefaultModelDraft,
@@ -34,6 +31,37 @@ pub enum LayoutMode {
 
 const CTRL_C_FORCE_EXIT_TICKS: u64 = 31;
 const CTRL_C_FORCE_EXIT_HINT: &str = "再次按 Ctrl+C 强制退出";
+
+fn sanitize_tool_summary(mut summary: ToolExecutionSummary) -> ToolExecutionSummary {
+    for file in &mut summary.files {
+        file.path = sanitize_terminal_text(&file.path);
+    }
+    summary.diff = summary.diff.map(|value| sanitize_terminal_text(&value));
+    if let Some(shell) = &mut summary.shell {
+        shell.command = sanitize_terminal_text(&shell.command);
+    }
+    summary.error = summary.error.map(|value| sanitize_terminal_text(&value));
+    if let Some(subagent) = &mut summary.subagent {
+        subagent.agent_id = subagent
+            .agent_id
+            .take()
+            .map(|value| sanitize_terminal_text(&value));
+        subagent.agent_name = subagent
+            .agent_name
+            .take()
+            .map(|value| sanitize_terminal_text(&value));
+        subagent.task = sanitize_terminal_text(&subagent.task);
+        subagent.result = subagent
+            .result
+            .take()
+            .map(|value| sanitize_terminal_text(&value));
+        subagent.error = subagent
+            .error
+            .take()
+            .map(|value| sanitize_terminal_text(&value));
+    }
+    summary
+}
 
 fn field(label: &str, value: &str, secret: bool) -> FormField {
     FormField {
@@ -148,7 +176,8 @@ fn delete_command(target: DeleteTarget) -> SettingsCommand {
 mod tests {
     use super::*;
     use agent_protocol::{
-        ApprovalOrigin, Message as ProtocolMessage, Session, ShellPolicy, Turn, TurnRecord,
+        ApprovalOrigin, Message as ProtocolMessage, Session, ShellCommandSummary, ShellPolicy,
+        Turn, TurnRecord,
     };
 
     fn session_snapshot(id: &str, running: bool) -> SessionSnapshot {
@@ -197,15 +226,6 @@ mod tests {
 
     fn modified_key(code: KeyCode, modifiers: KeyModifiers) -> Message {
         Message::Terminal(Event::Key(KeyEvent::new(code, modifiers)))
-    }
-
-    fn mouse(kind: MouseEventKind, column: u16, row: u16, modifiers: KeyModifiers) -> Message {
-        Message::Terminal(Event::Mouse(MouseEvent {
-            kind,
-            column,
-            row,
-            modifiers,
-        }))
     }
 
     fn completed_turn(prompt: &str, answer: &str) -> TurnRecord {
@@ -265,22 +285,6 @@ mod tests {
         assert_eq!(state.approval_scroll, u16::MAX);
         assert!(state.update(key(KeyCode::Home)).is_empty());
         assert_eq!(state.approval_scroll, 0);
-        assert_eq!(state.approvals.len(), 1);
-    }
-
-    #[test]
-    fn mouse_wheel_scrolls_the_approval_modal() {
-        let mut state = app(true);
-        state.approvals.push_back(PendingApproval {
-            session_id: "work".to_string(),
-            request: ApprovalRequest::shell_command("approval", "pwd", "/workspace", 10, "test"),
-        });
-        state.approval_scroll = 5;
-
-        state.update(mouse(MouseEventKind::ScrollUp, 0, 0, KeyModifiers::NONE));
-        assert_eq!(state.approval_scroll, 2);
-        state.update(mouse(MouseEventKind::ScrollDown, 0, 0, KeyModifiers::NONE));
-        assert_eq!(state.approval_scroll, 5);
         assert_eq!(state.approvals.len(), 1);
     }
 
@@ -410,6 +414,42 @@ mod tests {
     }
 
     #[test]
+    fn bottom_panels_return_to_their_parent_and_approval_has_priority() {
+        let mut state = app(false);
+        state.update(modified_key(KeyCode::Char(','), KeyModifiers::CONTROL));
+        assert_eq!(state.page, MainPage::Settings);
+        assert_eq!(state.bottom_panel(), BottomPanel::Settings);
+
+        state.update(key(KeyCode::Char('n')));
+        assert!(matches!(state.overlay, Some(Overlay::SettingsEditor(_))));
+        assert_eq!(state.bottom_panel(), BottomPanel::SettingsEditor);
+
+        state.update(key(KeyCode::Esc));
+        assert!(state.overlay.is_none());
+        assert_eq!(state.page, MainPage::Settings);
+
+        state.overlay = Some(Overlay::Help);
+        state.approvals.push_back(PendingApproval {
+            session_id: "work".to_string(),
+            request: ApprovalRequest::shell_command(
+                "approval",
+                "cargo test",
+                "/workspace",
+                60,
+                "run tests",
+            ),
+        });
+        assert_eq!(state.bottom_panel(), BottomPanel::Approval);
+
+        state.approvals.clear();
+        assert_eq!(state.bottom_panel(), BottomPanel::Help);
+        state.update(key(KeyCode::Esc));
+        assert_eq!(state.bottom_panel(), BottomPanel::Settings);
+        state.update(key(KeyCode::Esc));
+        assert_eq!(state.page, MainPage::Chat);
+    }
+
+    #[test]
     fn running_session_rejects_duplicate_without_losing_draft() {
         let mut state = app(true);
         state.composer.set("保留这份草稿");
@@ -440,43 +480,6 @@ mod tests {
 
         state.update(modified_key(KeyCode::Up, KeyModifiers::ALT));
         assert_eq!(state.active_view().unwrap().selected_message, 0);
-    }
-
-    #[test]
-    fn mouse_hit_selects_tool_and_shift_click_is_left_to_terminal() {
-        let mut state = app(false);
-        state.active_view_mut().unwrap().live.tools.push(ToolRun {
-            id: "tool-1".to_string(),
-            name: "read_file".to_string(),
-            status: TurnStatus::Completed,
-            detail: Some("src/main.rs".to_string()),
-        });
-        state.hit_regions.push(HitRegion::new(
-            Rect::new(10, 5, 20, 2),
-            HitTarget::RunTool(0),
-        ));
-
-        state.update(mouse(
-            MouseEventKind::Down(MouseButton::Left),
-            12,
-            6,
-            KeyModifiers::SHIFT,
-        ));
-        assert_eq!(state.active_view().unwrap().selected_tool, None);
-
-        state.update(mouse(
-            MouseEventKind::Down(MouseButton::Left),
-            12,
-            6,
-            KeyModifiers::NONE,
-        ));
-        assert_eq!(state.inspector_tab, InspectorTab::Run);
-        assert_eq!(state.selected_inspector, 0);
-        assert_eq!(state.active_view().unwrap().selected_tool, Some(0));
-        assert_eq!(
-            state.update(key(KeyCode::Char('Y'))),
-            vec![Effect::Copy("工具 read_file\n\nsrc/main.rs".to_string())]
-        );
     }
 
     #[test]
@@ -823,6 +826,46 @@ mod tests {
     }
 
     #[test]
+    fn finished_tools_keep_structured_sanitized_summaries() {
+        let mut state = app(true);
+        for event in [
+            AgentEvent::ToolCallStarted {
+                id: "call-1".to_string(),
+                name: "shell".to_string(),
+            },
+            AgentEvent::ToolCallFinished {
+                id: "call-1".to_string(),
+                name: "shell".to_string(),
+                ok: true,
+                summary: Some(ToolExecutionSummary::shell(ShellCommandSummary {
+                    command: "printf safe\u{1b}[31m".to_string(),
+                    exit_code: Some(0),
+                    timed_out: false,
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                })),
+            },
+        ] {
+            state.update(Message::Workspace(Ok(WorkspaceEvent::Agent {
+                session_id: "work".to_string(),
+                origin: AgentEventOrigin::Session,
+                event,
+            })));
+        }
+
+        let tool = &state.active_view().unwrap().live.tools[0];
+        assert_eq!(tool.status, TurnStatus::Completed);
+        assert_eq!(
+            tool.summary
+                .as_ref()
+                .and_then(|summary| summary.shell.as_ref())
+                .map(|shell| shell.command.as_str()),
+            Some("printf safe")
+        );
+        assert!(!tool.plain_text().contains('\u{1b}'));
+    }
+
+    #[test]
     fn terminal_sanitizer_state_is_independent_and_resets_for_new_turn() {
         let mut state = app(true);
         state.update(Message::Workspace(Ok(WorkspaceEvent::Agent {
@@ -1094,6 +1137,21 @@ pub enum MainPage {
     Settings,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BottomPanel {
+    Composer,
+    Sessions,
+    Inspector,
+    Settings,
+    Approval,
+    Help,
+    ActionPalette,
+    ExitConfirm,
+    ConfirmDelete,
+    SettingsEditor,
+    SubagentFollowUp,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum InspectorTab {
     #[default]
@@ -1241,7 +1299,52 @@ pub struct ToolRun {
     pub id: String,
     pub name: String,
     pub status: TurnStatus,
-    pub detail: Option<String>,
+    pub summary: Option<ToolExecutionSummary>,
+    pub result: Option<String>,
+}
+
+impl ToolRun {
+    pub fn plain_text(&self) -> String {
+        let mut text = format!("工具 {}", self.name);
+        if let Some(summary) = &self.summary {
+            for file in &summary.files {
+                text.push_str(&format!("\n{} {}", file.operation.as_str(), file.path));
+            }
+            if let Some(shell) = &summary.shell {
+                text.push_str(&format!("\n$ {}", shell.command));
+                if let Some(exit_code) = shell.exit_code {
+                    text.push_str(&format!("\nexit {exit_code}"));
+                }
+                if shell.timed_out {
+                    text.push_str("\n已超时");
+                }
+            }
+            if let Some(subagent) = &summary.subagent {
+                text.push_str(&format!("\n任务: {}", subagent.task));
+                if let Some(result) = &subagent.result {
+                    text.push('\n');
+                    text.push_str(result);
+                }
+                if let Some(error) = &subagent.error {
+                    text.push_str("\n错误: ");
+                    text.push_str(error);
+                }
+            }
+            if let Some(diff) = &summary.diff {
+                text.push_str("\n\n");
+                text.push_str(diff);
+            }
+            if let Some(error) = &summary.error {
+                text.push_str("\n错误: ");
+                text.push_str(error);
+            }
+        }
+        if let Some(result) = &self.result {
+            text.push_str("\n\n");
+            text.push_str(result);
+        }
+        sanitize_terminal_text(&text)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1267,32 +1370,6 @@ pub struct SessionView {
     pub selected_message: usize,
     pub selected_tool: Option<usize>,
     pub subagents: BTreeMap<String, SubagentInstanceSnapshot>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum HitTarget {
-    ChatTurn(usize),
-    RunTool(usize),
-    Subagent(usize),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct HitRegion {
-    pub area: Rect,
-    pub target: HitTarget,
-}
-
-impl HitRegion {
-    pub(crate) const fn new(area: Rect, target: HitTarget) -> Self {
-        Self { area, target }
-    }
-
-    fn contains(self, column: u16, row: u16) -> bool {
-        column >= self.area.x
-            && column < self.area.x.saturating_add(self.area.width)
-            && row >= self.area.y
-            && row < self.area.y.saturating_add(self.area.height)
-    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1362,7 +1439,6 @@ pub struct AppState {
     pub(crate) path_debounce: Option<(u8, Range<usize>, String)>,
     pub(crate) ctrl_c_armed_until_tick: Option<u64>,
     pub(crate) render_cache: HashMap<(String, usize, u16, u64), ratatui::text::Text<'static>>,
-    pub(crate) hit_regions: Vec<HitRegion>,
 }
 
 #[derive(Debug)]
@@ -1412,6 +1488,28 @@ pub enum Effect {
 }
 
 impl AppState {
+    pub(crate) fn bottom_panel(&self) -> BottomPanel {
+        if !self.approvals.is_empty() {
+            return BottomPanel::Approval;
+        }
+        if let Some(overlay) = &self.overlay {
+            return match overlay {
+                Overlay::Help => BottomPanel::Help,
+                Overlay::ActionPalette { .. } => BottomPanel::ActionPalette,
+                Overlay::ExitConfirm => BottomPanel::ExitConfirm,
+                Overlay::ConfirmDelete(_) => BottomPanel::ConfirmDelete,
+                Overlay::SettingsEditor(_) => BottomPanel::SettingsEditor,
+                Overlay::SubagentFollowUp { .. } => BottomPanel::SubagentFollowUp,
+            };
+        }
+        match self.page {
+            MainPage::Chat => BottomPanel::Composer,
+            MainPage::Sessions => BottomPanel::Sessions,
+            MainPage::Inspector => BottomPanel::Inspector,
+            MainPage::Settings => BottomPanel::Settings,
+        }
+    }
+
     pub fn new(
         workspace: PathBuf,
         snapshot: WorkspaceSnapshot,
@@ -1529,7 +1627,6 @@ impl AppState {
             path_debounce: None,
             ctrl_c_armed_until_tick: None,
             render_cache: HashMap::new(),
-            hit_regions: Vec::new(),
         }
     }
 
@@ -1842,7 +1939,8 @@ impl AppState {
                 id,
                 name,
                 status: TurnStatus::Running,
-                detail: None,
+                summary: None,
+                result: None,
             }),
             AgentEvent::ToolCallFinished {
                 id,
@@ -1856,7 +1954,8 @@ impl AppState {
                         id: id.clone(),
                         name: name.clone(),
                         status: TurnStatus::Running,
-                        detail: None,
+                        summary: None,
+                        result: None,
                     });
                     view.live.tools.len() - 1
                 });
@@ -1867,8 +1966,7 @@ impl AppState {
                     } else {
                         TurnStatus::Failed
                     };
-                    tool.detail =
-                        summary.map(|summary| sanitize_terminal_text(&format!("{summary:?}")));
+                    tool.summary = summary.map(sanitize_tool_summary);
                 }
             }
             AgentEvent::ApprovalRequested(request) => {
@@ -2164,7 +2262,6 @@ impl AppState {
                 }
                 Vec::new()
             }
-            Event::Mouse(event) => self.handle_mouse(event),
             Event::Key(key)
                 if key.kind == KeyEventKind::Repeat
                     && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -2177,74 +2274,6 @@ impl AppState {
             }
             _ => Vec::new(),
         }
-    }
-
-    fn handle_mouse(&mut self, event: MouseEvent) -> Vec<Effect> {
-        if event.modifiers.contains(KeyModifiers::SHIFT) {
-            // Let the terminal perform its native Shift+drag selection.
-            return Vec::new();
-        }
-        if !self.approvals.is_empty() {
-            match event.kind {
-                MouseEventKind::ScrollUp => {
-                    self.approval_scroll = self.approval_scroll.saturating_sub(3);
-                }
-                MouseEventKind::ScrollDown => {
-                    self.approval_scroll = self.approval_scroll.saturating_add(3);
-                }
-                _ => {}
-            }
-            return Vec::new();
-        }
-        if self.overlay.is_some() {
-            return Vec::new();
-        }
-        match event.kind {
-            MouseEventKind::Down(MouseButton::Left) => {
-                let target = self
-                    .hit_regions
-                    .iter()
-                    .rev()
-                    .find(|region| region.contains(event.column, event.row))
-                    .map(|region| region.target);
-                match target {
-                    Some(HitTarget::ChatTurn(index)) => {
-                        if let Some(view) = self.active_view_mut() {
-                            view.selected_message = index;
-                            view.selected_tool = None;
-                        }
-                    }
-                    Some(HitTarget::RunTool(index)) => {
-                        self.selected_inspector = index;
-                        self.inspector_tab = InspectorTab::Run;
-                        if let Some(view) = self.active_view_mut() {
-                            view.selected_tool = Some(index);
-                        }
-                    }
-                    Some(HitTarget::Subagent(index)) => {
-                        self.selected_inspector = index;
-                        self.inspector_tab = InspectorTab::Subagents;
-                        if let Some(view) = self.active_view_mut() {
-                            view.selected_tool = None;
-                        }
-                    }
-                    None => {}
-                }
-            }
-            MouseEventKind::ScrollUp => {
-                if let Some(view) = self.active_view_mut() {
-                    view.scroll = view.scroll.saturating_sub(3);
-                    view.at_bottom = false;
-                }
-            }
-            MouseEventKind::ScrollDown => {
-                if let Some(view) = self.active_view_mut() {
-                    view.scroll = view.scroll.saturating_add(3);
-                }
-            }
-            _ => {}
-        }
-        Vec::new()
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Vec<Effect> {
@@ -2865,12 +2894,7 @@ impl AppState {
         let view = self.active_view()?;
         let index = view.selected_tool?;
         let tool = view.live.tools.get(index)?;
-        let mut text = format!("工具 {}", tool.name);
-        if let Some(detail) = &tool.detail {
-            text.push_str("\n\n");
-            text.push_str(detail);
-        }
-        Some(sanitize_terminal_text(&text))
+        Some(tool.plain_text())
     }
 
     fn current_model(&self) -> Option<ModelSelection> {

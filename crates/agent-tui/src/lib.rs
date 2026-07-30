@@ -11,6 +11,7 @@ mod persistence;
 mod run;
 mod state;
 mod terminal;
+mod theme;
 mod ui;
 
 pub use backend::*;
@@ -30,9 +31,9 @@ use std::io;
 /// whenever possible; an error escapes only when startup or the event channel fails.
 #[derive(Debug, thiserror::Error)]
 pub enum TuiError {
-    #[error("无法初始化全屏终端: {0}")]
+    #[error("无法初始化交互终端: {0}")]
     Terminal(#[source] io::Error),
-    #[error("全屏终端运行失败: {0}")]
+    #[error("交互终端运行失败: {0}")]
     RuntimeTerminal(#[source] io::Error),
     #[error("TUI 后端错误: {0}")]
     Backend(#[from] BackendError),

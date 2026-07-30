@@ -1,71 +1,148 @@
 use std::borrow::Cow;
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 
 use agent_protocol::{
-    ApprovalAction, ApprovalOrigin, Message as ProtocolMessage, SubagentInstanceStatus, TurnStatus,
-    TurnStepKind,
+    ApprovalAction, ApprovalOrigin, Message as ProtocolMessage, Role, SubagentInstanceStatus,
+    ToolExecutionSummary, TurnStatus, TurnStep, TurnStepKind,
 };
 use ratatui::Frame;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Tabs, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Widget, Wrap,
+};
 use unicode_width::UnicodeWidthStr;
 
 use crate::backend::{McpTransport, SettingsSnapshot};
 use crate::input::sanitize_terminal_text;
 use crate::state::{
-    AppState, CompletionKind, HitRegion, HitTarget, InspectorTab, LayoutMode, MainPage, Overlay,
+    AppState, BottomPanel, CompletionKind, InspectorTab, LayoutMode, MainPage, Overlay,
     SettingsSection,
 };
+use crate::terminal::{InlineRender, ScrollbackFrame};
+use crate::theme;
 
 const SPINNER: &[char] = &['⣷', '⣯', '⣟', '⡿', '⢿', '⣻', '⣽', '⣾', '⣶', '⣧'];
 
 /// Render the complete TUI from the reducer state.
 pub fn render(frame: &mut Frame<'_>, state: &mut AppState) {
+    let _ = render_inline(frame, state);
+}
+
+pub(crate) fn render_inline(frame: &mut Frame<'_>, state: &mut AppState) -> InlineRender {
     let area = frame.area();
     state.terminal_size = (area.width, area.height);
-    state.hit_regions.clear();
     frame.render_widget(Clear, area);
 
     if state.layout_mode() == LayoutMode::TooSmall {
         render_too_small(frame, area, state);
-        return;
+        return InlineRender::default();
     }
 
     let page = area.inner(Margin {
         horizontal: if area.width >= 54 { 2 } else { 1 },
-        vertical: 1,
+        vertical: 0,
     });
-    if state.page == MainPage::Chat {
-        render_chat(frame, page, state);
+    let panel_height = bottom_panel_height(state, page);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(3),
+            Constraint::Length(panel_height),
+            Constraint::Length(2),
+        ])
+        .split(page);
+
+    let scrollback = if chat_is_empty(state) {
+        render_welcome(frame, rows[0], state);
+        None
     } else {
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(1), Constraint::Length(1)])
-            .split(page);
-        match state.page {
-            MainPage::Sessions => render_sessions(frame, rows[0], state, true),
-            MainPage::Inspector => render_inspector(frame, rows[0], state, true),
-            MainPage::Settings => render_settings(frame, rows[0], state),
-            MainPage::Chat => unreachable!(),
-        }
-        render_footer(frame, rows[1], state);
-    }
+        render_transcript(frame, rows[0], state)
+    };
 
     if let Some(approval) = state.approvals.front().cloned() {
-        state.hit_regions.clear();
-        render_approval(frame, area, state, &approval);
+        render_approval(frame, rows[1], state, &approval);
     } else if let Some(overlay) = state.overlay.clone() {
-        state.hit_regions.clear();
-        render_overlay(frame, area, state, &overlay);
+        render_overlay(frame, rows[1], state, &overlay);
+    } else {
+        match state.page {
+            MainPage::Chat => {
+                let composer_width = usize::from(rows[1].width.saturating_sub(4)).max(1);
+                let layout = composer_layout(
+                    state.composer.text(),
+                    state.composer.cursor(),
+                    composer_width,
+                );
+                render_composer(frame, rows[1], state, layout);
+            }
+            MainPage::Sessions => render_sessions(frame, rows[1], state),
+            MainPage::Inspector => render_inspector(frame, rows[1], state),
+            MainPage::Settings => render_settings(frame, rows[1], state),
+        }
     }
+    render_footer(frame, rows[2], state);
+    InlineRender { scrollback }
+}
+
+/// Render only durable conversation content before returning control to the shell.
+pub(crate) fn render_exit(frame: &mut Frame<'_>, state: &mut AppState) -> InlineRender {
+    let area = frame.area();
+    frame.render_widget(Clear, area);
+    let content = area.inner(Margin {
+        horizontal: if area.width >= 54 { 2 } else { 1 },
+        vertical: 0,
+    });
+    if chat_is_empty(state) {
+        render_welcome(frame, content, state);
+        InlineRender::default()
+    } else {
+        if let Some(view) = state.active_view_mut() {
+            view.at_bottom = true;
+        }
+        InlineRender {
+            scrollback: render_transcript(frame, content, state),
+        }
+    }
+}
+
+fn bottom_panel_height(state: &AppState, area: Rect) -> u16 {
+    let maximum = area.height.saturating_sub(5).max(1);
+    let requested = match state.bottom_panel() {
+        BottomPanel::Approval => 14,
+        BottomPanel::SettingsEditor => {
+            if let Some(Overlay::SettingsEditor(editor)) = &state.overlay {
+                (editor.fields.len() as u16)
+                    .saturating_mul(2)
+                    .saturating_add(4)
+            } else {
+                8
+            }
+        }
+        BottomPanel::Help => 18,
+        BottomPanel::ActionPalette => 11,
+        BottomPanel::ExitConfirm | BottomPanel::ConfirmDelete => 8,
+        BottomPanel::SubagentFollowUp => 7,
+        BottomPanel::Composer => {
+            let width = usize::from(area.width.saturating_sub(4)).max(1);
+            let layout = composer_layout(state.composer.text(), state.composer.cursor(), width);
+            (layout.lines.len() as u16).saturating_add(2).clamp(3, 8)
+        }
+        BottomPanel::Sessions => (state.sessions.len() as u16)
+            .saturating_mul(2)
+            .saturating_add(2)
+            .clamp(7, 16),
+        BottomPanel::Inspector => 16,
+        BottomPanel::Settings => 18,
+    };
+    requested.min(maximum)
 }
 
 fn render_too_small(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let message = Text::from(vec![
-        Line::styled("终端窗口太小", emphasis(state)),
+        Line::styled("Morrow · 终端窗口太小", emphasis(state)),
         Line::from(format!(
             "当前 {}×{}，至少需要 48×12",
             area.width, area.height
@@ -75,34 +152,91 @@ fn render_too_small(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     frame.render_widget(
         Paragraph::new(message)
             .alignment(Alignment::Center)
-            .wrap(Wrap { trim: true })
-            .block(Block::default().borders(Borders::ALL).title(" Morrow ")),
+            .wrap(Wrap { trim: true }),
         area,
     );
 }
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
-    let fallback = match state.page {
-        MainPage::Chat => "Enter 发送 · Ctrl+J 换行 · Ctrl+B 会话 · Ctrl+G 检查器 · F1 帮助",
-        MainPage::Sessions => "↑↓ 选择 · Enter 打开 · n 新建 · a 归档 · u 恢复 · / 搜索 · Esc 返回",
-        MainPage::Inspector => "Tab 切换 · ↑↓ 选择 · Y 复制 · f follow-up · x 取消 · Esc 返回",
-        MainPage::Settings => "←→ 分区 · ↑↓ 选择 · n 新建 · e 编辑 · d 删除 · Esc 返回",
+    let hint = if !state.approvals.is_empty() {
+        "Y 批准 · N 拒绝 · ↑↓/PageUp/PageDown 滚动"
+    } else if let Some(overlay) = &state.overlay {
+        match overlay {
+            Overlay::Help => "F1 / Esc 返回",
+            Overlay::ActionPalette { .. } => "↑↓ 选择 · Enter 执行 · Esc 返回",
+            Overlay::ExitConfirm => "按面板提示选择退出方式 · Esc 返回",
+            Overlay::ConfirmDelete(_) => "Y 确认 · N / Esc 返回",
+            Overlay::SettingsEditor(_) => "Ctrl+S 保存 · Esc 返回设置",
+            Overlay::SubagentFollowUp { .. } => "Enter 发送 · Esc 返回 Inspector",
+        }
+    } else {
+        match state.page {
+            MainPage::Chat => "Enter 发送 · Ctrl+J 换行 · Ctrl+B 会话 · Ctrl+G 检查器 · F1 帮助",
+            MainPage::Sessions => {
+                "↑↓ 选择 · Enter 打开 · n 新建 · a 归档 · u 恢复 · / 搜索 · Esc 返回"
+            }
+            MainPage::Inspector => "Tab 切换 · ↑↓ 选择 · Y 复制 · f follow-up · x 取消 · Esc 返回",
+            MainPage::Settings => "←→ 分区 · ↑↓ 选择 · n 新建 · e 编辑 · d 删除 · Esc 返回",
+        }
     };
-    let message = state.status.as_deref().unwrap_or(fallback);
+    let workspace = sanitize_terminal_text(&state.workspace.display().to_string());
+    let session = state
+        .active_info()
+        .map(|info| info.title.as_str())
+        .unwrap_or("未选择会话");
+    let activity = if state.has_active_work() {
+        format!("{} Morrow 正在工作", SPINNER[state.spinner % SPINNER.len()])
+    } else {
+        hint.to_string()
+    };
+    let status = state.status.as_deref().unwrap_or(&activity);
+
+    let model = state
+        .active_info()
+        .and_then(|info| info.model.as_ref())
+        .map_or("未配置模型", |model| model.model_id.as_str());
+    let context = match (&state.context.estimate, state.context.loading) {
+        (Some(estimate), _) => {
+            let percent = estimate
+                .used_tokens
+                .saturating_mul(100)
+                .checked_div(estimate.input_budget_tokens)
+                .unwrap_or_default();
+            format!(
+                "context {percent}% {}/{}",
+                compact_number(estimate.used_tokens),
+                compact_number(estimate.input_budget_tokens)
+            )
+        }
+        (None, true) => "context …".to_string(),
+        _ => "context --".to_string(),
+    };
+    let permission = format!(
+        "{} / shell {}",
+        state.permissions.mode.as_str(),
+        state.permissions.shell.as_str()
+    );
+    let right = format!("{model} · {} · {context}", state.reasoning.as_str());
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(1)])
+        .split(area);
     frame.render_widget(
-        Paragraph::new(Line::styled(
-            truncate_to_width(message, usize::from(area.width)),
-            if state.status.is_some() {
-                info_style(state)
-            } else {
-                muted(state)
-            },
+        Paragraph::new(left_right_line(
+            &format!("{workspace} · {session}"),
+            status,
+            rows[0].width,
+            state,
         )),
-        area,
+        rows[0],
+    );
+    frame.render_widget(
+        Paragraph::new(left_right_line(&permission, &right, rows[1].width, state)),
+        rows[1],
     );
 }
 
-fn render_sessions(frame: &mut Frame<'_>, area: Rect, state: &AppState, full_page: bool) {
+fn render_sessions(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let query = state.session_search.to_lowercase();
     let filtered = state
         .sessions
@@ -165,19 +299,19 @@ fn render_sessions(frame: &mut Frame<'_>, area: Rect, state: &AppState, full_pag
         format!(" 会话 · /{} ", state.session_search)
     };
     let block = Block::default()
-        .borders(Borders::ALL)
+        .borders(Borders::TOP | Borders::BOTTOM)
         .title(search)
-        .title_bottom(if full_page {
-            " n 新建 · Enter 打开 · a/u 归档/恢复 "
-        } else {
-            " Ctrl+B 隐藏 "
-        });
-    frame.render_widget(List::new(items).block(block), area);
+        .title_bottom(" Esc 返回 · n 新建 · Enter 打开 · a/u 归档/恢复 ");
+    let mut list_state = ListState::default().with_selected(
+        (!filtered.is_empty())
+            .then_some(state.selected_session.min(filtered.len().saturating_sub(1))),
+    );
+    frame.render_stateful_widget(List::new(items).block(block), area, &mut list_state);
 }
 
 struct ChatRender {
     text: Text<'static>,
-    turn_lines: Vec<(usize, std::ops::Range<usize>)>,
+    durable_lines: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,34 +319,6 @@ struct ComposerLayout {
     lines: Vec<String>,
     cursor_row: usize,
     cursor_column: usize,
-}
-
-fn render_chat(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
-    let status_height = if area.width >= 90 { 1 } else { 2 };
-    let composer_width = usize::from(area.width.saturating_sub(4)).max(1);
-    let composer_layout = composer_layout(
-        state.composer.text(),
-        state.composer.cursor(),
-        composer_width,
-    );
-    let composer_height = (composer_layout.lines.len() as u16)
-        .saturating_add(2)
-        .clamp(3, 8);
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(1),
-            Constraint::Length(composer_height.min(area.height.saturating_sub(status_height + 1))),
-            Constraint::Length(status_height),
-        ])
-        .split(area);
-    if chat_is_empty(state) {
-        render_welcome(frame, rows[0], state);
-    } else {
-        render_transcript(frame, rows[0], state);
-    }
-    render_composer(frame, rows[1], state, composer_layout);
-    render_chat_status(frame, rows[2], state);
 }
 
 fn chat_is_empty(state: &AppState) -> bool {
@@ -249,74 +355,24 @@ fn render_welcome(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
             .filter(|server| server.enabled)
             .count()
     });
-    let card_height = area.height.min(10);
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(card_height), Constraint::Min(0)])
-        .split(area);
     let lines = vec![
+        Line::from(""),
         Line::from(vec![
-            Span::styled("▣  ", accent(state).add_modifier(Modifier::BOLD)),
-            Span::styled("欢迎使用 Morrow!", emphasis(state)),
+            Span::styled("◆ ", accent(state).add_modifier(Modifier::BOLD)),
+            Span::styled("Morrow", emphasis(state)),
         ]),
-        Line::styled("    输入消息开始工作，按 F1 查看帮助。", muted(state)),
+        Line::styled("  输入消息开始工作，按 F1 查看帮助。", muted(state)),
         Line::from(""),
         welcome_value("工作区", &workspace, state),
         welcome_value("会话", session, state),
         welcome_value("模型", model, state),
-        welcome_value("版本", env!("CARGO_PKG_VERSION"), state),
-        welcome_value("MCP", &format!("{enabled_mcp} 个已启用"), state),
+        welcome_value(
+            "状态",
+            &format!("v{} · MCP {enabled_mcp}", env!("CARGO_PKG_VERSION")),
+            state,
+        ),
     ];
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(accent(state)),
-            )
-            .wrap(Wrap { trim: false }),
-        rows[0],
-    );
-
-    if rows[1].height == 0 {
-        return;
-    }
-    let mut notices = Vec::new();
-    if state.models.is_empty() {
-        notices.push(Line::from(vec![
-            Span::styled("✦ ", warning_style(state)),
-            Span::styled(
-                "尚未配置模型，按 Ctrl+, 或输入 :settings。",
-                warning_style(state),
-            ),
-        ]));
-    }
-    if let Some(settings) = &state.settings.snapshot {
-        for server in settings.mcp_servers.iter().filter(|server| server.enabled) {
-            let transport = match server.transport {
-                McpTransport::Stdio => "stdio",
-                McpTransport::Http => "http",
-            };
-            notices.push(Line::from(vec![
-                Span::styled("MCP ", colored(state, Color::Green)),
-                Span::styled(format!("\"{}\"", server.name), emphasis(state)),
-                Span::styled(format!(" 已启用 · {transport}"), muted(state)),
-            ]));
-        }
-    }
-    if notices.is_empty() {
-        notices.push(Line::styled(
-            "输入 / 使用托管命令，输入 @ 补全工作区路径。",
-            muted(state),
-        ));
-    }
-    frame.render_widget(
-        Paragraph::new(notices).wrap(Wrap { trim: false }),
-        rows[1].inner(Margin {
-            horizontal: 1,
-            vertical: 1.min(rows[1].height.saturating_sub(1)),
-        }),
-    );
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
 fn welcome_value(label: &str, value: &str, state: &AppState) -> Line<'static> {
@@ -329,36 +385,12 @@ fn welcome_value(label: &str, value: &str, state: &AppState) -> Line<'static> {
     ])
 }
 
-fn render_transcript(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(1)])
-        .split(area);
-    let workspace = state
-        .workspace
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_else(|| state.workspace.to_str().unwrap_or("workspace"));
-    let session = state
-        .active_info()
-        .map(|info| info.title.as_str())
-        .unwrap_or("未选择会话");
-    let activity = state
-        .has_active_work()
-        .then(|| format!("  {}", SPINNER[state.spinner % SPINNER.len()]));
-    let heading = format!(
-        "Morrow · {workspace} · {session}{}",
-        activity.as_deref().unwrap_or_default()
-    );
-    frame.render_widget(
-        Paragraph::new(Line::styled(
-            truncate_to_width(&heading, usize::from(rows[0].width)),
-            accent(state).add_modifier(Modifier::BOLD),
-        )),
-        rows[0],
-    );
-
-    let transcript_area = rows[1];
+fn render_transcript(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &mut AppState,
+) -> Option<ScrollbackFrame> {
+    let transcript_area = area;
     let width = transcript_area.width.max(1);
     let rendered = build_chat_text(state, width);
     let content_height = wrapped_text_height(&rendered.text, width);
@@ -380,108 +412,40 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
         scroll = view.scroll;
     }
     frame.render_widget(paragraph.scroll((scroll, 0)), transcript_area);
-    register_text_hit_regions(
-        state,
-        transcript_area,
-        &rendered.text,
-        &rendered.turn_lines,
-        scroll,
-        HitTarget::ChatTurn,
-    );
-}
 
-fn render_chat_status(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
-    let model = state
-        .active_info()
-        .and_then(|info| info.model.as_ref())
-        .map_or("未配置模型", |model| model.model_id.as_str());
-    let left = format!("{model} · thinking: {}", state.reasoning.as_str());
-    let right = match (&state.context.estimate, state.context.loading) {
-        (Some(estimate), _) => {
-            let percent = estimate
-                .used_tokens
-                .saturating_mul(100)
-                .checked_div(estimate.input_budget_tokens)
-                .unwrap_or_default();
-            format!(
-                "context: {percent}% ({}/{})",
-                compact_number(estimate.used_tokens),
-                compact_number(estimate.input_budget_tokens)
-            )
-        }
-        (None, true) => "context: estimating…".to_string(),
-        _ => "context: --".to_string(),
+    let durable_text = Text {
+        alignment: rendered.text.alignment,
+        style: rendered.text.style,
+        lines: rendered
+            .text
+            .lines
+            .iter()
+            .take(rendered.durable_lines)
+            .cloned()
+            .collect(),
     };
-    let center = state.status.as_deref().unwrap_or_else(|| {
-        if state.has_active_work() {
-            "Morrow 正在工作 · Ctrl+C 取消"
-        } else {
-            "Enter 发送 · Ctrl+B 会话 · Ctrl+G 检查器 · F1 帮助"
-        }
-    });
-
-    if area.height <= 1 {
-        frame.render_widget(
-            Paragraph::new(three_part_line(&left, center, &right, area.width, state)),
-            area,
-        );
-        return;
+    let durable_height = wrapped_text_height(&durable_text, width);
+    let commit_height = max_scroll.min(durable_height);
+    if commit_height == 0 {
+        return state
+            .active_session_id
+            .clone()
+            .map(|session_id| ScrollbackFrame {
+                session_id: Some(session_id),
+                x: transcript_area.x,
+                rows: Buffer::empty(Rect::new(0, 0, width, 0)),
+            });
     }
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(1)])
-        .split(area);
-    frame.render_widget(
-        Paragraph::new(left_right_line(&left, &right, rows[0].width, state)),
-        rows[0],
-    );
-    frame.render_widget(
-        Paragraph::new(Line::styled(
-            truncate_to_width(center, usize::from(rows[1].width)),
-            if state.status.is_some() {
-                info_style(state)
-            } else {
-                muted(state)
-            },
-        )),
-        rows[1],
-    );
-}
 
-fn three_part_line(
-    left: &str,
-    center: &str,
-    right: &str,
-    width: u16,
-    state: &AppState,
-) -> Line<'static> {
-    let width = usize::from(width);
-    let right = truncate_to_width(right, width / 3);
-    let left_limit = width.saturating_sub(UnicodeWidthStr::width(right.as_str()) + 2) / 2;
-    let left = truncate_to_width(left, left_limit);
-    let used = UnicodeWidthStr::width(left.as_str()) + UnicodeWidthStr::width(right.as_str()) + 2;
-    let center = truncate_to_width(center, width.saturating_sub(used));
-    let gap = width.saturating_sub(
-        UnicodeWidthStr::width(left.as_str())
-            + UnicodeWidthStr::width(center.as_str())
-            + UnicodeWidthStr::width(right.as_str()),
-    );
-    let first_gap = gap / 2;
-    let second_gap = gap.saturating_sub(first_gap);
-    Line::from(vec![
-        Span::styled(left, muted(state)),
-        Span::raw(" ".repeat(first_gap)),
-        Span::styled(
-            center,
-            if state.status.is_some() {
-                info_style(state)
-            } else {
-                muted(state)
-            },
-        ),
-        Span::raw(" ".repeat(second_gap)),
-        Span::styled(right, muted(state)),
-    ])
+    let mut rows = Buffer::empty(Rect::new(0, 0, width, commit_height));
+    Paragraph::new(rendered.text)
+        .wrap(Wrap { trim: false })
+        .render(rows.area, &mut rows);
+    Some(ScrollbackFrame {
+        session_id: state.active_session_id.clone(),
+        x: transcript_area.x,
+        rows,
+    })
 }
 
 fn left_right_line(left: &str, right: &str, width: u16, state: &AppState) -> Line<'static> {
@@ -505,13 +469,13 @@ fn build_chat_text(state: &mut AppState, width: u16) -> ChatRender {
                 Line::from(""),
                 Line::from("按 Ctrl+B 打开会话页，然后按 n 创建第一个会话。"),
             ]),
-            turn_lines: Vec::new(),
+            durable_lines: 3,
         };
     };
     let Some(view) = state.views.get(&session_id) else {
         return ChatRender {
             text: Text::from(Line::styled("正在加载会话…", muted(state))),
-            turn_lines: Vec::new(),
+            durable_lines: 1,
         };
     };
     let snapshot = view.snapshot.clone();
@@ -520,84 +484,74 @@ fn build_chat_text(state: &mut AppState, width: u16) -> ChatRender {
     let reasoning_expanded = state.reasoning_expanded;
     let no_color = state.no_color;
     let mut output = Text::default();
-    let mut turn_lines = Vec::new();
 
     if let Some(snapshot) = snapshot {
         if let Some(summary) = snapshot.session.context.summary.as_deref() {
-            output
-                .lines
-                .push(Line::styled("◈ 已压缩上下文", muted(state)));
-            push_plain(&mut output, summary, muted(state));
+            output.lines.push(Line::styled(
+                "◈ 已压缩上下文",
+                theme::thinking(state.no_color),
+            ));
+            push_plain(&mut output, summary, theme::thinking(state.no_color));
             output.lines.push(Line::from(""));
         }
         for (index, record) in snapshot.session.turns.iter().enumerate() {
-            let turn_start = output.lines.len();
             let selected = index == selected_message;
             if let Some(content) = &record.turn.user_message.content {
-                push_user_message(&mut output, content, selected, state);
+                push_user_message(&mut output, content, selected, width, state);
             } else {
-                push_user_message(&mut output, "", selected, state);
+                push_user_message(&mut output, "", selected, width, state);
             }
 
+            append_persisted_messages(
+                &mut output,
+                state,
+                &session_id,
+                index,
+                width,
+                &record.messages,
+                &record.turn.steps,
+                record.turn.assistant_message.as_ref(),
+                reasoning_expanded,
+                no_color,
+            );
             if record.turn.status == TurnStatus::Failed {
-                output
-                    .lines
-                    .push(Line::styled("✗ 审计错误", error_style(state)));
-                push_plain(
+                append_error_card(
                     &mut output,
+                    "本轮执行失败",
                     record.turn.error.as_deref().unwrap_or("本轮执行失败"),
-                    error_style(state),
+                    width,
+                    state,
                 );
-                output.lines.push(Line::from(""));
-                turn_lines.push((index, turn_start..output.lines.len()));
-                continue;
             }
-
-            if let Some(assistant) = &record.turn.assistant_message {
-                if reasoning_expanded
-                    && let Some(reasoning) = assistant.reasoning_content.as_deref()
-                    && !reasoning.is_empty()
-                {
-                    output.lines.push(Line::styled("thinking", muted(state)));
-                    push_plain(&mut output, reasoning, muted(state));
-                } else if assistant
-                    .reasoning_content
-                    .as_deref()
-                    .is_some_and(|reasoning| !reasoning.is_empty())
-                {
-                    output.lines.push(Line::styled(
-                        "▸ thinking 已折叠 · Ctrl+O 展开",
-                        muted(state),
-                    ));
-                }
-                if let Some(content) = assistant.content.as_deref() {
-                    let rendered =
-                        cached_markdown(state, &session_id, index, width, content, no_color);
-                    output.lines.extend(rendered.lines);
-                }
-                append_tool_calls(&mut output, assistant, state);
-            }
-            append_persisted_steps(&mut output, &record.turn.steps, state);
             output.lines.push(Line::from(""));
-            turn_lines.push((index, turn_start..output.lines.len()));
         }
     }
 
+    let durable_lines = output.lines.len();
+
     if let Some(prompt) = live.user_prompt {
-        push_user_message(&mut output, &prompt, true, state);
+        push_user_message(&mut output, &prompt, true, width, state);
     }
     if !live.reasoning.is_empty() {
         if reasoning_expanded {
-            output.lines.push(Line::styled("thinking…", muted(state)));
-            push_plain(&mut output, &live.reasoning, muted(state));
-        } else {
             output
                 .lines
-                .push(Line::styled("▸ thinking… · Ctrl+O 展开", muted(state)));
+                .push(Line::styled("thinking…", theme::thinking(state.no_color)));
+            push_plain(
+                &mut output,
+                &live.reasoning,
+                theme::thinking(state.no_color),
+            );
+        } else {
+            output.lines.push(Line::styled(
+                "▸ thinking… · Ctrl+O 展开",
+                theme::thinking(state.no_color),
+            ));
         }
     }
     if !live.text.is_empty() {
-        push_plain(&mut output, &live.text, Style::default());
+        let rendered = cached_markdown(state, &session_id, usize::MAX, width, &live.text, no_color);
+        output.lines.extend(rendered.lines);
     }
     for warning in live.warnings {
         output
@@ -605,17 +559,22 @@ fn build_chat_text(state: &mut AppState, width: u16) -> ChatRender {
             .push(Line::styled(format!("! {warning}"), warning_style(state)));
     }
     for tool in live.tools {
-        let marker = turn_status_marker(tool.status);
-        output.lines.push(Line::styled(
-            format!("{marker} {}", tool.name),
-            status_style(state, tool.status),
-        ));
+        append_tool_card(
+            &mut output,
+            &tool.name,
+            tool.status,
+            None,
+            tool.result.as_deref(),
+            tool.summary.as_ref(),
+            tool.summary
+                .as_ref()
+                .and_then(|summary| summary.error.as_deref()),
+            width,
+            state,
+        );
     }
     if let Some(error) = live.error {
-        output
-            .lines
-            .push(Line::styled("✗ 执行错误", error_style(state)));
-        push_plain(&mut output, &error, error_style(state));
+        append_error_card(&mut output, "执行错误", &error, width, state);
     }
     if live.awaiting_save {
         output
@@ -624,66 +583,473 @@ fn build_chat_text(state: &mut AppState, width: u16) -> ChatRender {
     }
     ChatRender {
         text: output,
-        turn_lines,
+        durable_lines,
     }
 }
 
-fn push_user_message(output: &mut Text<'static>, value: &str, selected: bool, state: &AppState) {
-    let sanitized = sanitize_terminal_text(value);
-    let mut lines = sanitized.lines();
-    let first = lines.next().unwrap_or_default();
-    output.lines.push(Line::from(vec![
-        Span::styled(
-            if selected { "▌ " } else { "  " },
-            if selected {
-                selected_style(state)
-            } else {
-                accent(state)
-            },
-        ),
-        Span::styled("> ", user_style(state)),
-        Span::raw(first.to_string()),
-    ]));
-    output
-        .lines
-        .extend(lines.map(|line| Line::from(vec![Span::raw("    "), Span::raw(line.to_string())])));
-}
-
-fn append_tool_calls(output: &mut Text<'static>, message: &ProtocolMessage, state: &AppState) {
-    let Some(tool_calls) = &message.tool_calls else {
-        return;
-    };
-    for tool in tool_calls {
-        output.lines.push(Line::styled(
-            format!("◇ {}", tool.function.name),
-            muted(state),
-        ));
-    }
-}
-
-fn append_persisted_steps(
+fn push_user_message(
     output: &mut Text<'static>,
-    steps: &[agent_protocol::TurnStep],
+    value: &str,
+    selected: bool,
+    width: u16,
     state: &AppState,
 ) {
-    for step in steps {
-        if step.kind == TurnStepKind::ModelCall && step.status == TurnStatus::Completed {
+    let sanitized = sanitize_terminal_text(value);
+    if output.lines.last().is_some_and(|line| line.width() > 0) {
+        output.lines.push(Line::from(""));
+    }
+    let style = if selected {
+        selected_style(state)
+    } else {
+        theme::user_card(state.no_color)
+    };
+    let lines = if sanitized.is_empty() {
+        vec![String::new()]
+    } else {
+        sanitized.lines().map(str::to_string).collect::<Vec<_>>()
+    };
+    for (index, line) in lines.into_iter().enumerate() {
+        let marker = if selected && index == 0 { "▌ " } else { "  " };
+        output.lines.push(Line::styled(
+            pad_to_width(&format!("{marker}{line}"), usize::from(width)),
+            style,
+        ));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_persisted_messages(
+    output: &mut Text<'static>,
+    state: &mut AppState,
+    session_id: &str,
+    turn_index: usize,
+    width: u16,
+    messages: &[ProtocolMessage],
+    steps: &[TurnStep],
+    fallback: Option<&ProtocolMessage>,
+    reasoning_expanded: bool,
+    no_color: bool,
+) {
+    let results = messages
+        .iter()
+        .filter(|message| message.role == Role::Tool)
+        .filter_map(|message| {
+            message
+                .tool_call_id
+                .as_deref()
+                .map(|tool_call_id| (tool_call_id, message))
+        })
+        .collect::<HashMap<_, _>>();
+    let result_counts = messages
+        .iter()
+        .filter(|message| message.role == Role::Tool)
+        .filter_map(|message| message.tool_call_id.as_deref())
+        .fold(HashMap::new(), |mut counts, tool_call_id| {
+            *counts.entry(tool_call_id).or_insert(0usize) += 1;
+            counts
+        });
+    let tool_steps = steps
+        .iter()
+        .filter(|step| step.kind == TurnStepKind::ToolCall)
+        .filter_map(|step| {
+            step.tool_call_id
+                .as_deref()
+                .map(|tool_call_id| (tool_call_id, step))
+        })
+        .collect::<HashMap<_, _>>();
+    let step_counts = steps
+        .iter()
+        .filter(|step| step.kind == TurnStepKind::ToolCall)
+        .filter_map(|step| step.tool_call_id.as_deref())
+        .fold(HashMap::new(), |mut counts, tool_call_id| {
+            *counts.entry(tool_call_id).or_insert(0usize) += 1;
+            counts
+        });
+    let call_counts = messages
+        .iter()
+        .filter(|message| message.role == Role::Assistant)
+        .filter_map(|message| message.tool_calls.as_ref())
+        .flatten()
+        .fold(HashMap::new(), |mut counts, call| {
+            *counts.entry(call.id.as_str()).or_insert(0usize) += 1;
+            counts
+        });
+    let mut matched_results = std::collections::HashSet::new();
+    let mut matched_calls = std::collections::HashSet::new();
+    let mut rendered_assistant = false;
+    for (message_index, message) in messages.iter().enumerate() {
+        if message.role != Role::Assistant {
             continue;
         }
-        let label = match step.kind {
-            TurnStepKind::ModelCall => "模型调用".to_string(),
-            TurnStepKind::ToolCall => {
-                format!("工具 {}", step.tool_name.as_deref().unwrap_or("未知"))
+        rendered_assistant = true;
+        append_assistant_content(
+            output,
+            state,
+            session_id,
+            turn_index
+                .saturating_mul(1024)
+                .saturating_add(message_index),
+            width,
+            message,
+            reasoning_expanded,
+            no_color,
+        );
+        if let Some(tool_calls) = &message.tool_calls {
+            for call in tool_calls {
+                matched_calls.insert(call.id.as_str());
+                let malformed = call.id.trim().is_empty()
+                    || call_counts
+                        .get(call.id.as_str())
+                        .copied()
+                        .unwrap_or_default()
+                        > 1
+                    || result_counts
+                        .get(call.id.as_str())
+                        .copied()
+                        .unwrap_or_default()
+                        > 1
+                    || step_counts
+                        .get(call.id.as_str())
+                        .copied()
+                        .unwrap_or_default()
+                        > 1;
+                if malformed {
+                    append_tool_card(
+                        output,
+                        &call.function.name,
+                        TurnStatus::Failed,
+                        Some(&call.function.arguments),
+                        None,
+                        None,
+                        Some("工具历史包含缺失或重复的 tool_call_id，无法安全匹配结果"),
+                        width,
+                        state,
+                    );
+                    continue;
+                }
+                let step = tool_steps.get(call.id.as_str()).copied();
+                let result = results.get(call.id.as_str()).copied();
+                if result.is_some() {
+                    matched_results.insert(call.id.as_str());
+                }
+                let status = step.map_or_else(
+                    || {
+                        if result.is_some() {
+                            TurnStatus::Completed
+                        } else {
+                            TurnStatus::Running
+                        }
+                    },
+                    |step| step.status,
+                );
+                append_tool_card(
+                    output,
+                    &call.function.name,
+                    status,
+                    Some(&call.function.arguments),
+                    result.and_then(|message| message.content.as_deref()),
+                    None,
+                    step.and_then(|step| step.error.as_deref()),
+                    width,
+                    state,
+                );
             }
-        };
-        output.lines.push(Line::styled(
-            format!("  {} {label}", turn_status_marker(step.status)),
-            status_style(state, step.status),
-        ));
-        if let Some(error) = &step.error {
-            push_plain(output, error, error_style(state));
         }
     }
+    if !rendered_assistant && let Some(message) = fallback {
+        append_assistant_content(
+            output,
+            state,
+            session_id,
+            turn_index,
+            width,
+            message,
+            reasoning_expanded,
+            no_color,
+        );
+    }
+    for message in messages.iter().filter(|message| message.role == Role::Tool) {
+        let tool_call_id = message.tool_call_id.as_deref();
+        if tool_call_id.is_some_and(|tool_call_id| matched_results.contains(tool_call_id)) {
+            continue;
+        }
+        let step = tool_call_id.and_then(|tool_call_id| {
+            (step_counts.get(tool_call_id).copied().unwrap_or_default() == 1)
+                .then(|| tool_steps.get(tool_call_id).copied())
+                .flatten()
+        });
+        let duplicate = tool_call_id.is_some_and(|tool_call_id| {
+            result_counts.get(tool_call_id).copied().unwrap_or_default() > 1
+        });
+        append_tool_card(
+            output,
+            if duplicate {
+                "重复工具结果"
+            } else {
+                step.and_then(|step| step.tool_name.as_deref())
+                    .unwrap_or("未知工具结果")
+            },
+            if duplicate || tool_call_id.is_none() {
+                TurnStatus::Failed
+            } else {
+                step.map_or(TurnStatus::Completed, |step| step.status)
+            },
+            None,
+            message.content.as_deref(),
+            None,
+            if tool_call_id.is_none() {
+                Some("工具结果缺少 tool_call_id")
+            } else if duplicate {
+                Some("同一 tool_call_id 存在多个工具结果")
+            } else {
+                step.and_then(|step| step.error.as_deref())
+            },
+            width,
+            state,
+        );
+    }
+    for step in steps.iter().filter(|step| {
+        step.kind == TurnStepKind::ToolCall
+            && step
+                .tool_call_id
+                .as_deref()
+                .is_none_or(|id| !matched_calls.contains(id))
+    }) {
+        if step
+            .tool_call_id
+            .as_deref()
+            .is_some_and(|id| results_contained(messages, id))
+        {
+            continue;
+        }
+        append_tool_card(
+            output,
+            step.tool_name.as_deref().unwrap_or("未知工具"),
+            step.status,
+            None,
+            None,
+            None,
+            step.error.as_deref(),
+            width,
+            state,
+        );
+    }
+    for step in steps
+        .iter()
+        .filter(|step| step.kind == TurnStepKind::ModelCall && step.status == TurnStatus::Failed)
+    {
+        append_error_card(
+            output,
+            "模型调用失败",
+            step.error.as_deref().unwrap_or("模型调用失败"),
+            width,
+            state,
+        );
+    }
+}
+
+fn results_contained(messages: &[ProtocolMessage], tool_call_id: &str) -> bool {
+    messages.iter().any(|message| {
+        message.role == Role::Tool && message.tool_call_id.as_deref() == Some(tool_call_id)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_assistant_content(
+    output: &mut Text<'static>,
+    state: &mut AppState,
+    session_id: &str,
+    cache_index: usize,
+    width: u16,
+    message: &ProtocolMessage,
+    reasoning_expanded: bool,
+    no_color: bool,
+) {
+    if let Some(reasoning) = message
+        .reasoning_content
+        .as_deref()
+        .filter(|reasoning| !reasoning.is_empty())
+    {
+        if reasoning_expanded {
+            output
+                .lines
+                .push(Line::styled("thinking", theme::thinking(state.no_color)));
+            push_plain(output, reasoning, theme::thinking(state.no_color));
+        } else {
+            output.lines.push(Line::styled(
+                "▸ thinking 已折叠 · Ctrl+O 展开",
+                theme::thinking(state.no_color),
+            ));
+        }
+    }
+    if let Some(content) = message
+        .content
+        .as_deref()
+        .filter(|content| !content.is_empty())
+    {
+        let rendered = cached_markdown(state, session_id, cache_index, width, content, no_color);
+        output.lines.extend(rendered.lines);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_tool_card(
+    output: &mut Text<'static>,
+    name: &str,
+    status: TurnStatus,
+    arguments: Option<&str>,
+    result: Option<&str>,
+    summary: Option<&ToolExecutionSummary>,
+    error: Option<&str>,
+    width: u16,
+    state: &AppState,
+) {
+    if output.lines.last().is_some_and(|line| line.width() > 0) {
+        output.lines.push(Line::from(""));
+    }
+    let card = match status {
+        TurnStatus::Running => theme::tool_pending(state.no_color),
+        TurnStatus::Completed => theme::tool_success(state.no_color),
+        TurnStatus::Failed => theme::tool_error(state.no_color),
+    };
+    output.lines.push(Line::styled(
+        pad_to_width(
+            &format!(
+                "  {} {}",
+                turn_status_marker(status),
+                sanitize_terminal_text(name)
+            ),
+            usize::from(width),
+        ),
+        status_style(state, status)
+            .patch(card)
+            .add_modifier(Modifier::BOLD),
+    ));
+
+    let mut details = Vec::new();
+    if let Some(arguments) = arguments.filter(|arguments| !arguments.trim().is_empty()) {
+        let pretty = pretty_json_or_text(arguments);
+        details.extend(pretty.lines().take(4).map(|line| format!("  {line}")));
+    }
+    if let Some(summary) = summary {
+        for file in &summary.files {
+            details.push(format!(
+                "  {} {} · {} replacement{}",
+                file.operation.as_str(),
+                file.path,
+                file.replacements,
+                if file.replacements == 1 { "" } else { "s" }
+            ));
+        }
+        if let Some(shell) = &summary.shell {
+            details.push(format!("  $ {}", shell.command));
+            let mut shell_status = shell
+                .exit_code
+                .map_or_else(|| "exit —".to_string(), |code| format!("exit {code}"));
+            if shell.timed_out {
+                shell_status.push_str(" · timeout");
+            }
+            if shell.stdout_truncated || shell.stderr_truncated {
+                shell_status.push_str(" · output truncated");
+            }
+            details.push(format!("  {shell_status}"));
+        }
+        if let Some(subagent) = &summary.subagent {
+            let identity = subagent
+                .agent_name
+                .as_deref()
+                .or(subagent.agent_id.as_deref())
+                .unwrap_or("Subagent");
+            details.push(format!("  {identity} · {}", subagent.task));
+            details.push(format!(
+                "  {} model calls · {} tool calls{}",
+                subagent.model_calls,
+                subagent.tool_calls,
+                if subagent.truncated {
+                    " · truncated"
+                } else {
+                    ""
+                }
+            ));
+            if let Some(value) = &subagent.result {
+                details.extend(value.lines().take(5).map(|line| format!("  {line}")));
+            }
+            if let Some(value) = &subagent.error {
+                details.extend(value.lines().take(5).map(|line| format!("  {line}")));
+            }
+        }
+        if let Some(diff) = &summary.diff {
+            details.extend(diff.lines().take(10).map(|line| format!("  {line}")));
+        }
+    }
+    if let Some(result) = result.filter(|result| !result.trim().is_empty()) {
+        let pretty = pretty_json_or_text(result);
+        details.extend(pretty.lines().take(8).map(|line| format!("  {line}")));
+    }
+    if let Some(error) = error.filter(|error| !error.trim().is_empty()) {
+        details.extend(
+            sanitize_terminal_text(error)
+                .lines()
+                .take(5)
+                .map(|line| format!("  {line}")),
+        );
+    }
+    let truncated = details.len() > 12;
+    details.truncate(12);
+    let detail_style = muted(state).patch(card);
+    for detail in details {
+        let trimmed = detail.trim_start();
+        let style =
+            if trimmed.starts_with('+') || trimmed.starts_with('-') || trimmed.starts_with("@@") {
+                diff_style(state, trimmed).patch(card)
+            } else {
+                detail_style
+            };
+        output.lines.push(Line::styled(
+            pad_to_width(&detail, usize::from(width)),
+            style,
+        ));
+    }
+    if truncated {
+        output.lines.push(Line::styled(
+            pad_to_width("  …更多内容请在 Inspector 中查看", usize::from(width)),
+            detail_style,
+        ));
+    }
+}
+
+fn append_error_card(
+    output: &mut Text<'static>,
+    title: &str,
+    error: &str,
+    width: u16,
+    state: &AppState,
+) {
+    let card = theme::tool_error(state.no_color);
+    output.lines.push(Line::styled(
+        pad_to_width(&format!("  × {title}"), usize::from(width)),
+        error_style(state).patch(card).add_modifier(Modifier::BOLD),
+    ));
+    for line in sanitize_terminal_text(error).lines().take(8) {
+        output.lines.push(Line::styled(
+            pad_to_width(&format!("  {line}"), usize::from(width)),
+            error_style(state).patch(card),
+        ));
+    }
+}
+
+fn pretty_json_or_text(value: &str) -> String {
+    let sanitized = sanitize_terminal_text(value);
+    serde_json::from_str::<serde_json::Value>(&sanitized)
+        .ok()
+        .and_then(|value| serde_json::to_string_pretty(&value).ok())
+        .unwrap_or(sanitized)
+}
+
+fn pad_to_width(value: &str, width: usize) -> String {
+    let value = truncate_to_width(value, width);
+    let padding = width.saturating_sub(UnicodeWidthStr::width(value.as_str()));
+    format!("{value}{}", " ".repeat(padding))
 }
 
 fn cached_markdown(
@@ -705,12 +1071,43 @@ fn cached_markdown(
     let mut rendered = own_text(tui_markdown::from_str(&sanitized));
     if no_color {
         strip_text_colors(&mut rendered);
+    } else {
+        apply_markdown_theme(&mut rendered);
     }
     if state.render_cache.len() >= 512 {
         state.render_cache.clear();
     }
     state.render_cache.insert(key, rendered.clone());
     rendered
+}
+
+fn apply_markdown_theme(text: &mut Text<'_>) {
+    map_markdown_style(&mut text.style);
+    for line in &mut text.lines {
+        map_markdown_style(&mut line.style);
+        for span in &mut line.spans {
+            map_markdown_style(&mut span.style);
+        }
+    }
+}
+
+fn map_markdown_style(style: &mut Style) {
+    style.bg = None;
+    style.underline_color = style.underline_color.map(markdown_color);
+    style.fg = style.fg.map(markdown_color);
+}
+
+fn markdown_color(color: Color) -> Color {
+    match color {
+        Color::Red | Color::LightRed => theme::ERROR,
+        Color::Green | Color::LightGreen => theme::SUCCESS,
+        Color::Yellow | Color::LightYellow => theme::WARNING,
+        Color::Blue | Color::LightBlue => theme::INFO,
+        Color::Cyan | Color::LightCyan | Color::Magenta | Color::LightMagenta => theme::ACCENT,
+        Color::Gray | Color::DarkGray => theme::MUTED,
+        Color::Reset => Color::Reset,
+        _ => theme::TEXT,
+    }
 }
 
 fn own_text(text: Text<'_>) -> Text<'static> {
@@ -773,17 +1170,17 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &AppState, layout: 
         )
     };
     let block = Block::default()
-        .borders(Borders::ALL)
+        .borders(Borders::TOP | Borders::BOTTOM)
         .border_style(accent(state));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let columns = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(2), Constraint::Min(1)])
+        .constraints([Constraint::Length(3), Constraint::Min(1)])
         .split(inner);
     frame.render_widget(
         Paragraph::new(Line::styled(
-            ">",
+            " › ",
             accent(state).add_modifier(Modifier::BOLD),
         )),
         columns[0],
@@ -859,7 +1256,12 @@ fn render_completion(
         .collect::<Vec<_>>();
     frame.render_widget(Clear, area);
     frame.render_widget(
-        List::new(items).block(Block::default().borders(Borders::ALL).title(kind)),
+        List::new(items).block(
+            Block::default()
+                .borders(Borders::TOP | Borders::BOTTOM)
+                .border_style(accent(state))
+                .title(kind),
+        ),
         area,
     );
 }
@@ -929,7 +1331,7 @@ fn composer_layout(text: &str, cursor: usize, width: usize) -> ComposerLayout {
     }
 }
 
-fn render_inspector(frame: &mut Frame<'_>, area: Rect, state: &mut AppState, full_page: bool) {
+fn render_inspector(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(3), Constraint::Min(1)])
@@ -946,23 +1348,27 @@ fn render_inspector(frame: &mut Frame<'_>, area: Rect, state: &mut AppState, ful
             })
             .highlight_style(selected_style(state))
             .divider(" │ ")
-            .block(Block::default().borders(Borders::ALL).title(" 检查器 ")),
+            .block(
+                Block::default()
+                    .borders(Borders::TOP | Borders::BOTTOM)
+                    .title(" 检查器 "),
+            ),
         rows[0],
     );
     match state.inspector_tab {
-        InspectorTab::Run => render_run_inspector(frame, rows[1], state, full_page),
-        InspectorTab::Subagents => render_subagents(frame, rows[1], state, full_page),
+        InspectorTab::Run => render_run_inspector(frame, rows[1], state),
+        InspectorTab::Subagents => render_subagents(frame, rows[1], state),
     }
 }
 
-fn render_run_inspector(frame: &mut Frame<'_>, area: Rect, state: &mut AppState, full_page: bool) {
+fn render_run_inspector(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
     let mut lines = Vec::new();
-    let mut tool_lines = Vec::new();
+    let mut selected_line = None;
     let Some(view) = state.active_view() else {
         frame.render_widget(
             Paragraph::new("选择会话后查看运行状态")
                 .style(muted(state))
-                .block(Block::default().borders(Borders::ALL)),
+                .block(Block::default().borders(Borders::TOP | Borders::BOTTOM)),
             area,
         );
         return;
@@ -1008,7 +1414,9 @@ fn render_run_inspector(frame: &mut Frame<'_>, area: Rect, state: &mut AppState,
     if !view.live.tools.is_empty() || view.live.user_prompt.is_some() {
         lines.push(Line::styled("当前运行", emphasis(state)));
         for (index, tool) in view.live.tools.iter().enumerate() {
-            let start = lines.len();
+            if index == state.selected_inspector {
+                selected_line = Some(lines.len());
+            }
             lines.push(Line::styled(
                 format!(
                     "{} {} {}",
@@ -1022,12 +1430,12 @@ fn render_run_inspector(frame: &mut Frame<'_>, area: Rect, state: &mut AppState,
                     status_style(state, tool.status)
                 },
             ));
-            if let Some(detail) = &tool.detail {
-                for line in sanitize_terminal_text(detail).lines().take(12) {
+            let detail = tool.plain_text();
+            if detail.lines().count() > 1 {
+                for line in detail.lines().skip(1).take(12) {
                     lines.push(Line::styled(format!("    {line}"), muted(state)));
                 }
             }
-            tool_lines.push((index, start..lines.len()));
         }
         if let Some(error) = &view.live.error {
             lines.push(Line::styled(format!("错误: {error}"), error_style(state)));
@@ -1036,28 +1444,19 @@ fn render_run_inspector(frame: &mut Frame<'_>, area: Rect, state: &mut AppState,
     if lines.is_empty() {
         lines.push(Line::styled("还没有运行记录", muted(state)));
     }
-    let title = if full_page {
-        " Run · ↑↓ 选择 · Y 复制 "
-    } else {
-        " Run "
-    };
-    let text = Text::from(lines);
+    let visible_height = usize::from(area.height.saturating_sub(2)).max(1);
+    let focus_line = selected_line.unwrap_or_else(|| lines.len().saturating_sub(1));
+    let scroll = focus_line.saturating_sub(visible_height.saturating_sub(1)) as u16;
     frame.render_widget(
-        Paragraph::new(text.clone())
-            .block(Block::default().borders(Borders::ALL).title(title))
+        Paragraph::new(Text::from(lines))
+            .block(
+                Block::default()
+                    .borders(Borders::TOP | Borders::BOTTOM)
+                    .title(" Run "),
+            )
+            .scroll((scroll, 0))
             .wrap(Wrap { trim: false }),
         area,
-    );
-    register_text_hit_regions(
-        state,
-        area.inner(Margin {
-            horizontal: 1,
-            vertical: 1,
-        }),
-        &text,
-        &tool_lines,
-        0,
-        HitTarget::RunTool,
     );
 }
 
@@ -1113,7 +1512,7 @@ fn append_limited_lines(
     }
 }
 
-fn render_subagents(frame: &mut Frame<'_>, area: Rect, state: &mut AppState, full_page: bool) {
+fn render_subagents(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
     let agents = state
         .active_view()
         .map(|view| view.subagents.values().collect::<Vec<_>>())
@@ -1194,37 +1593,17 @@ fn render_subagents(frame: &mut Frame<'_>, area: Rect, state: &mut AppState, ful
             })
             .collect()
     };
-    let title = if full_page {
-        " Subagent · Enter transcript · f follow-up · x 取消 · d 删除 "
-    } else {
-        " Subagent "
-    };
-    let mut row = 0;
-    let item_lines = if agents.is_empty() {
-        Vec::new()
-    } else {
-        items
-            .iter()
-            .enumerate()
-            .map(|(index, item)| {
-                let start = row;
-                row += item.height();
-                (index, start..row)
-            })
-            .collect::<Vec<_>>()
-    };
-    frame.render_widget(
-        List::new(items).block(Block::default().borders(Borders::ALL).title(title)),
-        area,
+    let mut list_state = ListState::default().with_selected(
+        (!agents.is_empty()).then_some(state.selected_inspector.min(agents.len() - 1)),
     );
-    register_row_hit_regions(
-        state,
-        area.inner(Margin {
-            horizontal: 1,
-            vertical: 1,
-        }),
-        &item_lines,
-        HitTarget::Subagent,
+    frame.render_stateful_widget(
+        List::new(items).block(
+            Block::default()
+                .borders(Borders::TOP | Borders::BOTTOM)
+                .title(" Subagent "),
+        ),
+        area,
+        &mut list_state,
     );
 }
 
@@ -1244,7 +1623,7 @@ fn render_settings(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
             .divider(" │ ")
             .block(
                 Block::default()
-                    .borders(Borders::ALL)
+                    .borders(Borders::TOP | Borders::BOTTOM)
                     .title(" Morrow 托管设置 "),
             ),
         rows[0],
@@ -1257,7 +1636,7 @@ fn render_settings(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                 SPINNER[state.spinner % SPINNER.len()]
             ))
             .style(muted(state))
-            .block(Block::default().borders(Borders::ALL)),
+            .block(Block::default().borders(Borders::TOP | Borders::BOTTOM)),
             rows[1],
         );
         return;
@@ -1266,7 +1645,7 @@ fn render_settings(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         frame.render_widget(
             Paragraph::new(format!("设置加载失败: {error}"))
                 .style(error_style(state))
-                .block(Block::default().borders(Borders::ALL)),
+                .block(Block::default().borders(Borders::TOP | Borders::BOTTOM)),
             rows[1],
         );
         return;
@@ -1275,7 +1654,7 @@ fn render_settings(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         frame.render_widget(
             Paragraph::new("设置尚未加载，按 Ctrl+, 重试。")
                 .style(muted(state))
-                .block(Block::default().borders(Borders::ALL)),
+                .block(Block::default().borders(Borders::TOP | Borders::BOTTOM)),
             rows[1],
         );
         return;
@@ -1400,14 +1779,22 @@ fn render_model_settings(
             },
         )));
     }
-    frame.render_widget(
+    let selected_row = if state.settings.selected >= settings.providers.len() {
+        state.settings.selected.saturating_add(1)
+    } else {
+        state.settings.selected
+    };
+    let mut list_state = ListState::default()
+        .with_selected((!items.is_empty()).then_some(selected_row.min(items.len() - 1)));
+    frame.render_stateful_widget(
         List::new(items).block(
             Block::default()
-                .borders(Borders::ALL)
+                .borders(Borders::TOP | Borders::BOTTOM)
                 .title(" 模型供应商 ")
                 .title_bottom(" n 新建 · e/Enter 编辑 · d 删除 · f 发现 · 模型上 Enter 设默认 "),
         ),
         area,
+        &mut list_state,
     );
 }
 
@@ -1483,14 +1870,17 @@ fn render_mcp_settings(
             })
             .collect()
     };
-    frame.render_widget(
+    let mut list_state = ListState::default()
+        .with_selected((!items.is_empty()).then_some(state.settings.selected.min(items.len() - 1)));
+    frame.render_stateful_widget(
         List::new(items).block(
             Block::default()
-                .borders(Borders::ALL)
+                .borders(Borders::TOP | Borders::BOTTOM)
                 .title(" MCP servers ")
                 .title_bottom(" n 新建 · i 导入 · e 编辑 · f 测试 · Space 启停 · d 删除 · editor Ctrl+T 测试草稿 "),
         ),
         area,
+        &mut list_state,
     );
 }
 
@@ -1534,14 +1924,17 @@ fn render_command_settings(
             })
             .collect()
     };
-    frame.render_widget(
+    let mut list_state = ListState::default()
+        .with_selected((!items.is_empty()).then_some(state.settings.selected.min(items.len() - 1)));
+    frame.render_stateful_widget(
         List::new(items).block(
             Block::default()
-                .borders(Borders::ALL)
+                .borders(Borders::TOP | Borders::BOTTOM)
                 .title(" 自定义命令 ")
                 .title_bottom(" n 新建 · e 编辑 · d 删除 "),
         ),
         area,
+        &mut list_state,
     );
 }
 
@@ -1596,14 +1989,19 @@ fn render_subagent_settings(
             })
             .collect()
     };
-    frame.render_widget(
+    let mut identity_state = ListState::default().with_selected(
+        (state.settings.selected < settings.subagent_identities.len())
+            .then_some(state.settings.selected),
+    );
+    frame.render_stateful_widget(
         List::new(identities).block(
             Block::default()
-                .borders(Borders::ALL)
+                .borders(Borders::TOP | Borders::BOTTOM)
                 .title(" 身份 ")
                 .title_bottom(" n 新建 · e 编辑/头像 · d 删除 · P 重置身份 "),
         ),
         columns[0],
+        &mut identity_state,
     );
 
     let role_offset = settings.subagent_identities.len();
@@ -1646,14 +2044,19 @@ fn render_subagent_settings(
             ])
         })
         .collect::<Vec<_>>();
-    frame.render_widget(
+    let mut role_state = ListState::default().with_selected(
+        (state.settings.selected >= role_offset)
+            .then_some(state.settings.selected.saturating_sub(role_offset)),
+    );
+    frame.render_stateful_widget(
         List::new(roles).block(
             Block::default()
-                .borders(Borders::ALL)
+                .borders(Borders::TOP | Borders::BOTTOM)
                 .title(" 角色设置 ")
                 .title_bottom(" e/Enter 编辑角色 · R 重置角色 "),
         ),
         columns[1],
+        &mut role_state,
     );
 }
 
@@ -1663,11 +2066,7 @@ fn render_approval(
     state: &AppState,
     pending: &crate::state::PendingApproval,
 ) {
-    let area = centered(
-        root,
-        root.width.saturating_sub(8).min(100),
-        root.height.saturating_sub(4).min(30),
-    );
+    let area = root;
     let mut lines = vec![
         Line::styled("工具请求需要批准", warning_style(state)),
         Line::from(format!(
@@ -1724,7 +2123,7 @@ fn render_approval(
     }
     frame.render_widget(Clear, area);
     let block = Block::default()
-        .borders(Borders::ALL)
+        .borders(Borders::TOP | Borders::BOTTOM)
         .title(" 审批 ")
         .border_style(warning_style(state));
     let inner = area.inner(Margin {
@@ -1767,7 +2166,7 @@ fn render_overlay(frame: &mut Frame<'_>, root: Rect, state: &AppState, overlay: 
     match overlay {
         Overlay::Help => render_help(frame, root, state),
         Overlay::ActionPalette { selected } => render_palette(frame, root, state, *selected),
-        Overlay::ExitConfirm => render_exit(frame, root, state),
+        Overlay::ExitConfirm => render_exit_confirm(frame, root, state),
         Overlay::ConfirmDelete(target) => {
             let (title, description, confirm) = match target {
                 crate::state::DeleteTarget::ResetSubagentRoles => (
@@ -1786,7 +2185,7 @@ fn render_overlay(frame: &mut Frame<'_>, root: Rect, state: &AppState, overlay: 
                     "Y 确认删除 · N / Esc 取消",
                 ),
             };
-            let area = centered(root, 64, 8);
+            let area = root;
             frame.render_widget(Clear, area);
             frame.render_widget(
                 Paragraph::new(vec![
@@ -1795,14 +2194,18 @@ fn render_overlay(frame: &mut Frame<'_>, root: Rect, state: &AppState, overlay: 
                     Line::from(""),
                     Line::styled(confirm, warning_style(state)),
                 ])
-                .block(Block::default().borders(Borders::ALL).title(title))
+                .block(
+                    Block::default()
+                        .borders(Borders::TOP | Borders::BOTTOM)
+                        .title(title),
+                )
                 .wrap(Wrap { trim: true }),
                 area,
             );
         }
         Overlay::SettingsEditor(editor) => render_settings_editor(frame, root, state, editor),
         Overlay::SubagentFollowUp { instance_id, value } => {
-            let area = centered(root, 76, 10);
+            let area = root;
             frame.render_widget(Clear, area);
             frame.render_widget(
                 Paragraph::new(Text::from(vec![
@@ -1816,7 +2219,7 @@ fn render_overlay(frame: &mut Frame<'_>, root: Rect, state: &AppState, overlay: 
                 ]))
                 .block(
                     Block::default()
-                        .borders(Borders::ALL)
+                        .borders(Borders::TOP | Borders::BOTTOM)
                         .title(" Follow-up · Enter 发送 · Esc 取消 "),
                 )
                 .wrap(Wrap { trim: false }),
@@ -1827,10 +2230,10 @@ fn render_overlay(frame: &mut Frame<'_>, root: Rect, state: &AppState, overlay: 
 }
 
 fn render_help(frame: &mut Frame<'_>, root: Rect, state: &AppState) {
-    let area = centered(root, 86, root.height.saturating_sub(6).min(28));
+    let area = root;
     let text = Text::from(vec![
         Line::styled("全局", emphasis(state)),
-        Line::from("Ctrl+B 会话栏  Ctrl+G 检查器  Ctrl+, 设置（也可用 :settings）"),
+        Line::from("Ctrl+B 会话  Ctrl+G 检查器  Ctrl+, 设置（也可用 :settings）"),
         Line::from("Ctrl+P 动作面板  F2 模型  F3 推理  F4 权限  Ctrl+O 推理展开"),
         Line::from("Ctrl+Q 退出"),
         Line::from(""),
@@ -1842,14 +2245,18 @@ fn render_help(frame: &mut Frame<'_>, root: Rect, state: &AppState) {
         Line::from(""),
         Line::styled("运行与审批", emphasis(state)),
         Line::from("Y 复制所选纯文本；审批框中 Y 批准、N 拒绝，Enter 不会默认批准。"),
-        Line::from("鼠标滚轮浏览；按住 Shift 拖动时保留终端原生选择。"),
+        Line::from("终端原生滚轮与选择用于 scrollback；PageUp/PageDown 浏览应用内记录。"),
         Line::from(""),
         Line::styled("F1 / Esc 关闭帮助", muted(state)),
     ]);
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(text)
-            .block(Block::default().borders(Borders::ALL).title(" 帮助 "))
+            .block(
+                Block::default()
+                    .borders(Borders::TOP | Borders::BOTTOM)
+                    .title(" 帮助 "),
+            )
             .wrap(Wrap { trim: false }),
         area,
     );
@@ -1879,19 +2286,19 @@ fn render_palette(frame: &mut Frame<'_>, root: Rect, state: &AppState, selected:
             )
         })
         .collect::<Vec<_>>();
-    let area = centered(root, 48, 12);
+    let area = root;
     frame.render_widget(Clear, area);
     frame.render_widget(
         List::new(items).block(
             Block::default()
-                .borders(Borders::ALL)
+                .borders(Borders::TOP | Borders::BOTTOM)
                 .title(" 动作 · Enter 执行 · Esc 关闭 "),
         ),
         area,
     );
 }
 
-fn render_exit(frame: &mut Frame<'_>, root: Rect, state: &AppState) {
+fn render_exit_confirm(frame: &mut Frame<'_>, root: Rect, state: &AppState) {
     let active = state.has_active_work();
     let lines = if active {
         vec![
@@ -1909,11 +2316,15 @@ fn render_exit(frame: &mut Frame<'_>, root: Rect, state: &AppState) {
             Line::from("Enter / Q 退出 · R / Esc 返回"),
         ]
     };
-    let area = centered(root, 68, if active { 10 } else { 7 });
+    let area = root;
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(Text::from(lines))
-            .block(Block::default().borders(Borders::ALL).title(" 退出 "))
+            .block(
+                Block::default()
+                    .borders(Borders::TOP | Borders::BOTTOM)
+                    .title(" 退出 "),
+            )
             .wrap(Wrap { trim: true }),
         area,
     );
@@ -1925,14 +2336,7 @@ fn render_settings_editor(
     state: &AppState,
     editor: &crate::state::SettingsEditor,
 ) {
-    let area = centered(
-        root,
-        root.width.saturating_sub(8).min(86),
-        (editor.fields.len() as u16)
-            .saturating_mul(2)
-            .saturating_add(6)
-            .min(root.height.saturating_sub(4)),
-    );
+    let area = root;
     let mut lines = Vec::new();
     for (index, field) in editor.fields.iter().enumerate() {
         let marker = selection_marker(index, editor.selected);
@@ -1977,24 +2381,13 @@ fn render_settings_editor(
         Paragraph::new(Text::from(lines))
             .block(
                 Block::default()
-                    .borders(Borders::ALL)
+                    .borders(Borders::TOP | Borders::BOTTOM)
                     .title(format!(" {} ", editor.title)),
             )
             .scroll((scroll, 0))
             .wrap(Wrap { trim: false }),
         area,
     );
-}
-
-fn centered(root: Rect, requested_width: u16, requested_height: u16) -> Rect {
-    let width = requested_width.clamp(1, root.width);
-    let height = requested_height.clamp(1, root.height);
-    Rect::new(
-        root.x + root.width.saturating_sub(width) / 2,
-        root.y + root.height.saturating_sub(height) / 2,
-        width,
-        height,
-    )
 }
 
 fn session_label(state: &AppState, session_id: &str) -> String {
@@ -2101,80 +2494,6 @@ fn wrapped_line_height(line: &Line<'_>, width: u16) -> u16 {
     (line.width().max(1).saturating_sub(1) / width + 1).min(usize::from(u16::MAX)) as u16
 }
 
-fn register_text_hit_regions(
-    state: &mut AppState,
-    viewport: Rect,
-    text: &Text<'_>,
-    line_ranges: &[(usize, std::ops::Range<usize>)],
-    scroll: u16,
-    target: fn(usize) -> HitTarget,
-) {
-    if viewport.width == 0 || viewport.height == 0 {
-        return;
-    }
-    let mut offsets = Vec::with_capacity(text.lines.len() + 1);
-    offsets.push(0_u16);
-    for line in &text.lines {
-        let next = offsets
-            .last()
-            .copied()
-            .unwrap_or_default()
-            .saturating_add(wrapped_line_height(line, viewport.width));
-        offsets.push(next);
-    }
-    let visible_end = scroll.saturating_add(viewport.height);
-    for (index, lines) in line_ranges {
-        let Some(start) = offsets.get(lines.start).copied() else {
-            continue;
-        };
-        let Some(end) = offsets.get(lines.end).copied() else {
-            continue;
-        };
-        let start = start.max(scroll);
-        let end = end.min(visible_end);
-        if start >= end {
-            continue;
-        }
-        state.hit_regions.push(HitRegion::new(
-            Rect::new(
-                viewport.x,
-                viewport.y.saturating_add(start.saturating_sub(scroll)),
-                viewport.width,
-                end.saturating_sub(start),
-            ),
-            target(*index),
-        ));
-    }
-}
-
-fn register_row_hit_regions(
-    state: &mut AppState,
-    viewport: Rect,
-    row_ranges: &[(usize, std::ops::Range<usize>)],
-    target: fn(usize) -> HitTarget,
-) {
-    if viewport.width == 0 || viewport.height == 0 {
-        return;
-    }
-    let visible_end = usize::from(viewport.height);
-    for (index, rows) in row_ranges {
-        let start = rows.start.min(visible_end);
-        let end = rows.end.min(visible_end);
-        if start >= end {
-            continue;
-        }
-        state.hit_regions.push(HitRegion::new(
-            Rect::new(
-                viewport.x,
-                viewport.y.saturating_add(start as u16),
-                viewport.width,
-                (end - start) as u16,
-            ),
-            target(*index),
-        ));
-    }
-}
-
 fn selection_marker(index: usize, selected: usize) -> &'static str {
     if index == selected { "›" } else { " " }
 }
@@ -2214,11 +2533,11 @@ fn truncate_to_width(value: &str, width: usize) -> String {
 
 fn diff_style(state: &AppState, line: &str) -> Style {
     if line.starts_with('+') && !line.starts_with("+++") {
-        colored(state, Color::Green)
+        theme::success(state.no_color)
     } else if line.starts_with('-') && !line.starts_with("---") {
-        colored(state, Color::Red)
+        theme::error(state.no_color)
     } else if line.starts_with("@@") {
-        colored(state, Color::Cyan)
+        theme::info(state.no_color)
     } else {
         Style::default()
     }
@@ -2227,68 +2546,44 @@ fn diff_style(state: &AppState, line: &str) -> Style {
 fn status_style(state: &AppState, status: TurnStatus) -> Style {
     match status {
         TurnStatus::Running => accent(state),
-        TurnStatus::Completed => colored(state, Color::Green),
+        TurnStatus::Completed => theme::success(state.no_color),
         TurnStatus::Failed => error_style(state),
     }
 }
 
 fn emphasis(state: &AppState) -> Style {
-    let style = colored(state, Color::White);
-    style.add_modifier(Modifier::BOLD)
-}
-
-fn user_style(state: &AppState) -> Style {
-    colored(state, Color::Cyan).add_modifier(Modifier::BOLD)
+    theme::emphasis(state.no_color)
 }
 
 fn accent(state: &AppState) -> Style {
-    colored(state, Color::LightCyan)
-}
-
-fn info_style(state: &AppState) -> Style {
-    colored(state, Color::LightBlue)
+    theme::accent(state.no_color)
 }
 
 fn muted(state: &AppState) -> Style {
-    colored(state, Color::DarkGray)
+    theme::muted(state.no_color)
 }
 
 fn warning_style(state: &AppState) -> Style {
-    colored(state, Color::Yellow)
+    theme::warning(state.no_color)
 }
 
 fn error_style(state: &AppState) -> Style {
-    colored(state, Color::LightRed)
+    theme::error(state.no_color)
 }
 
 fn selected_style(state: &AppState) -> Style {
-    if state.no_color {
-        Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
-    } else {
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::LightCyan)
-            .add_modifier(Modifier::BOLD)
-    }
-}
-
-fn colored(state: &AppState, color: Color) -> Style {
-    if state.no_color {
-        Style::default()
-    } else {
-        Style::default().fg(color)
-    }
+    theme::selected(state.no_color)
 }
 
 #[cfg(test)]
 mod tests {
     use agent_protocol::{
-        ApprovalRequest, Message, PermissionProfile, Session, SubagentIdentity,
-        SubagentInstanceSnapshot, SubagentInstanceStatus, SubagentRole, Turn, TurnRecord,
+        ApprovalRequest, Message, PermissionProfile, Session, ShellCommandSummary, ToolCall,
+        ToolExecutionSummary, Turn, TurnRecord, TurnStep,
     };
-    use crossterm::event::{Event, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::style::Color;
 
     use super::*;
     use crate::backend::{SessionInfo, SessionSnapshot, WorkspaceSnapshot};
@@ -2336,7 +2631,11 @@ mod tests {
     fn draw(width: u16, height: u16, state: &mut AppState) -> String {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| render(frame, state)).unwrap();
+        terminal
+            .draw(|frame| {
+                render(frame, state);
+            })
+            .unwrap();
         terminal
             .backend()
             .buffer()
@@ -2346,37 +2645,13 @@ mod tests {
             .collect::<String>()
     }
 
-    fn append_turn(state: &mut AppState, prompt: String, answer: String) {
-        let user = Message::user(prompt);
-        let assistant = Message::assistant(answer);
-        let mut turn = Turn::running(user.clone());
-        turn.complete(assistant.clone());
-        state
-            .active_view_mut()
-            .unwrap()
-            .snapshot
-            .as_mut()
-            .unwrap()
-            .session
-            .apply_turn(TurnRecord::new(turn, vec![user, assistant]));
-    }
-
-    fn click(state: &mut AppState, region: HitRegion) {
-        state.update(crate::state::Message::Terminal(Event::Mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: region.area.x,
-            row: region.area.y,
-            modifiers: KeyModifiers::NONE,
-        })));
-    }
-
     #[test]
     fn responsive_layouts_render_cjk_and_emoji_without_panics() {
         for (width, height) in [(160, 40), (112, 36), (80, 24), (48, 12), (40, 10)] {
             let mut state = test_state(width, height);
             let screen = draw(width, height, &mut state);
             assert!(!screen.is_empty());
-            assert!(screen.contains("Morrow"));
+            assert!(screen.contains("workspace") || screen.contains("Morrow"));
         }
     }
 
@@ -2394,8 +2669,8 @@ mod tests {
         let screen = draw(112, 36, &mut state);
         assert!(screen.contains("Morrow"), "{screen:?}");
         assert!(screen.contains(env!("CARGO_PKG_VERSION")), "{screen:?}");
-        assert!(screen.contains("context:"), "{screen:?}");
-        assert!(screen.contains('>'), "{screen:?}");
+        assert!(screen.contains("context"), "{screen:?}");
+        assert!(screen.contains('›'), "{screen:?}");
     }
 
     #[test]
@@ -2412,20 +2687,17 @@ mod tests {
                 id: "tool".to_string(),
                 name: "read_file".to_string(),
                 status: TurnStatus::Running,
-                detail: Some("README.md".to_string()),
+                summary: None,
+                result: Some("README.md".to_string()),
             });
 
-        draw(160, 40, &mut state);
-        assert!(
-            state
-                .hit_regions
-                .iter()
-                .all(|region| matches!(region.target, HitTarget::ChatTurn(_)))
-        );
+        let screen = draw(160, 40, &mut state);
+        assert!(screen.contains("read_file"), "{screen:?}");
+        assert!(!screen.contains("会话栏"), "{screen:?}");
     }
 
     #[test]
-    fn full_page_sections_render_at_reference_sizes() {
+    fn bottom_panel_sections_render_at_reference_sizes() {
         for (width, height) in [(160, 40), (112, 36), (80, 24), (48, 12)] {
             for page in [MainPage::Sessions, MainPage::Inspector, MainPage::Settings] {
                 let mut state = test_state(width, height);
@@ -2454,7 +2726,7 @@ mod tests {
         state.active_session_id = Some("session-123".to_string());
 
         let screen = draw(112, 36, &mut state);
-        assert_eq!(screen.matches("session-123").count(), 1, "{screen:?}");
+        assert_eq!(screen.matches("session-123").count(), 2, "{screen:?}");
     }
 
     #[test]
@@ -2485,110 +2757,75 @@ mod tests {
     }
 
     #[test]
-    fn chat_hit_regions_only_cover_visible_scrolled_turns() {
-        let mut state = test_state(72, 18);
-        for index in 1..8 {
-            append_turn(
-                &mut state,
-                format!("第 {index} 个问题：{}", "很长的内容 ".repeat(8)),
-                format!("第 {index} 个回答：{}", "继续说明 ".repeat(8)),
-            );
-        }
-        draw(72, 18, &mut state);
-
-        let regions = state
-            .hit_regions
-            .iter()
-            .copied()
-            .filter(|region| matches!(region.target, HitTarget::ChatTurn(_)))
-            .collect::<Vec<_>>();
-        assert!(!regions.is_empty());
-        assert!(
-            regions
-                .iter()
-                .all(|region| !matches!(region.target, HitTarget::ChatTurn(0)))
-        );
-        let selected = regions[0];
-        click(&mut state, selected);
-        let HitTarget::ChatTurn(index) = selected.target else {
-            unreachable!();
-        };
-        assert_eq!(state.active_view().unwrap().selected_message, index);
-    }
-
-    #[test]
-    fn full_page_inspector_registers_clickable_tool_and_subagent_rows() {
-        let mut state = test_state(160, 36);
-        state.page = MainPage::Inspector;
-        state.active_view_mut().unwrap().live.tools.extend([
-            crate::state::ToolRun {
-                id: "one".to_string(),
-                name: "read_file".to_string(),
-                status: TurnStatus::Completed,
-                detail: Some("README.md".to_string()),
-            },
-            crate::state::ToolRun {
-                id: "two".to_string(),
-                name: "apply_patch".to_string(),
-                status: TurnStatus::Running,
-                detail: Some("src/lib.rs".to_string()),
-            },
-        ]);
-        draw(160, 36, &mut state);
-        let tool = state
-            .hit_regions
-            .iter()
-            .copied()
-            .find(|region| region.target == HitTarget::RunTool(1))
-            .unwrap();
-        click(&mut state, tool);
-        assert_eq!(state.selected_inspector, 1);
-        assert_eq!(state.active_view().unwrap().selected_tool, Some(1));
-
-        let view = state.active_view_mut().unwrap();
-        for index in 0..2 {
-            let id = format!("agent-{index}");
-            view.subagents.insert(
-                id.clone(),
-                SubagentInstanceSnapshot {
-                    id,
-                    role: SubagentRole::Worker,
-                    identity: SubagentIdentity {
-                        id: format!("identity-{index}"),
-                        name: format!("成员 {index}"),
-                    },
-                    status: SubagentInstanceStatus::Idle,
-                    created_at_ms: 0,
-                    updated_at_ms: 0,
-                    latest_run_id: None,
-                    latest_task: None,
-                    queue_reason: None,
-                    latest_summary: None,
-                    event_log_truncated: false,
-                },
-            );
-        }
-        state.inspector_tab = InspectorTab::Subagents;
-        draw(160, 36, &mut state);
-        let subagent = state
-            .hit_regions
-            .iter()
-            .copied()
-            .find(|region| region.target == HitTarget::Subagent(1))
-            .unwrap();
-        click(&mut state, subagent);
-        assert_eq!(state.inspector_tab, InspectorTab::Subagents);
-        assert_eq!(state.selected_inspector, 1);
-    }
-
-    #[test]
-    fn modal_overlay_removes_underlying_hit_regions() {
+    fn overlay_replaces_the_bottom_panel_without_hiding_the_transcript() {
         let mut state = test_state(80, 24);
-        draw(80, 24, &mut state);
-        assert!(!state.hit_regions.is_empty());
         state.overlay = Some(Overlay::Help);
-        draw(80, 24, &mut state);
-        assert!(state.hit_regions.is_empty());
+        let screen = draw(80, 24, &mut state);
+        assert!(screen.contains("workspace"), "{screen:?}");
+        assert!(screen.contains("scrollback"), "{screen:?}");
+    }
+
+    #[test]
+    fn durable_history_above_the_viewport_is_exposed_for_native_scrollback() {
+        let mut state = test_state(80, 18);
+        let mut session = Session::new();
+        for index in 0..20 {
+            let user = Message::user(format!("history user {index}"));
+            let assistant = Message::assistant(format!("history assistant {index}"));
+            let mut turn = Turn::running(user.clone());
+            turn.complete(assistant.clone());
+            session.apply_turn(TurnRecord::new(turn, vec![user, assistant]));
+        }
+        state
+            .active_view_mut()
+            .unwrap()
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .session = session;
+        state.active_view_mut().unwrap().live.text = "mutable streaming tail".repeat(20);
+        let backend = TestBackend::new(80, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut inline = None;
+        terminal
+            .draw(|frame| {
+                inline = Some(render_inline(frame, &mut state));
+            })
+            .unwrap();
+
+        let scrollback = inline.unwrap().scrollback.unwrap();
+        let text = scrollback
+            .rows
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(scrollback.rows.area.height > 0);
+        assert!(text.contains("history user 0"), "{text:?}");
+        assert!(!text.contains("mutable streaming tail"), "{text:?}");
+    }
+
+    #[test]
+    fn exit_render_removes_transient_composer_and_footer() {
+        let mut state = test_state(80, 24);
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_exit(frame, &mut state);
+            })
+            .unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(!screen.contains("Enter 发送"), "{screen:?}");
+        assert!(!screen.contains("context"), "{screen:?}");
+        assert!(screen.contains('▌'), "{screen:?}");
     }
 
     #[test]
@@ -2657,12 +2894,149 @@ mod tests {
     }
 
     #[test]
+    fn persisted_tool_calls_reconstruct_semantic_cards() {
+        let mut state = test_state(100, 40);
+        let user = Message::user("inspect");
+        let call = ToolCall::function("call-1", "read_file", r#"{"path":"README.md"}"#);
+        let assistant_call = Message::assistant_tool_calls(vec![call]);
+        let tool_result = Message::tool_result("call-1", r#"{"ok":true,"path":"README.md"}"#);
+        let final_message = Message::assistant("done");
+        let mut turn = Turn::running(user.clone());
+        turn.steps[0].complete();
+        let mut tool_step = TurnStep::running_tool_call("read_file", "call-1");
+        tool_step.complete();
+        turn.steps.push(tool_step);
+        turn.complete(final_message.clone());
+        let mut session = Session::new();
+        session.apply_turn(TurnRecord::new(
+            turn,
+            vec![user, assistant_call, tool_result, final_message],
+        ));
+        state
+            .active_view_mut()
+            .unwrap()
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .session = session;
+
+        let screen = draw(100, 40, &mut state);
+        assert!(screen.contains("read_file"), "{screen:?}");
+        assert!(screen.contains("README.md"), "{screen:?}");
+        assert!(screen.contains("done"), "{screen:?}");
+    }
+
+    #[test]
+    fn malformed_tool_call_ids_render_safe_generic_cards() {
+        let mut state = test_state(100, 60);
+        let user = Message::user("inspect malformed history");
+        let assistant_call = Message::assistant_tool_calls(vec![
+            ToolCall::function("duplicate", "read_file", r#"{"path":"one"}"#),
+            ToolCall::function("duplicate", "read_file", r#"{"path":"two"}"#),
+        ]);
+        let first_result = Message::tool_result("duplicate", "duplicate-result-one");
+        let second_result = Message::tool_result("duplicate", "duplicate-result-two");
+        let mut missing_id = Message::tool_result("missing", "missing-id-result");
+        missing_id.tool_call_id = None;
+        let final_message = Message::assistant("done");
+        let mut turn = Turn::running(user.clone());
+        turn.steps[0].complete();
+        turn.steps
+            .push(TurnStep::running_tool_call("read_file", "duplicate"));
+        turn.steps
+            .push(TurnStep::running_tool_call("read_file", "duplicate"));
+        turn.complete(final_message.clone());
+        let mut session = Session::new();
+        session.apply_turn(TurnRecord::new(
+            turn,
+            vec![
+                user,
+                assistant_call,
+                first_result,
+                second_result,
+                missing_id,
+                final_message,
+            ],
+        ));
+        state
+            .active_view_mut()
+            .unwrap()
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .session = session;
+
+        let screen = draw(100, 60, &mut state);
+        assert!(screen.contains("tool_call_id"), "{screen:?}");
+        assert!(screen.contains("duplicate-result-one"), "{screen:?}");
+        assert!(screen.contains("duplicate-result-two"), "{screen:?}");
+        assert!(screen.contains("missing-id-result"), "{screen:?}");
+    }
+
+    #[test]
+    fn tool_cards_use_pending_success_and_error_backgrounds() {
+        let mut state = test_state(100, 60);
+        state.active_view_mut().unwrap().live.tools.extend([
+            crate::state::ToolRun {
+                id: "pending".to_string(),
+                name: "pending_tool".to_string(),
+                status: TurnStatus::Running,
+                summary: None,
+                result: None,
+            },
+            crate::state::ToolRun {
+                id: "success".to_string(),
+                name: "shell".to_string(),
+                status: TurnStatus::Completed,
+                summary: Some(ToolExecutionSummary::shell(ShellCommandSummary {
+                    command: "cargo check".to_string(),
+                    exit_code: Some(0),
+                    timed_out: false,
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                })),
+                result: None,
+            },
+            crate::state::ToolRun {
+                id: "error".to_string(),
+                name: "failed_tool".to_string(),
+                status: TurnStatus::Failed,
+                summary: Some(ToolExecutionSummary::error("boom")),
+                result: None,
+            },
+        ]);
+        let backend = TestBackend::new(100, 60);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render(frame, &mut state);
+            })
+            .unwrap();
+        let cells = terminal.backend().buffer().content();
+        assert!(
+            cells
+                .iter()
+                .any(|cell| cell.bg == theme::PENDING_BACKGROUND)
+        );
+        assert!(
+            cells
+                .iter()
+                .any(|cell| cell.bg == theme::SUCCESS_BACKGROUND)
+        );
+        assert!(cells.iter().any(|cell| cell.bg == theme::ERROR_BACKGROUND));
+    }
+
+    #[test]
     fn no_color_mode_does_not_emit_palette_colors() {
         let mut state = test_state(80, 24);
         state.no_color = true;
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+        terminal
+            .draw(|frame| {
+                render(frame, &mut state);
+            })
+            .unwrap();
         assert!(
             terminal
                 .backend()

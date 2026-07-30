@@ -77,11 +77,12 @@ cargo install --git https://github.com/catDforD/morrow --locked -p agent-cli
 ```bash
 morrow "summarize this repository"   # one-shot
 morrow                               # terminal UI (when stdin/stdout are terminals)
+morrow --no-color                    # TUI without foreground/background colors
 morrow --plain                       # plain REPL
 morrow server                        # local web dashboard
 ```
 
-With no prompt, Morrow opens the TUI on a usable terminal and creates a new persisted session for that launch. Use `--session <name>` to resume a named session. Redirected input/output, `TERM=dumb`, or a full-screen initialization failure falls back to the plain REPL. One-shot prompts, `--jsonl`, `--plain`, `server`, `init`, and `session` keep their existing behavior.
+With no prompt, Morrow opens the TUI on a usable terminal and creates a new persisted session for that launch. Use `--session <name>` to resume a named session. The TUI runs inline on the normal terminal screen, so native scrollback, text selection, and copying remain available. Use `--no-color` (or the standard `NO_COLOR` environment variable) to retain typography and status symbols without foreground/background colors. Redirected input/output, `TERM=dumb`, or an interactive-terminal initialization failure falls back to the plain REPL. One-shot prompts, `--jsonl`, `--plain`, `server`, `init`, and `session` keep their existing behavior.
 
 The dashboard listens on `127.0.0.1:3000` by default and uses the current workspace, config, sessions, and permissions. It is local-first and unauthenticated — do not bind it to a public interface. Customize with `morrow server --host 127.0.0.1 --port 3000`.
 
@@ -201,7 +202,7 @@ morrow session rename work backend-refactor
 morrow session delete backend-refactor
 ```
 
-The TUI supports session switching, archive/restore, full-page Run and Subagent inspectors, approval modals, multiline input, slash commands, workspace-relative `@` path completion, and a context meter. Press `F1` for shortcuts. `Ctrl+C` cancels the active task or clears the draft; press it again within one second to cancel all tasks and force exit. In `--plain` mode, useful REPL commands are `/status`, `/permissions ...`, `/compact`, `/reset`, and `/exit`. Compatibility aliases `--thread` / `--reset-thread` still work; prefer `--session` for new usage.
+The TUI supports session switching, archive/restore, bottom-panel Run and Subagent inspectors, approval cards, multiline input, slash commands, workspace-relative `@` path completion, and a context meter. Sessions, inspectors, settings, help, and confirmations replace the composer while keeping the conversation visible; `Esc` returns to the previous panel. Press `F1` for shortcuts. `Ctrl+C` cancels the active task or clears the draft; press it again within one second to cancel all tasks and force exit. In `--plain` mode, useful REPL commands are `/status`, `/permissions ...`, `/compact`, `/reset`, and `/exit`. Compatibility aliases `--thread` / `--reset-thread` still work; prefer `--session` for new usage.
 
 ## Automation
 

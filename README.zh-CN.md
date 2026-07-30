@@ -77,11 +77,12 @@ cargo install --git https://github.com/catDforD/morrow --locked -p agent-cli
 ```bash
 morrow "summarize this repository"   # 单次提示
 morrow                               # 终端可用时启动 TUI
+morrow --no-color                    # 不使用前景色和背景色的 TUI
 morrow --plain                       # 纯文本 REPL
 morrow server                        # 本地 Web 仪表盘
 ```
 
-没有 prompt 时，Morrow 会在可用终端中打开 TUI，并为本次启动创建一个立即持久化的新会话；使用 `--session <名称>` 可恢复指定会话。stdin/stdout 被重定向、`TERM=dumb` 或全屏终端初始化失败时，会提示并回退到纯文本 REPL。单次 prompt、`--jsonl`、`--plain`、`server`、`init` 和 `session` 保持原行为。
+没有 prompt 时，Morrow 会在可用终端中打开 TUI，并为本次启动创建一个立即持久化的新会话；使用 `--session <名称>` 可恢复指定会话。TUI 以内联方式运行在普通终端屏幕中，因此保留原生 scrollback、文本选择和复制。使用 `--no-color`（或标准 `NO_COLOR` 环境变量）可清除前景色和背景色，同时保留字体强调与状态符号。stdin/stdout 被重定向、`TERM=dumb` 或交互终端初始化失败时，会提示并回退到纯文本 REPL。单次 prompt、`--jsonl`、`--plain`、`server`、`init` 和 `session` 保持原行为。
 
 仪表盘默认监听 `127.0.0.1:3000`，使用当前工作区、配置、会话与权限。它是本地优先且无鉴权的，不要绑定到公网。可用 `morrow server --host 127.0.0.1 --port 3000` 自定义地址。
 
@@ -201,7 +202,7 @@ morrow session rename work backend-refactor
 morrow session delete backend-refactor
 ```
 
-TUI 支持会话切换、归档/恢复、全页 Run 与 Subagent 检查器、审批模态框、多行输入、斜杠命令、工作区相对 `@` 路径补全和 context meter；按 `F1` 查看快捷键。`Ctrl+C` 会取消当前任务或清空草稿，1 秒内再次按下会取消全部任务并强制退出。`--plain` 模式的常用 REPL 命令为 `/status`、`/permissions ...`、`/compact`、`/reset` 和 `/exit`。兼容别名 `--thread` / `--reset-thread` 仍可用，新用法请优先 `--session`。
+TUI 支持会话切换、归档/恢复、底部 Run 与 Subagent 检查器、审批卡片、多行输入、斜杠命令、工作区相对 `@` 路径补全和 context meter。会话、检查器、设置、帮助和确认界面会替换 composer，同时保留上方对话；按 `Esc` 返回上一层。按 `F1` 查看快捷键。`Ctrl+C` 会取消当前任务或清空草稿，1 秒内再次按下会取消全部任务并强制退出。`--plain` 模式的常用 REPL 命令为 `/status`、`/permissions ...`、`/compact`、`/reset` 和 `/exit`。兼容别名 `--thread` / `--reset-thread` 仍可用，新用法请优先 `--session`。
 
 ## 自动化
 

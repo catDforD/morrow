@@ -78,14 +78,23 @@ pub async fn run<B: WorkspaceBackend>(
     state.terminal_size = (size.width, size.height);
     terminal
         .terminal_mut()
-        .draw(|frame| crate::ui::render(frame, &mut state))
+        .draw_inline(|frame| crate::ui::render_inline(frame, &mut state))
         .map_err(TuiError::Terminal)?;
     let result = run_loop(backend, &mut terminal, &mut state, state_path).await;
+    let finish_result = if result.is_ok() {
+        terminal
+            .terminal_mut()
+            .finish(|frame| crate::ui::render_exit(frame, &mut state))
+    } else {
+        Ok(())
+    };
     let restore_result = terminal.restore();
-    match (result, restore_result) {
-        (Ok(outcome), Ok(())) => Ok(outcome),
-        (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(TuiError::RuntimeTerminal(error)),
+    match (result, finish_result, restore_result) {
+        (Ok(outcome), Ok(()), Ok(())) => Ok(outcome),
+        (Err(error), _, _) => Err(error),
+        (Ok(_), Err(error), _) | (Ok(_), Ok(()), Err(error)) => {
+            Err(TuiError::RuntimeTerminal(error))
+        }
     }
 }
 
@@ -164,8 +173,10 @@ async fn run_loop<B: WorkspaceBackend>(
             }
             _ = ticker.tick() => Message::Tick,
         };
-        let draw_now = matches!(message, Message::Terminal(_) | Message::Tick);
+        let tick = matches!(&message, Message::Tick);
         let effects = state.update(message);
+        let draw_now =
+            !tick || state.has_active_work() || state.context.loading || state.settings.loading;
 
         if state.should_quit {
             for effect in effects {
@@ -200,7 +211,7 @@ async fn run_loop<B: WorkspaceBackend>(
         if draw_now {
             terminal
                 .terminal_mut()
-                .draw(|frame| crate::ui::render(frame, state))
+                .draw_inline(|frame| crate::ui::render_inline(frame, state))
                 .map_err(TuiError::RuntimeTerminal)?;
         }
     }

@@ -63,6 +63,9 @@ struct Args {
     #[arg(long, help = "Use the existing line-oriented interactive mode")]
     plain: bool,
 
+    #[arg(long, help = "Disable TUI foreground and background colors")]
+    no_color: bool,
+
     #[command(subcommand)]
     command: Option<CliCommand>,
 
@@ -296,7 +299,7 @@ async fn run() -> Result<(), CliError> {
                         initial_session,
                         permission_override,
                         state_path: Some(state_path),
-                        no_color: std::env::var_os("NO_COLOR").is_some(),
+                        no_color: args.no_color || std::env::var_os("NO_COLOR").is_some(),
                     },
                 )
                 .await;
@@ -309,7 +312,7 @@ async fn run() -> Result<(), CliError> {
                     Err(agent_tui::TuiError::Terminal(error)) => {
                         app.shutdown(false).await;
                         eprintln!(
-                            "notice: failed to initialize the full-screen terminal ({error}); using plain interactive mode"
+                            "notice: failed to initialize the interactive terminal ({error}); using plain interactive mode"
                         );
                     }
                     Err(error) => {
@@ -1709,6 +1712,14 @@ compact test
         let args = Args::try_parse_from(["morrow", "--plain"]).expect("parse plain");
 
         assert!(args.plain);
+        assert!(args.prompt.is_empty());
+    }
+
+    #[test]
+    fn parses_no_color_flag() {
+        let args = Args::try_parse_from(["morrow", "--no-color"]).expect("parse no color");
+
+        assert!(args.no_color);
         assert!(args.prompt.is_empty());
     }
 

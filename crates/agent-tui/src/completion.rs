@@ -138,6 +138,7 @@ mod tests {
             std::thread::current().name().unwrap_or("test")
         ));
         let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".git")).unwrap();
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::create_dir_all(root.join("ignored")).unwrap();
         std::fs::write(root.join("src/lib.rs"), "").unwrap();
