@@ -1,3 +1,5 @@
+pub mod session_handle;
+pub mod session_projection;
 pub mod session_store;
 pub mod subagent_store;
 pub mod subagent_supervisor;
@@ -6,13 +8,15 @@ use agent_config::{ContextConfig, McpServerConfig, ModelContextLimits};
 use agent_core::{Agent, AgentError, ModelEvent, ModelFailure, ModelRequest, ToolExecutionContext};
 use agent_protocol::{
     AgentEvent, AgentEventOrigin, ApprovalDecision, ApprovalRequest, Conversation, Message,
-    ModelInvocation, PermissionProfile, Session, SubagentExecutionSummary, SubagentIdentity,
-    Thread, ToolDefinition, TurnRecord, TurnStatus, TurnStepKind,
+    ModelInvocation, PermissionProfile, Session, SessionFact, SessionTurnStatus,
+    SubagentExecutionSummary, SubagentIdentity, Thread, ToolCall, ToolDefinition, TurnRecord,
+    TurnStatus, TurnStepKind,
 };
 use agent_tools::{SubagentExecutor, ToolRegistry, ToolRegistryError};
 use futures_util::StreamExt;
 use futures_util::future::{BoxFuture, FutureExt};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -23,7 +27,14 @@ use thiserror::Error;
 
 pub use agent_core::{CancellationToken, Model};
 pub use agent_tools::{McpToolCache, SubagentController};
-pub use session_store::{SessionEntry, SessionListingEntry, SessionStore, SessionStoreError};
+pub use session_handle::{SessionHandle, SessionSubscription};
+pub use session_projection::{
+    SessionProjectionError, project_session, projection_to_legacy_session,
+};
+pub use session_store::{
+    SessionDirectoryListing, SessionEntry, SessionListingDiagnostic, SessionListingEntry,
+    SessionStore, SessionStoreError, SessionWriterLease,
+};
 pub use subagent_store::{SubagentInstanceDocument, SubagentSessionStore, SubagentStoreError};
 pub use subagent_supervisor::{
     DenySubagentObserver, MAX_CONCURRENT_SUBAGENT_RUNS, MAX_PERSISTENT_SUBAGENTS_PER_SESSION,
@@ -31,7 +42,7 @@ pub use subagent_supervisor::{
     subagent_store_for_session,
 };
 
-pub const EVENT_SCHEMA_VERSION: u32 = 7;
+pub const EVENT_SCHEMA_VERSION: u32 = 8;
 const MESSAGE_BASE_TOKENS: usize = 6;
 const TOOL_CALL_BASE_TOKENS: usize = 12;
 const REQUEST_PADDING_NUMERATOR: usize = 4;
@@ -364,6 +375,189 @@ pub trait TurnEventHandler {
     }
 }
 
+struct SessionFactRun<'a> {
+    handle: &'a SessionHandle,
+    operation_id: String,
+    turn_id: String,
+    current_model_call_id: String,
+    next_model_call_index: usize,
+    tool_calls: HashMap<String, ToolCall>,
+}
+
+enum OperationUpdate {
+    None,
+    Phase(&'static str),
+    ClearStreaming(&'static str),
+}
+
+impl<'a> SessionFactRun<'a> {
+    fn new(handle: &'a SessionHandle, operation_id: String, turn_id: String) -> Self {
+        Self {
+            handle,
+            operation_id,
+            turn_id,
+            current_model_call_id: "model-call-0".to_string(),
+            next_model_call_index: 0,
+            tool_calls: HashMap::new(),
+        }
+    }
+
+    async fn persist_event(&mut self, event: &AgentEvent) -> Result<(), RuntimeError> {
+        let (fact, operation_update) = match event {
+            AgentEvent::TurnStarted => (None, OperationUpdate::None),
+            AgentEvent::ModelCallStarted => {
+                let model_call_id = format!("model-call-{}", self.next_model_call_index);
+                self.next_model_call_index += 1;
+                self.current_model_call_id = model_call_id.clone();
+                (
+                    Some(SessionFact::ModelCallStarted { model_call_id }),
+                    OperationUpdate::Phase("model_call"),
+                )
+            }
+            AgentEvent::Warning(message) => (
+                Some(SessionFact::NoticeRecorded {
+                    message: message.clone(),
+                }),
+                OperationUpdate::None,
+            ),
+            AgentEvent::ReasoningDelta(delta) => {
+                self.handle
+                    .append_stream_delta(
+                        &self.operation_id,
+                        &self.current_model_call_id,
+                        None,
+                        Some(delta.clone()),
+                    )
+                    .await;
+                (None, OperationUpdate::None)
+            }
+            AgentEvent::TextDelta(delta) => {
+                self.handle
+                    .append_stream_delta(
+                        &self.operation_id,
+                        &self.current_model_call_id,
+                        Some(delta.clone()),
+                        None,
+                    )
+                    .await;
+                (None, OperationUpdate::None)
+            }
+            AgentEvent::ModelMessageCommitted {
+                model_call_id,
+                message,
+            } => {
+                for call in message.tool_calls.iter().flatten() {
+                    self.tool_calls.insert(call.id.clone(), call.clone());
+                }
+                (
+                    Some(SessionFact::ModelMessageCommitted {
+                        model_call_id: model_call_id.clone(),
+                        message: message.clone(),
+                    }),
+                    OperationUpdate::ClearStreaming("model_message_committed"),
+                )
+            }
+            AgentEvent::ToolCallStarted { id, name } => (
+                Some(SessionFact::ToolCallStarted {
+                    tool_call: self
+                        .tool_calls
+                        .get(id)
+                        .cloned()
+                        .unwrap_or_else(|| ToolCall::function(id.clone(), name.clone(), "{}")),
+                }),
+                OperationUpdate::Phase("tool_call"),
+            ),
+            AgentEvent::SubagentStarted { id, task, .. } => (
+                Some(SessionFact::ToolCallStarted {
+                    tool_call: self.tool_calls.get(id).cloned().unwrap_or_else(|| {
+                        ToolCall::function(
+                            id.clone(),
+                            "delegate_task",
+                            serde_json::json!({"task": task}).to_string(),
+                        )
+                    }),
+                }),
+                OperationUpdate::Phase("subagent"),
+            ),
+            AgentEvent::ApprovalRequested(request) => (
+                Some(SessionFact::ApprovalRequested {
+                    request: request.clone(),
+                }),
+                OperationUpdate::Phase("approval"),
+            ),
+            AgentEvent::ApprovalResolved(decision) => (
+                Some(SessionFact::ApprovalResolved {
+                    decision: decision.clone(),
+                }),
+                OperationUpdate::Phase("tool_call"),
+            ),
+            AgentEvent::ToolResultCommitted {
+                tool_call_id,
+                message,
+                ok,
+                summary,
+            } => (
+                Some(SessionFact::ToolCallFinished {
+                    tool_call_id: tool_call_id.clone(),
+                    result: message.clone(),
+                    ok: *ok,
+                    summary: summary.clone(),
+                }),
+                OperationUpdate::None,
+            ),
+            AgentEvent::TurnCompleted => (Some(SessionFact::TurnCompleted), OperationUpdate::None),
+            AgentEvent::Error(_) => (None, OperationUpdate::None),
+            AgentEvent::AgentMessage(_)
+            | AgentEvent::SubagentFinished { .. }
+            | AgentEvent::SubagentUpdated(_)
+            | AgentEvent::ToolCallFinished { .. } => (None, OperationUpdate::None),
+        };
+        if let Some(fact) = fact {
+            self.handle
+                .commit_fact(
+                    Some(self.operation_id.clone()),
+                    Some(self.turn_id.clone()),
+                    fact,
+                )
+                .await?;
+        }
+        match operation_update {
+            OperationUpdate::None => {}
+            OperationUpdate::Phase(phase) => self.handle.set_operation_phase(phase).await,
+            OperationUpdate::ClearStreaming(phase) => self.handle.clear_streaming(phase).await,
+        }
+        Ok(())
+    }
+
+    async fn persist_compaction(&self, session: &Session) -> Result<(), RuntimeError> {
+        let Some(summary) = session.context.summary.as_ref() else {
+            return Ok(());
+        };
+        if session.context.summarized_turns == 0 {
+            return Ok(());
+        }
+        let projection = self.handle.projection().await;
+        let Some(covered) = projection
+            .turns
+            .get(session.context.summarized_turns - 1)
+            .map(|turn| turn.id.clone())
+        else {
+            return Ok(());
+        };
+        self.handle
+            .commit_fact(
+                Some(self.operation_id.clone()),
+                None,
+                SessionFact::ContextCompacted {
+                    summary: summary.clone(),
+                    covered_through_turn_id: covered,
+                },
+            )
+            .await?;
+        Ok(())
+    }
+}
+
 pub async fn run_agent_turn(
     context: RunAgentTurnContext<'_>,
     session: &mut Session,
@@ -372,6 +566,110 @@ pub async fn run_agent_turn(
 ) -> Result<RunAgentTurnOutcome, RuntimeError> {
     run_agent_turn_with_cancellation(context, session, prompt, handler, CancellationToken::new())
         .await
+}
+
+pub async fn run_agent_turn_with_session_handle(
+    context: RunAgentTurnContext<'_>,
+    handle: &SessionHandle,
+    prompt: &str,
+    handler: &mut impl TurnEventHandler,
+    cancellation: CancellationToken,
+    controller: Option<Arc<dyn SubagentController>>,
+) -> Result<RunAgentTurnOutcome, RuntimeError> {
+    let (operation_id, turn_id) = handle
+        .begin_operation(
+            Message::user(prompt),
+            context.model.clone(),
+            context.permissions,
+        )
+        .await?;
+    run_agent_turn_with_prepared_session_handle(
+        context,
+        handle,
+        PreparedSessionTurn {
+            operation_id,
+            turn_id,
+            prompt,
+        },
+        handler,
+        cancellation,
+        controller,
+    )
+    .await
+}
+
+pub struct PreparedSessionTurn<'a> {
+    pub operation_id: String,
+    pub turn_id: String,
+    pub prompt: &'a str,
+}
+
+pub async fn run_agent_turn_with_prepared_session_handle(
+    context: RunAgentTurnContext<'_>,
+    handle: &SessionHandle,
+    prepared: PreparedSessionTurn<'_>,
+    handler: &mut impl TurnEventHandler,
+    cancellation: CancellationToken,
+    controller: Option<Arc<dyn SubagentController>>,
+) -> Result<RunAgentTurnOutcome, RuntimeError> {
+    let PreparedSessionTurn {
+        operation_id,
+        turn_id,
+        prompt,
+    } = prepared;
+    let projection = handle.projection().await;
+    let mut session = projection_to_legacy_session(&projection);
+    session
+        .turns
+        .retain(|record| record.turn.status != TurnStatus::Running);
+    let mut fact_run = SessionFactRun::new(handle, operation_id.clone(), turn_id.clone());
+    let result = run_agent_turn_with_optional_controller_and_facts(
+        context,
+        &mut session,
+        prompt,
+        handler,
+        cancellation.clone(),
+        controller,
+        Some(&mut fact_run),
+    )
+    .await;
+
+    let latest = handle.projection().await;
+    if latest
+        .turns
+        .iter()
+        .find(|turn| turn.id == turn_id)
+        .is_some_and(|turn| turn.status == SessionTurnStatus::Running)
+    {
+        let fact = if cancellation.is_cancelled() {
+            SessionFact::TurnCancelled {
+                reason: "turn cancelled".to_string(),
+            }
+        } else {
+            SessionFact::TurnFailed {
+                error: result
+                    .as_ref()
+                    .err()
+                    .map(ToString::to_string)
+                    .or_else(|| {
+                        result
+                            .as_ref()
+                            .ok()
+                            .and_then(|outcome| outcome.error.clone())
+                    })
+                    .unwrap_or_else(|| "turn ended without a terminal event".to_string()),
+            }
+        };
+        if let Err(error) = handle
+            .commit_fact(Some(operation_id), Some(turn_id), fact)
+            .await
+        {
+            handle.replace_operation(None).await;
+            return Err(error.into());
+        }
+    }
+    handle.replace_operation(None).await;
+    result
 }
 
 pub async fn run_agent_turn_with_cancellation(
@@ -412,6 +710,27 @@ async fn run_agent_turn_with_optional_controller(
     cancellation: CancellationToken,
     controller: Option<Arc<dyn SubagentController>>,
 ) -> Result<RunAgentTurnOutcome, RuntimeError> {
+    run_agent_turn_with_optional_controller_and_facts(
+        context,
+        session,
+        prompt,
+        handler,
+        cancellation,
+        controller,
+        None,
+    )
+    .await
+}
+
+async fn run_agent_turn_with_optional_controller_and_facts(
+    context: RunAgentTurnContext<'_>,
+    session: &mut Session,
+    prompt: &str,
+    handler: &mut impl TurnEventHandler,
+    cancellation: CancellationToken,
+    controller: Option<Arc<dyn SubagentController>>,
+    fact_run: Option<&mut SessionFactRun<'_>>,
+) -> Result<RunAgentTurnOutcome, RuntimeError> {
     // 所有状态先写入草稿；只有整个用例正常收束后才替换调用方持有的 Session。
     let mut draft = session.clone();
     let outcome = run_agent_turn_inner(
@@ -421,6 +740,7 @@ async fn run_agent_turn_with_optional_controller(
         handler,
         &cancellation,
         controller,
+        fact_run,
     )
     .await?;
     *session = draft;
@@ -434,6 +754,7 @@ async fn run_agent_turn_inner(
     handler: &mut impl TurnEventHandler,
     cancellation: &CancellationToken,
     controller: Option<Arc<dyn SubagentController>>,
+    mut fact_run: Option<&mut SessionFactRun<'_>>,
 ) -> Result<RunAgentTurnOutcome, RuntimeError> {
     let writer_lease = controller
         .as_ref()
@@ -480,6 +801,8 @@ async fn run_agent_turn_inner(
     };
     let tool_definitions = tools.definitions();
 
+    let previous_summary = session.context.summary.clone();
+    let previous_summarized_turns = session.context.summarized_turns;
     let compaction = tokio::select! {
         biased;
         _ = cancellation.cancelled() => None,
@@ -508,6 +831,12 @@ async fn run_agent_turn_inner(
             error: Some(message),
         });
     }
+    if (session.context.summary != previous_summary
+        || session.context.summarized_turns != previous_summarized_turns)
+        && let Some(run) = fact_run.as_deref_mut()
+    {
+        run.persist_compaction(session).await?;
+    }
 
     let agent = Agent::with_tools(context.client, effective_system_prompt, &tools);
     let mut agent_error = None;
@@ -524,6 +853,9 @@ async fn run_agent_turn_inner(
             AgentEvent::Warning(diagnostic),
         );
         event_index += 1;
+        if let Some(run) = fact_run.as_deref_mut() {
+            run.persist_event(&envelope.event).await?;
+        }
         if let Err(error) = handler.on_event(&envelope) {
             return Ok(record_failed_turn(
                 session,
@@ -572,6 +904,9 @@ async fn run_agent_turn_inner(
                 event.clone(),
             );
             event_index += 1;
+            if let Some(run) = fact_run.as_deref_mut() {
+                run.persist_event(&event).await?;
+            }
             match &event {
                 AgentEvent::TurnCompleted => {
                     turn_completed = true;
@@ -584,12 +919,14 @@ async fn run_agent_turn_inner(
                 | AgentEvent::Warning(_)
                 | AgentEvent::ReasoningDelta(_)
                 | AgentEvent::TextDelta(_)
+                | AgentEvent::ModelMessageCommitted { .. }
                 | AgentEvent::AgentMessage(_)
                 | AgentEvent::SubagentStarted { .. }
                 | AgentEvent::SubagentFinished { .. }
                 | AgentEvent::SubagentUpdated(_)
                 | AgentEvent::ToolCallStarted { .. }
                 | AgentEvent::ToolCallFinished { .. }
+                | AgentEvent::ToolResultCommitted { .. }
                 | AgentEvent::ApprovalRequested(_)
                 | AgentEvent::ApprovalResolved(_) => {}
             }
@@ -1913,13 +2250,17 @@ compact test
                 .iter()
                 .map(|event| event.event_index)
                 .collect::<Vec<_>>(),
-            vec![0, 1, 2, 3, 4]
+            vec![0, 1, 2, 3, 4, 5]
         );
         assert_eq!(handler.events[1].event, AgentEvent::ModelCallStarted);
         assert_eq!(
             handler.events[2].event,
             AgentEvent::TextDelta("ok".to_string())
         );
+        assert!(matches!(
+            handler.events[3].event,
+            AgentEvent::ModelMessageCommitted { .. }
+        ));
     }
 
     #[tokio::test]

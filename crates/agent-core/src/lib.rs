@@ -353,6 +353,7 @@ impl<'a> Agent<'a> {
             turn_messages: vec![user_message.clone()],
             assistant_reasoning: String::new(),
             assistant_text: String::new(),
+            model_call_index: 0,
             pending: VecDeque::from([AgentEvent::TurnStarted, AgentEvent::ModelCallStarted]),
             finished: false,
             tool_rounds: 0,
@@ -397,6 +398,7 @@ pub struct AgentTurnStream<'a> {
     turn_messages: Vec<Message>,
     assistant_reasoning: String,
     assistant_text: String,
+    model_call_index: usize,
     pending: VecDeque<AgentEvent>,
     finished: bool,
     tool_rounds: usize,
@@ -491,6 +493,14 @@ impl AgentTurnStream<'_> {
             .with_reasoning_content(self.assistant_reasoning.clone());
         self.turn_messages.push(assistant_message.clone());
         self.turn.complete(assistant_message);
+        self.pending.push_back(AgentEvent::ModelMessageCommitted {
+            model_call_id: format!("model-call-{}", self.model_call_index),
+            message: self
+                .turn
+                .assistant_message
+                .clone()
+                .expect("completed turn has assistant message"),
+        });
         self.pending
             .push_back(AgentEvent::AgentMessage(assistant_text));
         self.pending.push_back(AgentEvent::TurnCompleted);
@@ -552,7 +562,11 @@ impl AgentTurnStream<'_> {
         self.assistant_reasoning.clear();
         self.assistant_text.clear();
         self.conversation.push(assistant_message.clone());
-        self.turn_messages.push(assistant_message);
+        self.turn_messages.push(assistant_message.clone());
+        self.pending.push_back(AgentEvent::ModelMessageCommitted {
+            model_call_id: format!("model-call-{}", self.model_call_index),
+            message: assistant_message,
+        });
         self.pending_tool_calls = tool_calls.into_iter().enumerate().collect();
         self.pending_tool_results.clear();
         self.next_tool_result_index = 0;
@@ -719,7 +733,13 @@ impl AgentTurnStream<'_> {
         self.finish_tool_step(&tool_call, &result);
         let tool_message = Message::tool_result(id.clone(), result.content);
         self.conversation.push(tool_message.clone());
-        self.turn_messages.push(tool_message);
+        self.turn_messages.push(tool_message.clone());
+        self.pending.push_back(AgentEvent::ToolResultCommitted {
+            tool_call_id: id.clone(),
+            message: tool_message,
+            ok,
+            summary: summary.clone(),
+        });
 
         match self.tools.execution_kind(&tool_call) {
             ToolExecutionKind::Standard => {
@@ -774,6 +794,7 @@ impl AgentTurnStream<'_> {
 
     fn start_next_model_call(&mut self) {
         self.turn.steps.push(TurnStep::running_model_call());
+        self.model_call_index += 1;
         self.pending.push_back(AgentEvent::ModelCallStarted);
         self.model_start = Some(self.model.stream(ModelRequest {
             conversation: self.conversation.clone(),
@@ -1478,6 +1499,23 @@ mod tests {
     ) -> (Vec<AgentEvent>, Turn) {
         let mut events = Vec::new();
         while let Some(event) = stream.next().await {
+            if !matches!(
+                event,
+                AgentEvent::ModelMessageCommitted { .. } | AgentEvent::ToolResultCommitted { .. }
+            ) {
+                events.push(event);
+            }
+        }
+        let turn = apply_record(thread, stream.into_turn_record());
+        (events, turn)
+    }
+
+    async fn collect_all_events(
+        mut stream: AgentTurnStream<'_>,
+        thread: &mut Thread,
+    ) -> (Vec<AgentEvent>, Turn) {
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
             events.push(event);
         }
         let turn = apply_record(thread, stream.into_turn_record());
@@ -1485,7 +1523,15 @@ mod tests {
     }
 
     async fn next_event(stream: &mut AgentTurnStream<'_>) -> AgentEvent {
-        stream.next().await.expect("next agent event")
+        loop {
+            let event = stream.next().await.expect("next agent event");
+            if !matches!(
+                event,
+                AgentEvent::ModelMessageCommitted { .. } | AgentEvent::ToolResultCommitted { .. }
+            ) {
+                return event;
+            }
+        }
     }
 
     #[tokio::test]
@@ -1958,29 +2004,39 @@ mod tests {
             .run_turn(&thread, "Read note.txt")
             .await
             .expect("run turn");
-        let (events, turn) = collect_events(stream, &mut thread).await;
+        let (events, turn) = collect_all_events(stream, &mut thread).await;
 
-        assert_eq!(
-            events,
-            vec![
-                AgentEvent::TurnStarted,
-                AgentEvent::ModelCallStarted,
-                AgentEvent::ToolCallStarted {
-                    id: "call_1".to_string(),
-                    name: "read_file".to_string()
-                },
-                AgentEvent::ToolCallFinished {
-                    id: "call_1".to_string(),
-                    name: "read_file".to_string(),
-                    ok: true,
-                    summary: None
-                },
-                AgentEvent::ModelCallStarted,
-                AgentEvent::TextDelta("Read it".to_string()),
-                AgentEvent::AgentMessage("Read it".to_string()),
-                AgentEvent::TurnCompleted,
-            ]
-        );
+        assert_eq!(events.len(), 11);
+        assert!(matches!(events[0], AgentEvent::TurnStarted));
+        assert!(matches!(events[1], AgentEvent::ModelCallStarted));
+        assert!(matches!(
+            &events[2],
+            AgentEvent::ModelMessageCommitted { message, .. }
+                if message.tool_calls.as_ref().is_some_and(|calls| calls[0].id == "call_1")
+        ));
+        assert!(matches!(
+            &events[3],
+            AgentEvent::ToolCallStarted { id, name }
+                if id == "call_1" && name == "read_file"
+        ));
+        assert!(matches!(
+            &events[4],
+            AgentEvent::ToolResultCommitted { tool_call_id, ok: true, .. }
+                if tool_call_id == "call_1"
+        ));
+        assert!(matches!(
+            &events[5],
+            AgentEvent::ToolCallFinished { id, name, ok: true, summary: None }
+                if id == "call_1" && name == "read_file"
+        ));
+        assert!(matches!(events[6], AgentEvent::ModelCallStarted));
+        assert_eq!(events[7], AgentEvent::TextDelta("Read it".to_string()));
+        assert!(matches!(
+            events[8],
+            AgentEvent::ModelMessageCommitted { .. }
+        ));
+        assert_eq!(events[9], AgentEvent::AgentMessage("Read it".to_string()));
+        assert!(matches!(events[10], AgentEvent::TurnCompleted));
         assert_eq!(turn.status, TurnStatus::Completed);
         assert_eq!(turn.steps.len(), 3);
         assert_eq!(turn.steps[0].kind, TurnStepKind::ModelCall);

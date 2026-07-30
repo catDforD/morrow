@@ -2042,6 +2042,35 @@ mod tests {
     use tauri::ipc::RuntimeCapability;
     use tauri::utils::acl::capability::{CapabilityFile, PermissionEntry};
 
+    static HOME_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+    struct TestHome {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl TestHome {
+        fn set(path: &Path) -> Self {
+            let previous = std::env::var_os("HOME");
+            unsafe {
+                std::env::set_var("HOME", path);
+            }
+            Self { previous }
+        }
+    }
+
+    impl Drop for TestHome {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => unsafe {
+                    std::env::set_var("HOME", value);
+                },
+                None => unsafe {
+                    std::env::remove_var("HOME");
+                },
+            }
+        }
+    }
+
     #[test]
     fn desktop_action_deserializes_only_whitelisted_tagged_actions() {
         let cases = [
@@ -2311,6 +2340,7 @@ mod tests {
             },
             RemoteRequest::SubscribeSession {
                 session: "default".to_string(),
+                subscription_id: "subscription-test".to_string(),
             },
             RemoteRequest::SessionMessage {
                 session: "default".to_string(),
@@ -2326,15 +2356,14 @@ mod tests {
 
     #[tokio::test]
     async fn remote_settings_scope_supports_session_model_selection_routes() {
-        let root = std::env::temp_dir().join(format!(
-            "morrow-desktop-remote-settings-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
+        let _lock = HOME_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let root = std::env::temp_dir().join(format!("mdrs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("create test home");
+        let _home = TestHome::set(&root);
         let location = WorkspaceLocation::Wsl {
             distro: "Ubuntu".to_string(),
             user: "morrow".to_string(),
@@ -2349,6 +2378,16 @@ mod tests {
             },
         )
         .expect("remote settings server");
+
+        let created = server
+            .request(
+                "POST",
+                "/api/sessions",
+                Some(serde_json::json!({ "name": "default" })),
+            )
+            .await
+            .expect("create session response");
+        assert_eq!(created.status, 201, "response: {:?}", created.body);
 
         let response = server
             .request("GET", "/api/sessions/default/model-selection", None)

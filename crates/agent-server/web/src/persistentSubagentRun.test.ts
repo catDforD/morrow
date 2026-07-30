@@ -1,12 +1,12 @@
 // @vitest-environment jsdom
 
 import { describe, expect, it } from 'vitest'
-import { historyRunTrace } from './App'
-import type { Session } from './types'
+import { historyRunTrace } from './legacySubagentTimeline'
+import type { LegacyTurnRecord } from './legacySubagentTimeline'
 
 describe('persistent subagent run trace', () => {
   it('replays spawn_subagent as an identified child Agent instead of a generic tool', () => {
-    const record: Session['turns'][number] = {
+    const record: LegacyTurnRecord = {
       turn: {
         status: 'completed',
         user_message: { role: 'user', content: 'Inspect the runtime' },

@@ -1492,6 +1492,103 @@ a:focus-visible {
   padding: 32px;
 }
 
+.session-status-banner {
+  position: absolute;
+  z-index: 12;
+  top: 66px;
+  left: 50%;
+  width: min(680px, calc(100% - 32px));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  transform: translateX(-50%);
+  border: 2px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface-panel);
+  padding: 9px 12px;
+  box-shadow: 3px 3px 0 var(--border);
+  color: var(--foreground);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.conversation-panel.home-mode .session-status-banner {
+  top: 18px;
+}
+
+.session-status-banner.error {
+  background: color-mix(in srgb, var(--danger), var(--surface-panel) 88%);
+}
+
+.session-status-banner.warning {
+  background: color-mix(in srgb, var(--warn), var(--surface-panel) 82%);
+}
+
+.session-status-banner > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.session-status-banner > button:not(.mini-icon-button) {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 5px;
+  border: 1.5px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-main);
+  padding: 5px 8px;
+  color: var(--foreground);
+  cursor: pointer;
+  font: inherit;
+}
+
+.home-create-task {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.app-error-boundary {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  background: var(--surface-main);
+  padding: 24px;
+}
+
+.app-error-boundary section {
+  width: min(560px, 100%);
+  border: 3px solid var(--border);
+  border-radius: 18px;
+  background: var(--surface-panel);
+  padding: 28px;
+  box-shadow: 7px 7px 0 var(--border);
+}
+
+.app-error-boundary h1,
+.app-error-boundary p {
+  margin: 0;
+}
+
+.app-error-boundary p {
+  margin-top: 12px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.app-error-boundary button {
+  margin-top: 20px;
+  border: 2px solid var(--border);
+  border-radius: 9px;
+  background: var(--main);
+  padding: 9px 14px;
+  color: var(--main-foreground);
+  cursor: pointer;
+  font-weight: 750;
+}
+
 .home-prompt {
   width: min(800px, 100%);
   display: grid;

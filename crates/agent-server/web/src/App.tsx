@@ -45,8 +45,7 @@ import {
 } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { fetchJson, openSessionConnection } from './api'
-import type { SessionConnection } from './api'
+import { fetchJson } from './api'
 import {
   getDesktopPlatform,
   getDesktopShellState,
@@ -58,26 +57,23 @@ import {
   isMessageScrollNearBottom,
   scrollMessageListToBottom,
 } from './messageScroll'
-import {
-  failedPersistentSubagentStep,
-  finishedSubagentStep,
-  persistentSubagentHistory,
-  persistentSubagentSnapshotStep,
-  runningSubagentStep,
-  startingPersistentSubagentStep,
-  subagentHistory,
-  subagentStepTitle,
-} from './subagentTrace'
 import SettingsView from './SettingsView'
 import type { SettingsSection, ThemePreference } from './SettingsView'
+import {
+  timelineFromSnapshot,
+  toolsFromSnapshot,
+} from './sessionTimelineReducer'
+import { useSessionController } from './useSessionController'
+import type {
+  SessionSelectionStatus,
+  WorkspaceSessionStatus,
+} from './useSessionController'
 import {
   ProjectsDialog,
   RemoteConnectionDialog,
   WorkspaceMenu,
 } from './WorkspaceManager'
 import type {
-  ActivityItem,
-  AgentEvent,
   ApprovalRequest,
   ClientMessage,
   CommandSettingsResponse,
@@ -89,12 +85,7 @@ import type {
   ReasoningLevel,
   ResolveCommandResponse,
   RunningTurnSnapshot,
-  ServerMessage,
-  Session,
-  SessionArchiveResponse,
-  SessionDocument,
   SessionEntryResponse,
-  SessionModelSelectionResponse,
   StatusResponse,
   SubagentExecutionSummary,
   SubagentInstanceSnapshot,
@@ -121,14 +112,6 @@ type ResolvedTheme = Exclude<ThemePreference, 'system'>
 const markdownPlugins = [remarkGfm]
 const SubagentProfilesContext = createContext<SubagentProfileResponse[]>([])
 const PersistentSubagentsContext = createContext<SubagentInstanceSnapshot[]>([])
-const spawnSubagentToolName = 'spawn_subagent'
-
-interface PersistentSpawnBinding {
-  instanceId: string
-  runId: string
-  stepId: string
-  task: string
-}
 
 const permissionOptions: Array<{
   id: PermissionMode | 'plan'
@@ -164,30 +147,18 @@ const permissionOptions: Array<{
   },
 ]
 
-const emptySessionEntry = (name: string): SessionEntryResponse => ({
-  name,
-  path: '',
-  turns: 0,
-  active_messages: 0,
-  summarized_turns: 0,
-  has_summary: false,
-  archived: false,
-})
-
 export default function App() {
   const initialLocationRef = useRef(readAppLocation())
   const [status, setStatus] = useState<StatusResponse | null>(null)
-  const [sessions, setSessions] = useState<SessionEntryResponse[]>([])
-  const [selected, setSelected] = useState(initialLocationRef.current.session)
   const [appView, setAppView] = useState<AppView>(
     initialLocationRef.current.view,
   )
   const [settingsSection, setSettingsSection] = useState<SettingsSection>(
     initialLocationRef.current.section,
   )
-  const [timeline, setTimeline] = useState<TimelineItem[]>([])
-  const [tools, setTools] = useState<ToolRun[]>([])
-  const [activity, setActivity] = useState<ActivityItem[]>([])
+  const [runCollapsed, setRunCollapsed] = useState<Record<string, boolean>>({})
+  const [visibleError, setVisibleError] = useState<string | null>(null)
+  const [visibleNotice, setVisibleNotice] = useState<string | null>(null)
   const [sessionFilter, setSessionFilter] = useState('')
   const [isSearchOpen, setIsSearchOpen] = useState(false)
   const [isSidebarOpen, setIsSidebarOpen] = useState(false)
@@ -203,17 +174,8 @@ export default function App() {
   const [createSessionError, setCreateSessionError] = useState<string | null>(
     null,
   )
-  const [runningTurn, setRunningTurn] = useState<RunningTurnSnapshot | null>(
-    null,
-  )
-  const [pendingApproval, setPendingApproval] =
-    useState<ApprovalRequest | null>(null)
-  const [approvalQueue, setApprovalQueue] = useState<ApprovalRequest[]>([])
-  const [subagents, setSubagents] = useState<SubagentInstanceSnapshot[]>([])
   const [subagentTranscript, setSubagentTranscript] =
     useState<SubagentTranscriptSnapshot | null>(null)
-  const [connection, setConnection] =
-    useState<ConnectionStatus>('disconnected')
   const [prompt, setPrompt] = useState('')
   const [modelSettings, setModelSettings] =
     useState<ModelSettingsResponse | null>(null)
@@ -222,9 +184,6 @@ export default function App() {
   const [subagentSettings, setSubagentSettings] =
     useState<SubagentSettingsResponse | null>(null)
   const [isResolvingCommand, setIsResolvingCommand] = useState(false)
-  const [modelSelection, setModelSelection] = useState<ModelSelection | null>(
-    null,
-  )
   const [themePreference, setThemePreference] = useState<ThemePreference>(
     readSavedThemePreference,
   )
@@ -241,22 +200,10 @@ export default function App() {
   const [workspaceDialog, setWorkspaceDialog] = useState<'projects' | 'remote' | null>(null)
   const [workspaceAction, setWorkspaceAction] = useState<number | null>(null)
 
-  const socketRef = useRef<SessionConnection | null>(null)
-  const selectedRef = useRef(selected)
-  const modelSelectionRef = useRef<ModelSelection | null>(null)
-  const modelSettingsRef = useRef<ModelSettingsResponse | null>(null)
+  const selectedRef = useRef<string | null>(initialLocationRef.current.session)
   const appViewRef = useRef(appView)
   const settingsSectionRef = useRef(settingsSection)
-  const assistantMessageIdRef = useRef<string | null>(null)
-  const runTraceIdRef = useRef<string | null>(null)
-  const pendingPersistentSpawnsRef = useRef(new Map<string, string>())
-  const persistentSpawnBindingsRef = useRef(
-    new Map<string, PersistentSpawnBinding>(),
-  )
-  const knownSubagentIdsRef = useRef(new Set<string>())
   const idRef = useRef(0)
-  const selectionRef = useRef(0)
-  const modelSelectionRequestRef = useRef(0)
   const messageScrollRef = useRef<HTMLDivElement | null>(null)
   const followMessagesRef = useRef(true)
   const sessionSearchRef = useRef<HTMLInputElement | null>(null)
@@ -301,464 +248,88 @@ export default function App() {
     }
   }
 
-  const recordActivity = useCallback(
-    (
-      title: string,
-      detail: string | undefined,
-      tone: ActivityItem['tone'],
-    ) => {
-      const item: ActivityItem = {
-        id: nextId('activity'),
-        title,
-        detail,
-        tone,
-        time: new Date().toLocaleTimeString([], {
-          hour: '2-digit',
-          minute: '2-digit',
-          second: '2-digit',
-        }),
-      }
-      setActivity((items) => [...items.slice(-119), item])
-    },
-    [nextId],
-  )
-
-  const addTimelineMessage = useCallback(
-    (role: TimelineMessageItem['role'], content: string) => {
-      const id = nextId(role)
-      setTimeline((items) => [...items, { kind: 'message', id, role, content }])
-      return id
-    },
-    [nextId],
-  )
-
-  const addNotice = useCallback(
-    (
-      tone: TimelineNoticeItem['tone'],
-      title: string,
-      detail?: string,
-    ) => {
-      const id = nextId('notice')
-      setTimeline((items) => [...items, { kind: 'notice', id, tone, title, detail }])
-      return id
-    },
-    [nextId],
-  )
-
-  const updateRunTrace = useCallback(
-    (id: string, update: (trace: RunTrace) => RunTrace) => {
-      setTimeline((items) =>
-        items.map((item) =>
-          item.kind === 'run' && item.id === id
-            ? { ...item, trace: update(item.trace) }
-            : item,
-        ),
-      )
-    },
-    [],
-  )
-
-  const createRunTrace = useCallback(
-    (title: string, detail?: string) => {
-      const id = nextId('run')
-      const step: RunStep = {
-        id: nextId('step'),
-        kind: 'model',
-        status: 'running',
-        title,
-        detail,
-      }
-      const trace: RunTrace = {
-        id,
-        status: 'running',
-        collapsed: false,
-        startedAt: currentTime(),
-        steps: [step],
-        toolCount: 0,
-      }
-      runTraceIdRef.current = id
-      setTimeline((items) => [...items, { kind: 'run', id, trace }])
-      return id
-    },
-    [nextId],
-  )
-
-  const ensureRunTrace = useCallback(
-    (title: string, detail?: string) => {
-      if (runTraceIdRef.current) return runTraceIdRef.current
-      return createRunTrace(title, detail)
-    },
-    [createRunTrace],
-  )
-
-  const refreshCurrentModelStep = useCallback(
-    (title: string, detail?: string) => {
-      const id = ensureRunTrace(title, detail)
-      updateRunTrace(id, (trace) => {
-        const firstRunningModel = trace.steps.findIndex(
-          (step) => step.kind === 'model' && step.status === 'running',
-        )
-        if (firstRunningModel === -1) return trace
-        const steps = [...trace.steps]
-        steps[firstRunningModel] = { ...steps[firstRunningModel], title, detail }
-        return { ...trace, status: 'running', collapsed: false, steps }
-      })
-    },
-    [ensureRunTrace, updateRunTrace],
-  )
-
-  const ensureLiveModelStep = useCallback(
-    (status: RunStep['status'] = 'running') => {
-      const modelStep = modelStepPresentation(
-        modelSettingsRef.current,
-        modelSelectionRef.current,
-      )
-      const id = ensureRunTrace(modelStep.title, modelStep.detail)
-      updateRunTrace(id, (trace) => {
-        if (
-          trace.steps.some(
-            (step) => step.kind === 'model' && step.status === 'running',
-          )
-        ) {
-          return trace
-        }
-        return {
-          ...trace,
-          steps: [
-            ...trace.steps,
-            {
-              id: nextId('step'),
-              kind: 'model',
-              status,
-              title: modelStep.title,
-              detail: modelStep.detail,
-            },
-          ],
-        }
-      })
-      return id
-    },
-    [ensureRunTrace, nextId, updateRunTrace],
-  )
-
-  const completeLiveModelStep = useCallback(() => {
-    const modelStep = modelStepPresentation(
-      modelSettingsRef.current,
-      modelSelectionRef.current,
-    )
-    const id = ensureRunTrace(modelStep.title, modelStep.detail)
-    updateRunTrace(id, completeRunningModelStep)
-    return id
-  }, [ensureRunTrace, updateRunTrace])
-
-  const appendReasoningDelta = useCallback(
-    (text: string) => {
-      const id = ensureLiveModelStep()
-      updateRunTrace(id, (trace) => {
-        const index = trace.steps.findIndex(
-          (step) => step.kind === 'model' && step.status === 'running',
-        )
-        if (index === -1) return trace
-        const steps = [...trace.steps]
-        const step = steps[index]
-        steps[index] = { ...step, reasoning: (step.reasoning ?? '') + text }
-        return { ...trace, steps }
-      })
-    },
-    [ensureLiveModelStep, updateRunTrace],
-  )
-
-  const upsertRunStep = useCallback(
-    (runId: string, nextStep: RunStep) => {
-      updateRunTrace(runId, (trace) => {
-        const existing = trace.steps.findIndex((step) => step.id === nextStep.id)
-        const steps =
-          existing === -1
-            ? [...trace.steps, nextStep]
-            : trace.steps.map((step) =>
-                step.id === nextStep.id ? { ...step, ...nextStep } : step,
-              )
-        return {
-          ...trace,
-          collapsed: false,
-          steps,
-          toolCount: steps.filter((step) => step.kind === 'tool').length,
-        }
-      })
-    },
-    [updateRunTrace],
-  )
-
-  const startToolStep = useCallback(
-    (id: string, name: string) => {
-      const runId = completeLiveModelStep()
-      upsertRunStep(runId, {
-        id,
-        kind: 'tool',
-        status: 'running',
-        title: name,
-        detail: 'Tool call started',
-      })
-    },
-    [completeLiveModelStep, upsertRunStep],
-  )
-
-  const startPersistentSpawnStep = useCallback(
-    (id: string) => {
-      const runId = completeLiveModelStep()
-      pendingPersistentSpawnsRef.current.set(id, runId)
-    },
-    [completeLiveModelStep],
-  )
-
-  const applyPersistentSubagentSnapshot = useCallback(
-    (snapshot: SubagentInstanceSnapshot) => {
-      const existing = persistentSpawnBindingsRef.current.get(snapshot.id)
-      if (existing) {
-        upsertRunStep(
-          existing.runId,
-          persistentSubagentSnapshotStep(existing.stepId, snapshot, existing.task),
-        )
-        return
-      }
-
-      const wasKnown = knownSubagentIdsRef.current.has(snapshot.id)
-      knownSubagentIdsRef.current.add(snapshot.id)
-      if (wasKnown) return
-
-      const pendingRunId = pendingPersistentSpawnsRef.current
-        .values()
-        .next().value
-      const runId = runTraceIdRef.current ?? pendingRunId
-      if (!runId) return
-      const stepId = `persistent-subagent-${snapshot.id}`
-      const task = snapshot.latest_task || '等待主 Agent 分配任务'
-      persistentSpawnBindingsRef.current.set(snapshot.id, {
-        instanceId: snapshot.id,
-        runId,
-        stepId,
-        task,
-      })
-      upsertRunStep(
-        runId,
-        persistentSubagentSnapshotStep(stepId, snapshot, task),
-      )
-    },
-    [upsertRunStep],
-  )
-
-  const finishPersistentSpawnStep = useCallback(
-    (
-      id: string,
-      ok: boolean,
-      summary?: ToolExecutionSummary,
-    ) => {
-      const runId = pendingPersistentSpawnsRef.current.get(id)
-      pendingPersistentSpawnsRef.current.delete(id)
-      if (!runId) return
-
-      if (!ok) {
-        upsertRunStep(
-          runId,
-          failedPersistentSubagentStep(id, summary?.error),
-        )
-      }
-    },
-    [upsertRunStep],
-  )
-
-  const startSubagentStep = useCallback(
-    (
-      id: string,
-      agentId: string | undefined,
-      agentName: string | undefined,
-      task: string,
-    ) => {
-      const runId = completeLiveModelStep()
-      upsertRunStep(runId, runningSubagentStep(id, agentId, agentName, task))
-    },
-    [completeLiveModelStep, upsertRunStep],
-  )
-
-  const finishToolStep = useCallback(
-    (
-      id: string,
-      name: string,
-      ok: boolean,
-      summary?: ToolExecutionSummary,
-    ) => {
-      const runId = ensureRunTrace('Tool result received', name)
-      upsertRunStep(runId, {
-        id,
-        kind: 'tool',
-        status: ok ? 'ok' : 'error',
-        title: name,
-        detail: formatToolSummary(summary),
-        summary,
-      })
-    },
-    [ensureRunTrace, upsertRunStep],
-  )
-
-  const finishSubagentStep = useCallback(
-    (id: string, ok: boolean, summary: SubagentExecutionSummary) => {
-      const runId = ensureRunTrace('Subagent result received', summary.task)
-      upsertRunStep(runId, finishedSubagentStep(id, ok, summary))
-    },
-    [ensureRunTrace, upsertRunStep],
-  )
-
-  const setApprovalStep = useCallback(
-    (requestId: string, title: string, detail: string, approved?: boolean) => {
-      const runId = ensureRunTrace('Approval requested', detail)
-      upsertRunStep(runId, {
-        id: `approval-${requestId}`,
-        kind: 'approval',
-        status: approved == null ? 'approval' : approved ? 'ok' : 'error',
-        title,
-        detail,
-      })
-      updateRunTrace(runId, (trace) => ({
-        ...trace,
-        status: approved == null ? 'approval' : approved ? 'running' : 'failed',
-      }))
-    },
-    [ensureRunTrace, updateRunTrace, upsertRunStep],
-  )
-
-  const completeCurrentRun = useCallback(() => {
-    const id = runTraceIdRef.current
-    if (!id) return
-    updateRunTrace(id, (trace) => {
-      const hasFinalStep = trace.steps.some((step) => step.kind === 'final')
-      const completedSteps = trace.steps.map((step) =>
-        step.status === 'running' || step.status === 'approval'
-          ? { ...step, status: 'ok' as const }
-          : step,
-      )
-      const steps = hasFinalStep
-        ? completedSteps
-        : [
-            ...completedSteps,
-            {
-              id: nextId('step'),
-              kind: 'final' as const,
-              status: 'ok' as const,
-              title: 'Final response ready',
-            },
-          ]
-      return {
-        ...trace,
-        status: 'completed',
-        collapsed: true,
-        completedAt: currentTime(),
-        steps,
-      }
-    })
-    runTraceIdRef.current = null
-  }, [nextId, updateRunTrace])
-
-  const failCurrentRun = useCallback(
-    (message: string) => {
-      const id = runTraceIdRef.current
-      if (!id) {
-        addNotice('error', 'Error', message)
-        return
-      }
-      updateRunTrace(id, (trace) => ({
-        ...trace,
-        status: 'failed',
-        collapsed: false,
-        completedAt: currentTime(),
-        steps: [
-          ...trace.steps.map((step) =>
-            step.status === 'running' || step.status === 'approval'
-              ? { ...step, status: 'error' as const }
-              : step,
-          ),
-          {
-            id: nextId('step'),
-            kind: 'error',
-            status: 'error',
-            title: 'Error',
-            detail: message,
-          },
-        ],
-      }))
-      runTraceIdRef.current = null
-    },
-    [addNotice, nextId, updateRunTrace],
-  )
-
   const showError = useCallback(
     (error: unknown) => {
       const message = error instanceof Error ? error.message : String(error)
-      failCurrentRun(message)
-      recordActivity('Error', message, 'error')
-    },
-    [failCurrentRun, recordActivity],
-  )
-
-  const appendAssistantDelta = useCallback(
-    (text: string) => {
-      ensureLiveModelStep()
-      if (!assistantMessageIdRef.current) {
-        const id = nextId('assistant')
-        assistantMessageIdRef.current = id
-        setTimeline((items) => [
-          ...items,
-          { kind: 'message', id, role: 'assistant', content: text },
-        ])
-        return
-      }
-
-      const id = assistantMessageIdRef.current
-      setTimeline((items) =>
-        items.map((item) =>
-          item.kind === 'message' && item.id === id
-            ? { ...item, content: item.content + text }
-            : item,
-        ),
-      )
-    },
-    [ensureLiveModelStep, nextId],
-  )
-
-  const upsertTool = useCallback(
-    (
-      id: string,
-      name: string,
-      toolStatus: ToolRun['status'],
-      summary?: ToolExecutionSummary,
-    ) => {
-      setTools((items) => {
-        const existing = items.find((item) => item.id === id)
-        if (!existing) {
-          return [...items, { id, name, status: toolStatus, summary }]
-        }
-        return items.map((item) =>
-          item.id === id
-            ? { ...item, name, status: toolStatus, summary: summary ?? item.summary }
-            : item,
-        )
-      })
+      setVisibleError(message)
     },
     [],
   )
 
-  const loadSessions = useCallback(async () => {
-    const entries = await fetchJson<SessionEntryResponse[]>('/api/sessions')
-    const current = selectedRef.current
-    const nextEntries = entries.some((session) => session.name === current)
-      ? entries
-      : [emptySessionEntry(current), ...entries]
-    setSessions(nextEntries)
-    return nextEntries
-  }, [])
+  const sessionController = useSessionController({
+    initialSession: initialLocationRef.current.session,
+    onError: showError,
+    onNotice: (message) => {
+      setVisibleNotice(message)
+    },
+    onCommandData: (_requestId, data) => {
+      setSubagentTranscript(data as SubagentTranscriptSnapshot)
+    },
+    onSelectionChange: (name) => {
+      selectedRef.current = name
+      followMessagesRef.current = true
+      setIsSidebarOpen(false)
+      setVisibleError(null)
+      setVisibleNotice(null)
+      setRunCollapsed({})
+      writeAppLocation(
+        name,
+        appViewRef.current,
+        settingsSectionRef.current,
+        'replace',
+        readHistoryState().fromWorkspace,
+      )
+    },
+  })
+  const {
+    sessions,
+    selected,
+    timelineState: sessionTimelineState,
+    pendingTurnRequest,
+    modelSelection,
+    selectionStatus,
+    workspaceStatus,
+    diagnostics,
+    directoryError,
+    sessionError,
+  } = sessionController
+  const connection: ConnectionStatus =
+    selectionStatus === 'ready'
+      ? 'connected'
+      : selectionStatus === 'subscribing' || selectionStatus === 'reconnecting'
+        ? 'connecting'
+        : 'disconnected'
+  const sessionSnapshot = sessionTimelineState.snapshot
+  const timeline = useMemo(
+    () =>
+      timelineFromSnapshot(sessionSnapshot).map((item) =>
+        item.kind === 'run' && item.id in runCollapsed
+          ? {
+              ...item,
+              trace: { ...item.trace, collapsed: runCollapsed[item.id] },
+            }
+          : item,
+      ),
+    [runCollapsed, sessionSnapshot],
+  )
+  const tools = useMemo(() => toolsFromSnapshot(sessionSnapshot), [sessionSnapshot])
+  const approvalQueue = sessionSnapshot?.approvals ?? []
+  const pendingApproval = approvalQueue[0] ?? null
+  const subagents = sessionSnapshot?.subagents ?? []
+  const runningTurn: RunningTurnSnapshot | null = sessionSnapshot?.active_operation
+    ? {
+        turn_id: sessionSnapshot.active_operation.turn_id,
+        pending_approval: pendingApproval?.id ?? null,
+      }
+    : null
+
+  const selectSession = useCallback(async (name: string) => {
+    setSubagentTranscript(null)
+    await sessionController.selectSession(name)
+  }, [sessionController.selectSession])
 
   const loadModelSettings = useCallback(async () => {
     const settings = await fetchJson<ModelSettingsResponse>('/api/model-settings')
-    modelSettingsRef.current = settings
     setModelSettings(settings)
     return settings
   }, [])
@@ -774,378 +345,6 @@ export default function App() {
     setSubagentSettings(settings)
     return settings
   }, [])
-
-  const loadSessionModelSelection = useCallback(async (name: string) => {
-    const response = await fetchJson<SessionModelSelectionResponse>(
-      `/api/sessions/${encodeURIComponent(name)}/model-selection`,
-    )
-    return response.selection ?? null
-  }, [])
-
-  const sendSocketMessage = useCallback((message: ClientMessage) => {
-    const socket = socketRef.current
-    if (!socket || !socket.isOpen) {
-      throw new Error('websocket is not connected')
-    }
-    socket.send(JSON.stringify(message))
-  }, [])
-
-  const handleAgentEvent = useCallback(
-    (event: AgentEvent) => {
-      switch (event.type) {
-        case 'turn_started': {
-          const modelStep = modelStepPresentation(
-            modelSettingsRef.current,
-            modelSelectionRef.current,
-          )
-          assistantMessageIdRef.current = null
-          setTools([])
-          refreshCurrentModelStep(modelStep.title, modelStep.detail)
-          recordActivity('Turn started', selectedRef.current, 'running')
-          break
-        }
-        case 'model_call_started':
-          ensureLiveModelStep()
-          break
-        case 'warning':
-          recordActivity('Warning', event.data, 'error')
-          break
-        case 'reasoning_delta':
-          appendReasoningDelta(event.data)
-          break
-        case 'text_delta':
-          appendAssistantDelta(event.data)
-          break
-        case 'agent_message':
-          if (!assistantMessageIdRef.current && event.data.trim()) {
-            addTimelineMessage('assistant', event.data)
-          }
-          assistantMessageIdRef.current = null
-          break
-        case 'subagent_started':
-          upsertTool(
-            event.data.id,
-            subagentStepTitle(event.data.agent_name),
-            'running',
-          )
-          startSubagentStep(
-            event.data.id,
-            event.data.agent_id,
-            event.data.agent_name,
-            event.data.task,
-          )
-          recordActivity(
-            `${subagentStepTitle(event.data.agent_name)} 开始执行`,
-            event.data.task,
-            'running',
-          )
-          break
-        case 'subagent_finished':
-          upsertTool(
-            event.data.id,
-            subagentStepTitle(event.data.summary.agent_name),
-            event.data.ok ? 'ok' : 'error',
-            { subagent: event.data.summary },
-          )
-          finishSubagentStep(
-            event.data.id,
-            event.data.ok,
-            event.data.summary,
-          )
-          recordActivity(
-            `${subagentStepTitle(event.data.summary.agent_name)}${
-              event.data.ok ? ' 已完成' : ' 执行失败'
-            }`,
-            event.data.summary.task,
-            event.data.ok ? 'ok' : 'error',
-          )
-          break
-        case 'subagent_updated':
-          applyPersistentSubagentSnapshot(event.data)
-          setSubagents((current) => {
-            const next = current.filter((instance) => instance.id !== event.data.id)
-            next.push(event.data)
-            return next.sort((left, right) => left.created_at_ms - right.created_at_ms)
-          })
-          setSubagentTranscript((current) => current?.instance.id === event.data.id
-            ? { ...current, instance: event.data }
-            : current)
-          break
-        case 'tool_call_started':
-          upsertTool(event.data.id, event.data.name, 'running')
-          if (event.data.name === spawnSubagentToolName) {
-            startPersistentSpawnStep(event.data.id)
-            recordActivity('子 Agent 启动中', undefined, 'running')
-          } else {
-            startToolStep(event.data.id, event.data.name)
-            recordActivity('Tool started', event.data.name, 'running')
-          }
-          break
-        case 'tool_call_finished':
-          upsertTool(
-            event.data.id,
-            event.data.name,
-            event.data.ok ? 'ok' : 'error',
-            event.data.summary,
-          )
-          if (event.data.name === spawnSubagentToolName) {
-            finishPersistentSpawnStep(
-              event.data.id,
-              event.data.ok,
-              event.data.summary,
-            )
-            recordActivity(
-              event.data.ok ? '子 Agent 已启动' : '子 Agent 启动失败',
-              event.data.summary?.error,
-              event.data.ok ? 'ok' : 'error',
-            )
-          } else {
-            finishToolStep(
-              event.data.id,
-              event.data.name,
-              event.data.ok,
-              event.data.summary,
-            )
-            recordActivity(
-              event.data.ok ? 'Tool finished' : 'Tool failed',
-              event.data.name,
-              event.data.ok ? 'ok' : 'error',
-            )
-          }
-          break
-        case 'approval_requested':
-          setApprovalQueue((current) => current.some((request) => request.id === event.data.id)
-            ? current
-            : [...current, event.data])
-          setPendingApproval(event.data)
-          setApprovalStep(event.data.id, 'Approval requested', event.data.reason)
-          recordActivity('Approval requested', event.data.reason, 'approval')
-          break
-        case 'approval_resolved':
-          setApprovalQueue((current) => {
-            const next = current.filter((request) => request.id !== event.data.request_id)
-            setPendingApproval(next[0] ?? null)
-            return next
-          })
-          setApprovalStep(
-            event.data.request_id,
-            event.data.approved ? 'Approval granted' : 'Approval denied',
-            event.data.request_id,
-            event.data.approved,
-          )
-          recordActivity(
-            event.data.approved ? 'Approval granted' : 'Approval denied',
-            event.data.request_id,
-            event.data.approved ? 'ok' : 'error',
-          )
-          break
-        case 'turn_completed':
-          setRunningTurn(null)
-          assistantMessageIdRef.current = null
-          completeCurrentRun()
-          recordActivity('Turn completed', selectedRef.current, 'ok')
-          break
-        case 'error':
-          setRunningTurn(null)
-          showError(event.data)
-          break
-      }
-    },
-    [
-      addTimelineMessage,
-      applyPersistentSubagentSnapshot,
-      appendReasoningDelta,
-      appendAssistantDelta,
-      completeCurrentRun,
-      finishPersistentSpawnStep,
-      finishSubagentStep,
-      finishToolStep,
-      ensureLiveModelStep,
-      recordActivity,
-      refreshCurrentModelStep,
-      setApprovalStep,
-      showError,
-      startPersistentSpawnStep,
-      startSubagentStep,
-      startToolStep,
-      upsertTool,
-    ],
-  )
-
-  const handleServerMessage = useCallback(
-    (message: ServerMessage) => {
-      switch (message.type) {
-        case 'snapshot':
-          setRunningTurn(message.data.running_turn ?? null)
-          setSubagents(message.data.subagents ?? [])
-          knownSubagentIdsRef.current = new Set(
-            (message.data.subagents ?? []).map((instance) => instance.id),
-          )
-          setApprovalQueue(message.data.approvals ?? [])
-          setPendingApproval(message.data.approvals?.[0] ?? null)
-          break
-        case 'agent_event': {
-          const origin = message.data.origin
-          const event = message.data.event
-          const isChildEvent = origin?.kind === 'subagent_run'
-          if (!isChildEvent || event.type === 'approval_requested' || event.type === 'approval_resolved') {
-            handleAgentEvent(event)
-          } else if (event.type === 'error') {
-            recordActivity(
-              `${origin.identity_name ?? origin.role} failed`,
-              event.data,
-              'error',
-            )
-          }
-          break
-        }
-        case 'turn_saved':
-          void loadSessions().catch(showError)
-          setRunningTurn(null)
-          recordActivity('Turn saved', `#${message.data.turn_index}`, 'ok')
-          break
-        case 'turn_rejected':
-          setRunningTurn(null)
-          showError(message.data.reason)
-          break
-        case 'approval_queue_updated':
-          setApprovalQueue(message.data.approvals)
-          setPendingApproval(message.data.approvals[0] ?? null)
-          break
-        case 'subagent_transcript':
-          setSubagentTranscript(message.data.transcript)
-          break
-        case 'subagent_deleted':
-          knownSubagentIdsRef.current.delete(message.data.instance_id)
-          persistentSpawnBindingsRef.current.delete(message.data.instance_id)
-          setSubagents((current) => current.filter(
-            (instance) => instance.id !== message.data.instance_id,
-          ))
-          setSubagentTranscript((current) => current?.instance.id === message.data.instance_id
-            ? null
-            : current)
-          break
-        case 'subagent_rejected':
-          showError(message.data.reason)
-          break
-        case 'error':
-          showError(message.data.message)
-          break
-      }
-    },
-    [handleAgentEvent, loadSessions, recordActivity, showError],
-  )
-
-  const closeSocket = useCallback(() => {
-    const socket = socketRef.current
-    if (!socket) return
-    socket.close()
-    socketRef.current = null
-  }, [])
-
-  const openSocket = useCallback(
-    (name: string) => {
-      setConnection('connecting')
-      void openSessionConnection(name, {
-        onOpen: () => {
-          if (selectedRef.current !== name) return
-          setConnection('connected')
-          recordActivity('Session connected', name, 'ok')
-        },
-        onClose: () => {
-          if (selectedRef.current !== name) return
-          setConnection('disconnected')
-          setRunningTurn(null)
-          recordActivity('Session disconnected', name, 'neutral')
-        },
-        onMessage: (message) => {
-          if (selectedRef.current === name) {
-            handleServerMessage(message as ServerMessage)
-          }
-        },
-        onError: (error) => {
-          if (selectedRef.current === name) showError(error)
-        },
-      })
-        .then((connection) => {
-          if (selectedRef.current !== name) {
-            connection.close()
-            return
-          }
-          socketRef.current = connection
-        })
-        .catch(showError)
-    },
-    [handleServerMessage, recordActivity, showError],
-  )
-
-  const selectSession = useCallback(
-    async (name: string) => {
-      const selectionId = selectionRef.current + 1
-      selectionRef.current = selectionId
-      modelSelectionRequestRef.current += 1
-      selectedRef.current = name
-      followMessagesRef.current = true
-      setSelected(name)
-      setIsSidebarOpen(false)
-      setRunningTurn(null)
-      setPendingApproval(null)
-      setTools([])
-      setActivity([])
-      assistantMessageIdRef.current = null
-      runTraceIdRef.current = null
-      pendingPersistentSpawnsRef.current.clear()
-      persistentSpawnBindingsRef.current.clear()
-      knownSubagentIdsRef.current.clear()
-      setTimeline([])
-      modelSelectionRef.current = null
-      setModelSelection(null)
-      closeSocket()
-      writeAppLocation(
-        name,
-        appViewRef.current,
-        settingsSectionRef.current,
-        'replace',
-        readHistoryState().fromWorkspace,
-      )
-
-      try {
-        const [document, selection] = await Promise.all([
-          fetchJson<SessionDocument>(
-            `/api/sessions/${encodeURIComponent(name)}`,
-          ),
-          loadSessionModelSelection(name),
-        ])
-        if (selectionRef.current !== selectionId) return
-        modelSelectionRef.current = selection
-        setModelSelection(selection)
-        setTimeline(sessionTimeline(document.session))
-        recordActivity(
-          'Session loaded',
-          `${document.session.turns.length} turns`,
-          'ok',
-        )
-        openSocket(name)
-        await loadSessions()
-      } catch (error) {
-        if (selectionRef.current === selectionId) {
-          showError(error)
-        }
-      }
-    },
-    [
-      closeSocket,
-      loadSessionModelSelection,
-      loadSessions,
-      openSocket,
-      recordActivity,
-      showError,
-    ],
-  )
-
-  useEffect(() => {
-    selectedRef.current = selected
-  }, [selected])
 
   useEffect(() => {
     appViewRef.current = appView
@@ -1175,13 +374,17 @@ export default function App() {
       setIsInspectorOpen(false)
 
       if (next.session !== selectedRef.current) {
-        void selectSession(next.session)
+        if (next.session) {
+          void selectSession(next.session).catch(showError)
+        } else {
+          sessionController.clearSelection()
+        }
       }
     }
 
     window.addEventListener('popstate', handlePopState)
     return () => window.removeEventListener('popstate', handlePopState)
-  }, [selectSession])
+  }, [selectSession, sessionController.clearSelection, showError])
 
   useEffect(() => {
     if (isSearchOpen) {
@@ -1256,39 +459,22 @@ export default function App() {
         setStatus(loadedStatus)
         const savedMode = savedPermissionModeRef.current
         setPermissionMode(savedMode ?? loadedStatus.permissions.mode)
-        await Promise.all([
-          loadModelSettings(),
-          loadCommandSettings(),
-          loadSubagentSettings(),
-        ])
-        const requestedName = initialLocationRef.current.session
-        const entries = await loadSessions()
-        const requestedEntry = entries.find(
-          (session) => session.name === requestedName,
-        )
-        const name = requestedEntry?.archived
-          ? entries.find((session) => !session.archived)?.name ||
-            nextAvailableSessionName(entries)
-          : requestedName
-        selectedRef.current = name
-        await selectSession(name)
       } catch (error) {
         if (mounted) showError(error)
       }
+      void loadModelSettings().catch(showError)
+      void loadCommandSettings().catch(showError)
+      void loadSubagentSettings().catch(showError)
     }
 
     void boot()
     return () => {
       mounted = false
-      closeSocket()
     }
   }, [
-    closeSocket,
     loadCommandSettings,
     loadModelSettings,
     loadSubagentSettings,
-    loadSessions,
-    selectSession,
     showError,
   ])
 
@@ -1313,17 +499,23 @@ export default function App() {
   )
 
   const isRunning = Boolean(runningTurn)
+  const isSessionBusy = isRunning || pendingTurnRequest !== null
+  const sessionCommandsEnabled = selectionStatus === 'ready'
   const selectedModel = useMemo(
     () => findSelectedModel(modelSettings, modelSelection),
     [modelSelection, modelSettings],
   )
   const canSend =
-    connection === 'connected' &&
-    !isRunning &&
+    sessionCommandsEnabled &&
+    !isSessionBusy &&
     !isResolvingCommand &&
     prompt.trim().length > 0 &&
     Boolean(selectedModel)
-  const canCancel = Boolean(runningTurn?.turn_id && runningTurn.turn_id !== 'pending')
+  const canCancel = Boolean(
+    sessionCommandsEnabled &&
+      runningTurn?.turn_id &&
+      runningTurn.turn_id !== 'pending',
+  )
   const isWorkspaceSidebarCollapsed =
     !isNarrowViewport && isDesktopSidebarCollapsed
   const isWorkspaceSidebarVisible = isNarrowViewport
@@ -1415,14 +607,12 @@ export default function App() {
         : { matched: false, prompt: trimmed }
       const resolvedPrompt = resolved.prompt.trim()
       if (!resolvedPrompt) throw new Error('resolved prompt must not be empty')
-      const modelStep = modelStepPresentation(modelSettings, modelSelection)
       followMessagesRef.current = true
-      addTimelineMessage('user', resolvedPrompt)
-      createRunTrace(modelStep.title, modelStep.detail)
-      sendSocketMessage({
+      const requestId = `request-${Date.now()}`
+      sessionController.send({
         type: 'start_turn',
         data: {
-          request_id: `request-${Date.now()}`,
+          request_id: requestId,
           prompt: resolvedPrompt,
           prompt_resolved: true,
           permission_mode: permissionMode,
@@ -1430,19 +620,7 @@ export default function App() {
         },
       })
       setPrompt('')
-      setRunningTurn({ turn_id: 'pending' })
-      if (resolved.matched && resolved.command_name) {
-        recordActivity(
-          'Command expanded',
-          `/${resolved.command_name}`,
-          'neutral',
-        )
-      }
-      recordActivity(
-        'Turn requested',
-        compactText(resolvedPrompt, 90),
-        'running',
-      )
+      setVisibleError(null)
     } catch (error) {
       showError(error)
     } finally {
@@ -1480,14 +658,9 @@ export default function App() {
 
     try {
       setCreateSessionError(null)
-      await fetchJson<SessionDocument>(
-        `/api/sessions/${encodeURIComponent(name)}`,
-        { method: 'POST' },
-      )
+      await sessionController.createSession(name)
       setIsCreatingSession(false)
       setNewSessionName('')
-      await loadSessions()
-      await selectSession(name)
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       setCreateSessionError(message)
@@ -1496,8 +669,7 @@ export default function App() {
 
   const refresh = async () => {
     try {
-      await loadSessions()
-      await selectSession(selectedRef.current)
+      await sessionController.refreshSessions()
     } catch (error) {
       showError(error)
     }
@@ -1509,36 +681,10 @@ export default function App() {
   }
 
   const changeModelSelection = async (selection: ModelSelection) => {
-    if (isRunning) return
-    const session = selectedRef.current
-    const requestId = modelSelectionRequestRef.current + 1
-    modelSelectionRequestRef.current = requestId
-    const previous = modelSelectionRef.current
-    modelSelectionRef.current = selection
-    setModelSelection(selection)
+    if (isSessionBusy) return
     try {
-      const response = await fetchJson<SessionModelSelectionResponse>(
-        `/api/sessions/${encodeURIComponent(session)}/model-selection`,
-        {
-          method: 'PUT',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify(selection),
-        },
-      )
-      if (
-        selectedRef.current !== session ||
-        modelSelectionRequestRef.current !== requestId
-      ) return
-      const saved = response.selection ?? null
-      modelSelectionRef.current = saved
-      setModelSelection(saved)
+      await sessionController.changeModelSelection(selection)
     } catch (error) {
-      if (
-        selectedRef.current !== session ||
-        modelSelectionRequestRef.current !== requestId
-      ) return
-      modelSelectionRef.current = previous
-      setModelSelection(previous)
       showError(error)
     }
   }
@@ -1547,24 +693,7 @@ export default function App() {
     if (sessionAction) return
     setSessionAction(`archive:${name}`)
     try {
-      await fetchJson<SessionArchiveResponse>(
-        `/api/sessions/${encodeURIComponent(name)}/archive`,
-        { method: 'POST' },
-      )
-      if (name === selectedRef.current) {
-        const latestSessions = await loadSessions()
-        let nextName = latestSessions.find((session) => !session.archived)?.name
-        if (!nextName) {
-          nextName = nextAvailableSessionName(latestSessions)
-          await fetchJson<SessionDocument>(
-            `/api/sessions/${encodeURIComponent(nextName)}`,
-            { method: 'POST' },
-          )
-        }
-        await selectSession(nextName)
-      } else {
-        await loadSessions()
-      }
+      await sessionController.archiveSession(name)
     } catch (error) {
       showError(error)
     } finally {
@@ -1576,11 +705,7 @@ export default function App() {
     if (sessionAction) return
     setSessionAction(`restore:${name}`)
     try {
-      await fetchJson<SessionArchiveResponse>(
-        `/api/sessions/${encodeURIComponent(name)}/restore`,
-        { method: 'POST' },
-      )
-      await selectSession(name)
+      await sessionController.restoreSession(name)
     } catch (error) {
       showError(error)
     } finally {
@@ -1591,27 +716,25 @@ export default function App() {
   const cancelTurn = () => {
     if (!runningTurn || !canCancel) return
     try {
-      sendSocketMessage({
+      sessionController.send({
         type: 'cancel_turn',
         data: { turn_id: runningTurn.turn_id },
       })
-      recordActivity('Cancel requested', runningTurn.turn_id, 'error')
     } catch (error) {
       showError(error)
     }
   }
 
   const sendApproval = (approved: boolean) => {
-    if (!pendingApproval) return
+    if (!pendingApproval || !sessionCommandsEnabled) return
     try {
-      sendSocketMessage({
+      sessionController.send({
         type: 'approval_decision',
         data: {
           request_id: pendingApproval.id,
           approved,
         },
       })
-      setPendingApproval(null)
     } catch (error) {
       showError(error)
     }
@@ -1622,7 +745,7 @@ export default function App() {
       const invocation = subagentTranscript?.instance.id === instanceId
         ? subagentTranscript.model
         : null
-      sendSocketMessage({
+      sessionController.send({
         type: 'send_subagent',
         data: {
           request_id: nextId('subagent-request'),
@@ -1642,9 +765,12 @@ export default function App() {
 
   const inspectSubagent = (instanceId: string) => {
     try {
-      sendSocketMessage({
+      sessionController.send({
         type: 'inspect_subagent',
-        data: { instance_id: instanceId },
+        data: {
+          request_id: nextId('inspect-subagent'),
+          instance_id: instanceId,
+        },
       })
     } catch (error) {
       showError(error)
@@ -1653,7 +779,7 @@ export default function App() {
 
   const cancelSubagent = (instanceId: string) => {
     try {
-      sendSocketMessage({
+      sessionController.send({
         type: 'cancel_subagent',
         data: { instance_id: instanceId },
       })
@@ -1664,13 +790,26 @@ export default function App() {
 
   const deleteSubagent = (instanceId: string) => {
     try {
-      sendSocketMessage({
+      sessionController.send({
         type: 'delete_subagent',
         data: { instance_id: instanceId },
       })
     } catch (error) {
       showError(error)
     }
+  }
+
+  const retrySession = () => {
+    if (selected) {
+      void selectSession(selected).catch(showError)
+    } else {
+      void refresh()
+    }
+  }
+
+  const startCreateSessionFromWorkspace = () => {
+    openSidebar()
+    startCreateSession()
   }
 
   return (
@@ -1696,11 +835,10 @@ export default function App() {
             onThemeChange={setThemePreference}
             onPermissionModeChange={changePermissionMode}
             onModelSettingsChange={async () => {
-              modelSelectionRequestRef.current += 1
               await loadModelSettings()
-              const selection = await loadSessionModelSelection(selectedRef.current)
-              modelSelectionRef.current = selection
-              setModelSelection(selection)
+              if (selectedRef.current) {
+                await selectSession(selectedRef.current)
+              }
             }}
             onCommandSettingsChange={async () => {
               await loadCommandSettings()
@@ -1771,13 +909,20 @@ export default function App() {
                 selected={selected}
                 status={status}
                 connection={connection}
+                workspaceStatus={workspaceStatus}
+                selectionStatus={selectionStatus}
+                directoryError={directoryError}
+                sessionError={sessionError}
+                visibleError={visibleError}
+                visibleNotice={visibleNotice}
+                diagnosticCount={diagnostics.length}
                 timeline={timeline}
                 runningTurn={runningTurn}
                 pendingApproval={pendingApproval}
                 prompt={prompt}
                 canSend={canSend}
                 canCancel={canCancel}
-                isRunning={isRunning}
+                isRunning={isSessionBusy}
                 permissionMode={permissionMode}
                 modelSettings={modelSettings}
                 commandSettings={commandSettings}
@@ -1803,21 +948,23 @@ export default function App() {
                 }}
                 onReconnectWorkspace={(index) => void reconnectWorkspace(index)}
                 onOpenSidebar={openSidebar}
+                onStartCreateSession={startCreateSessionFromWorkspace}
+                onRetryDirectory={() => void refresh()}
+                onRetrySession={retrySession}
+                onDismissStatus={() => {
+                  setVisibleError(null)
+                  setVisibleNotice(null)
+                }}
                 onOpenInspector={openInspector}
                 onToggleRun={(id) => {
-                  setTimeline((items) =>
-                    items.map((item) =>
-                      item.kind === 'run' && item.id === id
-                        ? {
-                            ...item,
-                            trace: {
-                              ...item.trace,
-                              collapsed: !item.trace.collapsed,
-                            },
-                          }
-                        : item,
-                    ),
+                  const item = timeline.find(
+                    (candidate) => candidate.kind === 'run' && candidate.id === id,
                   )
+                  if (!item || item.kind !== 'run') return
+                  setRunCollapsed((current) => ({
+                    ...current,
+                    [id]: !item.trace.collapsed,
+                  }))
                 }}
                 messageScrollRef={messageScrollRef}
                 onMessageScroll={handleMessageScroll}
@@ -1838,12 +985,14 @@ export default function App() {
               onInspectSubagent={inspectSubagent}
               onCancelSubagent={cancelSubagent}
               onDeleteSubagent={deleteSubagent}
+              commandsEnabled={sessionCommandsEnabled}
             />
           </div>
         )}
       </DesktopShell>
       <ApprovalDialog
         request={pendingApproval}
+        disabled={!sessionCommandsEnabled}
         onApprove={() => sendApproval(true)}
         onDeny={() => sendApproval(false)}
       />
@@ -1906,7 +1055,7 @@ function AppSidebar({
   archivedSessions: SessionEntryResponse[]
   sessionCount: number
   runningTurn: RunningTurnSnapshot | null
-  selected: string
+  selected: string | null
   sessionAction: string | null
   isCreatingSession: boolean
   newSessionName: string
@@ -2168,6 +1317,13 @@ function ChatView({
   selected,
   status,
   connection,
+  workspaceStatus,
+  selectionStatus,
+  directoryError,
+  sessionError,
+  visibleError,
+  visibleNotice,
+  diagnosticCount,
   timeline,
   runningTurn,
   pendingApproval,
@@ -2195,14 +1351,25 @@ function ChatView({
   onOpenProjects,
   onReconnectWorkspace,
   onOpenSidebar,
+  onStartCreateSession,
+  onRetryDirectory,
+  onRetrySession,
+  onDismissStatus,
   onOpenInspector,
   onToggleRun,
   messageScrollRef,
   onMessageScroll,
 }: {
-  selected: string
+  selected: string | null
   status: StatusResponse | null
   connection: ConnectionStatus
+  workspaceStatus: WorkspaceSessionStatus
+  selectionStatus: SessionSelectionStatus
+  directoryError: string | null
+  sessionError: string | null
+  visibleError: string | null
+  visibleNotice: string | null
+  diagnosticCount: number
   timeline: TimelineItem[]
   runningTurn: RunningTurnSnapshot | null
   pendingApproval: ApprovalRequest | null
@@ -2230,15 +1397,20 @@ function ChatView({
   onOpenProjects: () => void
   onReconnectWorkspace: (index: number) => void
   onOpenSidebar: () => void
+  onStartCreateSession: () => void
+  onRetryDirectory: () => void
+  onRetrySession: () => void
+  onDismissStatus: () => void
   onOpenInspector: (panel: InspectorPanel) => void
   onToggleRun: (id: string) => void
   messageScrollRef: React.RefObject<HTMLDivElement | null>
   onMessageScroll: (event: UIEvent<HTMLDivElement>) => void
 }) {
   const isEmpty = timeline.length === 0
-  const composer = (
+  const composer = selected ? (
     <Composer
       prompt={prompt}
+      enabled={selectionStatus === 'ready'}
       canSend={canSend}
       canCancel={canCancel}
       isRunning={isRunning}
@@ -2263,10 +1435,23 @@ function ChatView({
       onOpenProjects={onOpenProjects}
       onReconnectWorkspace={onReconnectWorkspace}
     />
-  )
+  ) : null
 
   return (
     <section className={`conversation-panel${isEmpty ? ' home-mode' : ''}`}>
+      <SessionStatusBanner
+        workspaceStatus={workspaceStatus}
+        selectionStatus={selectionStatus}
+        directoryError={directoryError}
+        sessionError={sessionError}
+        visibleError={visibleError}
+        visibleNotice={visibleNotice}
+        diagnosticCount={diagnosticCount}
+        hasSelection={selected !== null}
+        onRetryDirectory={onRetryDirectory}
+        onRetrySession={onRetrySession}
+        onDismiss={onDismissStatus}
+      />
       {isEmpty ? (
         <>
           <button
@@ -2279,7 +1464,12 @@ function ChatView({
           >
             <PanelLeft size={19} />
           </button>
-          <HomePrompt status={status} onPickHint={onPromptChange}>
+          <HomePrompt
+            status={status}
+            hasSelection={selected !== null}
+            onCreateSession={onStartCreateSession}
+            onPickHint={selected ? onPromptChange : undefined}
+          >
             {composer}
           </HomePrompt>
         </>
@@ -2304,6 +1494,104 @@ function ChatView({
         </>
       )}
     </section>
+  )
+}
+
+function SessionStatusBanner({
+  workspaceStatus,
+  selectionStatus,
+  directoryError,
+  sessionError,
+  visibleError,
+  visibleNotice,
+  diagnosticCount,
+  hasSelection,
+  onRetryDirectory,
+  onRetrySession,
+  onDismiss,
+}: {
+  workspaceStatus: WorkspaceSessionStatus
+  selectionStatus: SessionSelectionStatus
+  directoryError: string | null
+  sessionError: string | null
+  visibleError: string | null
+  visibleNotice: string | null
+  diagnosticCount: number
+  hasSelection: boolean
+  onRetryDirectory: () => void
+  onRetrySession: () => void
+  onDismiss: () => void
+}) {
+  const status = (() => {
+    if (visibleError) {
+      return { tone: 'error', message: visibleError, dismissible: true } as const
+    }
+    if (sessionError) {
+      return {
+        tone: 'error',
+        message: sessionError,
+        action: hasSelection ? onRetrySession : undefined,
+        actionLabel: hasSelection ? 'Retry task' : undefined,
+      } as const
+    }
+    if (directoryError) {
+      return {
+        tone: 'error',
+        message: `Could not load tasks: ${directoryError}`,
+        action: onRetryDirectory,
+        actionLabel: 'Retry list',
+      } as const
+    }
+    if (selectionStatus === 'reconnecting') {
+      return {
+        tone: 'warning',
+        message: 'Connection interrupted. Reconnecting with a fresh snapshot…',
+      } as const
+    }
+    if (selectionStatus === 'subscribing') {
+      return {
+        tone: 'neutral',
+        message: 'Opening task and waiting for its snapshot…',
+      } as const
+    }
+    if (workspaceStatus === 'loading') {
+      return { tone: 'neutral', message: 'Loading task directory…' } as const
+    }
+    if (workspaceStatus === 'degraded' && diagnosticCount > 0) {
+      return {
+        tone: 'warning',
+        message: `${diagnosticCount} damaged task log${diagnosticCount === 1 ? '' : 's'} were skipped. Other tasks remain available.`,
+      } as const
+    }
+    if (visibleNotice) {
+      return {
+        tone: 'neutral',
+        message: visibleNotice,
+        dismissible: true,
+      } as const
+    }
+    return null
+  })()
+
+  if (!status) return null
+  return (
+    <div
+      className={`session-status-banner ${status.tone}`}
+      role={status.tone === 'error' ? 'alert' : 'status'}
+    >
+      <span>{status.message}</span>
+      {'action' in status && status.action ? (
+        <button type="button" onClick={status.action}>
+          <RefreshCw size={14} />
+          {status.actionLabel}
+        </button>
+      ) : null}
+      {'dismissible' in status && status.dismissible ? (
+        <MiniIconButton title="Dismiss message" onClick={onDismiss}>
+          <X size={14} />
+        </MiniIconButton>
+      ) : null}
+    </div>
   )
 }
 
@@ -2332,10 +1620,14 @@ const homeHints: { icon: ReactNode; label: string; prompt: string }[] = [
 
 function HomePrompt({
   status,
+  hasSelection,
+  onCreateSession,
   onPickHint,
   children,
 }: {
   status: StatusResponse | null
+  hasSelection: boolean
+  onCreateSession: () => void
   onPickHint?: (prompt: string) => void
   children: ReactNode
 }) {
@@ -2348,10 +1640,24 @@ function HomePrompt({
           <Bot size={29} />
         </div>
         <h1>
-          What should we build in <span>{workspace}</span>?
+          {hasSelection ? (
+            <>What should we build in <span>{workspace}</span>?</>
+          ) : (
+            <>Create a task to start in <span>{workspace}</span>.</>
+          )}
         </h1>
       </div>
       {children}
+      {!hasSelection ? (
+        <button
+          className="approve-button home-create-task"
+          type="button"
+          onClick={onCreateSession}
+        >
+          <Plus size={17} />
+          <span>New task</span>
+        </button>
+      ) : null}
       {onPickHint ? (
         <div className="home-hints" aria-label="快速开始">
           {homeHints.map((hint) => (
@@ -2387,7 +1693,7 @@ function ConversationHeader({
   onOpenSidebar,
   onOpenInspector,
 }: {
-  selected: string
+  selected: string | null
   connection: ConnectionStatus
   runningTurn: RunningTurnSnapshot | null
   pendingApproval: ApprovalRequest | null
@@ -2410,7 +1716,7 @@ function ConversationHeader({
         >
           <PanelLeft size={19} />
         </button>
-        <h1 title={selected}>{selected}</h1>
+        <h1 title={selected ?? 'No task'}>{selected ?? 'No task'}</h1>
       </div>
       <div className="conversation-actions">
         <span className={`connection-badge ${connectionState}`}>
@@ -2967,6 +2273,7 @@ function RunStepDetails({ step }: { step: RunStep }) {
 
 function Composer({
   prompt,
+  enabled,
   canSend,
   canCancel,
   isRunning,
@@ -2992,6 +2299,7 @@ function Composer({
   onReconnectWorkspace,
 }: {
   prompt: string
+  enabled: boolean
   canSend: boolean
   canCancel: boolean
   isRunning: boolean
@@ -3034,6 +2342,7 @@ function Composer({
     commandQuery != null &&
     commandSuggestions.length > 0 &&
     dismissedCommandPrompt !== prompt &&
+    enabled &&
     !isRunning &&
     !isResolvingCommand
 
@@ -3146,7 +2455,7 @@ function Composer({
           <textarea
             value={prompt}
             rows={variant === 'home' ? 3 : 2}
-            disabled={isRunning || isResolvingCommand}
+            disabled={!enabled || isRunning || isResolvingCommand}
             placeholder="Ask Morrow to edit, inspect, or explain this workspace"
             title="Enter 发送·Ctrl + Enter 换行"
             onChange={(event) => {
@@ -3168,7 +2477,7 @@ function Composer({
               </button>
               <PermissionPicker
                 mode={permissionMode}
-                disabled={isRunning || isResolvingCommand}
+                disabled={!enabled || isRunning || isResolvingCommand}
                 onChange={onPermissionModeChange}
               />
             </div>
@@ -3176,7 +2485,7 @@ function Composer({
               <ModelPicker
                 settings={modelSettings}
                 selection={modelSelection}
-                disabled={isRunning || isResolvingCommand}
+                disabled={!enabled || isRunning || isResolvingCommand}
                 onChange={onModelSelectionChange}
                 onManage={onManageModels}
               />
@@ -3508,6 +2817,7 @@ export function InspectorDrawer({
   onInspectSubagent,
   onCancelSubagent,
   onDeleteSubagent,
+  commandsEnabled = true,
 }: {
   open: boolean
   panel: InspectorPanel
@@ -3523,6 +2833,7 @@ export function InspectorDrawer({
   onInspectSubagent: (instanceId: string) => void
   onCancelSubagent: (instanceId: string) => void
   onDeleteSubagent: (instanceId: string) => void
+  commandsEnabled?: boolean
 }) {
   return (
     <aside
@@ -3572,6 +2883,7 @@ export function InspectorDrawer({
           onInspectSubagent={onInspectSubagent}
           onCancelSubagent={onCancelSubagent}
           onDeleteSubagent={onDeleteSubagent}
+          commandsEnabled={commandsEnabled}
         />
       </section>
     </aside>
@@ -3613,6 +2925,7 @@ function InspectorPanelContent({
   onInspectSubagent,
   onCancelSubagent,
   onDeleteSubagent,
+  commandsEnabled,
 }: {
   panel: InspectorPanel
   selectedEntry?: SessionEntryResponse
@@ -3625,6 +2938,7 @@ function InspectorPanelContent({
   onInspectSubagent: (instanceId: string) => void
   onCancelSubagent: (instanceId: string) => void
   onDeleteSubagent: (instanceId: string) => void
+  commandsEnabled: boolean
 }) {
   if (panel === 'subagents') {
     return (
@@ -3635,6 +2949,7 @@ function InspectorPanelContent({
         onInspect={onInspectSubagent}
         onCancel={onCancelSubagent}
         onDelete={onDeleteSubagent}
+        commandsEnabled={commandsEnabled}
       />
     )
   }
@@ -3691,6 +3006,7 @@ export function PersistentSubagentPanel({
   onInspect,
   onCancel,
   onDelete,
+  commandsEnabled = true,
 }: {
   instances: SubagentInstanceSnapshot[]
   transcript: SubagentTranscriptSnapshot | null
@@ -3698,6 +3014,7 @@ export function PersistentSubagentPanel({
   onInspect: (instanceId: string) => void
   onCancel: (instanceId: string) => void
   onDelete: (instanceId: string) => void
+  commandsEnabled?: boolean
 }) {
   const profiles = useContext(SubagentProfilesContext)
   const [followup, setFollowup] = useState('')
@@ -3721,7 +3038,7 @@ export function PersistentSubagentPanel({
   const send = (event: FormEvent) => {
     event.preventDefault()
     const value = followup.trim()
-    if (!selected || !value) return
+    if (!commandsEnabled || !selected || !value) return
     onSend(selected.id, value)
     setFollowup('')
   }
@@ -3757,6 +3074,7 @@ export function PersistentSubagentPanel({
                 className={`subagent-instance-card${selected?.id === instance.id ? ' selected' : ''}`}
                 type="button"
                 key={instance.id}
+                disabled={!commandsEnabled}
                 onClick={() => onInspect(instance.id)}
               >
                 <span className="subagent-instance-avatar">
@@ -3875,13 +3193,19 @@ export function PersistentSubagentPanel({
           ) : null}
           <div className="subagent-instance-actions">
             {isActiveSubagentStatus(transcript.instance.status) ? (
-              <button className="danger-button subtle" type="button" onClick={() => onCancel(transcript.instance.id)}>
+              <button
+                className="danger-button subtle"
+                type="button"
+                disabled={!commandsEnabled}
+                onClick={() => onCancel(transcript.instance.id)}
+              >
                 <Square size={14} /> Cancel
               </button>
             ) : (
               <button
                 className="danger-button subtle"
                 type="button"
+                disabled={!commandsEnabled}
                 onClick={() => {
                   if (window.confirm(`Delete ${transcript.instance.identity.name} and its transcript?`)) {
                     onDelete(transcript.instance.id)
@@ -3898,11 +3222,16 @@ export function PersistentSubagentPanel({
               <form className="subagent-followup-form" onSubmit={send}>
                 <textarea
                   value={followup}
+                  disabled={!commandsEnabled}
                   maxLength={4000}
                   placeholder="Continue this instance with preserved context…"
                   onChange={(event) => setFollowup(event.target.value)}
                 />
-                <button className="approve-button" type="submit" disabled={!followup.trim()}>
+                <button
+                  className="approve-button"
+                  type="submit"
+                  disabled={!commandsEnabled || !followup.trim()}
+                >
                   <Send size={14} /> Continue
                 </button>
               </form>
@@ -3914,11 +3243,10 @@ export function PersistentSubagentPanel({
   )
 }
 
-export function subagentTranscriptMessages(session: Session): Message[] {
-  if (session.turns.length > 0) {
-    return session.turns.flatMap((record) => record.messages)
-  }
-  return session.active_thread.messages
+export function subagentTranscriptMessages(
+  session: import('./types').SessionProjection,
+): Message[] {
+  return session.turns.flatMap((turn) => turn.messages)
 }
 
 function isActiveSubagentStatus(status: SubagentInstanceSnapshot['status']): boolean {
@@ -3947,32 +3275,6 @@ function ToolList({
           </div>
           <p>{formatToolSummary(tool.summary)}</p>
           {!compact && tool.summary?.diff ? <pre>{tool.summary.diff}</pre> : null}
-        </article>
-      ))}
-    </div>
-  )
-}
-
-function ActivityList({
-  items,
-  compact = false,
-}: {
-  items: ActivityItem[]
-  compact?: boolean
-}) {
-  if (items.length === 0) {
-    return <p className="muted-line">No events.</p>
-  }
-
-  return (
-    <div className={`activity-list${compact ? ' compact' : ''}`}>
-      {items.map((item) => (
-        <article key={item.id} className={`activity-item ${item.tone}`}>
-          <span>{item.time}</span>
-          <div>
-            <strong>{item.title}</strong>
-            {item.detail ? <p>{item.detail}</p> : null}
-          </div>
         </article>
       ))}
     </div>
@@ -4031,10 +3333,12 @@ function CreateSessionRow({
 
 function ApprovalDialog({
   request,
+  disabled,
   onApprove,
   onDeny,
 }: {
   request: ApprovalRequest | null
+  disabled: boolean
   onApprove: () => void
   onDeny: () => void
 }) {
@@ -4048,7 +3352,7 @@ function ApprovalDialog({
             <p className="eyebrow">Approval</p>
             <h2>{approvalTitle(request)}</h2>
           </div>
-          <IconButton title="Deny" onClick={onDeny}>
+          <IconButton title="Deny" disabled={disabled} onClick={onDeny}>
             <X size={20} />
           </IconButton>
         </header>
@@ -4056,10 +3360,20 @@ function ApprovalDialog({
         <p className="approval-reason">{request.reason}</p>
         <ApprovalBody request={request} />
         <footer>
-          <button className="danger-button" type="button" onClick={onDeny}>
+          <button
+            className="danger-button"
+            type="button"
+            disabled={disabled}
+            onClick={onDeny}
+          >
             Deny
           </button>
-          <button className="approve-button" type="button" onClick={onApprove}>
+          <button
+            className="approve-button"
+            type="button"
+            disabled={disabled}
+            onClick={onApprove}
+          >
             <CheckCircle2 size={18} />
             <span>Approve</span>
           </button>
@@ -4146,241 +3460,6 @@ function MiniIconButton({
       {children}
     </button>
   )
-}
-
-function sessionTimeline(session: Session): TimelineItem[] {
-  if (session.turns.length > 0) {
-    return session.turns.flatMap((record, index) =>
-      turnRecordTimeline(record, index),
-    )
-  }
-
-  return session.active_thread.messages.flatMap((message, index) =>
-    fallbackMessageTimeline(message, index),
-  )
-}
-
-function turnRecordTimeline(
-  record: Session['turns'][number],
-  turnIndex: number,
-): TimelineItem[] {
-  const items: TimelineItem[] = []
-  const userContent = record.turn.user_message.content
-  if (userContent) {
-    items.push({
-      kind: 'message',
-      id: `history-${turnIndex}-user`,
-      role: 'user',
-      content: userContent,
-    })
-  }
-
-  if (record.turn.steps.length > 0 || record.turn.error) {
-    const trace = historyRunTrace(record, turnIndex)
-    items.push({
-      kind: 'run',
-      id: trace.id,
-      trace,
-    })
-  }
-
-  const assistantContent = finalAssistantContent(record)
-  if (assistantContent) {
-    items.push({
-      kind: 'message',
-      id: `history-${turnIndex}-assistant`,
-      role: 'assistant',
-      content: assistantContent,
-    })
-  }
-
-  return items
-}
-
-export function historyRunTrace(
-  record: Session['turns'][number],
-  turnIndex: number,
-): RunTrace {
-  const turn = record.turn
-  const subagents = subagentHistory(record.messages)
-  const persistentSubagents = persistentSubagentHistory(record.messages)
-  const modelMessages = record.messages.filter(
-    (message) => message.role === 'assistant',
-  )
-  let modelMessageIndex = 0
-  const steps: RunStep[] = turn.steps.map((step, stepIndex) => {
-    const stepId = `history-${turnIndex}-step-${stepIndex}`
-    const isSubagent =
-      step.kind === 'tool_call' && step.tool_name === 'delegate_task'
-    const isPersistentSubagent =
-      step.kind === 'tool_call' && step.tool_name === spawnSubagentToolName
-    const subagent = step.tool_call_id
-      ? subagents.get(step.tool_call_id)
-      : undefined
-    const persistentSubagent = step.tool_call_id
-      ? persistentSubagents.get(step.tool_call_id)
-      : undefined
-    const modelMessage =
-      step.kind === 'model_call'
-        ? modelMessages[modelMessageIndex++]
-        : undefined
-
-    if (isPersistentSubagent) {
-      if (persistentSubagent?.snapshot) {
-        const snapshotStep = persistentSubagentSnapshotStep(
-          stepId,
-          persistentSubagent.snapshot,
-        )
-        return {
-          ...snapshotStep,
-          status: step.status === 'failed' ? 'error' : snapshotStep.status,
-          detail: step.error || snapshotStep.detail,
-        }
-      }
-      if (step.status === 'failed') {
-        return failedPersistentSubagentStep(
-          stepId,
-          step.error || undefined,
-          persistentSubagent,
-        )
-      }
-      return {
-        ...startingPersistentSubagentStep(stepId),
-        status: step.status === 'completed' ? 'ok' : 'running',
-        title: step.status === 'completed' ? '子 Agent 已启动' : '正在启动子 Agent',
-        detail: persistentSubagent?.task || '正在同步身份、职责和任务状态…',
-        ...(persistentSubagent?.role
-          ? { agentRole: persistentSubagent.role }
-          : {}),
-      }
-    }
-
-    return {
-      id: stepId,
-      kind: isSubagent
-        ? 'subagent'
-        : step.kind === 'tool_call'
-          ? 'tool'
-          : 'model',
-      status:
-        step.status === 'completed'
-          ? 'ok'
-          : step.status === 'failed'
-            ? 'error'
-            : 'running',
-      title:
-        isSubagent
-          ? subagentStepTitle(subagent?.agentName)
-          : step.kind === 'tool_call'
-          ? step.tool_name || 'Tool call'
-          : turn.model?.model_name || 'Model call',
-      detail:
-        (isSubagent && subagent?.task) ||
-        step.error ||
-        step.tool_call_id ||
-        (turn.model
-          ? `${turn.model.provider_name} · ${reasoningLabel(turn.model.reasoning)}`
-          : undefined),
-      reasoning: modelMessage?.reasoning_content || undefined,
-      summary: subagent?.summary
-        ? { subagent: subagent.summary }
-        : undefined,
-      agentId: subagent?.agentId,
-      agentName: subagent?.agentName,
-    }
-  })
-
-  if (turn.error && !steps.some((step) => step.status === 'error')) {
-    steps.push({
-      id: `history-${turnIndex}-error`,
-      kind: 'error',
-      status: 'error',
-      title: 'Error',
-      detail: turn.error,
-    })
-  }
-
-  return {
-    id: `history-${turnIndex}-run`,
-    status:
-      turn.status === 'completed'
-        ? 'completed'
-        : turn.status === 'failed'
-          ? 'failed'
-          : 'running',
-    collapsed: true,
-    startedAt: `turn ${turnIndex + 1}`,
-    steps,
-    toolCount: steps.filter((step) => step.kind === 'tool').length,
-  }
-}
-
-function finalAssistantContent(record: Session['turns'][number]): string {
-  const direct = record.turn.assistant_message?.content
-  if (direct?.trim()) return direct
-
-  const fallback = [...record.messages]
-    .reverse()
-    .find(
-      (message) =>
-        message.role === 'assistant' &&
-        Boolean(message.content?.trim()) &&
-        !message.tool_calls?.length,
-    )
-  return fallback?.content || ''
-}
-
-function fallbackMessageTimeline(
-  message: Message,
-  index: number,
-): TimelineItem[] {
-  if (message.role === 'system') return []
-
-  const content = message.content ?? formatToolCalls(message)
-  if (!content) return []
-
-  if (message.role === 'tool') {
-    return [
-      {
-        kind: 'notice',
-        id: `history-${index}-tool`,
-        tone: 'neutral',
-        title: 'Tool result',
-        detail: compactText(content, 180),
-      },
-    ]
-  }
-
-  if (message.role === 'assistant' && message.tool_calls?.length && !message.content) {
-    return [
-      {
-        kind: 'notice',
-        id: `history-${index}-tool-calls`,
-        tone: 'neutral',
-        title: 'Tool calls',
-        detail: compactText(content, 180),
-      },
-    ]
-  }
-
-  return [
-    {
-      kind: 'message',
-      id: `history-${index}-${message.role}`,
-      role: message.role,
-      content,
-    },
-  ]
-}
-
-function formatToolCalls(message: Message): string {
-  if (message.tool_calls) {
-    return JSON.stringify(message.tool_calls, null, 2)
-  }
-  if (message.tool_call_id) {
-    return `tool_call_id: ${message.tool_call_id}`
-  }
-  return ''
 }
 
 function formatToolSummary(summary?: ToolExecutionSummary): string {
@@ -4512,14 +3591,6 @@ function runStepIcon(step: RunStep): ReactNode {
   }
 }
 
-function currentTime(): string {
-  return new Date().toLocaleTimeString([], {
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-  })
-}
-
 function inspectorPanelTitle(panel: InspectorPanel): string {
   switch (panel) {
     case 'run':
@@ -4630,7 +3701,7 @@ function workspaceName(path: string): string {
 }
 
 type AppLocation = {
-  session: string
+  session: string | null
   view: AppView
   section: SettingsSection
 }
@@ -4656,7 +3727,7 @@ function readAppLocation(): AppLocation {
       : 'general'
 
   return {
-    session: params.get('session') || 'default',
+    session: params.get('session'),
     view,
     section,
   }
@@ -4678,20 +3749,21 @@ function readHistoryState(): MorrowHistoryState {
 }
 
 function writeAppLocation(
-  session: string,
+  session: string | null,
   view: AppView,
   section: SettingsSection,
   method: 'push' | 'replace',
   fromWorkspace: boolean,
 ): void {
   const params = new URLSearchParams()
-  params.set('session', session)
+  if (session) params.set('session', session)
   if (view === 'settings') {
     params.set('view', 'settings')
     params.set('section', section)
   }
 
-  const url = `${location.pathname}?${params.toString()}`
+  const query = params.toString()
+  const url = query ? `${location.pathname}?${query}` : location.pathname
   const state: MorrowHistoryState = { morrowView: view, fromWorkspace }
   if (method === 'push') {
     history.pushState(state, '', url)
@@ -4736,13 +3808,4 @@ function readSavedPermissionMode(): PermissionMode | null {
     saved === 'danger_full_access'
     ? saved
     : null
-}
-
-function nextAvailableSessionName(sessions: SessionEntryResponse[]): string {
-  const names = new Set(sessions.map((session) => session.name))
-  if (!names.has('default')) return 'default'
-
-  let index = 1
-  while (names.has(`task-${index}`)) index += 1
-  return `task-${index}`
 }

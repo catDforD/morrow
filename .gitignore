@@ -8,4 +8,5 @@ crates/agent-desktop/node_modules/
 .zcode/
 
 # 废止文档
-docs/
+docs/*
+!docs/session-consistency-protocol.md
