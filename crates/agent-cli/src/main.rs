@@ -21,6 +21,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
 
+mod tui_backend;
+
 const INIT_CONFIG_MODEL: &str = "gpt-4.1";
 const INIT_CONFIG_BASE_URL: &str = "https://api.openai.com/v1";
 const INIT_CONFIG_API_KEY_PLACEHOLDER: &str = "replace-with-your-openai-api-key";
@@ -32,7 +34,7 @@ const CONFIG_PROVIDER_NAME: &str = "默认配置";
 
 #[derive(Debug, Parser)]
 #[command(name = "morrow")]
-#[command(about = "Minimal OpenAI-compatible agent loop CLI")]
+#[command(about = "Morrow coding agent CLI and terminal interface")]
 struct Args {
     #[arg(long)]
     config: Option<PathBuf>,
@@ -57,6 +59,12 @@ struct Args {
 
     #[arg(long)]
     jsonl: bool,
+
+    #[arg(long, help = "Use the existing line-oriented interactive mode")]
+    plain: bool,
+
+    #[arg(long, help = "Disable TUI foreground and background colors")]
+    no_color: bool,
 
     #[command(subcommand)]
     command: Option<CliCommand>,
@@ -105,6 +113,33 @@ enum SessionCommand {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InteractiveFrontend {
+    Tui,
+    Plain(PlainModeReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlainModeReason {
+    Requested,
+    StdinNotTerminal,
+    StdoutNotTerminal,
+    DumbTerminal,
+}
+
+impl PlainModeReason {
+    fn notice(self) -> Option<&'static str> {
+        match self {
+            Self::Requested => None,
+            Self::StdinNotTerminal => Some("stdin is not a terminal; using plain interactive mode"),
+            Self::StdoutNotTerminal => {
+                Some("stdout is not a terminal; using plain interactive mode")
+            }
+            Self::DumbTerminal => Some("TERM=dumb; using plain interactive mode"),
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 enum CliError {
     #[error(transparent)]
@@ -120,7 +155,11 @@ enum CliError {
     #[error(transparent)]
     Server(#[from] agent_server::ServerError),
     #[error(transparent)]
-    SubagentSettings(#[from] agent_server::SubagentRegistryError),
+    App(#[from] agent_app::WorkspaceError),
+    #[error(transparent)]
+    Tui(#[from] agent_tui::TuiError),
+    #[error(transparent)]
+    SubagentSettings(#[from] agent_app::SubagentRegistryError),
     #[error("agent run failed: {0}")]
     AgentRun(String),
     #[error("--session and --thread cannot be used together")]
@@ -190,8 +229,8 @@ async fn run() -> Result<(), CliError> {
     let prompt = args.prompt.join(" ");
     validate_jsonl_prompt(&args, &prompt)?;
 
-    let workspace_root = agent_runtime::detect_workspace_root()?;
     if let Some(CliCommand::Server { host, port }) = args.command.as_ref() {
+        let workspace_root = agent_runtime::detect_workspace_root()?;
         let loaded = load_server_config(args.config.as_deref())?;
         let home = dirs::home_dir().ok_or(CliError::HomeDirNotFound)?;
         eprintln!("morrow server listening on http://{host}:{port}");
@@ -207,6 +246,85 @@ async fn run() -> Result<(), CliError> {
         return Ok(());
     }
 
+    if prompt.trim().is_empty() {
+        let frontend = select_interactive_frontend(
+            args.plain,
+            io::stdin().is_terminal(),
+            io::stdout().is_terminal(),
+            std::env::var("TERM").ok().as_deref(),
+        );
+        match frontend {
+            InteractiveFrontend::Plain(reason) => {
+                if let Some(notice) = reason.notice() {
+                    eprintln!("notice: {notice}");
+                }
+            }
+            InteractiveFrontend::Tui => {
+                let tui_workspace_root = std::env::current_dir()
+                    .map_err(agent_runtime::SessionStoreError::CurrentDir)?;
+                let home = dirs::home_dir().ok_or(CliError::HomeDirNotFound)?;
+                let loaded = load_server_config(args.config.as_deref())?;
+                let toml_permissions = loaded.config.permissions;
+                let state_path = home.join(".morrow").join("tui-state.json");
+                let state_permissions = agent_tui::TuiStateFile::load(&state_path)
+                    .ok()
+                    .and_then(|state| state.workspace(&tui_workspace_root).cloned())
+                    .map(|state| state.permissions);
+                let permission_override = tui_permission_override(
+                    toml_permissions,
+                    state_permissions,
+                    args.permission,
+                    args.allow_shell,
+                );
+                let initial_session = tui_initial_session(&args);
+                let options = agent_app::workspace_options_from_loaded_config(
+                    tui_workspace_root.clone(),
+                    &home,
+                    loaded,
+                    session_name.clone(),
+                    toml_permissions,
+                )?;
+                let app = agent_app::WorkspaceApp::new(options)?;
+                if args.reset_session || args.reset_thread {
+                    app.reset_session(&session_name).await?;
+                }
+                let backend = tui_backend::LocalWorkspaceBackend::new(
+                    app.clone(),
+                    tui_workspace_root.clone(),
+                );
+                let result = agent_tui::run(
+                    backend,
+                    agent_tui::LaunchOptions {
+                        workspace: tui_workspace_root,
+                        initial_session,
+                        permission_override,
+                        state_path: Some(state_path),
+                        no_color: args.no_color || std::env::var_os("NO_COLOR").is_some(),
+                    },
+                )
+                .await;
+                match result {
+                    Ok(outcome) => {
+                        app.shutdown(matches!(outcome, agent_tui::RunOutcome::CancelledActive))
+                            .await;
+                        return Ok(());
+                    }
+                    Err(agent_tui::TuiError::Terminal(error)) => {
+                        app.shutdown(false).await;
+                        eprintln!(
+                            "notice: failed to initialize the interactive terminal ({error}); using plain interactive mode"
+                        );
+                    }
+                    Err(error) => {
+                        app.shutdown(true).await;
+                        return Err(error.into());
+                    }
+                }
+            }
+        }
+    }
+
+    let workspace_root = agent_runtime::detect_workspace_root()?;
     let reset_session = args.reset_session || args.reset_thread;
     let home = dirs::home_dir().ok_or(CliError::HomeDirNotFound)?;
     let subagent_store_path = home.join(".morrow").join("subagents.json");
@@ -260,7 +378,7 @@ async fn run() -> Result<(), CliError> {
     }
 
     let mut stdout = io::stdout().lock();
-    let subagent_identities = agent_server::load_subagent_identities(&subagent_store_path)?;
+    let subagent_identities = agent_app::load_subagent_identities(&subagent_store_path)?;
     let outcome = run_agent_turn(
         RunAgentTurnContext {
             client: &client,
@@ -382,8 +500,7 @@ async fn run_repl(
         }
 
         let mut stdout = io::stdout().lock();
-        let subagent_identities =
-            agent_server::load_subagent_identities(context.subagent_store_path)?;
+        let subagent_identities = agent_app::load_subagent_identities(context.subagent_store_path)?;
         let outcome = run_agent_turn(
             RunAgentTurnContext {
                 client: context.client,
@@ -686,11 +803,57 @@ fn resolve_session_name(args: &Args) -> Result<String, CliError> {
     }
 }
 
+fn explicit_session_name(args: &Args) -> Option<&str> {
+    args.session.as_deref().or(args.thread.as_deref())
+}
+
+fn tui_initial_session(args: &Args) -> agent_tui::InitialSession {
+    explicit_session_name(args).map_or(agent_tui::InitialSession::New, |session| {
+        agent_tui::InitialSession::Named(session.to_string())
+    })
+}
+
 fn validate_jsonl_prompt(args: &Args, prompt: &str) -> Result<(), CliError> {
     if args.jsonl && prompt.trim().is_empty() {
         return Err(CliError::JsonlRequiresPrompt);
     }
     Ok(())
+}
+
+fn select_interactive_frontend(
+    plain: bool,
+    stdin_is_terminal: bool,
+    stdout_is_terminal: bool,
+    term: Option<&str>,
+) -> InteractiveFrontend {
+    if plain {
+        return InteractiveFrontend::Plain(PlainModeReason::Requested);
+    }
+    if !stdin_is_terminal {
+        return InteractiveFrontend::Plain(PlainModeReason::StdinNotTerminal);
+    }
+    if !stdout_is_terminal {
+        return InteractiveFrontend::Plain(PlainModeReason::StdoutNotTerminal);
+    }
+    if term.is_some_and(|value| value.eq_ignore_ascii_case("dumb")) {
+        return InteractiveFrontend::Plain(PlainModeReason::DumbTerminal);
+    }
+    InteractiveFrontend::Tui
+}
+
+fn tui_permission_override(
+    toml_permissions: PermissionProfile,
+    state_permissions: Option<PermissionProfile>,
+    mode_override: Option<PermissionMode>,
+    allow_shell: bool,
+) -> Option<PermissionProfile> {
+    (mode_override.is_some() || allow_shell).then(|| {
+        effective_permissions(
+            state_permissions.unwrap_or(toml_permissions),
+            mode_override,
+            allow_shell,
+        )
+    })
 }
 
 fn handle_cli_command(
@@ -1417,6 +1580,7 @@ compact test
             resolve_session_name(&default_args).expect("session"),
             "default"
         );
+        assert_eq!(explicit_session_name(&default_args), None);
 
         let session_args =
             Args::try_parse_from(["morrow", "--session", "work"]).expect("session args");
@@ -1424,6 +1588,7 @@ compact test
             resolve_session_name(&session_args).expect("session"),
             "work"
         );
+        assert_eq!(explicit_session_name(&session_args), Some("work"));
 
         let thread_args =
             Args::try_parse_from(["morrow", "--thread", "legacy"]).expect("thread args");
@@ -1431,6 +1596,7 @@ compact test
             resolve_session_name(&thread_args).expect("session"),
             "legacy"
         );
+        assert_eq!(explicit_session_name(&thread_args), Some("legacy"));
 
         let conflicting =
             Args::try_parse_from(["morrow", "--session", "work", "--thread", "legacy"])
@@ -1542,6 +1708,62 @@ compact test
     }
 
     #[test]
+    fn parses_plain_flag() {
+        let args = Args::try_parse_from(["morrow", "--plain"]).expect("parse plain");
+
+        assert!(args.plain);
+        assert!(args.prompt.is_empty());
+    }
+
+    #[test]
+    fn parses_no_color_flag() {
+        let args = Args::try_parse_from(["morrow", "--no-color"]).expect("parse no color");
+
+        assert!(args.no_color);
+        assert!(args.prompt.is_empty());
+    }
+
+    #[test]
+    fn bare_tui_starts_new_session_and_explicit_session_is_named() {
+        let bare = Args::try_parse_from(["morrow"]).expect("parse bare tui");
+        assert_eq!(tui_initial_session(&bare), agent_tui::InitialSession::New);
+
+        let named = Args::try_parse_from(["morrow", "--session", "work"]).expect("parse named tui");
+        assert_eq!(
+            tui_initial_session(&named),
+            agent_tui::InitialSession::Named("work".to_string())
+        );
+    }
+
+    #[test]
+    fn selects_tui_only_for_interactive_capable_terminals() {
+        assert_eq!(
+            select_interactive_frontend(false, true, true, Some("xterm-256color")),
+            InteractiveFrontend::Tui
+        );
+        assert_eq!(
+            select_interactive_frontend(true, true, true, Some("xterm-256color")),
+            InteractiveFrontend::Plain(PlainModeReason::Requested)
+        );
+        assert_eq!(
+            select_interactive_frontend(false, false, true, Some("xterm-256color")),
+            InteractiveFrontend::Plain(PlainModeReason::StdinNotTerminal)
+        );
+        assert_eq!(
+            select_interactive_frontend(false, true, false, Some("xterm-256color")),
+            InteractiveFrontend::Plain(PlainModeReason::StdoutNotTerminal)
+        );
+        assert_eq!(
+            select_interactive_frontend(false, true, true, Some("DUMB")),
+            InteractiveFrontend::Plain(PlainModeReason::DumbTerminal)
+        );
+        assert_eq!(
+            select_interactive_frontend(false, true, true, None),
+            InteractiveFrontend::Tui
+        );
+    }
+
+    #[test]
     fn effective_permissions_apply_cli_overrides() {
         let base = PermissionProfile {
             mode: PermissionMode::WorkspaceWrite,
@@ -1559,6 +1781,35 @@ compact test
                 mode: PermissionMode::WorkspaceWrite,
                 shell: ShellPolicy::Allow,
             }
+        );
+    }
+
+    #[test]
+    fn tui_permission_override_is_only_set_for_explicit_cli_flags() {
+        let toml = PermissionProfile::for_mode(PermissionMode::ReadOnly);
+        let persisted = PermissionProfile::for_mode(PermissionMode::WorkspaceWrite);
+
+        assert_eq!(
+            tui_permission_override(toml, Some(persisted), None, false),
+            None
+        );
+        assert_eq!(
+            tui_permission_override(toml, Some(persisted), None, true),
+            Some(PermissionProfile {
+                mode: PermissionMode::WorkspaceWrite,
+                shell: ShellPolicy::Allow,
+            })
+        );
+        assert_eq!(
+            tui_permission_override(
+                toml,
+                Some(persisted),
+                Some(PermissionMode::DangerFullAccess),
+                false,
+            ),
+            Some(PermissionProfile::for_mode(
+                PermissionMode::DangerFullAccess
+            ))
         );
     }
 

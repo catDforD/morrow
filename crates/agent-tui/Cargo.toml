@@ -1,0 +1,20 @@
+[package]
+name = "agent-tui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+agent-protocol = { workspace = true }
+async-trait = { workspace = true }
+crossterm = { version = "0.29", features = ["event-stream", "osc52"] }
+dirs = { workspace = true }
+futures-util = { workspace = true }
+ignore = "0.4"
+ratatui = { version = "0.30", features = ["scrolling-regions"] }
+ratatui-textarea = "0.9"
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tui-markdown = "0.3"
+unicode-width = "0.2"

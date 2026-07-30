@@ -2,7 +2,7 @@
 
 # Morrow
 
-**A local-first coding agent — CLI, interactive REPL, web dashboard, and desktop app, backed by any OpenAI-compatible API.**
+**A local-first coding agent — terminal UI, CLI, web dashboard, and desktop app, backed by any OpenAI-compatible API.**
 
 [![Release](https://img.shields.io/github/v/release/catDforD/morrow?style=flat-square)](https://github.com/catDforD/morrow/releases)
 [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
@@ -18,13 +18,13 @@ Morrow streams model output, persists project-scoped sessions, reads and edits f
 
 ## Features
 
-- **Several faces, one runtime** — CLI one-shots, an interactive REPL, a local browser dashboard, and a Tauri 2 desktop app.
-- **Bring your own model** — OpenAI-compatible config via `--config`, local `morrow.toml`, or `~/.morrow/config.toml`; Web-only provider management with per-session model and reasoning selection.
+- **Several faces, one application layer** — a terminal UI, CLI one-shots and plain REPL, a local browser dashboard, and a Tauri 2 desktop app.
+- **Bring your own model** — OpenAI-compatible config via `--config`, local `morrow.toml`, or `~/.morrow/config.toml`; Morrow-managed providers support per-session model and reasoning selection.
 - **Persistent sessions** — named, project-scoped sessions you can list, rename, export, and resume.
 - **Real tools** — file reads/edits, patches, search, directory listing, and shell commands.
 - **Permission profiles** — read-only, workspace-write, and full-access modes, with shell controlled separately.
 - **MCP support** — stdio and Streamable HTTP MCP servers from TOML or the dashboard.
-- **Session-scoped subagents** — run persistent `explore`, `plan`, `worker`, and `reviewer` instances in the background, then inspect, continue, cancel, or delete them from Web/Desktop.
+- **Session-scoped subagents** — run persistent `explore`, `plan`, `worker`, and `reviewer` instances in the background, then inspect, continue, cancel, or delete them from the TUI or Web/Desktop.
 - **Long-session friendly** — automatic context compaction.
 - **Scriptable** — JSONL event output for automation and integrations.
 
@@ -52,8 +52,10 @@ macOS and Linux:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/catDforD/morrow/main/install.sh | sh
-morrow init
+morrow
 ```
+
+Running `morrow` after installation opens the TUI immediately. `morrow init` is optional; use it when you prefer to prepare a TOML configuration before opening Settings in the TUI.
 
 Specific version or custom install directory:
 
@@ -74,15 +76,19 @@ cargo install --git https://github.com/catDforD/morrow --locked -p agent-cli
 
 ```bash
 morrow "summarize this repository"   # one-shot
-morrow                               # interactive
+morrow                               # terminal UI (when stdin/stdout are terminals)
+morrow --no-color                    # TUI without foreground/background colors
+morrow --plain                       # plain REPL
 morrow server                        # local web dashboard
 ```
+
+With no prompt, Morrow opens the TUI on a usable terminal and creates a new persisted session for that launch. Use `--session <name>` to resume a named session. The TUI runs inline on the normal terminal screen, so native scrollback, text selection, and copying remain available. Use `--no-color` (or the standard `NO_COLOR` environment variable) to retain typography and status symbols without foreground/background colors. Redirected input/output, `TERM=dumb`, or an interactive-terminal initialization failure falls back to the plain REPL. One-shot prompts, `--jsonl`, `--plain`, `server`, `init`, and `session` keep their existing behavior.
 
 The dashboard listens on `127.0.0.1:3000` by default and uses the current workspace, config, sessions, and permissions. It is local-first and unauthenticated — do not bind it to a public interface. Customize with `morrow server --host 127.0.0.1 --port 3000`.
 
 The dashboard picks permissions per turn (default `workspace_write`, remembering the latest browser choice); `[permissions]` in `morrow.toml` applies to CLI only.
 
-## Configuration
+## Optional configuration
 
 ```bash
 morrow init
@@ -116,9 +122,9 @@ mode = "read_only"
 shell = "deny"
 ```
 
-Inline `[model].OPENAI_API_KEY` wins when present; otherwise Morrow reads `api_key_env` (default `OPENAI_API_KEY`). CLI requires a valid model and API key. Without `--config`, `morrow server` can start with no config so the first provider can be set up in the browser.
+Inline `[model].OPENAI_API_KEY` wins when present; otherwise Morrow reads `api_key_env` (default `OPENAI_API_KEY`). One-shot and plain CLI modes require a valid model and API key. Without `--config`, the TUI and `morrow server` can start with no model so the first provider can be configured from Settings.
 
-Web-only models, MCP servers, custom commands, and subagent settings are managed under **Settings → Models / MCP Servers / Commands / Subagents** and stored under `~/.morrow/`; they do not change the CLI TOML config. See [`morrow.example.toml`](morrow.example.toml) for more examples.
+Morrow-managed models, MCP servers, custom commands, and subagent settings are available from the TUI and Web/Desktop Settings pages and are stored under `~/.morrow/`; they do not change the CLI TOML config. See [`morrow.example.toml`](morrow.example.toml) for more examples.
 
 ### MCP tools
 
@@ -139,7 +145,7 @@ MCP tools are treated as explicitly trusted — review server commands and remot
 
 ### Subagents
 
-Web/Desktop sessions support persistent, background subagents through `spawn_subagent`, `send_subagent`, `inspect_subagent`, `wait_subagents`, and `cancel_subagent`. A parent turn can end while its subagents keep running. Users can inspect the complete transcript and event log, continue an idle or interrupted instance with preserved context, cancel active work, or delete a terminal instance from the Subagents inspector.
+TUI and Web/Desktop sessions support persistent, background subagents through `spawn_subagent`, `send_subagent`, `inspect_subagent`, `wait_subagents`, and `cancel_subagent`. A parent turn can end while its subagents keep running. Users can inspect the complete transcript and event log, continue an idle or interrupted instance with preserved context, cancel active work, or delete a terminal instance from the Subagents inspector.
 
 | Role | Built-in tools | Permission ceiling |
 | --- | --- | --- |
@@ -154,11 +160,11 @@ Each session retains at most eight persistent instances and runs at most four su
 
 Persistent instances live under `~/.morrow/subagent-sessions/<workspace-scope>/<session>/`. Their event log stops storing streaming deltas after 16 MiB but keeps messages, tools, approvals, and terminal events. On restart, queued/running/waiting-for-approval runs become `interrupted`; approvals and leases are cleared, and unfinished operations are never replayed automatically. Remote model credentials are transmitted only when starting or continuing work and remain in memory; they are not written to the instance sidecar.
 
-The compatibility `delegate_task({task})` tool remains synchronous and strictly read-only. It creates a temporary `explore` agent, follows parent-turn cancellation, and does not consume persistent-instance capacity. CLI exposes this compatibility tool only; persistent lifecycle controls are currently Web/Desktop and remote-workspace features. Names and avatars remain separately configurable under **Settings → Subagents** (`~/.morrow/subagents.json`).
+The compatibility `delegate_task({task})` tool remains synchronous and strictly read-only. It creates a temporary `explore` agent, follows parent-turn cancellation, and does not consume persistent-instance capacity. Persistent lifecycle controls are available in the TUI, Web/Desktop, and remote workspaces. Names and avatars remain separately configurable under **Settings → Subagents** (`~/.morrow/subagents.json`).
 
-### Web custom commands
+### Custom commands
 
-**Settings → Commands** manages slash commands in `~/.morrow/commands/*.md` (Web only). Type `/` in the composer to search; `$ARGUMENTS` is replaced with the supplied args.
+**Settings → Commands** manages slash commands in `~/.morrow/commands/*.md`. Type `/` in the TUI or Web composer to search; `$ARGUMENTS` is replaced with the supplied args.
 
 ## Permissions
 
@@ -196,7 +202,7 @@ morrow session rename work backend-refactor
 morrow session delete backend-refactor
 ```
 
-Useful REPL commands: `/status`, `/permissions ...`, `/compact`, `/reset`, `/exit`. Compatibility aliases `--thread` / `--reset-thread` still work; prefer `--session` for new usage.
+The TUI supports session switching, archive/restore, bottom-panel Run and Subagent inspectors, approval cards, multiline input, slash commands, workspace-relative `@` path completion, and a context meter. Sessions, inspectors, settings, help, and confirmations replace the composer while keeping the conversation visible; `Esc` returns to the previous panel. Press `F1` for shortcuts. `Ctrl+C` cancels the active task or clears the draft; press it again within one second to cancel all tasks and force exit. In `--plain` mode, useful REPL commands are `/status`, `/permissions ...`, `/compact`, `/reset`, and `/exit`. Compatibility aliases `--thread` / `--reset-thread` still work; prefer `--session` for new usage.
 
 ## Automation
 
@@ -212,16 +218,18 @@ Crate boundaries, turn lifecycle, and extension points: [`ARCHITECTURE.md`](ARCH
 
 | Crate | Responsibility |
 | --- | --- |
-| `agent-cli` | CLI, REPL, JSONL, server, config wiring |
+| `agent-app` | Typed workspace application services, settings, sessions, approvals, and Subagents |
+| `agent-cli` | CLI dispatch, plain REPL, JSONL, and config wiring |
 | `agent-desktop` | Tauri 2 shell and local server lifecycle |
 | `agent-config` | Config loading |
 | `agent-core` | Turn execution and event streams |
 | `agent-model` | OpenAI-compatible client and streaming |
 | `agent-protocol` | Shared protocol types |
 | `agent-runtime` | Sessions, compaction, workspace, turn helpers |
-| `agent-server` | HTTP/WebSocket and embedded dashboard |
+| `agent-server` | Axum HTTP/WebSocket and embedded dashboard adapter |
 | `agent-sandbox` | Permission evaluation |
 | `agent-tools` | Built-in file and shell tools |
+| `agent-tui` | Ratatui terminal UI and local TUI state |
 
 ```bash
 cargo build --workspace
