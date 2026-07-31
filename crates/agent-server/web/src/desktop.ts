@@ -39,7 +39,10 @@ export type RemoteRequest =
   | { type: 'environment' }
   | { type: 'list_directory'; data: { path?: string; show_hidden: boolean } }
   | { type: 'http'; data: { method: string; path: string; body?: unknown } }
-  | { type: 'subscribe_session'; data: { session: string } }
+  | {
+      type: 'subscribe_session'
+      data: { session: string; subscription_id: string }
+    }
   | { type: 'unsubscribe_session'; data: { subscription_id: string } }
   | { type: 'session_message'; data: { session: string; message: unknown } }
 
@@ -65,6 +68,7 @@ export type RemoteResponse =
       type: 'session_subscribed'
       data: { subscription_id: string; snapshot: unknown }
     }
+  | { type: 'session_command'; data: { message: unknown } }
   | { type: 'error'; data: { code: string; message: string } }
 
 export interface RemoteEnvelope {

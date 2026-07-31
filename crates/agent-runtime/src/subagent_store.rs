@@ -1,4 +1,7 @@
-use crate::{AgentEventEnvelope, timestamp_ms};
+use crate::{
+    AgentEventEnvelope, SessionHandle, SessionStore, SessionStoreError,
+    projection_to_legacy_session, timestamp_ms,
+};
 use agent_protocol::{
     ModelInvocation, PermissionProfile, Session, SubagentInstanceSnapshot, SubagentInstanceStatus,
     SubagentRoleOverride, SubagentRunStatus,
@@ -20,6 +23,7 @@ pub struct SubagentInstanceDocument {
     pub permission_ceiling: PermissionProfile,
     pub model: ModelInvocation,
     pub system_prompt: String,
+    #[serde(default, skip_serializing)]
     pub session: Session,
     pub runs: Vec<agent_protocol::SubagentRunRecord>,
 }
@@ -129,12 +133,15 @@ pub enum SubagentStoreError {
         #[source]
         source: std::io::Error,
     },
+    #[error(transparent)]
+    Session(#[from] SessionStoreError),
 }
 
 #[derive(Debug, Clone)]
 pub struct SubagentSessionStore {
     root: PathBuf,
     scope: String,
+    session_name: String,
     directory: PathBuf,
     archived_directory: PathBuf,
 }
@@ -168,6 +175,7 @@ impl SubagentSessionStore {
         Ok(Self {
             root,
             scope,
+            session_name: session_name.to_string(),
             directory,
             archived_directory,
         })
@@ -213,7 +221,19 @@ impl SubagentSessionStore {
     pub fn load_recovered(&self) -> Result<Vec<SubagentInstanceDocument>, SubagentStoreError> {
         let mut documents = self.list()?;
         for document in &mut documents {
-            if document.interrupt_active_run() {
+            let fact_store = self.fact_store(&document.snapshot.id)?;
+            let migrated = !fact_store.path().is_file();
+            if migrated {
+                fact_store.save(&document.session)?;
+            }
+            let handle = SessionHandle::open(
+                fact_store,
+                document.snapshot.id.clone(),
+                document.permission_ceiling,
+            )?;
+            document.session = projection_to_legacy_session(&handle.store().load_projection()?);
+            let interrupted = document.interrupt_active_run();
+            if migrated || interrupted {
                 self.save(document)?;
             }
         }
@@ -311,11 +331,20 @@ impl SubagentSessionStore {
         if event.is_file() {
             remove_file(&event)?;
         }
+        let facts = self.fact_store(instance_id)?;
+        if facts.path().is_file() {
+            facts.delete()?;
+        }
         Ok(())
     }
 
     pub fn reset(&self) -> Result<(), SubagentStoreError> {
         remove_directory_if_exists(&self.directory)
+    }
+
+    pub fn delete_all(&self) -> Result<(), SubagentStoreError> {
+        remove_directory_if_exists(&self.directory)?;
+        remove_directory_if_exists(&self.archived_directory)
     }
 
     pub fn archive(&self) -> Result<(), SubagentStoreError> {
@@ -366,6 +395,7 @@ impl SubagentSessionStore {
         let target = Self {
             root: self.root.clone(),
             scope: self.scope.clone(),
+            session_name: target_name.to_string(),
             directory: self.root.join(&self.scope).join(target_name),
             archived_directory: self
                 .root
@@ -416,6 +446,17 @@ impl SubagentSessionStore {
 
     fn event_path(&self, instance_id: &str) -> PathBuf {
         self.directory.join(format!("{instance_id}.events.jsonl"))
+    }
+
+    pub(crate) fn fact_store(&self, instance_id: &str) -> Result<SessionStore, SubagentStoreError> {
+        validate_instance_id(instance_id)?;
+        SessionStore::from_parts(
+            self.root.clone(),
+            self.root.join("legacy-session-facts"),
+            format!("{}/{}/facts", self.scope, self.session_name),
+            instance_id,
+        )
+        .map_err(Into::into)
     }
 }
 
@@ -627,6 +668,22 @@ mod tests {
         assert!(renamed.load("subagent-1").is_ok());
         renamed.reset().expect("reset");
         assert!(renamed.list().expect("list reset").is_empty());
+    }
+
+    #[test]
+    fn delete_all_removes_archived_session_data() {
+        let root = unique_dir("delete-root");
+        let workspace = unique_dir("delete-workspace");
+        let store = SubagentSessionStore::new(&root, &workspace, "default").expect("store");
+        store
+            .save(&document(SubagentInstanceStatus::Idle))
+            .expect("save");
+        store.archive().expect("archive");
+
+        store.delete_all().expect("delete all");
+
+        assert!(!store.directory.exists());
+        assert!(!store.archived_directory.exists());
     }
 
     #[test]

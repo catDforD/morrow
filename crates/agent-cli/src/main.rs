@@ -2,14 +2,16 @@ use agent_config::{
     ContextConfig, McpServerConfig, ModelContextLimits, load_config, load_server_config,
 };
 use agent_model::{ModelError, OpenAiCompatClient, OpenAiCompatConfig};
+#[cfg(test)]
+use agent_protocol::Session;
 use agent_protocol::{
     AgentEvent, ApprovalAction, ApprovalDecision, ApprovalRequest, FileChangeSummary,
-    ModelInvocation, PermissionMode, PermissionProfile, ReasoningLevel, Session,
-    ShellCommandSummary, ShellPolicy, SubagentIdentity, ToolExecutionSummary,
+    ModelInvocation, PermissionMode, PermissionProfile, ReasoningLevel, ShellCommandSummary,
+    ShellPolicy, SubagentIdentity, ToolExecutionSummary,
 };
 use agent_runtime::{
-    AgentEventEnvelope, CompactionOutcome, McpToolCache, RunAgentTurnOutcome, SessionStore,
-    SubagentSessionStore, TurnEventHandler,
+    AgentEventEnvelope, CompactionOutcome, McpToolCache, RunAgentTurnOutcome, SessionHandle,
+    SessionStore, SubagentSessionStore, TurnEventHandler,
 };
 use clap::{Parser, Subcommand};
 use futures_util::future::{BoxFuture, FutureExt};
@@ -176,6 +178,7 @@ async fn main() {
 async fn run() -> Result<(), CliError> {
     let args = Args::parse();
     let session_name = resolve_session_name(&args)?;
+    let workspace_root = agent_runtime::detect_workspace_root()?;
 
     if let Some(command) = args.command.as_ref() {
         if args.jsonl {
@@ -183,14 +186,13 @@ async fn run() -> Result<(), CliError> {
         }
         if !matches!(command, CliCommand::Server { .. }) {
             let mut stdout = io::stdout().lock();
-            return handle_cli_command(command, &session_name, &mut stdout);
+            return handle_cli_command(command, &session_name, &workspace_root, &mut stdout);
         }
     }
 
     let prompt = args.prompt.join(" ");
     validate_jsonl_prompt(&args, &prompt)?;
 
-    let workspace_root = agent_runtime::detect_workspace_root()?;
     if let Some(CliCommand::Server { host, port }) = args.command.as_ref() {
         let loaded = load_server_config(args.config.as_deref())?;
         let home = dirs::home_dir().ok_or(CliError::HomeDirNotFound)?;
@@ -221,17 +223,14 @@ async fn run() -> Result<(), CliError> {
         api_key: loaded.api_key,
         timeout: Duration::from_secs(loaded.config.model.timeout_secs),
     })?;
-    let session_scope_root =
-        std::env::current_dir().map_err(agent_runtime::SessionStoreError::CurrentDir)?;
-    let session_store = SessionStore::for_current_dir(&session_name)?;
-    let mut session = if reset_session {
-        let session = Session::new();
-        session_store.save(&session)?;
+    let session_scope_root = workspace_root.clone();
+    let session_store = SessionStore::for_workspace(&session_scope_root, &session_name)?;
+    if reset_session {
+        session_store.reset()?;
         SubagentSessionStore::for_workspace(&session_scope_root, &session_name)?.reset()?;
-        session
-    } else {
-        session_store.load()?
-    };
+    }
+    let session_handle =
+        SessionHandle::open(session_store.clone(), session_name.clone(), permissions)?;
     let mcp_cache = McpToolCache::new();
 
     if prompt.trim().is_empty() {
@@ -243,7 +242,7 @@ async fn run() -> Result<(), CliError> {
                 system_prompt: &loaded.config.agent.system_prompt,
                 context_config: loaded.config.context,
                 model_limits,
-                session_store: &session_store,
+                session_handle: &session_handle,
                 session_name: &session_name,
                 workspace_root: &workspace_root,
                 session_scope_root: &session_scope_root,
@@ -252,7 +251,6 @@ async fn run() -> Result<(), CliError> {
                 mcp_cache: &mcp_cache,
                 subagent_store_path: &subagent_store_path,
             },
-            &mut session,
             &mut permissions,
         )
         .await?;
@@ -261,7 +259,8 @@ async fn run() -> Result<(), CliError> {
 
     let mut stdout = io::stdout().lock();
     let subagent_identities = agent_server::load_subagent_identities(&subagent_store_path)?;
-    let outcome = run_agent_turn(
+    let projection = session_handle.projection().await;
+    let outcome = run_persisted_agent_turn(
         RunAgentTurnContext {
             client: &client,
             model: &model_invocation,
@@ -277,21 +276,18 @@ async fn run() -> Result<(), CliError> {
             output: if args.jsonl {
                 OutputMode::Jsonl {
                     session_name: &session_name,
-                    turn_index: session.turns.len(),
+                    turn_index: projection.turns.len(),
                 }
             } else {
                 OutputMode::Human
             },
         },
-        &mut session,
+        &session_handle,
         &prompt,
         &mut stdout,
     )
     .await?;
 
-    if outcome.session_changed {
-        session_store.save(&session)?;
-    }
     if let Some(error) = outcome.error {
         return Err(CliError::AgentRun(error));
     }
@@ -305,7 +301,7 @@ struct ReplContext<'a> {
     system_prompt: &'a str,
     context_config: ContextConfig,
     model_limits: ModelContextLimits,
-    session_store: &'a SessionStore,
+    session_handle: &'a SessionHandle,
     session_name: &'a str,
     workspace_root: &'a Path,
     session_scope_root: &'a Path,
@@ -355,7 +351,6 @@ struct InputLine {
 
 async fn run_repl(
     context: ReplContext<'_>,
-    session: &mut Session,
     permissions: &mut PermissionProfile,
 ) -> Result<(), CliError> {
     eprintln!("morrow interactive mode. Type /exit to quit.");
@@ -375,7 +370,7 @@ async fn run_repl(
         }
 
         if input.starts_with('/') {
-            if handle_repl_command(input, &context, session, permissions).await? {
+            if handle_repl_command(input, &context, permissions).await? {
                 break;
             }
             continue;
@@ -384,7 +379,7 @@ async fn run_repl(
         let mut stdout = io::stdout().lock();
         let subagent_identities =
             agent_server::load_subagent_identities(context.subagent_store_path)?;
-        let outcome = run_agent_turn(
+        let outcome = run_persisted_agent_turn(
             RunAgentTurnContext {
                 client: context.client,
                 model: context.model,
@@ -399,15 +394,12 @@ async fn run_repl(
                 interactive_approvals: io::stdin().is_terminal(),
                 output: OutputMode::Human,
             },
-            session,
+            context.session_handle,
             input,
             &mut stdout,
         )
         .await?;
 
-        if outcome.session_changed {
-            context.session_store.save(session)?;
-        }
         if let Some(error) = outcome.error {
             return Err(CliError::AgentRun(error));
         }
@@ -419,7 +411,6 @@ async fn run_repl(
 async fn handle_repl_command(
     input: &str,
     context: &ReplContext<'_>,
-    session: &mut Session,
     permissions: &mut PermissionProfile,
 ) -> Result<bool, CliError> {
     let mut parts = input.split_whitespace();
@@ -428,12 +419,13 @@ async fn handle_repl_command(
     match command {
         "/exit" | "/quit" => Ok(true),
         "/status" => {
+            let projection = context.session_handle.projection().await;
             eprintln!("session: {}", context.session_name);
-            eprintln!("turns: {}", session.turns.len());
-            eprintln!("active messages: {}", session.active_thread.messages.len());
+            eprintln!("turns: {}", projection.turns.len());
+            eprintln!("active messages: {}", projection.context.messages.len());
             eprintln!(
                 "summary: {}",
-                if session.context.summary.is_some() {
+                if projection.context.summary.is_some() {
                     "yes"
                 } else {
                     "no"
@@ -446,19 +438,47 @@ async fn handle_repl_command(
             Ok(false)
         }
         "/reset" => {
-            *session = Session::new();
-            context.session_store.save(session)?;
+            context.session_handle.hard_reset().await?;
             SubagentSessionStore::for_workspace(context.session_scope_root, context.session_name)?
                 .reset()?;
             eprintln!("session reset");
             Ok(false)
         }
         "/compact" => {
-            match agent_runtime::compact_session(context.client, session, context.context_config)
-                .await?
+            let projection = context.session_handle.projection().await;
+            let mut session = agent_runtime::projection_to_legacy_session(&projection);
+            match agent_runtime::compact_session(
+                context.client,
+                &mut session,
+                context.context_config,
+            )
+            .await?
             {
                 CompactionOutcome::Changed => {
-                    context.session_store.save(session)?;
+                    let covered = projection
+                        .turns
+                        .get(session.context.summarized_turns.saturating_sub(1))
+                        .map(|turn| turn.id.clone())
+                        .ok_or_else(|| {
+                            CliError::AgentRun(
+                                "compaction did not resolve a covered turn".to_string(),
+                            )
+                        })?;
+                    context
+                        .session_handle
+                        .commit_fact(
+                            None,
+                            None,
+                            agent_protocol::SessionFact::ContextCompacted {
+                                summary: session
+                                    .context
+                                    .summary
+                                    .clone()
+                                    .expect("changed compaction has summary"),
+                                covered_through_turn_id: covered,
+                            },
+                        )
+                        .await?;
                     eprintln!("session compacted");
                 }
                 CompactionOutcome::Noop => {
@@ -488,6 +508,48 @@ async fn handle_repl_command(
     }
 }
 
+async fn run_persisted_agent_turn(
+    context: RunAgentTurnContext<'_>,
+    session_handle: &SessionHandle,
+    prompt: &str,
+    stdout: &mut dyn Write,
+) -> Result<RunAgentTurnOutcome, CliError> {
+    let turn_index = match context.output {
+        OutputMode::Human => session_handle.projection().await.turns.len(),
+        OutputMode::Jsonl { turn_index, .. } => turn_index,
+    };
+    let session_name = match context.output {
+        OutputMode::Human => session_handle.session_name(),
+        OutputMode::Jsonl { session_name, .. } => session_name,
+    };
+    let mut handler = CliTurnHandler::new(context, stdout);
+
+    agent_runtime::run_agent_turn_with_session_handle(
+        agent_runtime::RunAgentTurnContext {
+            client: context.client,
+            model: context.model,
+            subagent_identities: context.subagent_identities,
+            system_prompt: context.system_prompt,
+            context_config: context.context_config,
+            model_limits: context.model_limits,
+            workspace_root: context.workspace_root,
+            permissions: context.permissions,
+            mcp_servers: context.mcp_servers,
+            mcp_cache: context.mcp_cache,
+            session_name,
+            turn_index,
+        },
+        session_handle,
+        prompt,
+        &mut handler,
+        agent_runtime::CancellationToken::new(),
+        None,
+    )
+    .await
+    .map_err(CliError::from)
+}
+
+#[cfg(test)]
 async fn run_agent_turn(
     context: RunAgentTurnContext<'_>,
     session: &mut Session,
@@ -503,7 +565,6 @@ async fn run_agent_turn(
         OutputMode::Jsonl { session_name, .. } => session_name,
     };
     let mut handler = CliTurnHandler::new(context, stdout);
-
     agent_runtime::run_agent_turn(
         agent_runtime::RunAgentTurnContext {
             client: context.client,
@@ -580,6 +641,7 @@ impl TurnEventHandler for CliTurnHandler<'_, '_> {
                         .map_err(agent_runtime::RuntimeError::event_handler)?;
                 }
             }
+            AgentEvent::ModelMessageCommitted { .. } | AgentEvent::ToolResultCommitted { .. } => {}
             AgentEvent::AgentMessage(_) => {}
             AgentEvent::SubagentStarted {
                 agent_name, task, ..
@@ -696,13 +758,14 @@ fn validate_jsonl_prompt(args: &Args, prompt: &str) -> Result<(), CliError> {
 fn handle_cli_command(
     command: &CliCommand,
     default_session_name: &str,
+    workspace_root: &Path,
     stdout: &mut dyn Write,
 ) -> Result<(), CliError> {
     match command {
         CliCommand::Init { force, template } => handle_init_command(*force, *template, stdout),
         CliCommand::Server { .. } => Ok(()),
         CliCommand::Session { command } => {
-            handle_session_command(command, default_session_name, stdout)
+            handle_session_command(command, default_session_name, workspace_root, stdout)
         }
     }
 }
@@ -793,11 +856,12 @@ shell = "deny"
 fn handle_session_command(
     command: &SessionCommand,
     default_session_name: &str,
+    workspace_root: &Path,
     stdout: &mut dyn Write,
 ) -> Result<(), CliError> {
     match command {
         SessionCommand::List => {
-            let store = SessionStore::for_current_dir(default_session_name)?;
+            let store = SessionStore::for_workspace(workspace_root, default_session_name)?;
             let entries = store.list_current_scope()?;
             if entries.is_empty() {
                 writeln!(stdout, "no sessions").map_err(CliError::Stdout)?;
@@ -820,7 +884,7 @@ fn handle_session_command(
         }
         SessionCommand::Show { name } => {
             let name = name.as_deref().unwrap_or(default_session_name);
-            let store = SessionStore::for_current_dir(name)?;
+            let store = SessionStore::for_workspace(workspace_root, name)?;
             let session = store.load_existing()?;
             writeln!(stdout, "name: {name}").map_err(CliError::Stdout)?;
             writeln!(stdout, "path: {}", store.path().display()).map_err(CliError::Stdout)?;
@@ -849,18 +913,14 @@ fn handle_session_command(
             .map_err(CliError::Stdout)?;
         }
         SessionCommand::Delete { name } => {
-            let store = SessionStore::for_current_dir(name)?;
+            let store = SessionStore::for_workspace(workspace_root, name)?;
             store.delete()?;
-            let workspace =
-                std::env::current_dir().map_err(agent_runtime::SessionStoreError::CurrentDir)?;
-            SubagentSessionStore::for_workspace(&workspace, name)?.reset()?;
+            SubagentSessionStore::for_workspace(workspace_root, name)?.delete_all()?;
             writeln!(stdout, "deleted session: {name}").map_err(CliError::Stdout)?;
         }
         SessionCommand::Rename { old, new } => {
-            let store = SessionStore::for_current_dir(old)?;
-            let workspace =
-                std::env::current_dir().map_err(agent_runtime::SessionStoreError::CurrentDir)?;
-            let subagents = SubagentSessionStore::for_workspace(&workspace, old)?;
+            let store = SessionStore::for_workspace(workspace_root, old)?;
+            let subagents = SubagentSessionStore::for_workspace(workspace_root, old)?;
             let renamed_subagents = subagents.rename(new)?;
             let target = match store.rename(new) {
                 Ok(target) => target,
@@ -878,7 +938,7 @@ fn handle_session_command(
         }
         SessionCommand::Export { name, output } => {
             let name = name.as_deref().unwrap_or(default_session_name);
-            let store = SessionStore::for_current_dir(name)?;
+            let store = SessionStore::for_workspace(workspace_root, name)?;
             let bytes = store.export_document_bytes()?;
             if let Some(path) = output {
                 if path.exists() {
@@ -1764,8 +1824,8 @@ compact test
             .lines()
             .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json line"))
             .collect::<Vec<_>>();
-        assert_eq!(lines.len(), 5);
-        assert_eq!(lines[0]["schema_version"], json!(7));
+        assert_eq!(lines.len(), 6);
+        assert_eq!(lines[0]["schema_version"], json!(8));
         assert!(lines[0]["timestamp_ms"].as_u64().is_some());
         assert_eq!(lines[0]["session"], "default");
         assert_eq!(lines[0]["workspace_root"], root.display().to_string());
@@ -1779,9 +1839,19 @@ compact test
         );
         assert_eq!(
             lines[3]["event"],
+            json!({
+                "type": "model_message_committed",
+                "data": {
+                    "model_call_id": "model-call-0",
+                    "message": {"role": "assistant", "content": "ok"}
+                }
+            })
+        );
+        assert_eq!(
+            lines[4]["event"],
             json!({"type": "agent_message", "data": "ok"})
         );
-        assert_eq!(lines[4]["event"], json!({"type": "turn_completed"}));
+        assert_eq!(lines[5]["event"], json!({"type": "turn_completed"}));
     }
 
     #[test]
@@ -1804,7 +1874,7 @@ compact test
         write_jsonl_event(&mut output, &envelope).expect("write JSONL event");
 
         let value: serde_json::Value = serde_json::from_slice(&output).expect("parse JSONL event");
-        assert_eq!(value["schema_version"], json!(7));
+        assert_eq!(value["schema_version"], json!(8));
         assert_eq!(
             value["event"],
             json!({

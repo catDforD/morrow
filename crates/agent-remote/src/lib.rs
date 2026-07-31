@@ -6,7 +6,7 @@ use agent_protocol::{
     REMOTE_PROTOCOL_VERSION, RemoteDirectoryEntry, RemoteDirectoryListing, RemoteEnvelope,
     RemoteEnvironment, RemoteError, RemoteEvent, RemoteFallbackModelSpec, RemoteHello,
     RemoteMcpServerSummary, RemoteMcpTransport, RemoteMessage, RemoteRequest, RemoteResponse,
-    RemoteRole, RemoteWorkspaceConfiguration, RemoteWorkspaceInfo,
+    RemoteRole, RemoteWorkspaceConfiguration, RemoteWorkspaceInfo, SessionStreamFrame,
 };
 use agent_server::{EmbeddedServer, discover_remote_models, server_options_from_loaded_config};
 use client::RemoteClient;
@@ -464,43 +464,53 @@ async fn handle_workspace_request(
                 Err(error) => remote_error("http", error),
             }
         }
-        RemoteRequest::SubscribeSession { session } => {
-            match server.subscribe_session(&session).await {
-                Ok(mut subscription) => {
-                    let subscription_id = format!("subscription-{channel_id}-{session}");
-                    let snapshot = subscription.snapshot.clone();
-                    if let Some(handle) = subscriptions.lock().await.remove(&subscription_id) {
-                        handle.abort();
-                    }
-                    let id_for_task = subscription_id.clone();
-                    let outbound_for_task = outbound.clone();
-                    let task = tokio::spawn(async move {
-                        while let Ok(message) = subscription.recv().await {
-                            let envelope = RemoteEnvelope::new(
-                                channel_id,
-                                format!("event-{id_for_task}"),
-                                RemoteMessage::Event(RemoteEvent::SessionMessage {
-                                    subscription_id: id_for_task.clone(),
-                                    message,
-                                }),
-                            );
-                            if outbound_for_task.send(envelope).await.is_err() {
-                                break;
-                            }
-                        }
-                    });
-                    subscriptions
-                        .lock()
-                        .await
-                        .insert(subscription_id.clone(), task.abort_handle());
-                    RemoteResponse::SessionSubscribed {
-                        subscription_id,
-                        snapshot,
-                    }
+        RemoteRequest::SubscribeSession {
+            session,
+            subscription_id,
+        } => match server.subscribe_session(&session).await {
+            Ok(mut subscription) => {
+                let snapshot = subscription.snapshot.clone();
+                if let Some(handle) = subscriptions.lock().await.remove(&subscription_id) {
+                    handle.abort();
                 }
-                Err(error) => remote_error("session_subscribe", error),
+                let id_for_task = subscription_id.clone();
+                let outbound_for_task = outbound.clone();
+                let task = tokio::spawn(async move {
+                    loop {
+                        let message = match subscription.recv().await {
+                            Ok(message) => message,
+                            Err(error) => SessionStreamFrame::ResyncRequired {
+                                reason: error.to_string(),
+                            },
+                        };
+                        let resync = matches!(message, SessionStreamFrame::ResyncRequired { .. });
+                        let envelope = RemoteEnvelope::new(
+                            channel_id,
+                            format!("event-{id_for_task}"),
+                            RemoteMessage::Event(RemoteEvent::SessionMessage {
+                                subscription_id: id_for_task.clone(),
+                                message: Box::new(message),
+                            }),
+                        );
+                        if outbound_for_task.send(envelope).await.is_err() {
+                            break;
+                        }
+                        if resync {
+                            break;
+                        }
+                    }
+                });
+                subscriptions
+                    .lock()
+                    .await
+                    .insert(subscription_id.clone(), task.abort_handle());
+                RemoteResponse::SessionSubscribed {
+                    subscription_id,
+                    snapshot: Box::new(snapshot),
+                }
             }
-        }
+            Err(error) => remote_error("session_subscribe", error),
+        },
         RemoteRequest::UnsubscribeSession { subscription_id } => {
             if let Some(handle) = subscriptions.lock().await.remove(&subscription_id) {
                 handle.abort();
@@ -509,7 +519,10 @@ async fn handle_workspace_request(
         }
         RemoteRequest::SessionMessage { session, message } => {
             match server.send_session_message(&session, message).await {
-                Ok(()) => RemoteResponse::Ack,
+                Ok(Some(message)) => RemoteResponse::SessionCommand {
+                    message: Box::new(message),
+                },
+                Ok(None) => RemoteResponse::Ack,
                 Err(error) => remote_error("session_message", error),
             }
         }

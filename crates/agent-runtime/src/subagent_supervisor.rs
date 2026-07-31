@@ -1,7 +1,7 @@
 use crate::subagent_store::{SubagentInstanceDocument, SubagentSessionStore};
 use crate::{
-    AgentEventEnvelope, EVENT_SCHEMA_VERSION, RuntimeError, maybe_auto_compact_with_tools,
-    timestamp_ms,
+    AgentEventEnvelope, EVENT_SCHEMA_VERSION, RuntimeError, SessionFactRun, SessionHandle,
+    maybe_auto_compact_with_tools, projection_to_legacy_session, timestamp_ms,
 };
 use agent_config::{ContextConfig, ModelContextLimits};
 use agent_core::{Agent, Model, ToolExecutionContext};
@@ -9,10 +9,10 @@ use agent_protocol::{
     AgentEvent, AgentEventOrigin, ApprovalDecision, ApprovalOrigin, ApprovalRequest,
     FileChangeSummary, MAX_SUBAGENT_PROMPT_SUFFIX_CHARS, MAX_SUBAGENT_TIMEOUT_SECS,
     MAX_SUBAGENT_TOOL_ROUNDS, MIN_SUBAGENT_TIMEOUT_SECS, MIN_SUBAGENT_TOOL_ROUNDS, ModelInvocation,
-    PermissionProfile, Session, ShellCommandSummary, SubagentIdentity, SubagentInstanceSnapshot,
-    SubagentInstanceStatus, SubagentRole, SubagentRoleOverride, SubagentRunRecord,
-    SubagentRunStatus, SubagentRunSummary, ToolExecutionSummary, TurnRecord, TurnStatus,
-    TurnStepKind, default_subagent_identities,
+    PermissionProfile, Session, SessionFact, SessionTurnStatus, ShellCommandSummary,
+    SubagentIdentity, SubagentInstanceSnapshot, SubagentInstanceStatus, SubagentRole,
+    SubagentRoleOverride, SubagentRunRecord, SubagentRunStatus, SubagentRunSummary,
+    ToolExecutionSummary, TurnRecord, TurnStatus, TurnStepKind, default_subagent_identities,
 };
 use agent_tools::{
     BuiltInToolAllowlist, CancellationToken, MAX_SUBAGENT_TASK_CHARS, SubagentController,
@@ -23,7 +23,7 @@ use futures_util::future::{BoxFuture, FutureExt};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify, RwLock, Semaphore};
 
@@ -125,6 +125,7 @@ struct ChildTurnRequest {
     task: String,
     turn_index: usize,
     cancellation: CancellationToken,
+    termination_code: Arc<AtomicU8>,
 }
 
 struct SubagentSupervisorInit {
@@ -312,6 +313,21 @@ impl SubagentSupervisor {
             .get(instance_id)
             .map(|instance| instance.document.clone())
             .ok_or_else(|| format!("subagent instance {instance_id:?} was not found"))
+    }
+
+    pub async fn projection(
+        &self,
+        instance_id: &str,
+    ) -> Result<agent_protocol::SessionProjection, RuntimeError> {
+        let document = self
+            .document(instance_id)
+            .await
+            .map_err(RuntimeError::AgentRun)?;
+        let store = self.inner.store.fact_store(instance_id)?;
+        if !store.path().is_file() {
+            store.save(&document.session)?;
+        }
+        Ok(store.load_projection()?)
     }
 
     pub fn events(&self, instance_id: &str) -> Result<Vec<AgentEventEnvelope>, RuntimeError> {
@@ -628,6 +644,7 @@ impl SubagentSupervisor {
         };
         let turn_index = document.session.turns.len();
         let child_cancellation = CancellationToken::new();
+        let termination_code = Arc::new(AtomicU8::new(0));
         let execution = self.execute_child_turn(ChildTurnRequest {
             document,
             runtime: runtime.clone(),
@@ -636,12 +653,14 @@ impl SubagentSupervisor {
             task: task.clone(),
             turn_index,
             cancellation: child_cancellation.clone(),
+            termination_code: termination_code.clone(),
         });
         tokio::pin!(execution);
         let timeout = Duration::from_secs(runtime.role_config.timeout_secs);
         let (outcome, termination) = tokio::select! {
             biased;
             _ = cancellation.cancelled() => {
+                termination_code.store(1, Ordering::Release);
                 child_cancellation.cancel();
                 self.inner
                     .observer
@@ -662,6 +681,7 @@ impl SubagentSupervisor {
                 (outcome, RunTermination::Cancelled)
             }
             _ = tokio::time::sleep(timeout) => {
+                termination_code.store(2, Ordering::Release);
                 child_cancellation.cancel();
                 self.inner
                     .observer
@@ -742,6 +762,7 @@ impl SubagentSupervisor {
             task,
             turn_index,
             cancellation,
+            termination_code,
         } = request;
         let allowed =
             BuiltInToolAllowlist::for_subagent(document.snapshot.role, document.permission_ceiling);
@@ -753,6 +774,24 @@ impl SubagentSupervisor {
             allowed,
             writer_lease,
         )?;
+        let fact_store = self.inner.store.fact_store(&instance_id)?;
+        if !fact_store.path().is_file() {
+            fact_store.save(&document.session)?;
+        }
+        let session_handle =
+            SessionHandle::open(fact_store, instance_id.clone(), document.permission_ceiling)?;
+        document.session = projection_to_legacy_session(&session_handle.projection().await);
+        let (operation_id, turn_id) = session_handle
+            .begin_operation(
+                agent_protocol::Message::user(task.clone()),
+                document.model.clone(),
+                document.permission_ceiling,
+            )
+            .await?;
+        let mut fact_run =
+            SessionFactRun::new(&session_handle, operation_id.clone(), turn_id.clone());
+        let previous_summary = document.session.context.summary.clone();
+        let previous_summarized_turns = document.session.context.summarized_turns;
         if let Err(error) = maybe_auto_compact_with_tools(
             runtime.model.as_ref(),
             &document.system_prompt,
@@ -765,6 +804,17 @@ impl SubagentSupervisor {
         .await
         {
             let record = failed_record(&task, &document.model, error.to_string());
+            session_handle
+                .commit_fact(
+                    Some(operation_id.clone()),
+                    Some(turn_id.clone()),
+                    SessionFact::TurnFailed {
+                        error: error.to_string(),
+                    },
+                )
+                .await?;
+            let session = projection_to_legacy_session(&session_handle.projection().await);
+            session_handle.replace_operation(None).await;
             let summary = failed_summary(
                 &instance_id,
                 &run_id,
@@ -774,15 +824,20 @@ impl SubagentSupervisor {
                 timestamp_ms(),
             );
             return Ok(ChildTurnOutcome {
-                session: document.session,
+                session,
                 record,
                 summary,
             });
         }
+        if document.session.context.summary != previous_summary
+            || document.session.context.summarized_turns != previous_summarized_turns
+        {
+            fact_run.persist_compaction(&document.session).await?;
+        }
 
         let agent = Agent::with_tools(runtime.model.as_ref(), &document.system_prompt, &tools)
             .with_max_tool_rounds(document.role_config.max_tool_rounds);
-        let mut stream = agent
+        let mut stream = match agent
             .run_turn_with_context(
                 &document.session.active_thread,
                 task.clone(),
@@ -790,7 +845,23 @@ impl SubagentSupervisor {
                     cancellation: cancellation.clone(),
                 },
             )
-            .await?;
+            .await
+        {
+            Ok(stream) => stream,
+            Err(error) => {
+                session_handle
+                    .commit_fact(
+                        Some(operation_id),
+                        Some(turn_id),
+                        SessionFact::TurnFailed {
+                            error: error.to_string(),
+                        },
+                    )
+                    .await?;
+                session_handle.replace_operation(None).await;
+                return Err(error.into());
+            }
+        };
         let started_at_ms = timestamp_ms();
         let mut event_index = 0usize;
         let mut cancellation_observed = false;
@@ -841,6 +912,7 @@ impl SubagentSupervisor {
                     },
                 };
                 event = AgentEvent::ApprovalRequested(external_request.clone());
+                fact_run.persist_event(&event).await?;
                 self.emit_child_event(
                     &instance_id,
                     &run_id,
@@ -897,6 +969,7 @@ impl SubagentSupervisor {
                 active_external_approval = None;
             }
 
+            fact_run.persist_event(&event).await?;
             self.emit_child_event(
                 &instance_id,
                 &run_id,
@@ -913,6 +986,41 @@ impl SubagentSupervisor {
         if record.turn.model.is_none() {
             record.turn.model = Some(document.model.clone());
         }
+        let projection = session_handle.projection().await;
+        if projection
+            .turns
+            .iter()
+            .find(|turn| turn.id == turn_id)
+            .is_some_and(|turn| turn.status == SessionTurnStatus::Running)
+        {
+            let terminal = if record.turn.status == TurnStatus::Completed {
+                SessionFact::TurnCompleted
+            } else if termination_code.load(Ordering::Acquire) == 2 {
+                SessionFact::TurnFailed {
+                    error: format!(
+                        "subagent timed out after {} seconds",
+                        runtime.role_config.timeout_secs
+                    ),
+                }
+            } else if cancellation.is_cancelled() {
+                SessionFact::TurnCancelled {
+                    reason: "subagent run cancelled".to_string(),
+                }
+            } else {
+                SessionFact::TurnFailed {
+                    error: record
+                        .turn
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "subagent run failed".to_string()),
+                }
+            };
+            session_handle
+                .commit_fact(Some(operation_id.clone()), Some(turn_id.clone()), terminal)
+                .await?;
+        }
+        let projected_session = projection_to_legacy_session(&session_handle.projection().await);
+        session_handle.replace_operation(None).await;
         let model_calls = record
             .turn
             .steps
@@ -968,7 +1076,7 @@ impl SubagentSupervisor {
             truncated,
         };
         Ok(ChildTurnOutcome {
-            session: document.session,
+            session: projected_session,
             record,
             summary,
         })
@@ -981,14 +1089,7 @@ impl SubagentSupervisor {
                 return;
             };
             instance.document.session = outcome.session;
-            if instance
-                .document
-                .session
-                .try_apply_turn(outcome.record)
-                .is_err()
-            {
-                return;
-            }
+            let _ = outcome.record;
             let summary = outcome.summary;
             if let Some(run) = instance
                 .document

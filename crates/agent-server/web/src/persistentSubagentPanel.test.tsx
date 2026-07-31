@@ -10,7 +10,7 @@ import {
   PersistentSubagentPanel,
   subagentTranscriptMessages,
 } from './App'
-import type { Session, SubagentTranscriptSnapshot } from './types'
+import type { SessionProjection, SubagentTranscriptSnapshot } from './types'
 
 let roots: Root[] = []
 
@@ -166,24 +166,38 @@ describe('subagentTranscriptMessages', () => {
 
 function buildTranscript(): SubagentTranscriptSnapshot {
   const result = `Review completed with three findings. ${'Supporting detail. '.repeat(40)}SHOULD_NOT_APPEAR`
-  const session: Session = {
-    active_thread: {
-      messages: [{ role: 'system', content: 'compacted-only active thread' }],
-    },
+  const session: SessionProjection = {
+    session_id: 'session-subagent-1',
+    revision: 4,
     turns: [{
-      turn: {
-        status: 'completed',
-        user_message: { role: 'user', content: 'first question' },
-        assistant_message: { role: 'assistant', content: 'first answer' },
-        steps: [],
-        error: null,
+      id: 'turn-1',
+      operation_id: 'operation-1',
+      index: 0,
+      status: 'completed',
+      user_message: { role: 'user', content: 'first question' },
+      model: {
+        provider_id: 'provider-1',
+        provider_name: 'Provider',
+        model_id: 'model-1',
+        model_name: 'Model',
+        reasoning: 'high',
       },
+      permissions: { mode: 'read_only', shell: 'prompt' },
       messages: [
         { role: 'user', content: 'first question' },
         { role: 'assistant', content: 'first answer' },
       ],
+      steps: [],
+      notices: [],
+      started_at_ms: 1,
+      completed_at_ms: 2,
     }],
-    context: { summarized_turns: 1, summary: 'summary' },
+    context: {
+      summary: 'summary',
+      covered_through_turn_id: 'turn-1',
+      messages: [{ role: 'system', content: 'compacted-only active thread' }],
+    },
+    diagnostics: [],
   }
   return {
     instance: {

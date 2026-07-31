@@ -224,9 +224,16 @@ export interface SessionEntryResponse {
   archived: boolean
 }
 
-export interface SessionArchiveResponse {
-  name: string
-  archived: boolean
+export interface SessionDirectoryDiagnostic {
+  name?: string | null
+  path: string
+  message: string
+}
+
+export interface SessionDirectoryResponse {
+  schema_version: number
+  sessions: SessionEntryResponse[]
+  diagnostics: SessionDirectoryDiagnostic[]
 }
 
 export interface ToolFunctionCall {
@@ -248,49 +255,138 @@ export interface Message {
   tool_call_id?: string
 }
 
-export interface Thread {
-  messages: Message[]
-}
+export type SessionTurnStatus =
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+  | 'interrupted'
 
-export interface SessionContext {
-  summary?: string
-  summarized_turns: number
-}
+export type SessionStepStatus =
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'interrupted'
+  | 'outcome_unknown'
 
-export type TurnStatus = 'running' | 'completed' | 'failed'
-
-export interface TurnStep {
+export interface SessionStepProjection {
+  id: string
   kind: 'model_call' | 'tool_call'
-  status: TurnStatus
-  tool_name?: string
-  tool_call_id?: string
+  status: SessionStepStatus
+  model_message?: Message | null
+  tool_call?: ToolCall | null
+  tool_result?: Message | null
+  tool_summary?: ToolExecutionSummary | null
+  approval?: ApprovalRequest | null
+  approval_decision?: ApprovalDecision | null
   error?: string | null
 }
 
-export interface Turn {
-  status: TurnStatus
+export interface TurnProjection {
+  id: string
+  operation_id: string
+  index: number
+  status: SessionTurnStatus
   user_message: Message
-  assistant_message?: Message | null
-  model?: ModelInvocation | null
-  steps: TurnStep[]
-  error?: string | null
-}
-
-export interface TurnRecord {
-  turn: Turn
+  model: ModelInvocation
+  permissions: PermissionProfile
   messages: Message[]
+  steps: SessionStepProjection[]
+  notices: string[]
+  error?: string | null
+  started_at_ms: number
+  completed_at_ms?: number | null
 }
 
-export interface Session {
-  active_thread: Thread
-  turns: TurnRecord[]
-  context: SessionContext
+export interface ModelContextProjection {
+  summary?: string | null
+  covered_through_turn_id?: string | null
+  messages: Message[]
+  legacy_checkpoint?: boolean
 }
 
-export interface SessionDocument {
+export interface SessionProjection {
+  session_id: string
+  revision: number
+  turns: TurnProjection[]
+  context: ModelContextProjection
+  diagnostics: string[]
+}
+
+export interface StreamingMessageProjection {
+  model_call_id: string
+  content: string
+  reasoning: string
+}
+
+export interface OperationProjection {
+  operation_id: string
+  turn_id: string
+  phase: string
+  streaming?: StreamingMessageProjection | null
+  cancellable: boolean
+}
+
+export interface StreamCursor {
+  stream_id: string
+  sequence: number
+}
+
+export interface SessionSnapshot {
   schema_version: number
-  session: Session
+  session_name: string
+  session_id: string
+  revision: number
+  cursor: StreamCursor
+  session: SessionProjection
+  active_operation?: OperationProjection | null
+  permissions: PermissionProfile
+  approvals: ApprovalRequest[]
+  subagents: SubagentInstanceSnapshot[]
 }
+
+export type SessionUpdate =
+  | { type: 'turn_upserted'; data: TurnProjection }
+  | { type: 'context_replaced'; data: ModelContextProjection }
+  | { type: 'operation_replaced'; data: OperationProjection | null }
+  | {
+      type: 'model_stream_delta'
+      data: {
+        operation_id: string
+        model_call_id: string
+        text?: string | null
+        reasoning?: string | null
+      }
+    }
+  | { type: 'approvals_replaced'; data: ApprovalRequest[] }
+  | { type: 'subagent_upserted'; data: SubagentInstanceSnapshot }
+  | { type: 'subagent_removed'; data: { instance_id: string } }
+  | { type: 'notice'; data: { message: string } }
+
+export interface SessionUpdateEnvelope {
+  schema_version: number
+  stream_id: string
+  sequence: number
+  session_revision: number
+  timestamp_ms: number
+  update: SessionUpdate
+}
+
+export type SessionStreamFrame =
+  | { type: 'snapshot'; data: SessionSnapshot }
+  | { type: 'event'; data: SessionUpdateEnvelope }
+  | { type: 'resync_required'; data: { reason: string } }
+  | {
+      type: 'command_result'
+      data: {
+        request_id: string
+        accepted: boolean
+        operation_id?: string | null
+        turn_id?: string | null
+        error?: string | null
+      }
+    }
+  | { type: 'command_data'; data: { request_id: string; data: unknown } }
 
 export type FileChangeOperation = 'add' | 'update' | 'delete'
 
@@ -491,7 +587,7 @@ export interface SubagentTranscriptSnapshot {
   model: ModelInvocation
   permission_ceiling: PermissionProfile
   role_config: SubagentRoleOverride
-  session: Session
+  session: SessionProjection
   runs: SubagentRunRecord[]
   events: AgentEventEnvelope[]
 }
@@ -500,29 +596,6 @@ export interface RunningTurnSnapshot {
   turn_id: string
   pending_approval?: string | null
 }
-
-export type ServerMessage =
-  | {
-      type: 'snapshot'
-      data: {
-        session: Session
-        running_turn?: RunningTurnSnapshot | null
-        permissions: PermissionProfile
-        subagents: SubagentInstanceSnapshot[]
-        approvals: ApprovalRequest[]
-      }
-    }
-  | { type: 'agent_event'; data: AgentEventEnvelope }
-  | { type: 'turn_saved'; data: { session: string; turn_index: number } }
-  | { type: 'turn_rejected'; data: { request_id: string; reason: string } }
-  | { type: 'approval_queue_updated'; data: { approvals: ApprovalRequest[] } }
-  | {
-      type: 'subagent_transcript'
-      data: { transcript: SubagentTranscriptSnapshot }
-    }
-  | { type: 'subagent_deleted'; data: { instance_id: string } }
-  | { type: 'subagent_rejected'; data: { request_id: string; reason: string } }
-  | { type: 'error'; data: { message: string } }
 
 export type ClientMessage =
   | {
@@ -553,7 +626,10 @@ export type ClientMessage =
         model_selection?: ModelSelection | null
       }
     }
-  | { type: 'inspect_subagent'; data: { instance_id: string } }
+  | {
+      type: 'inspect_subagent'
+      data: { request_id: string; instance_id: string }
+    }
   | { type: 'cancel_subagent'; data: { instance_id: string } }
   | { type: 'delete_subagent'; data: { instance_id: string } }
 

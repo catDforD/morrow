@@ -17,15 +17,16 @@ use agent_protocol::{
     AgentEvent, AgentEventOrigin, ApprovalDecision, ApprovalOrigin, ApprovalRequest,
     ModelSelection, PermissionMode, PermissionProfile, ReasoningProfile, RemoteMcpServerSpec,
     RemoteModelConnectionSpec, RemoteModelSpec, RemoteSubagentMessageSpec, RemoteSubagentRoleSpec,
-    RemoteTurnModel, RemoteTurnSpec, Session, SessionDocument, SubagentIdentity,
-    SubagentInstanceSnapshot, SubagentRole, SubagentRoleOverride, SubagentRunRecord,
-    WorkspaceLocation,
+    RemoteTurnModel, RemoteTurnSpec, Session, SessionProjection, SessionStreamFrame,
+    SubagentIdentity, SubagentInstanceSnapshot, SubagentRole, SubagentRoleOverride,
+    SubagentRunRecord, WorkspaceLocation,
 };
 use agent_runtime::{
     AgentEventEnvelope, CancellationToken, McpInspection, McpToolCache, Model, RunAgentTurnContext,
-    SessionListingEntry, SessionStore, SubagentController, SubagentInstanceDocument,
-    SubagentObserver, SubagentRoleRuntime, SubagentSupervisor, TurnEventHandler,
-    inspect_mcp_servers, subagent_store_for_session,
+    SessionHandle, SessionListingDiagnostic, SessionListingEntry, SessionStore,
+    SessionSubscription, SubagentController, SubagentInstanceDocument, SubagentObserver,
+    SubagentRoleRuntime, SubagentSupervisor, TurnEventHandler, inspect_mcp_servers,
+    subagent_store_for_session,
 };
 use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -67,6 +68,7 @@ use tokio::task::{AbortHandle, JoinHandle};
 use tower::ServiceExt;
 
 pub const DEFAULT_WEB_PERMISSION_MODE: PermissionMode = PermissionMode::WorkspaceWrite;
+const SESSION_DIRECTORY_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone)]
 pub struct ServerOptions {
@@ -218,22 +220,30 @@ pub struct EmbeddedHttpResponse {
 }
 
 pub struct EmbeddedSessionSubscription {
-    pub snapshot: serde_json::Value,
-    receiver: broadcast::Receiver<ServerMessage>,
+    pub snapshot: SessionStreamFrame,
+    subscription: SessionSubscription,
+    service: WorkspaceService,
+    session_name: String,
 }
 
 impl EmbeddedSessionSubscription {
-    pub async fn recv(&mut self) -> Result<serde_json::Value, String> {
-        loop {
-            match self.receiver.recv().await {
-                Ok(message) => {
-                    return serde_json::to_value(message).map_err(|error| error.to_string());
-                }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => {
-                    return Err("session event stream closed".to_string());
-                }
-            }
+    pub async fn recv(&mut self) -> Result<SessionStreamFrame, String> {
+        self.subscription
+            .recv()
+            .await
+            .map(|event| SessionStreamFrame::Event(Box::new(event)))
+            .map_err(|error| error.to_string())
+    }
+}
+
+impl Drop for EmbeddedSessionSubscription {
+    fn drop(&mut self) {
+        let service = self.service.clone();
+        let session_name = self.session_name.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                release_session_subscription(&service, &session_name).await;
+            });
         }
     }
 }
@@ -299,7 +309,7 @@ impl EmbeddedServer {
         &self,
         session_name: &str,
         value: serde_json::Value,
-    ) -> Result<(), String> {
+    ) -> Result<Option<SessionStreamFrame>, String> {
         self.service.send_session_message(session_name, value).await
     }
 
@@ -459,7 +469,7 @@ impl EmbeddedServer {
     pub async fn start_remote_turn(&self, turn: RemoteTurnSpec) -> Result<(), String> {
         let RemoteTurnSpec {
             session,
-            request_id,
+            request_id: _,
             prompt,
             permission_mode,
             model,
@@ -496,7 +506,6 @@ impl EmbeddedServer {
             self.service.clone(),
             session,
             StartTurnRequest {
-                request_id,
                 prompt,
                 prompt_resolved: true,
                 permission_mode,
@@ -509,11 +518,24 @@ impl EmbeddedServer {
             },
             tx,
         )
-        .await;
-        Ok(())
+        .await
+        .map(|_| ())
     }
 
     pub async fn send_remote_subagent_message(
+        &self,
+        command: RemoteSubagentMessageSpec,
+    ) -> Result<(), String> {
+        let session = command.session.clone();
+        with_session_command(
+            &self.service,
+            &session,
+            self.send_remote_subagent_message_inner(command),
+        )
+        .await
+    }
+
+    async fn send_remote_subagent_message_inner(
         &self,
         command: RemoteSubagentMessageSpec,
     ) -> Result<(), String> {
@@ -688,14 +710,26 @@ impl WorkspaceService {
         &self,
         session_name: &str,
     ) -> Result<EmbeddedSessionSubscription, String> {
-        let tx = session_sender(self, session_name).await;
-        let receiver = tx.subscribe();
-        let snapshot = snapshot_message(self, session_name)
-            .await
-            .map_err(|error| error.message)?;
+        let resources = register_session_subscription(self, session_name).await?;
+        let snapshots = resources.supervisor.snapshots().await;
+        resources.handle.replace_subagents(snapshots).await;
+        resources
+            .handle
+            .set_approvals(approval_snapshots(self, session_name).await)
+            .await;
+        let subscription = match resources.handle.subscribe().await {
+            Ok(subscription) => subscription,
+            Err(error) => {
+                release_session_subscription(self, session_name).await;
+                return Err(error.to_string());
+            }
+        };
+        let snapshot = SessionStreamFrame::Snapshot(Box::new(subscription.snapshot.clone()));
         Ok(EmbeddedSessionSubscription {
-            snapshot: serde_json::to_value(snapshot).map_err(|error| error.to_string())?,
-            receiver,
+            snapshot,
+            subscription,
+            service: self.clone(),
+            session_name: session_name.to_string(),
         })
     }
 
@@ -703,12 +737,11 @@ impl WorkspaceService {
         &self,
         session_name: &str,
         value: serde_json::Value,
-    ) -> Result<(), String> {
+    ) -> Result<Option<SessionStreamFrame>, String> {
         let message = serde_json::from_value::<ClientMessage>(value)
             .map_err(|error| format!("invalid session message: {error}"))?;
         let tx = session_sender(self, session_name).await;
-        dispatch_client_message(message, self, session_name, &tx).await;
-        Ok(())
+        Ok(dispatch_client_message(message, self, session_name, &tx).await)
     }
 
     pub async fn activity(&self) -> ServerActivity {
@@ -954,14 +987,11 @@ fn build_router_with_settings(
         .route("/style.css", get(style_css))
         .route("/assets/{*path}", get(asset))
         .route("/api/status", get(status))
-        .route("/api/sessions", get(list_sessions))
-        .route(
-            "/api/sessions/{name}",
-            get(get_session).post(create_session),
-        )
+        .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/sessions/{name}/reset", post(reset_session))
         .route("/api/sessions/{name}/archive", post(archive_session))
         .route("/api/sessions/{name}/restore", post(restore_session))
+        .route("/api/sessions/{name}/export", get(export_session))
         .route("/api/sessions/{name}/ws", get(session_ws));
     if persistent_settings {
         router = router
@@ -1249,10 +1279,14 @@ async fn cancel_all_turns(state: &AppState, timeout: Duration) {
 
 struct SessionRuntime {
     tx: broadcast::Sender<ServerMessage>,
+    handle: Option<Arc<SessionHandle>>,
     running: Option<RunningTurn>,
     approvals: VecDeque<PendingApproval>,
     supervisor: Option<Arc<SubagentSupervisor>>,
     writer_lease: Arc<Semaphore>,
+    subscribers: usize,
+    active_commands: usize,
+    lifecycle_mutation: bool,
 }
 
 struct RunningTurn {
@@ -1293,9 +1327,22 @@ struct SessionEntryResponse {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct SessionArchiveResponse {
+struct SessionDirectoryDiagnosticResponse {
+    name: Option<String>,
+    path: String,
+    message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SessionDirectoryResponse {
+    schema_version: u32,
+    sessions: Vec<SessionEntryResponse>,
+    diagnostics: Vec<SessionDirectoryDiagnosticResponse>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CreateSessionRequest {
     name: String,
-    archived: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1310,19 +1357,23 @@ pub struct SubagentTranscriptSnapshot {
     model: agent_protocol::ModelInvocation,
     permission_ceiling: PermissionProfile,
     role_config: SubagentRoleOverride,
-    session: Session,
+    session: SessionProjection,
     runs: Vec<SubagentRunRecord>,
     events: Vec<AgentEventEnvelope>,
 }
 
 impl SubagentTranscriptSnapshot {
-    fn from_document(document: SubagentInstanceDocument, events: Vec<AgentEventEnvelope>) -> Self {
+    fn from_document(
+        document: SubagentInstanceDocument,
+        session: SessionProjection,
+        events: Vec<AgentEventEnvelope>,
+    ) -> Self {
         Self {
             instance: document.snapshot,
             model: document.model,
             permission_ceiling: document.permission_ceiling,
             role_config: document.role_config,
-            session: document.session,
+            session,
             runs: document.runs,
             events,
         }
@@ -1399,6 +1450,7 @@ pub enum ClientMessage {
         model_selection: Option<ModelSelection>,
     },
     InspectSubagent {
+        request_id: String,
         instance_id: String,
     },
     CancelSubagent {
@@ -1463,8 +1515,8 @@ impl From<agent_runtime::RuntimeError> for ApiError {
     }
 }
 
-async fn index() -> Html<&'static str> {
-    Html(include_str!("../assets/index.html"))
+async fn index() -> Response {
+    no_store(Html(include_str!("../assets/index.html")).into_response())
 }
 
 async fn app_js() -> Response {
@@ -1480,7 +1532,7 @@ async fn asset(Path(path): Path<String>) -> Response {
 }
 
 fn asset_response(path: &str) -> Response {
-    match path {
+    let response = match path {
         "app.js" => (
             [(
                 header::CONTENT_TYPE,
@@ -1495,7 +1547,15 @@ fn asset_response(path: &str) -> Response {
         )
             .into_response(),
         _ => StatusCode::NOT_FOUND.into_response(),
-    }
+    };
+    no_store(response)
+}
+
+fn no_store(mut response: Response) -> Response {
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
@@ -1815,7 +1875,7 @@ async fn get_session_model_selection(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<Json<SessionModelSelectionResponse>, ApiError> {
-    session_store(&state, &name)?;
+    require_active_session(&state, &name)?;
     Ok(Json(
         state.inner.model_registry.session_selection(&name).await,
     ))
@@ -1826,7 +1886,7 @@ async fn set_session_model_selection(
     Path(name): Path<String>,
     Json(selection): Json<ModelSelection>,
 ) -> Result<Json<SessionModelSelectionResponse>, ApiError> {
-    session_store(&state, &name)?;
+    require_active_session(&state, &name)?;
     state
         .inner
         .model_registry
@@ -1838,35 +1898,44 @@ async fn set_session_model_selection(
 
 async fn list_sessions(
     State(state): State<AppState>,
-) -> Result<Json<Vec<SessionEntryResponse>>, ApiError> {
-    let store = session_store(&state, &state.inner.options.default_session_name)?;
-    let entries = store
-        .list_current_scope_with_archived()
-        .map_err(|error| ApiError::internal(error.to_string()))?
-        .into_iter()
-        .map(session_entry_response)
-        .collect();
-
-    Ok(Json(entries))
+) -> Result<Json<SessionDirectoryResponse>, ApiError> {
+    session_directory_response(&state).map(Json)
 }
 
-async fn get_session(
+async fn export_session(
     State(state): State<AppState>,
     Path(name): Path<String>,
-) -> Result<Json<SessionDocument>, ApiError> {
-    let store = session_store(&state, &name)?;
-    reject_archived_session(&store, &name)?;
-    Ok(Json(SessionDocument::new(
-        store
-            .load()
-            .map_err(|error| ApiError::internal(error.to_string()))?,
-    )))
+) -> Result<Response, ApiError> {
+    let store = require_active_session(&state, &name)?;
+    let handle = state
+        .inner
+        .sessions
+        .lock()
+        .await
+        .get(&name)
+        .and_then(|runtime| runtime.handle.clone());
+    let bytes = match handle {
+        Some(handle) => handle.export_document_bytes().await,
+        None => store.export_document_bytes(),
+    }
+    .map_err(|error| ApiError::internal(error.to_string()))?;
+    let mut response = bytes.into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/x-ndjson"),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_static("attachment; filename=\"session.jsonl\""),
+    );
+    Ok(response)
 }
 
 async fn create_session(
     State(state): State<AppState>,
-    Path(name): Path<String>,
-) -> Result<Json<SessionDocument>, ApiError> {
+    Json(request): Json<CreateSessionRequest>,
+) -> Result<(StatusCode, Json<SessionEntryResponse>), ApiError> {
+    let name = request.name;
     if session_has_active_work(&state, &name).await {
         return Err(ApiError::conflict("session has active agent work"));
     }
@@ -1887,84 +1956,95 @@ async fn create_session(
         Err(error) => return Err(ApiError::internal(error.to_string())),
     }
 
-    let session = Session::new();
     store
-        .save(&session)
+        .reset()
         .map_err(|error| ApiError::internal(error.to_string()))?;
-    Ok(Json(SessionDocument::new(session)))
+    let entry = session_entry_for_name(&state, &name, false)?;
+    Ok((StatusCode::CREATED, Json(entry)))
 }
 
 async fn reset_session(
     State(state): State<AppState>,
     Path(name): Path<String>,
-) -> Result<Json<SessionDocument>, ApiError> {
-    if session_has_active_work(&state, &name).await {
-        return Err(ApiError::conflict("session has active agent work"));
+) -> Result<Json<SessionEntryResponse>, ApiError> {
+    let store = require_active_session(&state, &name)?;
+    let handle = begin_session_lifecycle(&state, &name).await?;
+    let result = async {
+        match handle {
+            Some(handle) => handle
+                .hard_reset()
+                .await
+                .map_err(|error| ApiError::internal(error.to_string()))?,
+            None => store
+                .reset()
+                .map_err(|error| ApiError::internal(error.to_string()))?,
+        };
+        let subagents = subagent_store_for_session(&state.inner.options.workspace_root, &name)
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+        subagents
+            .reset()
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+        if let Some(runtime) = state.inner.sessions.lock().await.get_mut(&name) {
+            runtime.supervisor = None;
+            runtime.approvals.clear();
+        }
+        session_entry_for_name(&state, &name, false).map(Json)
     }
-
-    let store = session_store(&state, &name)?;
-    reject_archived_session(&store, &name)?;
-    let session = Session::new();
-    store
-        .save(&session)
-        .map_err(|error| ApiError::internal(error.to_string()))?;
-    let subagents = subagent_store_for_session(&state.inner.options.workspace_root, &name)
-        .map_err(|error| ApiError::internal(error.to_string()))?;
-    subagents
-        .reset()
-        .map_err(|error| ApiError::internal(error.to_string()))?;
-    if let Some(runtime) = state.inner.sessions.lock().await.get_mut(&name) {
-        runtime.supervisor = None;
-        runtime.approvals.clear();
-    }
-    Ok(Json(SessionDocument::new(session)))
+    .await;
+    finish_session_lifecycle(&state, &name).await;
+    result
 }
 
 async fn archive_session(
     State(state): State<AppState>,
     Path(name): Path<String>,
-) -> Result<Json<SessionArchiveResponse>, ApiError> {
-    if session_has_active_work(&state, &name).await {
-        return Err(ApiError::conflict("session has active agent work"));
+) -> Result<Json<SessionEntryResponse>, ApiError> {
+    let store = require_active_session(&state, &name)?;
+    let handle = begin_session_lifecycle(&state, &name).await?;
+    let result = async {
+        let subagents = subagent_store_for_session(&state.inner.options.workspace_root, &name)
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+        subagents
+            .archive()
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+        let archived = match handle {
+            Some(handle) => handle.archive().await,
+            None => store.archive(),
+        };
+        if let Err(error) = archived.map_err(session_mutation_error) {
+            let _ = subagents.restore();
+            return Err(error);
+        }
+        session_entry_for_name(&state, &name, true).map(Json)
     }
-
-    let store = session_store(&state, &name)?;
-    let subagents = subagent_store_for_session(&state.inner.options.workspace_root, &name)
-        .map_err(|error| ApiError::internal(error.to_string()))?;
-    subagents
-        .archive()
-        .map_err(|error| ApiError::internal(error.to_string()))?;
-    if let Err(error) = store.archive().map_err(session_mutation_error) {
-        let _ = subagents.restore();
-        return Err(error);
+    .await;
+    if result.is_ok() {
+        state.inner.sessions.lock().await.remove(&name);
+    } else {
+        finish_session_lifecycle(&state, &name).await;
     }
-    state.inner.sessions.lock().await.remove(&name);
-    Ok(Json(SessionArchiveResponse {
-        name,
-        archived: true,
-    }))
+    result
 }
 
 async fn restore_session(
     State(state): State<AppState>,
     Path(name): Path<String>,
-) -> Result<Json<SessionArchiveResponse>, ApiError> {
-    if session_has_active_work(&state, &name).await {
-        return Err(ApiError::conflict("session has active agent work"));
+) -> Result<Json<SessionEntryResponse>, ApiError> {
+    let _handle = begin_session_lifecycle(&state, &name).await?;
+    let result = async {
+        let store = session_store(&state, &name)?;
+        store.restore().map_err(session_mutation_error)?;
+        let subagents = subagent_store_for_session(&state.inner.options.workspace_root, &name)
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+        if let Err(error) = subagents.restore() {
+            let _ = store.archive();
+            return Err(ApiError::internal(error.to_string()));
+        }
+        session_entry_for_name(&state, &name, false).map(Json)
     }
-
-    let store = session_store(&state, &name)?;
-    store.restore().map_err(session_mutation_error)?;
-    let subagents = subagent_store_for_session(&state.inner.options.workspace_root, &name)
-        .map_err(|error| ApiError::internal(error.to_string()))?;
-    if let Err(error) = subagents.restore() {
-        let _ = store.archive();
-        return Err(ApiError::internal(error.to_string()));
-    }
-    Ok(Json(SessionArchiveResponse {
-        name,
-        archived: false,
-    }))
+    .await;
+    state.inner.sessions.lock().await.remove(&name);
+    result
 }
 
 async fn session_ws(
@@ -1972,30 +2052,52 @@ async fn session_ws(
     Path(name): Path<String>,
     ws: WebSocketUpgrade,
 ) -> Response {
+    if let Err(error) = require_active_session(&state, &name) {
+        return error.into_response();
+    }
     ws.on_upgrade(move |socket| handle_socket(socket, state, name))
 }
 
 async fn handle_socket(socket: WebSocket, state: AppState, session_name: String) {
-    let tx = session_sender(&state, &session_name).await;
-    let mut rx = tx.subscribe();
     let (mut sender, mut receiver) = socket.split();
-
-    match snapshot_message(&state, &session_name).await {
-        Ok(snapshot) => {
-            if send_server_message(&mut sender, &snapshot).await.is_err() {
-                return;
-            }
-        }
+    let resources = match register_session_subscription(&state, &session_name).await {
+        Ok(resources) => resources,
         Err(error) => {
-            let _ = send_server_message(
+            let _ = send_session_frame(
                 &mut sender,
-                &ServerMessage::Error {
-                    message: error.message,
-                },
+                &SessionStreamFrame::ResyncRequired { reason: error },
             )
             .await;
             return;
         }
+    };
+    resources
+        .handle
+        .replace_subagents(resources.supervisor.snapshots().await)
+        .await;
+    resources
+        .handle
+        .set_approvals(approval_snapshots(&state, &session_name).await)
+        .await;
+    let tx = resources.tx;
+    let mut subscription = match resources.handle.subscribe().await {
+        Ok(subscription) => subscription,
+        Err(error) => {
+            let _ = send_session_frame(
+                &mut sender,
+                &SessionStreamFrame::ResyncRequired {
+                    reason: error.to_string(),
+                },
+            )
+            .await;
+            release_session_subscription(&state, &session_name).await;
+            return;
+        }
+    };
+    let snapshot = SessionStreamFrame::Snapshot(Box::new(subscription.snapshot.clone()));
+    if send_session_frame(&mut sender, &snapshot).await.is_err() {
+        release_session_subscription(&state, &session_name).await;
+        return;
     }
 
     loop {
@@ -2004,28 +2106,42 @@ async fn handle_socket(socket: WebSocket, state: AppState, session_name: String)
                 let Some(Ok(message)) = incoming else {
                     break;
                 };
-                if !handle_client_ws_message(message, &state, &session_name, &tx).await {
-                    break;
-                }
-            }
-            broadcast = rx.recv() => {
-                match broadcast {
-                    Ok(message) => {
-                        if send_server_message(&mut sender, &message).await.is_err() {
+                match handle_client_ws_message(message, &state, &session_name, &tx).await {
+                    Ok(Some(frame)) => {
+                        if send_session_frame(&mut sender, &frame).await.is_err() {
                             break;
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Ok(None) => {}
+                    Err(()) => break,
+                }
+            }
+            event = subscription.recv() => {
+                match event {
+                    Ok(event) => {
+                        let frame = SessionStreamFrame::Event(Box::new(event));
+                        if send_session_frame(&mut sender, &frame).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        let frame = SessionStreamFrame::ResyncRequired {
+                            reason: format!("session stream lagged by {skipped} events"),
+                        };
+                        let _ = send_session_frame(&mut sender, &frame).await;
+                        break;
+                    }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
         }
     }
+    release_session_subscription(&state, &session_name).await;
 }
 
-async fn send_server_message(
+async fn send_session_frame(
     sender: &mut SplitSink<WebSocket, Message>,
-    message: &ServerMessage,
+    message: &SessionStreamFrame,
 ) -> Result<(), ()> {
     let json = serde_json::to_string(message).map_err(|_| ())?;
     sender
@@ -2039,21 +2155,25 @@ async fn handle_client_ws_message(
     state: &AppState,
     session_name: &str,
     tx: &broadcast::Sender<ServerMessage>,
-) -> bool {
+) -> Result<Option<SessionStreamFrame>, ()> {
     let text = match message {
         Message::Text(text) => text,
-        Message::Close(_) => return false,
-        _ => return true,
+        Message::Close(_) => return Err(()),
+        _ => return Ok(None),
     };
 
     let parsed = serde_json::from_str::<ClientMessage>(&text);
     let Ok(message) = parsed else {
-        broadcast_error(tx, "invalid websocket message");
-        return true;
+        return Ok(Some(SessionStreamFrame::CommandResult {
+            request_id: "invalid-message".to_string(),
+            accepted: false,
+            operation_id: None,
+            turn_id: None,
+            error: Some("invalid websocket message".to_string()),
+        }));
     };
 
-    dispatch_client_message(message, state, session_name, tx).await;
-    true
+    Ok(dispatch_client_message(message, state, session_name, tx).await)
 }
 
 async fn dispatch_client_message(
@@ -2061,7 +2181,7 @@ async fn dispatch_client_message(
     state: &AppState,
     session_name: &str,
     tx: &broadcast::Sender<ServerMessage>,
-) {
+) -> Option<SessionStreamFrame> {
     match message {
         ClientMessage::StartTurn {
             request_id,
@@ -2070,11 +2190,10 @@ async fn dispatch_client_message(
             permission_mode,
             model_selection,
         } => {
-            start_turn(
+            let result = start_turn(
                 state.clone(),
                 session_name.to_string(),
                 StartTurnRequest {
-                    request_id,
                     prompt,
                     prompt_resolved,
                     permission_mode,
@@ -2088,29 +2207,45 @@ async fn dispatch_client_message(
                 tx.clone(),
             )
             .await;
+            Some(match result {
+                Ok((operation_id, turn_id)) => SessionStreamFrame::CommandResult {
+                    request_id,
+                    accepted: true,
+                    operation_id: Some(operation_id),
+                    turn_id: Some(turn_id),
+                    error: None,
+                },
+                Err(error) => SessionStreamFrame::CommandResult {
+                    request_id,
+                    accepted: false,
+                    operation_id: None,
+                    turn_id: None,
+                    error: Some(error),
+                },
+            })
         }
         ClientMessage::ApprovalDecision {
             request_id,
             approved,
         } => {
             resolve_approval(state, session_name, request_id, approved, tx).await;
+            None
         }
         ClientMessage::CancelTurn { turn_id } => {
             cancel_turn(state, session_name, turn_id, tx).await;
+            None
         }
         ClientMessage::SpawnSubagent {
             request_id,
             role,
             task,
         } => {
-            let result = async {
+            let result = with_session_command(state, session_name, async {
                 let supervisor = prepare_direct_subagent_supervisor(state, session_name).await?;
                 supervisor.spawn(role, task).await
-            }
+            })
             .await;
-            if let Err(reason) = result {
-                broadcast_message(tx, ServerMessage::SubagentRejected { request_id, reason });
-            }
+            Some(command_result(request_id, result.map(|_| ())))
         }
         ClientMessage::SendSubagent {
             request_id,
@@ -2118,34 +2253,47 @@ async fn dispatch_client_message(
             message,
             ..
         } => {
-            let result = async {
+            let result = with_session_command(state, session_name, async {
                 let supervisor = prepare_direct_subagent_supervisor(state, session_name).await?;
                 supervisor.send(instance_id, message).await
-            }
+            })
             .await;
-            if let Err(reason) = result {
-                broadcast_message(tx, ServerMessage::SubagentRejected { request_id, reason });
-            }
+            Some(command_result(request_id, result.map(|_| ())))
         }
-        ClientMessage::InspectSubagent { instance_id } => {
+        ClientMessage::InspectSubagent {
+            request_id,
+            instance_id,
+        } => {
             let result = async {
                 let resources = ensure_session_resources(state, session_name).await?;
                 let document = resources.supervisor.document(&instance_id).await?;
+                let projection = resources
+                    .supervisor
+                    .projection(&instance_id)
+                    .await
+                    .map_err(|error| error.to_string())?;
                 let events = resources
                     .supervisor
                     .events(&instance_id)
                     .map_err(|error| error.to_string())?;
-                Ok::<_, String>(SubagentTranscriptSnapshot::from_document(document, events))
+                Ok::<_, String>(SubagentTranscriptSnapshot::from_document(
+                    document, projection, events,
+                ))
             }
             .await;
             match result {
-                Ok(transcript) => broadcast_message(
-                    tx,
-                    ServerMessage::SubagentTranscript {
-                        transcript: Box::new(transcript),
-                    },
-                ),
-                Err(error) => broadcast_error(tx, error),
+                Ok(transcript) => Some(SessionStreamFrame::CommandData {
+                    request_id,
+                    data: serde_json::to_value(transcript)
+                        .expect("subagent transcript must serialize"),
+                }),
+                Err(error) => Some(SessionStreamFrame::CommandResult {
+                    request_id,
+                    accepted: false,
+                    operation_id: None,
+                    turn_id: None,
+                    error: Some(error),
+                }),
             }
         }
         ClientMessage::CancelSubagent { instance_id } => {
@@ -2157,23 +2305,45 @@ async fn dispatch_client_message(
             if let Err(error) = result {
                 broadcast_error(tx, error);
             }
+            None
         }
         ClientMessage::DeleteSubagent { instance_id } => {
             let result = async {
                 let resources = ensure_session_resources(state, session_name).await?;
-                resources.supervisor.delete(&instance_id).await
+                resources.supervisor.delete(&instance_id).await?;
+                resources.handle.remove_subagent(instance_id.clone()).await;
+                Ok::<_, String>(())
             }
             .await;
             match result {
                 Ok(()) => broadcast_message(tx, ServerMessage::SubagentDeleted { instance_id }),
                 Err(error) => broadcast_error(tx, error),
             }
+            None
         }
     }
 }
 
+fn command_result(request_id: String, result: Result<(), String>) -> SessionStreamFrame {
+    match result {
+        Ok(()) => SessionStreamFrame::CommandResult {
+            request_id,
+            accepted: true,
+            operation_id: None,
+            turn_id: None,
+            error: None,
+        },
+        Err(error) => SessionStreamFrame::CommandResult {
+            request_id,
+            accepted: false,
+            operation_id: None,
+            turn_id: None,
+            error: Some(error),
+        },
+    }
+}
+
 struct StartTurnRequest {
-    request_id: String,
     prompt: String,
     prompt_resolved: bool,
     permission_mode: Option<PermissionMode>,
@@ -2190,9 +2360,20 @@ async fn start_turn(
     session_name: String,
     request: StartTurnRequest,
     tx: broadcast::Sender<ServerMessage>,
-) {
+) -> Result<(String, String), String> {
+    let guard = begin_session_command(&state, &session_name).await?;
+    let result = start_turn_inner(state.clone(), session_name.clone(), request, tx).await;
+    guard.finish().await;
+    result
+}
+
+async fn start_turn_inner(
+    state: AppState,
+    session_name: String,
+    request: StartTurnRequest,
+    tx: broadcast::Sender<ServerMessage>,
+) -> Result<(String, String), String> {
     let StartTurnRequest {
-        request_id,
         prompt,
         prompt_resolved,
         permission_mode,
@@ -2204,14 +2385,7 @@ async fn start_turn(
         subagent_role_models,
     } = request;
     if state.inner.shutting_down.load(Ordering::Acquire) {
-        broadcast_message(
-            &tx,
-            ServerMessage::TurnRejected {
-                request_id,
-                reason: "server is shutting down".to_string(),
-            },
-        );
-        return;
+        return Err("server is shutting down".to_string());
     }
     let prompt = if prompt_resolved {
         prompt
@@ -2222,66 +2396,23 @@ async fn start_turn(
             .resolve(ResolveCommandRequest { input: prompt })
         {
             Ok(resolved) => resolved.prompt,
-            Err(error) => {
-                broadcast_message(
-                    &tx,
-                    ServerMessage::TurnRejected {
-                        request_id,
-                        reason: error.to_string(),
-                    },
-                );
-                return;
-            }
+            Err(error) => return Err(error.to_string()),
         }
     };
     if prompt.trim().is_empty() {
-        broadcast_message(
-            &tx,
-            ServerMessage::TurnRejected {
-                request_id,
-                reason: "prompt must not be empty".to_string(),
-            },
-        );
-        return;
+        return Err("prompt must not be empty".to_string());
     }
-    let store = match session_store(&state, &session_name) {
-        Ok(store) => store,
-        Err(error) => {
-            broadcast_message(
-                &tx,
-                ServerMessage::TurnRejected {
-                    request_id,
-                    reason: error.message,
-                },
-            );
-            return;
-        }
-    };
+    let store = session_store(&state, &session_name).map_err(|error| error.message)?;
     if store.is_archived() {
-        broadcast_message(
-            &tx,
-            ServerMessage::TurnRejected {
-                request_id,
-                reason: format!(
-                    "session {session_name:?} is archived; restore it before starting a turn"
-                ),
-            },
-        );
-        return;
+        return Err(format!(
+            "session {session_name:?} is archived; restore it before starting a turn"
+        ));
     }
 
-    let turn_id = format!("turn-{}", agent_runtime::timestamp_ms());
     let cancellation = CancellationToken::new();
     let permissions = requested_permissions(state.inner.options.permissions, permission_mode);
     if running_snapshot(&state, &session_name).await.is_some() {
-        broadcast_message(
-            &tx,
-            ServerMessage::TurnRejected {
-                request_id,
-                reason: "session already has a running turn".to_string(),
-            },
-        );
-        return;
+        return Err("session already has a running turn".to_string());
     }
     let persist_model_selection = resolved_model.is_none();
     let resolved_model = match resolved_model {
@@ -2293,16 +2424,7 @@ async fn start_turn(
             .await
         {
             Ok(model) => model,
-            Err(error) => {
-                broadcast_message(
-                    &tx,
-                    ServerMessage::TurnRejected {
-                        request_id,
-                        reason: error.to_string(),
-                    },
-                );
-                return;
-            }
+            Err(error) => return Err(error.to_string()),
         },
     };
     if persist_model_selection
@@ -2312,31 +2434,17 @@ async fn start_turn(
             .set_session_selection(&session_name, resolved_model.selection.clone())
             .await
     {
-        broadcast_message(
-            &tx,
-            ServerMessage::TurnRejected {
-                request_id,
-                reason: error.to_string(),
-            },
-        );
-        return;
+        return Err(error.to_string());
     }
     let subagent_identities = match subagent_identities {
         Some(identities) if identities.len() >= subagent_settings::MIN_SUBAGENT_PROFILES => {
             identities
         }
         Some(_) => {
-            broadcast_message(
-                &tx,
-                ServerMessage::TurnRejected {
-                    request_id,
-                    reason: format!(
-                        "at least {} subagent identities are required",
-                        subagent_settings::MIN_SUBAGENT_PROFILES
-                    ),
-                },
-            );
-            return;
+            return Err(format!(
+                "at least {} subagent identities are required",
+                subagent_settings::MIN_SUBAGENT_PROFILES
+            ));
         }
         None => state.inner.subagent_registry.identities().await,
     };
@@ -2356,41 +2464,41 @@ async fn start_turn(
     .await
     {
         Ok(supervisor) => supervisor,
-        Err(error) => {
-            broadcast_message(
-                &tx,
-                ServerMessage::TurnRejected {
-                    request_id,
-                    reason: error,
-                },
-            );
-            return;
-        }
+        Err(error) => return Err(error),
     };
-    {
+    let resources = ensure_session_resources(&state, &session_name).await?;
+    let session_handle = resources.handle;
+    let result = {
         let mut sessions = state.inner.sessions.lock().await;
         let runtime = sessions
             .entry(session_name.clone())
             .or_insert_with(SessionRuntime::new);
-        if runtime.running.is_some() {
-            broadcast_message(
-                &tx,
-                ServerMessage::TurnRejected {
-                    request_id,
-                    reason: "session already has a running turn".to_string(),
-                },
-            );
-            return;
+        if runtime.handle.is_none() {
+            runtime.handle = Some(session_handle.clone());
         }
+        if runtime.running.is_some() {
+            return Err("session already has a running turn".to_string());
+        }
+        let (operation_id, turn_id) = session_handle
+            .begin_operation(
+                agent_protocol::Message::user(prompt.clone()),
+                resolved_model.invocation.clone(),
+                permissions,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let result = (operation_id.clone(), turn_id.clone());
         let state_for_task = state.clone();
         let session_for_task = session_name.clone();
         let turn_for_task = turn_id.clone();
         let cancellation_for_task = cancellation.clone();
         let tx_for_task = tx.clone();
+        let handle_for_task = session_handle.clone();
         let worker = tokio::spawn(async move {
             run_turn_task(TurnTaskContext {
                 state: state_for_task,
                 session_name: session_for_task,
+                operation_id,
                 turn_id: turn_for_task,
                 prompt,
                 permissions,
@@ -2399,6 +2507,7 @@ async fn start_turn(
                 subagent_identities,
                 supervisor,
                 tx: tx_for_task,
+                session_handle: handle_for_task,
                 cancellation: cancellation_for_task,
             })
             .await;
@@ -2420,16 +2529,15 @@ async fn start_turn(
             cancellation,
             handle,
         });
-    }
-
-    if let Ok(snapshot) = snapshot_message(&state, &session_name).await {
-        broadcast_message(&tx, snapshot);
-    }
+        result
+    };
+    Ok(result)
 }
 
 struct TurnTaskContext {
     state: AppState,
     session_name: String,
+    operation_id: String,
     turn_id: String,
     prompt: String,
     permissions: PermissionProfile,
@@ -2438,13 +2546,18 @@ struct TurnTaskContext {
     subagent_identities: Vec<SubagentIdentity>,
     supervisor: Arc<SubagentSupervisor>,
     tx: broadcast::Sender<ServerMessage>,
+    session_handle: Arc<SessionHandle>,
     cancellation: CancellationToken,
 }
 
 async fn run_turn_task(context: TurnTaskContext) {
     let tx = context.tx.clone();
+    let session_handle = context.session_handle.clone();
     let result = run_turn_task_inner(context).await;
     if let Err(error) = result {
+        session_handle
+            .notice(format!("turn stopped after runtime error: {error}"))
+            .await;
         broadcast_error(&tx, error.to_string());
     }
 }
@@ -2457,6 +2570,32 @@ async fn supervise_turn_worker(
     worker: tokio::task::JoinHandle<()>,
 ) {
     if worker.await.is_err_and(|error| error.is_panic()) {
+        let handle = {
+            let sessions = state.inner.sessions.lock().await;
+            sessions
+                .get(&session_name)
+                .and_then(|runtime| runtime.handle.clone())
+        };
+        if let Some(handle) = handle {
+            let projection = handle.projection().await;
+            if let Some(turn) = projection.turns.iter().find(|turn| turn.id == turn_id) {
+                let result = handle
+                    .commit_fact(
+                        Some(turn.operation_id.clone()),
+                        Some(turn.id.clone()),
+                        agent_protocol::SessionFact::TurnInterrupted {
+                            reason: "turn worker panicked".to_string(),
+                        },
+                    )
+                    .await;
+                handle.replace_operation(None).await;
+                if let Err(error) = result {
+                    handle
+                        .notice(format!("failed to record panicked turn: {error}"))
+                        .await;
+                }
+            }
+        }
         broadcast_error(&tx, format!("turn {turn_id} worker panicked"));
     }
     cancel_matching_approvals(&state, &session_name, &tx, |request| {
@@ -2477,6 +2616,7 @@ async fn run_turn_task_inner(context: TurnTaskContext) -> Result<(), agent_runti
     let TurnTaskContext {
         state,
         session_name,
+        operation_id,
         turn_id,
         prompt,
         permissions,
@@ -2485,6 +2625,7 @@ async fn run_turn_task_inner(context: TurnTaskContext) -> Result<(), agent_runti
         subagent_identities,
         supervisor,
         tx,
+        session_handle,
         cancellation,
     } = context;
     let options = state.inner.options.clone();
@@ -2493,17 +2634,20 @@ async fn run_turn_task_inner(context: TurnTaskContext) -> Result<(), agent_runti
         Some(servers) => servers,
         None => state.inner.mcp_registry.effective_servers().await,
     };
-    let store = SessionStore::for_workspace(&options.workspace_root, &session_name)?;
-    let mut session = store.load()?;
-    let turn_index = session.turns.len();
+    let projection = session_handle.projection().await;
+    let turn_index = projection
+        .turns
+        .iter()
+        .position(|turn| turn.id == turn_id)
+        .unwrap_or_else(|| projection.turns.len().saturating_sub(1));
     let mut handler = ServerTurnHandler {
         state: state.clone(),
         session_name: session_name.clone(),
-        turn_id,
+        turn_id: turn_id.clone(),
         tx: tx.clone(),
     };
 
-    let outcome = agent_runtime::run_agent_turn_with_subagent_controller(
+    let outcome = agent_runtime::run_agent_turn_with_prepared_session_handle(
         RunAgentTurnContext {
             client: &resolved_model.client,
             model: &resolved_model.invocation,
@@ -2518,24 +2662,18 @@ async fn run_turn_task_inner(context: TurnTaskContext) -> Result<(), agent_runti
             session_name: &session_name,
             turn_index,
         },
-        &mut session,
-        &prompt,
+        &session_handle,
+        agent_runtime::PreparedSessionTurn {
+            operation_id,
+            turn_id: turn_id.clone(),
+            prompt: &prompt,
+        },
         &mut handler,
         cancellation,
-        supervisor,
+        Some(supervisor),
     )
     .await?;
 
-    if outcome.session_changed {
-        store.save(&session)?;
-        broadcast_message(
-            &tx,
-            ServerMessage::TurnSaved {
-                session: session_name,
-                turn_index,
-            },
-        );
-    }
     if let Some(error) = outcome.error {
         broadcast_error(&tx, error);
     }
@@ -2662,12 +2800,16 @@ async fn broadcast_approval_queue(
     session_name: &str,
     tx: &broadcast::Sender<ServerMessage>,
 ) {
+    let approvals = approval_snapshots(state, session_name).await;
     broadcast_message(
         tx,
         ServerMessage::ApprovalQueueUpdated {
-            approvals: approval_snapshots(state, session_name).await,
+            approvals: approvals.clone(),
         },
     );
+    if let Ok(resources) = ensure_session_resources(state, session_name).await {
+        resources.handle.set_approvals(approvals).await;
+    }
 }
 
 async fn cancel_turn(
@@ -2741,6 +2883,7 @@ async fn clear_running_turn(state: &AppState, session_name: &str, turn_id: &str)
             .is_some_and(|running| running.turn_id == turn_id)
     {
         runtime.running = None;
+        release_idle_session_handle(runtime);
     }
 }
 
@@ -2827,6 +2970,24 @@ struct ServerSubagentObserver {
 impl SubagentObserver for ServerSubagentObserver {
     fn on_event(&self, event: &AgentEventEnvelope) {
         broadcast_message(&self.tx, ServerMessage::AgentEvent(Box::new(event.clone())));
+        if let AgentEvent::SubagentUpdated(snapshot) = &event.event {
+            let state = self.state.clone();
+            let session_name = self.session_name.clone();
+            let snapshot = (**snapshot).clone();
+            tokio::spawn(async move {
+                if let Some(inner) = state.upgrade() {
+                    let handle = inner
+                        .sessions
+                        .lock()
+                        .await
+                        .get(&session_name)
+                        .and_then(|runtime| runtime.handle.clone());
+                    if let Some(handle) = handle {
+                        handle.upsert_subagent(snapshot).await;
+                    }
+                }
+            });
+        }
     }
 
     fn resolve_approval(
@@ -2881,10 +3042,14 @@ impl SessionRuntime {
         let (tx, _) = broadcast::channel(256);
         Self {
             tx,
+            handle: None,
             running: None,
             approvals: VecDeque::new(),
             supervisor: None,
             writer_lease: Arc::new(Semaphore::new(1)),
+            subscribers: 0,
+            active_commands: 0,
+            lifecycle_mutation: false,
         }
     }
 }
@@ -2892,6 +3057,7 @@ impl SessionRuntime {
 #[derive(Clone)]
 struct SessionResources {
     tx: broadcast::Sender<ServerMessage>,
+    handle: Arc<SessionHandle>,
     supervisor: Arc<SubagentSupervisor>,
 }
 
@@ -2904,6 +3070,21 @@ async fn ensure_session_resources(
     let runtime = sessions
         .entry(session_name.to_string())
         .or_insert_with(SessionRuntime::new);
+    if runtime.lifecycle_mutation {
+        return Err("session lifecycle mutation is in progress".to_string());
+    }
+    if runtime.handle.is_none() {
+        let store = SessionStore::for_workspace(&state.inner.options.workspace_root, session_name)
+            .map_err(|error| error.to_string())?;
+        runtime.handle = Some(Arc::new(
+            SessionHandle::open_existing(
+                store,
+                session_name.to_string(),
+                state.inner.options.permissions,
+            )
+            .map_err(|error| error.to_string())?,
+        ));
+    }
     if runtime.supervisor.is_none() {
         let observer = Arc::new(ServerSubagentObserver {
             state: Arc::downgrade(&state.inner),
@@ -2924,6 +3105,11 @@ async fn ensure_session_resources(
     }
     Ok(SessionResources {
         tx: runtime.tx.clone(),
+        handle: runtime
+            .handle
+            .as_ref()
+            .expect("session handle initialized")
+            .clone(),
         supervisor: runtime
             .supervisor
             .as_ref()
@@ -2932,42 +3118,47 @@ async fn ensure_session_resources(
     })
 }
 
-async fn session_sender(state: &AppState, session_name: &str) -> broadcast::Sender<ServerMessage> {
-    match ensure_session_resources(state, session_name).await {
-        Ok(resources) => resources.tx,
-        Err(error) => {
-            let tx = {
-                let mut sessions = state.inner.sessions.lock().await;
-                sessions
-                    .entry(session_name.to_string())
-                    .or_insert_with(SessionRuntime::new)
-                    .tx
-                    .clone()
-            };
-            broadcast_error(&tx, error);
-            tx
-        }
+async fn register_session_subscription(
+    state: &AppState,
+    session_name: &str,
+) -> Result<SessionResources, String> {
+    let resources = ensure_session_resources(state, session_name).await?;
+    let mut sessions = state.inner.sessions.lock().await;
+    let runtime = sessions
+        .entry(session_name.to_string())
+        .or_insert_with(SessionRuntime::new);
+    if runtime.lifecycle_mutation {
+        return Err("session lifecycle mutation is in progress".to_string());
+    }
+    if runtime.handle.is_none() {
+        runtime.handle = Some(resources.handle.clone());
+    }
+    runtime.subscribers += 1;
+    Ok(resources)
+}
+
+async fn release_session_subscription(state: &AppState, session_name: &str) {
+    let mut sessions = state.inner.sessions.lock().await;
+    let Some(runtime) = sessions.get_mut(session_name) else {
+        return;
+    };
+    runtime.subscribers = runtime.subscribers.saturating_sub(1);
+    release_idle_session_handle(runtime);
+}
+
+fn release_idle_session_handle(runtime: &mut SessionRuntime) {
+    if runtime.subscribers == 0 && runtime.running.is_none() {
+        runtime.handle = None;
     }
 }
 
-async fn snapshot_message(state: &AppState, session_name: &str) -> Result<ServerMessage, ApiError> {
-    let store = session_store(state, session_name)?;
-    reject_archived_session(&store, session_name)?;
-    let session = store
-        .load()
-        .map_err(|error| ApiError::internal(error.to_string()))?;
-    let resources = ensure_session_resources(state, session_name)
-        .await
-        .map_err(ApiError::internal)?;
-    let subagents = resources.supervisor.snapshots().await;
-    let approvals = approval_snapshots(state, session_name).await;
-    Ok(ServerMessage::Snapshot {
-        session,
-        running_turn: running_snapshot(state, session_name).await,
-        permissions: state.inner.options.permissions,
-        subagents,
-        approvals,
-    })
+async fn session_sender(state: &AppState, session_name: &str) -> broadcast::Sender<ServerMessage> {
+    let mut sessions = state.inner.sessions.lock().await;
+    sessions
+        .entry(session_name.to_string())
+        .or_insert_with(SessionRuntime::new)
+        .tx
+        .clone()
 }
 
 async fn running_snapshot(state: &AppState, session_name: &str) -> Option<RunningTurnSnapshot> {
@@ -2990,7 +3181,11 @@ async fn session_has_active_work(state: &AppState, session_name: &str) -> bool {
         let Some(runtime) = sessions.get(session_name) else {
             return false;
         };
-        if runtime.running.is_some() || !runtime.approvals.is_empty() {
+        if runtime.running.is_some()
+            || !runtime.approvals.is_empty()
+            || runtime.active_commands > 0
+            || runtime.lifecycle_mutation
+        {
             return true;
         }
         runtime.supervisor.clone()
@@ -2998,6 +3193,109 @@ async fn session_has_active_work(state: &AppState, session_name: &str) -> bool {
     match supervisor {
         Some(supervisor) => supervisor.has_active_runs().await,
         None => false,
+    }
+}
+
+struct SessionCommandGuard {
+    state: AppState,
+    session_name: String,
+    finished: bool,
+}
+
+impl SessionCommandGuard {
+    async fn finish(mut self) {
+        end_session_command(&self.state, &self.session_name).await;
+        self.finished = true;
+    }
+}
+
+impl Drop for SessionCommandGuard {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let state = self.state.clone();
+        let session_name = self.session_name.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                end_session_command(&state, &session_name).await;
+            });
+        }
+    }
+}
+
+async fn begin_session_command(
+    state: &AppState,
+    session_name: &str,
+) -> Result<SessionCommandGuard, String> {
+    let mut sessions = state.inner.sessions.lock().await;
+    let runtime = sessions
+        .entry(session_name.to_string())
+        .or_insert_with(SessionRuntime::new);
+    if runtime.lifecycle_mutation {
+        return Err("session lifecycle mutation is in progress".to_string());
+    }
+    runtime.active_commands += 1;
+    Ok(SessionCommandGuard {
+        state: state.clone(),
+        session_name: session_name.to_string(),
+        finished: false,
+    })
+}
+
+async fn end_session_command(state: &AppState, session_name: &str) {
+    let mut sessions = state.inner.sessions.lock().await;
+    let Some(runtime) = sessions.get_mut(session_name) else {
+        return;
+    };
+    runtime.active_commands = runtime.active_commands.saturating_sub(1);
+    release_idle_session_handle(runtime);
+}
+
+async fn with_session_command<T>(
+    state: &AppState,
+    session_name: &str,
+    operation: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    let guard = begin_session_command(state, session_name).await?;
+    let result = operation.await;
+    guard.finish().await;
+    result
+}
+
+async fn begin_session_lifecycle(
+    state: &AppState,
+    session_name: &str,
+) -> Result<Option<Arc<SessionHandle>>, ApiError> {
+    let (handle, supervisor) = {
+        let mut sessions = state.inner.sessions.lock().await;
+        let runtime = sessions
+            .entry(session_name.to_string())
+            .or_insert_with(SessionRuntime::new);
+        if runtime.lifecycle_mutation
+            || runtime.active_commands > 0
+            || runtime.running.is_some()
+            || !runtime.approvals.is_empty()
+        {
+            return Err(ApiError::conflict("session has active agent work"));
+        }
+        runtime.lifecycle_mutation = true;
+        (runtime.handle.clone(), runtime.supervisor.clone())
+    };
+    if let Some(supervisor) = supervisor
+        && supervisor.has_active_runs().await
+    {
+        finish_session_lifecycle(state, session_name).await;
+        return Err(ApiError::conflict("session has active agent work"));
+    }
+    Ok(handle)
+}
+
+async fn finish_session_lifecycle(state: &AppState, session_name: &str) {
+    let mut sessions = state.inner.sessions.lock().await;
+    if let Some(runtime) = sessions.get_mut(session_name) {
+        runtime.lifecycle_mutation = false;
+        release_idle_session_handle(runtime);
     }
 }
 
@@ -3021,6 +3319,50 @@ async fn approval_snapshots(state: &AppState, session_name: &str) -> Vec<Approva
 fn session_store(state: &AppState, name: &str) -> Result<SessionStore, ApiError> {
     SessionStore::for_workspace(&state.inner.options.workspace_root, name)
         .map_err(|error| ApiError::bad_request(error.to_string()))
+}
+
+fn require_active_session(state: &AppState, name: &str) -> Result<SessionStore, ApiError> {
+    let store = session_store(state, name)?;
+    reject_archived_session(&store, name)?;
+    store.load_projection().map_err(|error| match error {
+        agent_runtime::SessionStoreError::SessionNotFound { .. } => {
+            ApiError::not_found(error.to_string())
+        }
+        _ => ApiError::internal(error.to_string()),
+    })?;
+    Ok(store)
+}
+
+fn session_directory_response(state: &AppState) -> Result<SessionDirectoryResponse, ApiError> {
+    let store = session_store(state, &state.inner.options.default_session_name)?;
+    let listing = store
+        .list_current_scope_with_diagnostics()
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    Ok(SessionDirectoryResponse {
+        schema_version: SESSION_DIRECTORY_SCHEMA_VERSION,
+        sessions: listing
+            .entries
+            .into_iter()
+            .map(session_entry_response)
+            .collect(),
+        diagnostics: listing
+            .diagnostics
+            .into_iter()
+            .map(session_directory_diagnostic_response)
+            .collect(),
+    })
+}
+
+fn session_entry_for_name(
+    state: &AppState,
+    name: &str,
+    archived: bool,
+) -> Result<SessionEntryResponse, ApiError> {
+    session_directory_response(state)?
+        .sessions
+        .into_iter()
+        .find(|entry| entry.name == name && entry.archived == archived)
+        .ok_or_else(|| ApiError::internal(format!("session {name:?} disappeared from directory")))
 }
 
 fn requested_permissions(
@@ -3217,6 +3559,16 @@ fn session_entry_response(entry: SessionListingEntry) -> SessionEntryResponse {
     }
 }
 
+fn session_directory_diagnostic_response(
+    diagnostic: SessionListingDiagnostic,
+) -> SessionDirectoryDiagnosticResponse {
+    SessionDirectoryDiagnosticResponse {
+        name: diagnostic.name,
+        path: diagnostic.path.display().to_string(),
+        message: diagnostic.message,
+    }
+}
+
 fn broadcast_message(tx: &broadcast::Sender<ServerMessage>, message: ServerMessage) {
     let _ = tx.send(message);
 }
@@ -3246,6 +3598,33 @@ mod tests {
     use tower::ServiceExt;
 
     static ENV_LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
+
+    struct HomeGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl HomeGuard {
+        fn set(path: &std::path::Path) -> Self {
+            let previous = std::env::var_os("HOME");
+            unsafe {
+                std::env::set_var("HOME", path);
+            }
+            Self { previous }
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => unsafe {
+                    std::env::set_var("HOME", value);
+                },
+                None => unsafe {
+                    std::env::remove_var("HOME");
+                },
+            }
+        }
+    }
 
     fn test_options() -> ServerOptions {
         let root = unique_test_dir("options");
@@ -3569,12 +3948,20 @@ mod tests {
 
     #[tokio::test]
     async fn workspace_accepts_managed_model_resolved_by_desktop() {
+        let _lock = ENV_LOCK.get_or_init(|| AsyncMutex::new(())).lock().await;
+        let home = unique_test_dir("managed-workspace-home");
+        let _home = HomeGuard::set(&home);
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind model listener");
         let mut options = test_options();
         options.fallback_model = None;
         let server = EmbeddedServer::new_workspace(options).expect("workspace server");
+        let created = server
+            .request("POST", "/api/sessions", Some(json!({ "name": "remote" })))
+            .await
+            .expect("create session");
+        assert_eq!(created.status, StatusCode::CREATED.as_u16());
         let mut subscription = server
             .subscribe_session("remote")
             .await
@@ -3624,18 +4011,13 @@ mod tests {
 
         let accepted = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                let message = subscription.recv().await?;
-                match message["type"].as_str() {
-                    Some("turn_rejected") => {
-                        return Err(message["data"]["reason"]
-                            .as_str()
-                            .unwrap_or("turn rejected")
-                            .to_string());
-                    }
-                    Some("snapshot") if !message["data"]["running_turn"].is_null() => {
-                        return Ok(());
-                    }
-                    _ => {}
+                let message = subscription.recv().await.map_err(|error| error.to_string())?;
+                if matches!(
+                    message,
+                    SessionStreamFrame::Event(event)
+                        if matches!(event.update, agent_protocol::SessionUpdate::OperationReplaced(Some(_)))
+                ) {
+                    return Ok::<(), String>(());
                 }
             }
         })
@@ -3832,7 +4214,14 @@ mod tests {
 
     #[tokio::test]
     async fn reset_rejects_running_session() {
+        let _lock = ENV_LOCK.get_or_init(|| AsyncMutex::new(())).lock().await;
+        let home = unique_test_dir("reset-running-home");
+        let _home = HomeGuard::set(&home);
         let state = test_state();
+        SessionStore::for_workspace(&state.inner.options.workspace_root, "default")
+            .expect("store")
+            .reset()
+            .expect("create session");
         let worker = tokio::spawn(std::future::pending::<()>());
         {
             let mut sessions = state.inner.sessions.lock().await;
@@ -3948,13 +4337,26 @@ mod tests {
 
         let state = test_state();
         let workspace = state.inner.options.workspace_root.clone();
-        let response = create_session(State(state), Path("fresh".to_string()))
-            .await
-            .expect("create session");
+        let response = create_session(
+            State(state.clone()),
+            Json(CreateSessionRequest {
+                name: "fresh".to_string(),
+            }),
+        )
+        .await
+        .expect("create session");
         let store = SessionStore::for_workspace(&workspace, "fresh").expect("store");
         let session = store.load_existing().expect("load created session");
 
-        assert_eq!(response.0.session, Session::new());
+        assert_eq!(response.0, StatusCode::CREATED);
+        assert_eq!(response.1.0.name, "fresh");
+        assert!(!response.1.0.archived);
+        let reset = reset_session(State(state), Path("fresh".to_string()))
+            .await
+            .expect("reset session");
+        assert_eq!(reset.0.name, "fresh");
+        assert_eq!(reset.0.turns, 0);
+        assert!(!reset.0.archived);
         assert_eq!(session, Session::new());
         assert!(store.path().is_file());
 
@@ -3983,7 +4385,13 @@ mod tests {
             .expect("store");
         store.save(&Session::new()).expect("save existing session");
 
-        let result = create_session(State(state), Path("existing".to_string())).await;
+        let result = create_session(
+            State(state),
+            Json(CreateSessionRequest {
+                name: "existing".to_string(),
+            }),
+        )
+        .await;
 
         assert!(matches!(
             result,
@@ -4005,6 +4413,203 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_collection_is_versioned_and_legacy_projection_routes_are_absent() {
+        let _lock = ENV_LOCK.get_or_init(|| AsyncMutex::new(())).lock().await;
+        let home = unique_test_dir("collection-home");
+        let _home = HomeGuard::set(&home);
+        let router = router(test_options()).expect("router");
+
+        let empty = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("list response");
+        assert_eq!(empty.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(empty.into_body(), 1024 * 1024)
+            .await
+            .expect("directory body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("directory json");
+        assert_eq!(body["schema_version"], 1);
+        assert_eq!(body["sessions"], json!([]));
+        assert_eq!(body["diagnostics"], json!([]));
+
+        let created = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"name":"task_one"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("create response");
+        assert_eq!(created.status(), StatusCode::CREATED);
+
+        for method in [Method::GET, Method::POST] {
+            let legacy = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri("/api/sessions/task_one")
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("legacy response");
+            assert_eq!(legacy.status(), StatusCode::NOT_FOUND);
+        }
+    }
+
+    #[tokio::test]
+    async fn create_session_rejects_invalid_and_archived_names() {
+        let _lock = ENV_LOCK.get_or_init(|| AsyncMutex::new(())).lock().await;
+        let home = unique_test_dir("create-validation-home");
+        let _home = HomeGuard::set(&home);
+        let state = test_state();
+
+        for name in ["bad name", " padded "] {
+            let invalid = create_session(
+                State(state.clone()),
+                Json(CreateSessionRequest {
+                    name: name.to_string(),
+                }),
+            )
+            .await;
+            assert!(matches!(
+                invalid,
+                Err(ApiError {
+                    status: StatusCode::BAD_REQUEST,
+                    ..
+                })
+            ));
+        }
+
+        let store = SessionStore::for_workspace(&state.inner.options.workspace_root, "archived")
+            .expect("store");
+        store.save(&Session::new()).expect("save session");
+        store.archive().expect("archive session");
+        let archived = create_session(
+            State(state),
+            Json(CreateSessionRequest {
+                name: "archived".to_string(),
+            }),
+        )
+        .await;
+        assert!(matches!(
+            archived,
+            Err(ApiError {
+                status: StatusCode::CONFLICT,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn missing_subscription_and_lifecycle_calls_do_not_create_session_files() {
+        let _lock = ENV_LOCK.get_or_init(|| AsyncMutex::new(())).lock().await;
+        let home = unique_test_dir("missing-session-home");
+        let _home = HomeGuard::set(&home);
+        let state = test_state();
+        let store = SessionStore::for_workspace(&state.inner.options.workspace_root, "missing")
+            .expect("store");
+        let lock_path = store.path().with_extension("lock");
+
+        assert!(state.subscribe_session("missing").await.is_err());
+        assert!(matches!(
+            reset_session(State(state.clone()), Path("missing".to_string())).await,
+            Err(ApiError {
+                status: StatusCode::NOT_FOUND,
+                ..
+            })
+        ));
+        assert!(matches!(
+            archive_session(State(state.clone()), Path("missing".to_string())).await,
+            Err(ApiError {
+                status: StatusCode::NOT_FOUND,
+                ..
+            })
+        ));
+        assert!(matches!(
+            get_session_model_selection(State(state), Path("missing".to_string())).await,
+            Err(ApiError {
+                status: StatusCode::NOT_FOUND,
+                ..
+            })
+        ));
+        assert!(!store.path().exists());
+        assert!(!lock_path.exists());
+    }
+
+    #[tokio::test]
+    async fn corrupt_session_is_reported_without_blocking_other_sessions() {
+        let _lock = ENV_LOCK.get_or_init(|| AsyncMutex::new(())).lock().await;
+        let home = unique_test_dir("corrupt-directory-home");
+        let _home = HomeGuard::set(&home);
+        let state = test_state();
+        let corrupt = SessionStore::for_workspace(&state.inner.options.workspace_root, "broken")
+            .expect("store");
+        corrupt.reset().expect("create log");
+        fs::write(corrupt.path(), b"{broken\n").expect("corrupt log");
+
+        let directory = list_sessions(State(state.clone()))
+            .await
+            .expect("list sessions")
+            .0;
+        assert!(directory.sessions.is_empty());
+        assert_eq!(directory.diagnostics.len(), 1);
+        assert_eq!(directory.diagnostics[0].name.as_deref(), Some("broken"));
+        assert!(state.subscribe_session("broken").await.is_err());
+
+        let created = create_session(
+            State(state.clone()),
+            Json(CreateSessionRequest {
+                name: "healthy".to_string(),
+            }),
+        )
+        .await
+        .expect("create healthy session");
+        assert_eq!(created.0, StatusCode::CREATED);
+        let directory = list_sessions(State(state)).await.expect("list sessions").0;
+        assert!(
+            directory
+                .sessions
+                .iter()
+                .any(|entry| entry.name == "healthy")
+        );
+        assert_eq!(directory.diagnostics.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn static_application_assets_are_never_cached() {
+        let router = router(test_options()).expect("router");
+        for path in ["/", "/app.js", "/style.css"] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("asset response");
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers().get(header::CACHE_CONTROL),
+                Some(&HeaderValue::from_static("no-store"))
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn archive_and_restore_session_updates_session_listing() {
         let lock = ENV_LOCK.get_or_init(|| AsyncMutex::new(())).lock().await;
         let home = unique_test_dir("archive-home");
@@ -4017,18 +4622,62 @@ mod tests {
         let store = SessionStore::for_workspace(&state.inner.options.workspace_root, "work")
             .expect("store");
         store.save(&Session::new()).expect("save session");
+        let mut subscription = state
+            .subscribe_session("work")
+            .await
+            .expect("subscribe before archive");
+        let snapshot_stream_id = match &subscription.snapshot {
+            SessionStreamFrame::Snapshot(snapshot) => snapshot.cursor.stream_id.clone(),
+            _ => panic!("expected snapshot"),
+        };
+        let exported = export_session(State(state.clone()), Path("work".to_string()))
+            .await
+            .expect("export subscribed session");
+        assert_eq!(
+            exported.headers().get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static("application/x-ndjson")),
+        );
+        let exported = axum::body::to_bytes(exported.into_body(), 1024 * 1024)
+            .await
+            .expect("read export");
+        let header: agent_protocol::SessionLogHeader = serde_json::from_slice(
+            exported
+                .split(|byte| *byte == b'\n')
+                .next()
+                .expect("export header"),
+        )
+        .expect("parse export header");
+        assert_eq!(header.schema_version, 5);
 
         let archived = archive_session(State(state.clone()), Path("work".to_string()))
             .await
             .expect("archive session");
+        let invalidation = subscription.recv().await.expect("archive invalidation");
+        let SessionStreamFrame::Event(invalidation) = invalidation else {
+            panic!("expected invalidation event");
+        };
         let entries = list_sessions(State(state.clone()))
             .await
             .expect("list sessions");
 
         assert!(archived.0.archived);
+        assert_ne!(invalidation.stream_id, snapshot_stream_id);
         assert!(store.is_archived());
-        assert_eq!(entries.0.len(), 1);
-        assert!(entries.0[0].archived);
+        assert!(state.subscribe_session("work").await.is_err());
+        assert!(matches!(
+            get_session_model_selection(State(state.clone()), Path("work".to_string())).await,
+            Err(ApiError {
+                status: StatusCode::CONFLICT,
+                ..
+            })
+        ));
+        assert!(
+            entries
+                .0
+                .sessions
+                .iter()
+                .any(|entry| entry.name == "work" && entry.archived)
+        );
 
         let restored = restore_session(State(state), Path("work".to_string()))
             .await
@@ -4157,7 +4806,14 @@ mod tests {
 
     #[tokio::test]
     async fn approval_queue_is_fifo_across_parent_and_subagent_sources() {
+        let _lock = ENV_LOCK.get_or_init(|| AsyncMutex::new(())).lock().await;
+        let home = unique_test_dir("approval-queue-home");
+        let _home = HomeGuard::set(&home);
         let state = test_state();
+        SessionStore::for_workspace(&state.inner.options.workspace_root, "default")
+            .expect("store")
+            .reset()
+            .expect("create session");
         let tx = session_sender(&state, "default").await;
         let mut rx = tx.subscribe();
         let parent = ApprovalRequest::shell_command(
@@ -4200,12 +4856,10 @@ mod tests {
         });
         wait_for_approval_count(&state, "default", 2).await;
 
-        let snapshot = snapshot_message(&state, "default")
+        let resources = ensure_session_resources(&state, "default")
             .await
-            .expect("reconnect snapshot");
-        let ServerMessage::Snapshot { approvals, .. } = snapshot else {
-            panic!("snapshot expected");
-        };
+            .expect("session resources");
+        let approvals = resources.handle.snapshot().await.approvals;
         assert_eq!(
             approvals
                 .iter()
