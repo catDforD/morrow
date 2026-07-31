@@ -8,7 +8,7 @@ import type {
   ClientMessage,
   SessionStreamFrame,
 } from './types'
-import { sessionEntry, snapshotFrame, testModelSelection } from './sessionTestFixtures'
+import { eventFrame, sessionEntry, snapshotFrame, turnProjection, testModelSelection } from './sessionTestFixtures'
 
 const api = vi.hoisted(() => {
   class SessionProtocolError extends Error {}
@@ -275,6 +275,88 @@ describe('App Session creation flow', () => {
       'Connection interrupted. Reconnecting with a fresh snapshot',
     )
     expect(document.body.textContent).not.toContain('[object Event]')
+  })
+
+  it('dismisses the damaged task log banner until diagnostics change', async () => {
+    const diagnostic = {
+      name: 'broken-task',
+      path: '/sessions/broken-task.jsonl',
+      message: 'invalid JSON at line 3',
+    }
+    api.sessionClient.listSessions.mockReset().mockResolvedValue({
+      schema_version: 1,
+      sessions: [],
+      diagnostics: [diagnostic],
+    })
+    await renderApp()
+
+    expect(document.body.textContent).toContain(
+      '1 damaged task log were skipped. Other tasks remain available.',
+    )
+    const dismiss = document.querySelector<HTMLButtonElement>(
+      'button[title="Dismiss message"]',
+    )
+    expect(dismiss).not.toBeNull()
+    await act(async () => dismiss?.click())
+    expect(document.body.textContent).not.toContain('damaged task log')
+
+    await act(async () => {
+      document.querySelector<HTMLButtonElement>('.home-create-task')?.click()
+    })
+    await setInput(
+      document.querySelector<HTMLInputElement>('input[aria-label="New session name"]'),
+      'task-one',
+    )
+    await act(async () => {
+      document.querySelector<HTMLFormElement>('.session-create-row')?.requestSubmit()
+      for (let index = 0; index < 6; index += 1) await Promise.resolve()
+    })
+    await act(async () => {
+      handlers?.onMessage(snapshotFrame('task-one'))
+      for (let index = 0; index < 4; index += 1) await Promise.resolve()
+    })
+
+    // Refreshing the directory with identical diagnostics keeps it dismissed.
+    const callsBeforeRefresh = api.sessionClient.listSessions.mock.calls.length
+    await act(async () => {
+      handlers?.onMessage(
+        eventFrame('task-one', 1, {
+          type: 'turn_upserted',
+          data: turnProjection('completed'),
+        }),
+      )
+      for (let index = 0; index < 6; index += 1) await Promise.resolve()
+    })
+    expect(api.sessionClient.listSessions.mock.calls.length).toBe(
+      callsBeforeRefresh + 1,
+    )
+    expect(document.body.textContent).not.toContain('damaged task log')
+
+    // A changed diagnostics set has a new signature and re-shows the banner.
+    api.sessionClient.listSessions.mockResolvedValue({
+      schema_version: 1,
+      sessions: [sessionEntry('task-one')],
+      diagnostics: [
+        diagnostic,
+        {
+          name: null,
+          path: '/sessions/another-broken.jsonl',
+          message: 'missing turn id',
+        },
+      ],
+    })
+    await act(async () => {
+      handlers?.onMessage(
+        eventFrame('task-one', 2, {
+          type: 'turn_upserted',
+          data: turnProjection('completed'),
+        }),
+      )
+      for (let index = 0; index < 6; index += 1) await Promise.resolve()
+    })
+    expect(document.body.textContent).toContain(
+      '2 damaged task logs were skipped. Other tasks remain available.',
+    )
   })
 })
 

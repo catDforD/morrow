@@ -159,6 +159,9 @@ export default function App() {
   const [runCollapsed, setRunCollapsed] = useState<Record<string, boolean>>({})
   const [visibleError, setVisibleError] = useState<string | null>(null)
   const [visibleNotice, setVisibleNotice] = useState<string | null>(null)
+  const [dismissedDiagnosticsKey, setDismissedDiagnosticsKey] = useState<
+    string | null
+  >(null)
   const [sessionFilter, setSessionFilter] = useState('')
   const [isSearchOpen, setIsSearchOpen] = useState(false)
   const [isSidebarOpen, setIsSidebarOpen] = useState(false)
@@ -293,6 +296,12 @@ export default function App() {
     directoryError,
     sessionError,
   } = sessionController
+  const diagnosticsKey = diagnostics
+    .map(
+      (diagnostic) =>
+        `${diagnostic.name ?? ''}:${diagnostic.path}:${diagnostic.message}`,
+    )
+    .join('\n')
   const connection: ConnectionStatus =
     selectionStatus === 'ready'
       ? 'connected'
@@ -915,7 +924,11 @@ export default function App() {
                 sessionError={sessionError}
                 visibleError={visibleError}
                 visibleNotice={visibleNotice}
-                diagnosticCount={diagnostics.length}
+                diagnosticCount={
+                  dismissedDiagnosticsKey === diagnosticsKey
+                    ? 0
+                    : diagnostics.length
+                }
                 timeline={timeline}
                 runningTurn={runningTurn}
                 pendingApproval={pendingApproval}
@@ -954,6 +967,7 @@ export default function App() {
                 onDismissStatus={() => {
                   setVisibleError(null)
                   setVisibleNotice(null)
+                  setDismissedDiagnosticsKey(diagnosticsKey)
                 }}
                 onOpenInspector={openInspector}
                 onToggleRun={(id) => {
@@ -1561,6 +1575,7 @@ function SessionStatusBanner({
       return {
         tone: 'warning',
         message: `${diagnosticCount} damaged task log${diagnosticCount === 1 ? '' : 's'} were skipped. Other tasks remain available.`,
+        dismissible: true,
       } as const
     }
     if (visibleNotice) {
