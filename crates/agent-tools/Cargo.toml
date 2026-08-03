@@ -9,6 +9,9 @@ agent-core = { workspace = true }
 agent-protocol = { workspace = true }
 agent-sandbox = { workspace = true }
 async-trait = { workspace = true }
+dom_query = { workspace = true }
+dom_smoothie = { workspace = true }
+encoding_rs = { workspace = true }
 futures-util = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }

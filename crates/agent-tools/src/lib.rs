@@ -1,4 +1,5 @@
 pub mod mcp;
+mod web_fetch;
 
 use agent_config::McpServerConfig;
 pub use agent_core::{
@@ -36,6 +37,8 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
 pub use mcp::McpToolCache;
+pub use web_fetch::WEB_FETCH_TOOL_NAME;
+use web_fetch::WebFetchTool;
 
 const DEFAULT_READ_LINES: usize = 200;
 const MAX_READ_LINES: usize = 1000;
@@ -85,6 +88,7 @@ impl BuiltInToolAllowlist {
             WRITE_FILE_TOOL_NAME,
             APPLY_PATCH_TOOL_NAME,
             SHELL_COMMAND_TOOL_NAME,
+            WEB_FETCH_TOOL_NAME,
         ])
     }
 
@@ -93,6 +97,7 @@ impl BuiltInToolAllowlist {
             READ_FILE_TOOL_NAME,
             LIST_FILES_TOOL_NAME,
             SEARCH_TEXT_TOOL_NAME,
+            WEB_FETCH_TOOL_NAME,
         ])
     }
 
@@ -106,6 +111,7 @@ impl BuiltInToolAllowlist {
                     LIST_FILES_TOOL_NAME,
                     SEARCH_TEXT_TOOL_NAME,
                     SHELL_COMMAND_TOOL_NAME,
+                    WEB_FETCH_TOOL_NAME,
                 ])
                 .names
             }
@@ -182,6 +188,8 @@ pub enum ToolRegistryError {
     DuplicateTool { name: String },
     #[error("mcp server {server}: {message}")]
     McpServer { server: String, message: String },
+    #[error("failed to initialize web_fetch: {0}")]
+    WebFetch(String),
 }
 
 #[async_trait]
@@ -434,24 +442,58 @@ impl ToolRegistry {
         allowed: BuiltInToolAllowlist,
         writer_lease: Option<Arc<Semaphore>>,
     ) -> Result<Self, ToolRegistryError> {
-        let evaluator = PermissionEvaluator::new(root, permissions)?;
+        Self::built_in_with_allowlist_and_writer_lease_and_artifact_root(
+            root,
+            permissions,
+            allowed,
+            writer_lease,
+            None,
+        )
+    }
+
+    pub fn built_in_with_allowlist_and_writer_lease_and_artifact_root(
+        root: impl Into<PathBuf>,
+        permissions: PermissionProfile,
+        allowed: BuiltInToolAllowlist,
+        writer_lease: Option<Arc<Semaphore>>,
+        artifact_root: Option<PathBuf>,
+    ) -> Result<Self, ToolRegistryError> {
+        let evaluator = PermissionEvaluator::new_with_read_roots(
+            root,
+            permissions,
+            artifact_root.iter().cloned(),
+        )?;
         let mut registry = Self::empty();
         registry.register(Arc::new(BuiltInTools {
             evaluator,
-            allowed,
+            allowed: allowed.clone(),
             writer_lease,
         }))?;
+        if allowed.contains(WEB_FETCH_TOOL_NAME) {
+            registry.register(Arc::new(
+                WebFetchTool::new(artifact_root).map_err(ToolRegistryError::WebFetch)?,
+            ))?;
+        }
         Ok(registry)
     }
 
     pub fn research(root: impl Into<PathBuf>) -> Result<Self, ToolRegistryError> {
-        Self::built_in_with_allowlist(
+        Self::research_with_artifact_root(root, None)
+    }
+
+    pub fn research_with_artifact_root(
+        root: impl Into<PathBuf>,
+        artifact_root: Option<PathBuf>,
+    ) -> Result<Self, ToolRegistryError> {
+        Self::built_in_with_allowlist_and_writer_lease_and_artifact_root(
             root,
             PermissionProfile {
                 mode: PermissionMode::ReadOnly,
                 shell: ShellPolicy::Deny,
             },
             BuiltInToolAllowlist::research(),
+            None,
+            artifact_root,
         )
     }
 
@@ -472,12 +514,32 @@ impl ToolRegistry {
         mcp_cache: &McpToolCache,
         writer_lease: Option<Arc<Semaphore>>,
     ) -> Result<ToolRegistryBuild, ToolRegistryError> {
+        Self::with_mcp_cache_and_writer_lease_and_artifact_root_async(
+            root,
+            permissions,
+            mcp_servers,
+            mcp_cache,
+            writer_lease,
+            None,
+        )
+        .await
+    }
+
+    pub async fn with_mcp_cache_and_writer_lease_and_artifact_root_async(
+        root: impl Into<PathBuf>,
+        permissions: PermissionProfile,
+        mcp_servers: &[McpServerConfig],
+        mcp_cache: &McpToolCache,
+        writer_lease: Option<Arc<Semaphore>>,
+        artifact_root: Option<PathBuf>,
+    ) -> Result<ToolRegistryBuild, ToolRegistryError> {
         let root = root.into();
-        let mut registry = Self::built_in_with_allowlist_and_writer_lease(
+        let mut registry = Self::built_in_with_allowlist_and_writer_lease_and_artifact_root(
             &root,
             permissions,
             BuiltInToolAllowlist::all(),
             writer_lease,
+            artifact_root,
         )?;
         let discovery = mcp::discover_tools(&root, mcp_servers, mcp_cache).await;
         for tool in discovery.tools {
@@ -1740,8 +1802,7 @@ impl BuiltInTools {
     }
 
     fn path_allowed(&self, path: &Path) -> Result<bool, String> {
-        let evaluator = self.evaluator()?;
-        Ok(evaluator.allows_paths_outside_workspace() || path.starts_with(evaluator.root()))
+        Ok(self.evaluator()?.allows_read_path(path))
     }
 
     fn collect_entries(
@@ -3259,6 +3320,7 @@ mod tests {
             assert!(allowlist.contains(READ_FILE_TOOL_NAME));
             assert!(allowlist.contains(LIST_FILES_TOOL_NAME));
             assert!(allowlist.contains(SEARCH_TEXT_TOOL_NAME));
+            assert!(allowlist.contains(WEB_FETCH_TOOL_NAME));
             assert!(!allowlist.contains(EDIT_FILE_TOOL_NAME));
             assert!(!allowlist.contains(WRITE_FILE_TOOL_NAME));
             assert!(!allowlist.contains(APPLY_PATCH_TOOL_NAME));
@@ -3274,6 +3336,7 @@ mod tests {
             WRITE_FILE_TOOL_NAME,
             APPLY_PATCH_TOOL_NAME,
             SHELL_COMMAND_TOOL_NAME,
+            WEB_FETCH_TOOL_NAME,
         ] {
             assert!(worker.contains(name), "worker should expose {name}");
         }
@@ -3283,6 +3346,7 @@ mod tests {
         assert!(reviewer.contains(LIST_FILES_TOOL_NAME));
         assert!(reviewer.contains(SEARCH_TEXT_TOOL_NAME));
         assert!(reviewer.contains(SHELL_COMMAND_TOOL_NAME));
+        assert!(reviewer.contains(WEB_FETCH_TOOL_NAME));
         assert!(!reviewer.contains(EDIT_FILE_TOOL_NAME));
         assert!(!reviewer.contains(WRITE_FILE_TOOL_NAME));
         assert!(!reviewer.contains(APPLY_PATCH_TOOL_NAME));
@@ -3298,6 +3362,7 @@ mod tests {
         assert!(!denied.contains(WRITE_FILE_TOOL_NAME));
         assert!(!denied.contains(APPLY_PATCH_TOOL_NAME));
         assert!(!denied.contains(SHELL_COMMAND_TOOL_NAME));
+        assert!(denied.contains(WEB_FETCH_TOOL_NAME));
     }
 
     #[test]
@@ -3497,7 +3562,10 @@ mod tests {
             .map(|definition| definition.function.name)
             .collect::<Vec<_>>();
 
-        assert_eq!(names, vec!["read_file", "list_files", "search_text"]);
+        assert_eq!(
+            names,
+            vec!["read_file", "list_files", "search_text", "web_fetch"]
+        );
         let result = completed_result(registry.execute(&call(
             "write_file",
             json!({"path": "blocked.txt", "content": "blocked"}),
@@ -3605,6 +3673,86 @@ mod tests {
                 .expect("error")
                 .contains("outside the workspace root")
         );
+    }
+
+    #[test]
+    fn file_tools_share_only_the_current_session_artifact_root() {
+        let workspace = unique_dir("artifact-read-workspace");
+        let sessions = unique_dir("artifact-read-sessions");
+        let current = sessions.join("current");
+        let other = sessions.join("other");
+        fs::create_dir_all(&other).expect("create other artifacts");
+        let current_file = current.join("page.md");
+        let other_file = other.join("secret.md");
+        fs::write(&other_file, "other session secret").expect("write other artifact");
+        let tools = ToolRegistry::built_in_with_allowlist_and_writer_lease_and_artifact_root(
+            &workspace,
+            PermissionProfile::for_mode(PermissionMode::WorkspaceWrite),
+            BuiltInToolAllowlist::all(),
+            None,
+            Some(current.clone()),
+        )
+        .expect("artifact-aware registry");
+        fs::create_dir_all(&current).expect("create current artifacts after registry");
+        fs::write(&current_file, "shared artifact needle").expect("write current artifact");
+
+        let read = content(tools.execute(&call(
+            READ_FILE_TOOL_NAME,
+            json!({"path": current_file.display().to_string()}),
+        )));
+        assert_eq!(read["ok"], true);
+        assert_eq!(read["data"]["content"], "shared artifact needle");
+
+        let listed = content(tools.execute(&call(
+            LIST_FILES_TOOL_NAME,
+            json!({"path": current.display().to_string()}),
+        )));
+        assert_eq!(listed["ok"], true);
+        assert!(listed["data"]["entries"].as_array().is_some_and(|entries| {
+            entries.iter().any(|entry| {
+                entry["path"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with("page.md"))
+            })
+        }));
+
+        let searched = content(tools.execute(&call(
+            SEARCH_TEXT_TOOL_NAME,
+            json!({"query": "needle", "path": current.display().to_string()}),
+        )));
+        assert_eq!(searched["ok"], true);
+        assert_eq!(
+            searched["data"]["results"][0]["text"],
+            "shared artifact needle"
+        );
+
+        let other_read = content(tools.execute(&call(
+            READ_FILE_TOOL_NAME,
+            json!({"path": other_file.display().to_string()}),
+        )));
+        assert_eq!(other_read["ok"], false);
+
+        let traversed = content(tools.execute(&call(
+            READ_FILE_TOOL_NAME,
+            json!({
+                "path": current
+                    .join("..")
+                    .join("other/secret.md")
+                    .display()
+                    .to_string()
+            }),
+        )));
+        assert_eq!(traversed["ok"], false);
+
+        let write = content(tools.execute(&call(
+            WRITE_FILE_TOOL_NAME,
+            json!({
+                "path": current.join("blocked.md").display().to_string(),
+                "content": "blocked"
+            }),
+        )));
+        assert_eq!(write["ok"], false);
+        assert!(!current.join("blocked.md").exists());
     }
 
     #[test]

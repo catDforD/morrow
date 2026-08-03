@@ -7,7 +7,7 @@ use agent_protocol::{
 };
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
@@ -88,6 +88,12 @@ pub enum SessionStoreError {
     },
     #[error("failed to remove session file {path}: {source}")]
     Remove {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to remove session artifact directory {path}: {source}")]
+    RemoveArtifact {
         path: PathBuf,
         #[source]
         source: std::io::Error,
@@ -447,6 +453,9 @@ impl SessionStore {
         lease: &SessionWriterLease,
     ) -> Result<SessionProjection, SessionStoreError> {
         self.validate_lease(lease)?;
+        if let Some(artifact_root) = self.artifact_root_for_log(&self.path) {
+            remove_artifact_root(&artifact_root)?;
+        }
         let header = new_header();
         write_log_atomic(&self.path, &header, &[])?;
         let _ = remove_if_exists(&self.legacy_session_path)?;
@@ -459,6 +468,20 @@ impl SessionStore {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn artifact_root(&self) -> Result<PathBuf, SessionStoreError> {
+        let path = if self.path.is_file() {
+            &self.path
+        } else if self.archived_path.is_file() {
+            &self.archived_path
+        } else {
+            return Err(SessionStoreError::SessionNotFound {
+                name: self.session_name.clone(),
+            });
+        };
+        let header = read_log_header(path)?;
+        Ok(self.artifact_root_for_session_id(&header.session_id))
     }
 
     #[cfg(test)]
@@ -663,6 +686,13 @@ impl SessionStore {
 
     pub fn delete(&self) -> Result<(), SessionStoreError> {
         let _lease = self.acquire_lock()?;
+        let artifact_roots = [&self.path, &self.archived_path]
+            .into_iter()
+            .filter_map(|path| self.artifact_root_for_log(path))
+            .collect::<std::collections::BTreeSet<_>>();
+        for artifact_root in artifact_roots {
+            remove_artifact_root(&artifact_root)?;
+        }
         let mut targets = vec![
             &self.path,
             &self.legacy_session_path,
@@ -1069,6 +1099,19 @@ impl SessionStore {
         self.scope_dir().join("archive")
     }
 
+    fn artifact_root_for_session_id(&self, session_id: &str) -> PathBuf {
+        self.scope_dir()
+            .join("artifacts")
+            .join(hex_encode(session_id.as_bytes()))
+    }
+
+    fn artifact_root_for_log(&self, path: &Path) -> Option<PathBuf> {
+        path.is_file()
+            .then(|| read_log_header(path).ok())
+            .flatten()
+            .map(|header| self.artifact_root_for_session_id(&header.session_id))
+    }
+
     fn store_for_name(&self, session_name: &str) -> Result<Self, SessionStoreError> {
         Self::from_parts(
             self.root.clone(),
@@ -1118,6 +1161,28 @@ fn new_header() -> SessionLogHeader {
         session_id: new_session_id(),
         created_at_ms: timestamp_ms(),
     }
+}
+
+fn remove_artifact_root(path: &Path) -> Result<(), SessionStoreError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(SessionStoreError::RemoveArtifact {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    let result = if metadata.file_type().is_symlink() || metadata.is_file() {
+        fs::remove_file(path)
+    } else {
+        fs::remove_dir_all(path)
+    };
+    result.map_err(|source| SessionStoreError::RemoveArtifact {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 fn new_session_id() -> String {
@@ -1180,6 +1245,41 @@ fn read_log_path(
     }
     project_session(&header, &facts)?;
     Ok((header, facts))
+}
+
+fn read_log_header(path: &Path) -> Result<SessionLogHeader, SessionStoreError> {
+    let file = File::open(path).map_err(|source| SessionStoreError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .map_err(|source| SessionStoreError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if line.trim().is_empty() {
+        return Err(SessionStoreError::InvalidLog {
+            path: path.to_path_buf(),
+            message: "missing log header".to_string(),
+        });
+    }
+    let header = serde_json::from_str::<SessionLogHeader>(line.trim_end()).map_err(|source| {
+        SessionStoreError::Parse {
+            path: path.to_path_buf(),
+            source,
+        }
+    })?;
+    if header.schema_version != SESSION_DOCUMENT_SCHEMA_VERSION {
+        return Err(SessionStoreError::UnsupportedSchemaVersion {
+            path: path.to_path_buf(),
+            version: header.schema_version,
+            expected: SESSION_DOCUMENT_SCHEMA_VERSION,
+        });
+    }
+    Ok(header)
 }
 
 fn write_log_atomic(
@@ -1794,6 +1894,77 @@ mod tests {
         assert_ne!(before, after.session_id);
         assert_eq!(after.revision, 0);
         assert!(after.turns.is_empty());
+    }
+
+    #[test]
+    fn reset_removes_old_session_artifacts_and_uses_a_new_root() {
+        let root = unique_dir("reset-artifacts");
+        let legacy = unique_dir("reset-artifacts-legacy");
+        let cwd = unique_dir("reset-artifacts-cwd");
+        let store = make_store(&root, &legacy, &cwd, "default");
+        store.save(&sample_session()).expect("save");
+        let old_artifact_root = store.artifact_root().expect("old artifact root");
+        fs::create_dir_all(old_artifact_root.join("web_fetch")).expect("create artifacts");
+        fs::write(
+            old_artifact_root.join("web_fetch").join("page.md"),
+            "private artifact",
+        )
+        .expect("write artifact");
+
+        store.reset().expect("reset");
+
+        let new_artifact_root = store.artifact_root().expect("new artifact root");
+        assert_ne!(old_artifact_root, new_artifact_root);
+        assert!(!old_artifact_root.exists());
+        assert!(!new_artifact_root.exists());
+    }
+
+    #[test]
+    fn artifacts_follow_session_identity_without_entering_exports() {
+        let root = unique_dir("artifact-lifecycle");
+        let legacy = unique_dir("artifact-lifecycle-legacy");
+        let cwd = unique_dir("artifact-lifecycle-cwd");
+        let store = make_store(&root, &legacy, &cwd, "default");
+        store.save(&sample_session()).expect("save");
+        let artifact_root = store.artifact_root().expect("artifact root");
+        let session_id = store.load_projection().expect("projection").session_id;
+        assert_eq!(
+            artifact_root,
+            store
+                .scope_dir()
+                .join("artifacts")
+                .join(hex_encode(session_id.as_bytes()))
+        );
+        fs::create_dir_all(artifact_root.join("web_fetch")).expect("create artifacts");
+        fs::write(
+            artifact_root.join("web_fetch").join("page.md"),
+            "artifact-only-secret",
+        )
+        .expect("write artifact");
+
+        let renamed = store.rename("renamed").expect("rename");
+        assert_eq!(
+            renamed.artifact_root().expect("renamed root"),
+            artifact_root
+        );
+        assert!(artifact_root.exists());
+        renamed.archive().expect("archive");
+        assert_eq!(
+            renamed.artifact_root().expect("archived root"),
+            artifact_root
+        );
+        assert!(artifact_root.exists());
+        renamed.restore().expect("restore");
+        assert_eq!(
+            renamed.artifact_root().expect("restored root"),
+            artifact_root
+        );
+        let export = String::from_utf8(renamed.export_document_bytes().expect("export"))
+            .expect("UTF-8 JSONL");
+        assert!(!export.contains("artifact-only-secret"));
+
+        renamed.delete().expect("delete");
+        assert!(!artifact_root.exists());
     }
 
     #[test]
