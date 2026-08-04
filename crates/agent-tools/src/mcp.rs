@@ -1395,8 +1395,10 @@ mod tests {
     use std::fs;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::AtomicU64;
     use std::thread;
-    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static UNIQUE_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     struct FakeTransport {
         requests: Vec<String>,
@@ -2350,11 +2352,11 @@ done
     }
 
     fn unique_dir(name: &str) -> PathBuf {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("morrow-mcp-{name}-{stamp}"));
+        let path = std::env::temp_dir().join(format!(
+            "morrow-mcp-{name}-{}-{}",
+            std::process::id(),
+            UNIQUE_DIR_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
         fs::create_dir_all(&path).expect("create temp dir");
         path
     }

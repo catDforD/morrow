@@ -3302,7 +3302,9 @@ mod tests {
     use agent_protocol::{ApprovalAction, PermissionMode, ShellPolicy};
     use async_trait::async_trait;
     use std::future::Future;
-    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+    use std::time::Instant;
+
+    static UNIQUE_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     struct TestTool(&'static str);
 
@@ -3451,11 +3453,11 @@ mod tests {
     }
 
     fn unique_dir(name: &str) -> PathBuf {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("morrow-tools-{name}-{stamp}"));
+        let path = std::env::temp_dir().join(format!(
+            "morrow-tools-{name}-{}-{}",
+            std::process::id(),
+            UNIQUE_DIR_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
         fs::create_dir_all(&path).expect("create temp dir");
         path
     }
