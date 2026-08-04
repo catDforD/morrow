@@ -27,6 +27,7 @@ pub enum PermissionDecision {
 #[derive(Debug, Clone)]
 pub struct PermissionEvaluator {
     root: PathBuf,
+    read_roots: Vec<PathBuf>,
     profile: PermissionProfile,
 }
 
@@ -35,12 +36,34 @@ impl PermissionEvaluator {
         root: impl Into<PathBuf>,
         profile: PermissionProfile,
     ) -> Result<Self, PermissionEvaluatorError> {
+        Self::new_with_read_roots(root, profile, std::iter::empty::<PathBuf>())
+    }
+
+    pub fn new_with_read_roots(
+        root: impl Into<PathBuf>,
+        profile: PermissionProfile,
+        read_roots: impl IntoIterator<Item = PathBuf>,
+    ) -> Result<Self, PermissionEvaluatorError> {
         let root = root.into();
         let root = root
             .canonicalize()
             .map_err(|source| PermissionEvaluatorError::Root { path: root, source })?;
+        let read_roots = read_roots
+            .into_iter()
+            .map(|path| {
+                if path.is_absolute() {
+                    path
+                } else {
+                    root.join(path)
+                }
+            })
+            .collect();
 
-        Ok(Self { root, profile })
+        Ok(Self {
+            root,
+            read_roots,
+            profile,
+        })
     }
 
     pub fn root(&self) -> &Path {
@@ -53,6 +76,10 @@ impl PermissionEvaluator {
 
     pub fn allows_paths_outside_workspace(&self) -> bool {
         self.profile.mode == PermissionMode::DangerFullAccess
+    }
+
+    pub fn allows_read_path(&self, path: &Path) -> bool {
+        self.allows_paths_outside_workspace() || self.is_read_path_allowed(path)
     }
 
     pub fn resolve_existing_path(&self, input: &str) -> Result<PathBuf, String> {
@@ -71,7 +98,7 @@ impl PermissionEvaluator {
             .canonicalize()
             .map_err(|err| format!("failed to resolve path {input:?}: {err}"))?;
 
-        if !self.allows_paths_outside_workspace() && !path.starts_with(&self.root) {
+        if !self.allows_read_path(&path) {
             return Err(format!("path {input:?} is outside the workspace root"));
         }
 
@@ -177,6 +204,14 @@ impl PermissionEvaluator {
         } else {
             relative.display().to_string()
         }
+    }
+
+    fn is_read_path_allowed(&self, path: &Path) -> bool {
+        path.starts_with(&self.root)
+            || self
+                .read_roots
+                .iter()
+                .any(|root| root.canonicalize().is_ok_and(|root| path.starts_with(root)))
     }
 }
 
@@ -414,5 +449,57 @@ mod tests {
             .expect("outside write path");
 
         assert_eq!(path, outside);
+    }
+
+    #[test]
+    fn session_artifact_read_root_is_isolated_and_never_write_enabled() {
+        let workspace = unique_dir("artifact-workspace");
+        let sessions = unique_dir("artifact-sessions");
+        let current = sessions.join("current");
+        let other = sessions.join("other");
+        fs::create_dir_all(&current).expect("create current artifact root");
+        fs::create_dir_all(&other).expect("create other artifact root");
+        let current_file = current.join("page.md");
+        let other_file = other.join("secret.md");
+        fs::write(&current_file, "current").expect("write current artifact");
+        fs::write(&other_file, "other").expect("write other artifact");
+        let evaluator = PermissionEvaluator::new_with_read_roots(
+            &workspace,
+            PermissionProfile::for_mode(PermissionMode::WorkspaceWrite),
+            [current.clone()],
+        )
+        .expect("eval");
+
+        assert_eq!(
+            evaluator
+                .resolve_existing_path(&current_file.display().to_string())
+                .expect("current artifact is readable"),
+            current_file.canonicalize().expect("canonical current file")
+        );
+        assert!(
+            evaluator
+                .resolve_existing_path(&other_file.display().to_string())
+                .expect_err("other session artifact must be denied")
+                .contains("outside the workspace root")
+        );
+        assert!(
+            evaluator
+                .resolve_existing_path(
+                    &current
+                        .join("..")
+                        .join("other")
+                        .join("secret.md")
+                        .display()
+                        .to_string()
+                )
+                .expect_err("artifact traversal must be denied")
+                .contains("outside the workspace root")
+        );
+        assert!(
+            evaluator
+                .resolve_write_path(&current.join("new.md").display().to_string())
+                .expect_err("artifact root must remain read-only")
+                .contains("outside the workspace root")
+        );
     }
 }

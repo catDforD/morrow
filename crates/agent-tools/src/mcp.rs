@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, Command};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -19,10 +19,20 @@ use tokio::sync::{mpsc, oneshot, watch};
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const STDERR_TAIL_BYTES: usize = 8192;
 const MCP_ACTOR_QUEUE_CAPACITY: usize = 64;
+const MCP_START_FAILURE_COOLDOWN: Duration = Duration::from_secs(600);
 
-#[derive(Default)]
 pub struct McpToolCache {
     entries: tokio::sync::Mutex<HashMap<McpServerKey, McpCacheEntry>>,
+    failure_cooldown: Duration,
+}
+
+impl Default for McpToolCache {
+    fn default() -> Self {
+        Self {
+            entries: tokio::sync::Mutex::new(HashMap::new()),
+            failure_cooldown: MCP_START_FAILURE_COOLDOWN,
+        }
+    }
 }
 
 impl McpToolCache {
@@ -30,33 +40,41 @@ impl McpToolCache {
         Self::default()
     }
 
+    #[cfg(test)]
+    fn with_failure_cooldown(failure_cooldown: Duration) -> Self {
+        Self {
+            failure_cooldown,
+            ..Self::default()
+        }
+    }
+
     pub async fn clear(&self) {
         self.entries.lock().await.clear();
     }
 
-    async fn get_or_start(
-        &self,
-        config: &McpServerConfig,
-        cwd: PathBuf,
-    ) -> Result<Arc<CachedMcpServer>, String> {
+    async fn get_or_start(&self, config: &McpServerConfig, cwd: PathBuf) -> McpStartOutcome {
         let key = McpServerKey::from_config(config, &cwd);
 
         loop {
             match self.cache_action(&key).await {
                 McpCacheAction::Ready(entry) => {
                     if entry.runtime.is_healthy().await {
-                        return Ok(entry);
+                        return McpStartOutcome::Ready(entry);
                     }
                     self.evict_ready_if_current(&key, &entry).await;
                 }
                 McpCacheAction::Starting(mut wait) => {
                     self.wait_for_start(&key, &mut wait).await;
                 }
-                McpCacheAction::Start(signal) => {
+                McpCacheAction::CachedFailure => return McpStartOutcome::Cooldown,
+                McpCacheAction::Start { signal, was_failed } => {
                     let result = start_mcp_server(config, cwd.clone()).await;
-                    self.finish_start(&key, signal, result.as_ref().ok().cloned())
-                        .await;
-                    return result;
+                    self.finish_start(&key, signal, result.clone()).await;
+                    return match result {
+                        Ok(entry) if was_failed => McpStartOutcome::Recovered(entry),
+                        Ok(entry) => McpStartOutcome::Ready(entry),
+                        Err(message) => McpStartOutcome::Failed(message),
+                    };
                 }
             }
         }
@@ -67,21 +85,39 @@ impl McpToolCache {
         match entries.get(key) {
             Some(McpCacheEntry::Ready(entry)) => McpCacheAction::Ready(entry.clone()),
             Some(McpCacheEntry::Starting(wait)) => McpCacheAction::Starting(wait.clone()),
-            None => {
-                let generation = Arc::new(());
-                let (completed, receiver) = watch::channel(false);
-                entries.insert(
-                    key.clone(),
-                    McpCacheEntry::Starting(McpStartWait {
-                        generation: generation.clone(),
-                        completed: receiver,
-                    }),
-                );
-                McpCacheAction::Start(McpStartSignal {
-                    generation,
-                    completed,
-                })
+            // 冷却期内直接复用失败结果，避免每轮会话都重启注定失败的进程。
+            Some(McpCacheEntry::Failed(failed_at))
+                if failed_at.elapsed() < self.failure_cooldown =>
+            {
+                McpCacheAction::CachedFailure
             }
+            Some(McpCacheEntry::Failed(_)) => McpCacheAction::Start {
+                signal: Self::begin_start(&mut entries, key),
+                was_failed: true,
+            },
+            None => McpCacheAction::Start {
+                signal: Self::begin_start(&mut entries, key),
+                was_failed: false,
+            },
+        }
+    }
+
+    fn begin_start(
+        entries: &mut HashMap<McpServerKey, McpCacheEntry>,
+        key: &McpServerKey,
+    ) -> McpStartSignal {
+        let generation = Arc::new(());
+        let (completed, receiver) = watch::channel(false);
+        entries.insert(
+            key.clone(),
+            McpCacheEntry::Starting(McpStartWait {
+                generation: generation.clone(),
+                completed: receiver,
+            }),
+        );
+        McpStartSignal {
+            generation,
+            completed,
         }
     }
 
@@ -120,7 +156,7 @@ impl McpToolCache {
         &self,
         key: &McpServerKey,
         signal: McpStartSignal,
-        entry: Option<Arc<CachedMcpServer>>,
+        result: Result<Arc<CachedMcpServer>, String>,
     ) {
         let mut entries = self.entries.lock().await;
         if matches!(
@@ -129,8 +165,14 @@ impl McpToolCache {
                 if Arc::ptr_eq(&current.generation, &signal.generation)
         ) {
             entries.remove(key);
-            if let Some(entry) = entry {
-                entries.insert(key.clone(), McpCacheEntry::Ready(entry));
+            match result {
+                Ok(entry) => {
+                    entries.insert(key.clone(), McpCacheEntry::Ready(entry));
+                }
+                // 失败也落缓存：冷却期内的后续 discovery 静默跳过，不再重复提醒。
+                Err(_) => {
+                    entries.insert(key.clone(), McpCacheEntry::Failed(Instant::now()));
+                }
             }
         }
         drop(entries);
@@ -152,12 +194,26 @@ impl std::fmt::Debug for McpToolCache {
 enum McpCacheEntry {
     Ready(Arc<CachedMcpServer>),
     Starting(McpStartWait),
+    // 记录启动失败的时刻；冷却期内的 discovery 直接复用失败，不再重试或提醒。
+    Failed(Instant),
 }
 
 enum McpCacheAction {
     Ready(Arc<CachedMcpServer>),
     Starting(McpStartWait),
-    Start(McpStartSignal),
+    CachedFailure,
+    Start {
+        signal: McpStartSignal,
+        was_failed: bool,
+    },
+}
+
+// get_or_start 的结果，区分“新失败”和“冷却期内的已知失败”，后者不产生 diagnostic。
+enum McpStartOutcome {
+    Ready(Arc<CachedMcpServer>),
+    Recovered(Arc<CachedMcpServer>),
+    Failed(String),
+    Cooldown,
 }
 
 #[derive(Clone)]
@@ -234,11 +290,18 @@ pub async fn discover_tools(
 
     for (server_name, result) in discoveries {
         let entry = match result {
-            Ok(entry) => entry,
-            Err(message) => {
+            McpStartOutcome::Ready(entry) => entry,
+            McpStartOutcome::Recovered(entry) => {
+                diagnostics.push(format!(
+                    "mcp server {server_name}: recovered and is available again"
+                ));
+                entry
+            }
+            McpStartOutcome::Failed(message) => {
                 diagnostics.push(format!("mcp server {server_name}: {message}"));
                 continue;
             }
+            McpStartOutcome::Cooldown => continue,
         };
 
         if let Some(tool) =
@@ -1395,8 +1458,10 @@ mod tests {
     use std::fs;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::AtomicU64;
     use std::thread;
-    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static UNIQUE_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     struct FakeTransport {
         requests: Vec<String>,
@@ -1424,7 +1489,7 @@ mod tests {
         );
         let key = McpServerKey::from_config(&config, &root);
         let cache = Arc::new(McpToolCache::new());
-        let McpCacheAction::Start(signal) = cache.cache_action(&key).await else {
+        let McpCacheAction::Start { signal, .. } = cache.cache_action(&key).await else {
             panic!("first caller must start the MCP server");
         };
 
@@ -1445,14 +1510,19 @@ mod tests {
         waiter_ready_rx
             .await
             .expect("waiter reached starting state");
-        cache.finish_start(&key, signal, None).await;
+        cache
+            .finish_start(&key, signal, Err("start failed".to_string()))
+            .await;
         release_waiter_tx.send(()).expect("release waiter");
 
         tokio::time::timeout(Duration::from_secs(1), waiter)
             .await
             .expect("waiter must observe the completion sent before it waited")
             .expect("waiter task");
-        assert!(!cache.entries.lock().await.contains_key(&key));
+        assert!(matches!(
+            cache.entries.lock().await.get(&key),
+            Some(McpCacheEntry::Failed(_))
+        ));
     }
 
     #[tokio::test]
@@ -1465,7 +1535,7 @@ mod tests {
         );
         let key = McpServerKey::from_config(&config, &root);
         let cache = McpToolCache::new();
-        let McpCacheAction::Start(_signal) = cache.cache_action(&key).await else {
+        let McpCacheAction::Start { .. } = cache.cache_action(&key).await else {
             panic!("first caller must start the MCP server");
         };
 
@@ -1769,6 +1839,51 @@ mod tests {
         assert!(second.diagnostics.is_empty());
         assert_eq!(first.tools.len(), 1);
         assert_eq!(second.tools.len(), 1);
+        assert_eq!(started_count(&fixture.marker), 2);
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn failed_mcp_server_is_cached_without_retry_or_repeat_diagnostics() {
+        let fixture = fake_server(false, false);
+        fs::write(fixture.root.join("fail"), "1").expect("write fail gate");
+        let cache = McpToolCache::with_failure_cooldown(Duration::from_secs(3600));
+
+        let first =
+            discover_tools(&fixture.root, std::slice::from_ref(&fixture.config), &cache).await;
+        let second =
+            discover_tools(&fixture.root, std::slice::from_ref(&fixture.config), &cache).await;
+
+        assert!(first.tools.is_empty());
+        assert_eq!(first.diagnostics.len(), 1);
+        assert!(first.diagnostics[0].contains("mcp server fake"));
+        assert!(second.tools.is_empty());
+        assert!(second.diagnostics.is_empty());
+        assert_eq!(started_count(&fixture.marker), 1);
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn mcp_server_recovery_after_cooldown_is_reported_once() {
+        let fixture = fake_server(false, false);
+        fs::write(fixture.root.join("fail"), "1").expect("write fail gate");
+        let cache = McpToolCache::with_failure_cooldown(Duration::ZERO);
+
+        let failing =
+            discover_tools(&fixture.root, std::slice::from_ref(&fixture.config), &cache).await;
+        fs::remove_file(fixture.root.join("fail")).expect("remove fail gate");
+        let recovered =
+            discover_tools(&fixture.root, std::slice::from_ref(&fixture.config), &cache).await;
+        let stable =
+            discover_tools(&fixture.root, std::slice::from_ref(&fixture.config), &cache).await;
+
+        assert!(failing.tools.is_empty());
+        assert_eq!(failing.diagnostics.len(), 1);
+        assert_eq!(recovered.tools.len(), 1);
+        assert_eq!(recovered.diagnostics.len(), 1);
+        assert!(recovered.diagnostics[0].contains("recovered"));
+        assert_eq!(stable.tools.len(), 1);
+        assert!(stable.diagnostics.is_empty());
         assert_eq!(started_count(&fixture.marker), 2);
     }
 
@@ -2129,6 +2244,10 @@ mod tests {
             format!(
                 r#"#!/bin/sh
 printf 'started\n' >> '{}'
+# 测试开关：root 下存在 fail 文件时模拟启动失败。
+if [ -f '{}' ]; then
+  exit 1
+fi
 while IFS= read -r line; do
   case "$line" in
     *'"method":"initialize"'*)
@@ -2151,6 +2270,7 @@ while IFS= read -r line; do
 done
 "#,
                 marker.display(),
+                root.join("fail").display(),
                 hang_on_list,
                 exit_after_list
             ),
@@ -2350,11 +2470,11 @@ done
     }
 
     fn unique_dir(name: &str) -> PathBuf {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("morrow-mcp-{name}-{stamp}"));
+        let path = std::env::temp_dir().join(format!(
+            "morrow-mcp-{name}-{}-{}",
+            std::process::id(),
+            UNIQUE_DIR_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
         fs::create_dir_all(&path).expect("create temp dir");
         path
     }
