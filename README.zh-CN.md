@@ -218,6 +218,10 @@ JSONL 模式要求提供提示词，不可用于交互模式或 session 子命�
 
 crate 边界、turn 生命周期与扩展点见 [`ARCHITECTURE.md`](ARCHITECTURE.md)。
 
+<p align="center">
+  <img src="docs/architecture/architecture-ports.svg" alt="Morrow 架构 —— 核心定义端口，适配器实现端口" width="720">
+</p>
+
 | Crate | 职责 |
 | --- | --- |
 | `agent-cli` | CLI、REPL、JSONL、server 与配置装配 |

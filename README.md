@@ -218,6 +218,10 @@ JSONL mode requires a prompt and is not available for interactive mode or sessio
 
 Crate boundaries, turn lifecycle, and extension points: [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
+<p align="center">
+  <img src="docs/architecture/architecture-ports.svg" alt="Morrow architecture — core defines ports, adapters implement them" width="720">
+</p>
+
 | Crate | Responsibility |
 | --- | --- |
 | `agent-cli` | CLI, REPL, JSONL, server, config wiring |
