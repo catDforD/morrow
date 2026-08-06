@@ -22,6 +22,7 @@ import {
   Sparkles,
   Sun,
   Terminal,
+  TriangleAlert,
   X,
 } from 'lucide-react'
 import type { PermissionMode, StatusResponse } from './types'
@@ -404,6 +405,20 @@ function AboutSettings({ status }: { status: StatusResponse | null }) {
           />
         </dl>
       </div>
+
+      {status?.config_diagnostics.length ? (
+        <div className="settings-safety-note settings-diagnostics-note" role="status">
+          <TriangleAlert size={24} />
+          <div>
+            <strong>配置诊断</strong>
+            <ul>
+              {status.config_diagnostics.map((diagnostic, index) => (
+                <li key={`${index}-${diagnostic}`}>{diagnostic}</li>
+              ))}
+            </ul>
+          </div>
+        </div>
+      ) : null}
 
       <div className="settings-safety-note">
         <ShieldCheck size={24} />

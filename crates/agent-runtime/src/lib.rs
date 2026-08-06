@@ -43,6 +43,9 @@ pub use subagent_supervisor::{
 };
 
 pub const EVENT_SCHEMA_VERSION: u32 = 8;
+const AGENTS_MD_FILE_NAME: &str = "AGENTS.md";
+const MAX_AGENTS_MD_BYTES: u64 = 32 * 1024;
+const PROJECT_INSTRUCTIONS_PREFIX: &str = "Project instructions from AGENTS.md. Follow them for work in this workspace unless they conflict with runtime safety or role constraints:\n<project_instructions>";
 const MESSAGE_BASE_TOKENS: usize = 6;
 const TOOL_CALL_BASE_TOKENS: usize = 12;
 const REQUEST_PADDING_NUMERATOR: usize = 4;
@@ -129,6 +132,128 @@ pub struct RunAgentTurnOutcome {
     /// agent 或事件接收方错误。事件投递可能在 turn 完成后失败，因此这里为 Some
     /// 不等于 `TurnStatus::Failed`；最终状态应以 Session 中的 TurnRecord 为准。
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceInstructionsLoad {
+    pub effective_system_prompt: String,
+    pub diagnostics: Vec<String>,
+}
+
+pub fn load_workspace_instructions(
+    workspace_root: &Path,
+    base_system_prompt: &str,
+) -> WorkspaceInstructionsLoad {
+    let path = workspace_root.join(AGENTS_MD_FILE_NAME);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return unchanged_workspace_instructions(base_system_prompt);
+        }
+        Err(error) => {
+            return workspace_instruction_diagnostic(
+                base_system_prompt,
+                format!("failed to inspect {}: {error}", path.display()),
+            );
+        }
+    };
+
+    if !metadata.file_type().is_file() {
+        return workspace_instruction_diagnostic(
+            base_system_prompt,
+            format!(
+                "ignored {}: AGENTS.md must be a regular file and symbolic links are not supported",
+                path.display()
+            ),
+        );
+    }
+
+    if metadata.len() > MAX_AGENTS_MD_BYTES {
+        return oversized_workspace_instruction_diagnostic(
+            base_system_prompt,
+            &path,
+            metadata.len(),
+        );
+    }
+
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return workspace_instruction_diagnostic(
+                base_system_prompt,
+                format!("failed to read {}: {error}", path.display()),
+            );
+        }
+    };
+    if bytes.len() as u64 > MAX_AGENTS_MD_BYTES {
+        return oversized_workspace_instruction_diagnostic(
+            base_system_prompt,
+            &path,
+            bytes.len() as u64,
+        );
+    }
+
+    let content = match String::from_utf8(bytes) {
+        Ok(content) => content,
+        Err(error) => {
+            return workspace_instruction_diagnostic(
+                base_system_prompt,
+                format!(
+                    "ignored {}: AGENTS.md is not valid UTF-8: {error}",
+                    path.display()
+                ),
+            );
+        }
+    };
+    let content = content.trim_start_matches('\u{feff}').trim();
+    if content.is_empty() {
+        return unchanged_workspace_instructions(base_system_prompt);
+    }
+
+    let project_instructions =
+        format!("{PROJECT_INSTRUCTIONS_PREFIX}\n{content}\n</project_instructions>");
+    let base_system_prompt = base_system_prompt.trim_end();
+    let effective_system_prompt = if base_system_prompt.is_empty() {
+        project_instructions
+    } else {
+        format!("{base_system_prompt}\n\n{project_instructions}")
+    };
+
+    WorkspaceInstructionsLoad {
+        effective_system_prompt,
+        diagnostics: Vec::new(),
+    }
+}
+
+fn unchanged_workspace_instructions(base_system_prompt: &str) -> WorkspaceInstructionsLoad {
+    WorkspaceInstructionsLoad {
+        effective_system_prompt: base_system_prompt.to_string(),
+        diagnostics: Vec::new(),
+    }
+}
+
+fn workspace_instruction_diagnostic(
+    base_system_prompt: &str,
+    diagnostic: String,
+) -> WorkspaceInstructionsLoad {
+    WorkspaceInstructionsLoad {
+        effective_system_prompt: base_system_prompt.to_string(),
+        diagnostics: vec![diagnostic],
+    }
+}
+
+fn oversized_workspace_instruction_diagnostic(
+    base_system_prompt: &str,
+    path: &Path,
+    bytes: u64,
+) -> WorkspaceInstructionsLoad {
+    workspace_instruction_diagnostic(
+        base_system_prompt,
+        format!(
+            "ignored {}: AGENTS.md is {bytes} bytes and exceeds the {MAX_AGENTS_MD_BYTES}-byte limit",
+            path.display()
+        ),
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1757,6 +1882,93 @@ mod tests {
         path
     }
 
+    #[test]
+    fn workspace_instructions_append_agents_md_and_snapshot_the_content() {
+        let root = unique_dir("agents-valid");
+        let path = root.join(AGENTS_MD_FILE_NAME);
+        fs::write(&path, "\nUse the repository test commands.\n").expect("write AGENTS.md");
+
+        let loaded = load_workspace_instructions(&root, "base system prompt\n");
+        assert!(loaded.diagnostics.is_empty());
+        assert_eq!(
+            loaded.effective_system_prompt,
+            format!(
+                "base system prompt\n\n{PROJECT_INSTRUCTIONS_PREFIX}\nUse the repository test commands.\n</project_instructions>"
+            )
+        );
+
+        fs::write(&path, "Use the updated commands.").expect("update AGENTS.md");
+        assert!(!loaded.effective_system_prompt.contains("updated"));
+        let reloaded = load_workspace_instructions(&root, "base system prompt");
+        assert!(reloaded.effective_system_prompt.contains("updated"));
+
+        fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[test]
+    fn workspace_instructions_ignore_missing_empty_and_nested_agents_md() {
+        let root = unique_dir("agents-noop");
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested).expect("create nested root");
+        fs::write(nested.join(AGENTS_MD_FILE_NAME), "nested rule").expect("write nested rules");
+
+        let missing = load_workspace_instructions(&root, "base");
+        assert_eq!(missing.effective_system_prompt, "base");
+        assert!(missing.diagnostics.is_empty());
+
+        fs::write(root.join(AGENTS_MD_FILE_NAME), " \n\t").expect("write empty rules");
+        let empty = load_workspace_instructions(&root, "base");
+        assert_eq!(empty.effective_system_prompt, "base");
+        assert!(empty.diagnostics.is_empty());
+
+        fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[test]
+    fn workspace_instructions_warn_and_keep_base_for_invalid_files() {
+        let root = unique_dir("agents-invalid");
+        let path = root.join(AGENTS_MD_FILE_NAME);
+
+        fs::write(&path, [0xff, 0xfe]).expect("write invalid UTF-8");
+        let invalid = load_workspace_instructions(&root, "base");
+        assert_eq!(invalid.effective_system_prompt, "base");
+        assert_eq!(invalid.diagnostics.len(), 1);
+        assert!(invalid.diagnostics[0].contains("not valid UTF-8"));
+
+        fs::write(&path, vec![b'x'; MAX_AGENTS_MD_BYTES as usize + 1])
+            .expect("write oversized rules");
+        let oversized = load_workspace_instructions(&root, "base");
+        assert_eq!(oversized.effective_system_prompt, "base");
+        assert_eq!(oversized.diagnostics.len(), 1);
+        assert!(oversized.diagnostics[0].contains("exceeds the 32768-byte limit"));
+
+        fs::remove_file(&path).expect("remove oversized rules");
+        fs::create_dir(&path).expect("create AGENTS.md directory");
+        let directory = load_workspace_instructions(&root, "base");
+        assert_eq!(directory.effective_system_prompt, "base");
+        assert_eq!(directory.diagnostics.len(), 1);
+        assert!(directory.diagnostics[0].contains("must be a regular file"));
+
+        fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_instructions_do_not_follow_symbolic_links() {
+        let root = unique_dir("agents-symlink");
+        let target = root.join("shared-instructions.md");
+        fs::write(&target, "shared rule").expect("write symlink target");
+        std::os::unix::fs::symlink(&target, root.join(AGENTS_MD_FILE_NAME))
+            .expect("create AGENTS.md symlink");
+
+        let loaded = load_workspace_instructions(&root, "base");
+        assert_eq!(loaded.effective_system_prompt, "base");
+        assert_eq!(loaded.diagnostics.len(), 1);
+        assert!(loaded.diagnostics[0].contains("symbolic links are not supported"));
+
+        fs::remove_dir_all(root).expect("remove root");
+    }
+
     fn context_config(retain_recent_turns: usize) -> ContextConfig {
         ContextConfig {
             auto_compact: true,
@@ -2284,6 +2496,12 @@ compact test
     async fn delegate_task_runs_an_isolated_read_only_subagent() {
         let root = unique_dir("subagent-success");
         fs::write(root.join("note.txt"), "workspace evidence\n").expect("write note");
+        fs::write(
+            root.join(AGENTS_MD_FILE_NAME),
+            "Always preserve the workspace evidence.",
+        )
+        .expect("write project instructions");
+        let workspace_instructions = load_workspace_instructions(&root, "project policy");
         let (base_url, requests) = spawn_recording_sse_server(vec![
             tool_call_body(
                 "delegate-1",
@@ -2313,7 +2531,7 @@ compact test
                 client: &client,
                 model: test_model_invocation(),
                 subagent_identities: &subagent_identities,
-                system_prompt: "project policy",
+                system_prompt: &workspace_instructions.effective_system_prompt,
                 context_config: context_config(2),
                 model_limits: model_limits(100_000),
                 workspace_root: &root,
@@ -2388,8 +2606,10 @@ compact test
         assert!(requests[0].contains("delegate_task"));
         assert!(requests[0].contains("web_fetch"));
         assert!(requests[0].contains(PARENT_SUBAGENT_GUIDANCE));
+        assert!(requests[0].contains("Always preserve the workspace evidence."));
         assert!(requests[1].contains("Read note.txt and report the evidence"));
         assert!(requests[1].contains(CHILD_SUBAGENT_GUIDANCE));
+        assert!(requests[1].contains("Always preserve the workspace evidence."));
         assert!(requests[1].contains("read_file"));
         assert!(requests[1].contains("list_files"));
         assert!(requests[1].contains("search_text"));

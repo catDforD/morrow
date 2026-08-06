@@ -1975,7 +1975,12 @@ mod tests {
         let original = ConstantModel::new("original reply");
         let original_requests = original.requests.clone();
         let original_model: Arc<dyn Model> = Arc::new(original);
-        let roles = roles_with("original", |_| original_model.clone());
+        let mut roles = roles_with("original", |_| original_model.clone());
+        for runtime in roles.values_mut() {
+            runtime.base_system_prompt = Arc::from(
+                "test system prompt\n\nProject instructions from AGENTS.md:\nPreserve project rules.",
+            );
+        }
         let (supervisor, store_root, workspace) = test_supervisor("follow-up", roles);
         let instance = supervisor
             .spawn_instance(SubagentRole::Explore, "first question".to_string())
@@ -2041,6 +2046,7 @@ mod tests {
             .and_then(|message| message.content.as_deref())
             .expect("system prompt");
         assert!(system_prompt.contains("test system prompt"));
+        assert!(system_prompt.contains("Preserve project rules."));
         assert!(system_prompt.contains("web_fetch"));
         assert!(!system_prompt.contains("replacement system prompt"));
         assert!(!system_prompt.contains("replacement suffix"));
