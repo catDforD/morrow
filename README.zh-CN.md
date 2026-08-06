@@ -120,6 +120,14 @@ shell = "deny"
 
 Web 端的模型、MCP 服务器、自定义命令与 Subagent 设置分别在 **Settings → Models / MCP Servers / Commands / Subagents** 中管理，数据保存在 `~/.morrow/` 下，不影响 CLI 的 TOML 配置。更多示例见 [`morrow.example.toml`](morrow.example.toml)。
 
+### 项目指令
+
+工作区启动时，Morrow 会读取已解析工作区根目录下的 `AGENTS.md`，并将其追加到 `[agent].system_prompt`。同一份快照会应用于主 Agent、临时委派 Agent 和持久 Subagent。运行时角色限制与权限校验仍然优先，`AGENTS.md` 不能授予额外的工具访问权限。
+
+只加载根目录的 `AGENTS.md`。文件必须是普通 UTF-8 文件且不超过 32 KiB；不会跟随符号链接，也不会查找嵌套文件或备用文件名。文件缺失或为空时直接忽略；读取失败会在启动终端及 **设置 → 关于** 中显示告警，同时继续使用基础 system prompt。
+
+文件修改会在下次启动 CLI/server，或重新打开桌面/WSL 工作区时生效。其内容会作为 system prompt 的一部分发送给所配置的模型，因此不要在 `AGENTS.md` 中保存密钥等敏感信息。
+
 ### MCP 工具
 
 可在配置中注册 stdio 与 Streamable HTTP MCP 服务器，发现后的工具以 `mcp__server__tool` 形式暴露给模型：
@@ -209,6 +217,10 @@ JSONL 模式要求提供提示词，不可用于交互模式或 session 子命�
 ## 开发
 
 crate 边界、turn 生命周期与扩展点见 [`ARCHITECTURE.md`](ARCHITECTURE.md)。
+
+<p align="center">
+  <img src="docs/architecture/architecture-ports.svg" alt="Morrow 架构 —— 核心定义端口，适配器实现端口" width="720">
+</p>
 
 | Crate | 职责 |
 | --- | --- |

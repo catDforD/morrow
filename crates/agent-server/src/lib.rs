@@ -26,7 +26,7 @@ use agent_runtime::{
     SessionHandle, SessionListingDiagnostic, SessionListingEntry, SessionStore,
     SessionSubscription, SubagentController, SubagentInstanceDocument, SubagentObserver,
     SubagentRoleRuntime, SubagentSupervisor, TurnEventHandler, inspect_mcp_servers,
-    subagent_store_for_session,
+    load_workspace_instructions, subagent_store_for_session,
 };
 use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -99,6 +99,10 @@ pub fn server_options_from_loaded_config(
     loaded: LoadedServerConfig,
     default_session_name: String,
 ) -> Result<ServerOptions, ModelError> {
+    let workspace_instructions =
+        load_workspace_instructions(&workspace_root, &loaded.config.agent.system_prompt);
+    let mut config_diagnostics = loaded.diagnostics;
+    config_diagnostics.extend(workspace_instructions.diagnostics);
     let fallback_model = loaded
         .model
         .map(|model| {
@@ -132,12 +136,12 @@ pub fn server_options_from_loaded_config(
         mcp_store_path: home.join(".morrow").join("web-mcp.json"),
         command_store_path: home.join(".morrow").join("commands"),
         subagent_store_path: home.join(".morrow").join("subagents.json"),
-        system_prompt: loaded.config.agent.system_prompt,
+        system_prompt: workspace_instructions.effective_system_prompt,
         context_config: loaded.config.context,
         workspace_root,
         workspace_location,
         config_path: loaded.path,
-        config_diagnostics: loaded.diagnostics,
+        config_diagnostics,
         permissions: PermissionProfile::for_mode(DEFAULT_WEB_PERMISSION_MODE),
         mcp_servers: loaded.config.mcp_servers,
         default_session_name,
@@ -3585,7 +3589,7 @@ fn broadcast_error(tx: &broadcast::Sender<ServerMessage>, message: impl ToString
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_config::ModelContextLimits;
+    use agent_config::{AgentConfig, ModelContextLimits, ServerAppConfig};
     use agent_model::{OpenAiCompatClient, OpenAiCompatConfig};
     use agent_protocol::{
         ModelInvocation, PermissionMode, ReasoningLevel, ReasoningProfile, ShellPolicy,
@@ -3672,7 +3676,10 @@ mod tests {
     }
 
     fn test_state() -> AppState {
-        let options = test_options();
+        test_state_with_options(test_options())
+    }
+
+    fn test_state_with_options(options: ServerOptions) -> AppState {
         let model_registry = ModelRegistry::load(
             options.model_store_path.clone(),
             &options.workspace_root,
@@ -3710,6 +3717,69 @@ mod tests {
         path
     }
 
+    #[test]
+    fn server_options_load_workspace_instructions_and_preserve_diagnostics() {
+        let root = unique_test_dir("agents-options");
+        fs::write(
+            root.join("AGENTS.md"),
+            "Use the workspace release checklist.",
+        )
+        .expect("write AGENTS.md");
+        let loaded_config = || LoadedServerConfig {
+            config: ServerAppConfig {
+                agent: AgentConfig {
+                    system_prompt: "base system prompt".to_string(),
+                },
+                context: ContextConfig {
+                    auto_compact: false,
+                    auto_compact_threshold: 0.835,
+                    retain_recent_turns: 2,
+                    summary_target_tokens: 256,
+                    compact_max_retries: 2,
+                },
+                permissions: PermissionProfile::for_mode(DEFAULT_WEB_PERMISSION_MODE),
+                mcp_servers: Vec::new(),
+            },
+            path: None,
+            model: None,
+            diagnostics: vec!["existing diagnostic".to_string()],
+        };
+
+        let options = server_options_from_loaded_config(
+            "127.0.0.1".parse().expect("host"),
+            0,
+            root.clone(),
+            &root,
+            loaded_config(),
+            "default".to_string(),
+        )
+        .expect("server options");
+        assert!(options.system_prompt.starts_with("base system prompt"));
+        assert!(
+            options
+                .system_prompt
+                .contains("Use the workspace release checklist.")
+        );
+        assert_eq!(options.config_diagnostics, ["existing diagnostic"]);
+
+        fs::write(root.join("AGENTS.md"), [0xff]).expect("write invalid AGENTS.md");
+        let invalid = server_options_from_loaded_config(
+            "127.0.0.1".parse().expect("host"),
+            0,
+            root.clone(),
+            &root,
+            loaded_config(),
+            "default".to_string(),
+        )
+        .expect("server options with invalid instructions");
+        assert_eq!(invalid.system_prompt, "base system prompt");
+        assert_eq!(invalid.config_diagnostics.len(), 2);
+        assert_eq!(invalid.config_diagnostics[0], "existing diagnostic");
+        assert!(invalid.config_diagnostics[1].contains("not valid UTF-8"));
+
+        fs::remove_dir_all(root).expect("remove root");
+    }
+
     #[tokio::test]
     async fn status_response_omits_api_key() {
         let response = status(State(test_state())).await;
@@ -3723,6 +3793,19 @@ mod tests {
                 .is_some_and(|path| path.ends_with("subagents.json"))
         );
         assert!(!value.to_string().contains("secret-test-key"));
+    }
+
+    #[tokio::test]
+    async fn status_response_includes_workspace_instruction_diagnostics() {
+        let mut options = test_options();
+        options.config_diagnostics = vec!["AGENTS.md could not be loaded".to_string()];
+        let response = status(State(test_state_with_options(options))).await;
+        let value = serde_json::to_value(response.0).expect("status json");
+
+        assert_eq!(
+            value["config_diagnostics"],
+            json!(["AGENTS.md could not be loaded"])
+        );
     }
 
     #[tokio::test]

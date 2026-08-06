@@ -120,6 +120,14 @@ Inline `[model].OPENAI_API_KEY` wins when present; otherwise Morrow reads `api_k
 
 Web-only models, MCP servers, custom commands, and subagent settings are managed under **Settings → Models / MCP Servers / Commands / Subagents** and stored under `~/.morrow/`; they do not change the CLI TOML config. See [`morrow.example.toml`](morrow.example.toml) for more examples.
 
+### Project instructions
+
+When a workspace starts, Morrow reads `AGENTS.md` from the resolved workspace root and appends it to `[agent].system_prompt`. The same snapshot applies to the main agent, temporary delegated agents, and persistent subagents. Runtime role restrictions and permission enforcement still take precedence; `AGENTS.md` cannot grant additional tool access.
+
+Only the root `AGENTS.md` is loaded. It must be a regular UTF-8 file no larger than 32 KiB; symbolic links, nested files, and fallback names are not followed. Missing and empty files are ignored. Read failures produce a startup warning and appear under **Settings → About**, while the agent continues with the base system prompt.
+
+Changes take effect the next time the CLI/server starts or the desktop/WSL workspace is reopened. The instructions are sent to the configured model as part of the system prompt, so do not put secrets in `AGENTS.md`.
+
 ### MCP tools
 
 Register stdio and Streamable HTTP MCP servers in config. Discovered tools are exposed as `mcp__server__tool`:
@@ -209,6 +217,10 @@ JSONL mode requires a prompt and is not available for interactive mode or sessio
 ## Development
 
 Crate boundaries, turn lifecycle, and extension points: [`ARCHITECTURE.md`](ARCHITECTURE.md).
+
+<p align="center">
+  <img src="docs/architecture/architecture-ports.svg" alt="Morrow architecture — core defines ports, adapters implement them" width="720">
+</p>
 
 | Crate | Responsibility |
 | --- | --- |

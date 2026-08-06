@@ -1,0 +1,125 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="780" viewBox="0 0 960 780" role="img" aria-label="Morrow Agent 架构图（端口视角）">
+  <style>
+    :root {
+      --bg: #ffffff; --box: #ffffff; --line: #d7dbe0;
+      --text: #111827; --sub: #5f6b7a; --label: #9aa3ad;
+      --arrow: #9aa3ad; --accent: #0f766e; --accent-bg: #effaf8;
+      --core: #111827; --core-text: #f9fafb; --core-sub: #c3cad3;
+      --faint: #c9cfd6;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0d1117; --box: #161b22; --line: #30363d;
+        --text: #e6edf3; --sub: #9da7b3; --label: #6e7681;
+        --arrow: #6e7681; --accent: #2dd4bf; --accent-bg: rgba(45,212,191,.08);
+        --core: #e6edf3; --core-text: #11151c; --core-sub: #3d4654;
+        --faint: #3d444d;
+      }
+    }
+    text { font-family: ui-sans-serif, -apple-system, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif; }
+    .title { font-size: 21px; font-weight: 650; fill: var(--text); }
+    .tagline { font-size: 12px; fill: var(--sub); }
+    .name { font-size: 15px; font-weight: 600; fill: var(--text); }
+    .sub { font-size: 12px; fill: var(--sub); }
+    .box { fill: var(--box); stroke: var(--line); stroke-width: 1.2; }
+    .flow { stroke: var(--arrow); stroke-width: 1.3; fill: none; }
+    .impl { stroke: var(--accent); stroke-width: 1.3; fill: none; stroke-dasharray: 5 4; }
+    .dep { stroke: var(--faint); stroke-width: 1.2; fill: none; stroke-dasharray: 3 4; }
+    .corename { font-size: 16px; font-weight: 600; fill: var(--core-text); }
+    .coresub { font-size: 12px; fill: var(--core-sub); }
+    .coretiny { font-size: 10.5px; fill: var(--core-sub); }
+    .note { font-size: 11px; fill: var(--sub); }
+    .port { fill: var(--bg); stroke: var(--accent); stroke-width: 1.3; }
+    .porttext { font-size: 11px; fill: var(--accent); }
+  </style>
+
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+      <path d="M0 1 L8 5 L0 9 z" fill="var(--arrow)"/>
+    </marker>
+    <marker id="arrA" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+      <path d="M0 1 L8 5 L0 9 z" fill="var(--accent)"/>
+    </marker>
+    <marker id="arrF" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+      <path d="M0 1 L8 5 L0 9 z" fill="var(--faint)"/>
+    </marker>
+  </defs>
+
+  <rect width="960" height="780" rx="12" fill="var(--bg)"/>
+
+  <text x="60" y="44" class="title">Morrow Agent 架构</text>
+  <text x="60" y="66" class="tagline">核心定义端口，适配器实现端口，编排层注入实现</text>
+
+  <!-- 入口 -->
+  <rect x="60" y="86" width="190" height="64" rx="10" class="box"/>
+  <text x="76" y="112" class="name">agent-cli</text>
+  <text x="76" y="134" class="sub">CLI · REPL · JSONL</text>
+  <rect x="285" y="86" width="190" height="64" rx="10" class="box"/>
+  <text x="301" y="112" class="name">agent-server</text>
+  <text x="301" y="134" class="sub">HTTP · WS · Web UI</text>
+  <rect x="510" y="86" width="190" height="64" rx="10" class="box"/>
+  <text x="526" y="112" class="name">agent-desktop</text>
+  <text x="526" y="134" class="sub">Tauri 桌面端</text>
+  <rect x="735" y="86" width="190" height="64" rx="10" class="box"/>
+  <text x="751" y="112" class="name">agent-remote</text>
+  <text x="751" y="134" class="sub">remote protocol v2</text>
+
+  <path class="flow" marker-end="url(#arr)" d="M155 150 L360 216"/>
+  <path class="flow" marker-end="url(#arr)" d="M380 150 L440 216"/>
+  <path class="flow" marker-end="url(#arr)" d="M605 150 L520 216"/>
+  <path class="flow" marker-end="url(#arr)" d="M830 150 L600 216"/>
+
+  <!-- 编排 -->
+  <rect x="310" y="216" width="340" height="72" rx="10" fill="var(--accent-bg)" stroke="var(--accent)" stroke-width="1.4"/>
+  <text x="328" y="242" class="name">agent-runtime</text>
+  <text x="328" y="264" class="sub">编排 · 压缩 · SessionStore · MCP 装配</text>
+
+  <path class="flow" marker-end="url(#arr)" d="M480 288 L480 334"/>
+  <text x="494" y="314" class="note">注入端口实现</text>
+
+  <!-- 核心 -->
+  <circle cx="480" cy="430" r="88" fill="var(--core)"/>
+  <text x="480" y="420" text-anchor="middle" class="corename">agent-core</text>
+  <text x="480" y="442" text-anchor="middle" class="coresub">turn 状态机</text>
+  <text x="480" y="460" text-anchor="middle" class="coretiny">审批 · 取消 · 并发</text>
+
+  <!-- 左适配器：模型 -->
+  <rect x="40" y="394" width="220" height="72" rx="10" class="box"/>
+  <text x="58" y="420" class="name">agent-model</text>
+  <text x="58" y="442" class="sub">OpenAI-compatible · SSE</text>
+  <path class="impl" marker-end="url(#arrA)" d="M260 430 L344 430"/>
+  <rect x="348" y="417" width="80" height="26" rx="13" class="port"/>
+  <text x="388" y="434" text-anchor="middle" class="porttext">Model 端口</text>
+
+  <!-- 右适配器：工具 -->
+  <rect x="700" y="394" width="220" height="72" rx="10" class="box"/>
+  <text x="718" y="420" class="name">agent-tools</text>
+  <text x="718" y="442" class="sub">内置工具 · ToolRegistry · MCP</text>
+  <path class="impl" marker-end="url(#arrA)" d="M700 430 L638 430"/>
+  <rect x="510" y="417" width="124" height="26" rx="13" class="port"/>
+  <text x="572" y="434" text-anchor="middle" class="porttext">ToolRuntime 端口</text>
+
+  <!-- 沙箱 -->
+  <path class="flow" marker-end="url(#arr)" d="M810 466 L810 540"/>
+  <rect x="700" y="540" width="220" height="56" rx="10" class="box"/>
+  <text x="718" y="564" class="name">agent-sandbox</text>
+  <text x="718" y="584" class="sub">路径约束 · 权限策略</text>
+
+  <!-- 基础 -->
+  <path class="dep" marker-end="url(#arrF)" d="M330 668 L445 514"/>
+  <path class="dep" marker-end="url(#arrF)" d="M630 668 L515 514"/>
+  <rect x="170" y="668" width="280" height="64" rx="10" class="box"/>
+  <text x="188" y="694" class="name">agent-protocol</text>
+  <text x="188" y="716" class="sub">Message / Turn / Session / Event</text>
+  <rect x="510" y="668" width="280" height="64" rx="10" class="box"/>
+  <text x="528" y="694" class="name">agent-config</text>
+  <text x="528" y="716" class="sub">配置加载与校验</text>
+
+  <!-- 图例 -->
+  <line x1="60" y1="756" x2="92" y2="756" class="flow" marker-end="url(#arr)"/>
+  <text x="100" y="760" class="note">编译依赖</text>
+  <line x1="190" y1="756" x2="222" y2="756" class="impl" marker-end="url(#arrA)"/>
+  <text x="230" y="760" class="note">实现端口（依赖倒置）</text>
+  <line x1="410" y1="756" x2="442" y2="756" class="dep" marker-end="url(#arrF)"/>
+  <text x="450" y="760" class="note">共享类型 / 配置</text>
+</svg>

@@ -1493,6 +1493,21 @@ a:focus-visible {
   line-height: 1.5;
 }
 
+.settings-diagnostics-note {
+  background: var(--surface-danger);
+}
+
+.settings-diagnostics-note ul {
+  display: grid;
+  gap: 6px;
+  margin: 6px 0 0;
+  padding-left: 18px;
+  color: color-mix(in srgb, var(--foreground), transparent 18%);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
 .conversation-panel {
   position: relative;
   width: 100%;

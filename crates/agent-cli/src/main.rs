@@ -11,7 +11,7 @@ use agent_protocol::{
 };
 use agent_runtime::{
     AgentEventEnvelope, CompactionOutcome, McpToolCache, RunAgentTurnOutcome, SessionHandle,
-    SessionStore, SubagentSessionStore, TurnEventHandler,
+    SessionStore, SubagentSessionStore, TurnEventHandler, load_workspace_instructions,
 };
 use clap::{Parser, Subcommand};
 use futures_util::future::{BoxFuture, FutureExt};
@@ -196,7 +196,6 @@ async fn run() -> Result<(), CliError> {
     if let Some(CliCommand::Server { host, port }) = args.command.as_ref() {
         let loaded = load_server_config(args.config.as_deref())?;
         let home = dirs::home_dir().ok_or(CliError::HomeDirNotFound)?;
-        eprintln!("morrow server listening on http://{host}:{port}");
         let options = agent_server::server_options_from_loaded_config(
             *host,
             *port,
@@ -205,6 +204,8 @@ async fn run() -> Result<(), CliError> {
             loaded,
             session_name,
         )?;
+        print_startup_diagnostics(&options.config_diagnostics);
+        eprintln!("morrow server listening on http://{host}:{port}");
         agent_server::serve(options).await?;
         return Ok(());
     }
@@ -213,6 +214,10 @@ async fn run() -> Result<(), CliError> {
     let home = dirs::home_dir().ok_or(CliError::HomeDirNotFound)?;
     let subagent_store_path = home.join(".morrow").join("subagents.json");
     let loaded = load_config(args.config.as_deref())?;
+    let workspace_instructions =
+        load_workspace_instructions(&workspace_root, &loaded.config.agent.system_prompt);
+    print_startup_diagnostics(&workspace_instructions.diagnostics);
+    let system_prompt = workspace_instructions.effective_system_prompt;
     let model_limits = loaded.config.model.context_limits();
     let model_invocation = config_model_invocation(&loaded.config.model.model);
     let permissions =
@@ -239,7 +244,7 @@ async fn run() -> Result<(), CliError> {
             ReplContext {
                 client: &client,
                 model: &model_invocation,
-                system_prompt: &loaded.config.agent.system_prompt,
+                system_prompt: &system_prompt,
                 context_config: loaded.config.context,
                 model_limits,
                 session_handle: &session_handle,
@@ -265,7 +270,7 @@ async fn run() -> Result<(), CliError> {
             client: &client,
             model: &model_invocation,
             subagent_identities: &subagent_identities,
-            system_prompt: &loaded.config.agent.system_prompt,
+            system_prompt: &system_prompt,
             context_config: loaded.config.context,
             model_limits,
             workspace_root: &workspace_root,
@@ -293,6 +298,12 @@ async fn run() -> Result<(), CliError> {
     }
 
     Ok(())
+}
+
+fn print_startup_diagnostics(diagnostics: &[String]) {
+    for diagnostic in diagnostics {
+        eprintln!("warning: {diagnostic}");
+    }
 }
 
 struct ReplContext<'a> {
