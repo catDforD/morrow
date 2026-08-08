@@ -3438,6 +3438,7 @@ async fn prepare_subagent_supervisor_with_runtime(
                 role_config,
                 base_system_prompt: Arc::from(state.inner.options.system_prompt.clone()),
                 parent_permissions,
+                middleware: Arc::new(agent_runtime::MiddlewareRegistry::default()),
             },
         );
     }
@@ -4730,7 +4731,10 @@ mod tests {
                 .expect("export header"),
         )
         .expect("parse export header");
-        assert_eq!(header.schema_version, 5);
+        assert_eq!(
+            header.schema_version,
+            agent_protocol::SESSION_DOCUMENT_SCHEMA_VERSION
+        );
 
         let archived = archive_session(State(state.clone()), Path("work".to_string()))
             .await

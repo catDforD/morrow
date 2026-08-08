@@ -632,6 +632,22 @@ impl TurnEventHandler for CliTurnHandler<'_, '_> {
         match &envelope.event {
             AgentEvent::TurnStarted => {}
             AgentEvent::ModelCallStarted => {}
+            AgentEvent::MiddlewareStarted(invocation) => {
+                if self.context.output == OutputMode::Human {
+                    eprintln!(
+                        "middleware {} {:?} started",
+                        invocation.middleware_id, invocation.stage
+                    );
+                }
+            }
+            AgentEvent::MiddlewareFinished(invocation) => {
+                if self.context.output == OutputMode::Human {
+                    eprintln!(
+                        "middleware {} {:?} {:?}",
+                        invocation.middleware_id, invocation.stage, invocation.outcome
+                    );
+                }
+            }
             AgentEvent::Warning(message) => {
                 if self.context.output == OutputMode::Human {
                     eprintln!("warning: {message}");

@@ -310,6 +310,7 @@ export interface SessionProjection {
   revision: number
   turns: TurnProjection[]
   context: ModelContextProjection
+  middleware_audit: MiddlewareInvocationFinished[]
   diagnostics: string[]
 }
 
@@ -361,6 +362,7 @@ export type SessionUpdate =
   | { type: 'approvals_replaced'; data: ApprovalRequest[] }
   | { type: 'subagent_upserted'; data: SubagentInstanceSnapshot }
   | { type: 'subagent_removed'; data: { instance_id: string } }
+  | { type: 'middleware_recorded'; data: MiddlewareInvocationFinished }
   | { type: 'notice'; data: { message: string } }
 
 export interface SessionUpdateEnvelope {
@@ -523,9 +525,45 @@ export interface ApprovalDecision {
   approved: boolean
 }
 
+export type MiddlewareStage =
+  | 'before_prompt'
+  | 'before_tool'
+  | 'permission_request'
+  | 'after_tool'
+  | 'pre_compact'
+  | 'post_compact'
+
+export type MiddlewareSource = 'internal' | 'user_command' | 'project_command'
+
+export type MiddlewareOutcome =
+  | 'continue'
+  | 'approve'
+  | 'deny'
+  | 'failed_open'
+  | 'failed_closed'
+  | 'cancelled'
+  | 'skipped_untrusted'
+
+export interface MiddlewareInvocationStarted {
+  invocation_id: string
+  middleware_id: string
+  source: MiddlewareSource
+  stage: MiddlewareStage
+  started_at_ms: number
+}
+
+export interface MiddlewareInvocationFinished
+  extends MiddlewareInvocationStarted {
+  outcome: MiddlewareOutcome
+  duration_ms: number
+  reason?: string | null
+}
+
 export type AgentEvent =
   | { type: 'turn_started' }
   | { type: 'model_call_started' }
+  | { type: 'middleware_started'; data: MiddlewareInvocationStarted }
+  | { type: 'middleware_finished'; data: MiddlewareInvocationFinished }
   | { type: 'warning'; data: string }
   | { type: 'reasoning_delta'; data: string }
   | { type: 'text_delta'; data: string }

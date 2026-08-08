@@ -312,6 +312,7 @@ impl SessionStore {
         self.validate_lease(lease)?;
         if self.path.is_file() {
             repair_log_tail(&self.path)?;
+            upgrade_v5_log_schema(&self.path)?;
             read_log_path(&self.path)?;
             return Ok(());
         }
@@ -329,6 +330,7 @@ impl SessionStore {
         self.validate_lease(lease)?;
         if self.path.is_file() {
             repair_log_tail(&self.path)?;
+            upgrade_v5_log_schema(&self.path)?;
             read_log_path(&self.path)?;
             return Ok(());
         }
@@ -1220,7 +1222,7 @@ fn read_log_path(
             source,
         }
     })?;
-    if header.schema_version != SESSION_DOCUMENT_SCHEMA_VERSION {
+    if !matches!(header.schema_version, 5 | SESSION_DOCUMENT_SCHEMA_VERSION) {
         return Err(SessionStoreError::UnsupportedSchemaVersion {
             path: path.to_path_buf(),
             version: header.schema_version,
@@ -1272,7 +1274,7 @@ fn read_log_header(path: &Path) -> Result<SessionLogHeader, SessionStoreError> {
             source,
         }
     })?;
-    if header.schema_version != SESSION_DOCUMENT_SCHEMA_VERSION {
+    if !matches!(header.schema_version, 5 | SESSION_DOCUMENT_SCHEMA_VERSION) {
         return Err(SessionStoreError::UnsupportedSchemaVersion {
             path: path.to_path_buf(),
             version: header.schema_version,
@@ -1338,6 +1340,72 @@ fn write_log_atomic(
     sync_parent_directory(parent).map_err(|source| SessionStoreError::Write {
         path: parent.to_path_buf(),
         source,
+    })
+}
+
+fn upgrade_v5_log_schema(path: &Path) -> Result<(), SessionStoreError> {
+    let bytes = fs::read(path).map_err(|source| SessionStoreError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let Some(newline) = bytes.iter().position(|byte| *byte == b'\n') else {
+        return Err(SessionStoreError::InvalidLog {
+            path: path.to_path_buf(),
+            message: "missing log header terminator".to_string(),
+        });
+    };
+    let mut header =
+        serde_json::from_slice::<SessionLogHeader>(&bytes[..newline]).map_err(|source| {
+            SessionStoreError::Parse {
+                path: path.to_path_buf(),
+                source,
+            }
+        })?;
+    if header.schema_version == SESSION_DOCUMENT_SCHEMA_VERSION {
+        return Ok(());
+    }
+    if header.schema_version != 5 {
+        return Err(SessionStoreError::UnsupportedSchemaVersion {
+            path: path.to_path_buf(),
+            version: header.schema_version,
+            expected: SESSION_DOCUMENT_SCHEMA_VERSION,
+        });
+    }
+    header.schema_version = SESSION_DOCUMENT_SCHEMA_VERSION;
+    let mut upgraded =
+        serde_json::to_vec(&header).map_err(|source| SessionStoreError::Serialize {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    upgraded.push(b'\n');
+    upgraded.extend_from_slice(&bytes[newline + 1..]);
+    let temp = path.with_file_name(format!(
+        "{}.schema-upgrade-{}",
+        path.file_name()
+            .expect("session path has file name")
+            .to_string_lossy(),
+        std::process::id()
+    ));
+    let mut file = File::create(&temp).map_err(|source| SessionStoreError::Write {
+        path: temp.clone(),
+        source,
+    })?;
+    file.write_all(&upgraded)
+        .and_then(|_| file.flush())
+        .and_then(|_| file.sync_all())
+        .map_err(|source| SessionStoreError::Write {
+            path: temp.clone(),
+            source,
+        })?;
+    replace_file(&temp, path).map_err(|source| SessionStoreError::Replace {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    sync_parent_directory(path.parent().expect("session path must have parent")).map_err(|source| {
+        SessionStoreError::Write {
+            path: path.to_path_buf(),
+            source,
+        }
     })
 }
 
@@ -1736,7 +1804,7 @@ mod tests {
     }
 
     #[test]
-    fn saves_v5_jsonl_and_loads_projected_context() {
+    fn saves_v6_jsonl_and_loads_projected_context() {
         let root = unique_dir("save");
         let legacy = unique_dir("save-legacy");
         let cwd = unique_dir("save-cwd");
@@ -1749,9 +1817,59 @@ mod tests {
             Some("jsonl")
         );
         let (header, facts) = store.load_log().expect("load log");
-        assert_eq!(header.schema_version, 5);
+        assert_eq!(header.schema_version, 6);
         assert!(!facts.is_empty());
         assert_eq!(store.load().expect("load"), sample_session());
+    }
+
+    #[test]
+    fn upgrades_v5_jsonl_header_without_rewriting_facts() {
+        let root = unique_dir("upgrade-v5");
+        let legacy = unique_dir("upgrade-v5-legacy");
+        let cwd = unique_dir("upgrade-v5-cwd");
+        let store = make_store(&root, &legacy, &cwd, "default");
+        store.save(&sample_session()).expect("save");
+
+        let original = fs::read(store.path()).expect("read v6 log");
+        let newline = original
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .expect("header newline");
+        let mut header: SessionLogHeader =
+            serde_json::from_slice(&original[..newline]).expect("parse header");
+        header.schema_version = 5;
+        let mut legacy_bytes = serde_json::to_vec(&header).expect("serialize v5 header");
+        legacy_bytes.push(b'\n');
+        legacy_bytes.extend_from_slice(&original[newline + 1..]);
+        fs::write(store.path(), &legacy_bytes).expect("write v5 log");
+
+        assert_eq!(
+            store
+                .load_log()
+                .expect("read compatible v5")
+                .0
+                .schema_version,
+            5
+        );
+        let lease = store.acquire_writer().expect("lease");
+        store.ensure_v5(&lease).expect("upgrade");
+
+        let upgraded = fs::read(store.path()).expect("read upgraded log");
+        let upgraded_newline = upgraded
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .expect("upgraded header newline");
+        let upgraded_header: SessionLogHeader =
+            serde_json::from_slice(&upgraded[..upgraded_newline]).expect("parse upgraded header");
+        assert_eq!(
+            upgraded_header.schema_version,
+            SESSION_DOCUMENT_SCHEMA_VERSION
+        );
+        assert_eq!(
+            &upgraded[upgraded_newline + 1..],
+            &legacy_bytes[newline + 1..]
+        );
+        assert_eq!(store.load().expect("load upgraded"), sample_session());
     }
 
     #[test]

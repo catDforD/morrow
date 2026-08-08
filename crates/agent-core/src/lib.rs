@@ -1,3 +1,12 @@
+mod middleware;
+
+pub use middleware::{
+    AfterToolInput, AgentMiddleware, AgentMiddlewareChain, BeforeToolInput, ContextBlock,
+    FailureMode, GateDecision, GateOutput, GateRun, MiddlewareContextBlock, MiddlewareError,
+    MiddlewareExecutionContext, MiddlewareFuture, ObservationOutput, ObservationRun,
+    PermissionDecision, PermissionOutput, PermissionRequestInput, PermissionRun,
+};
+
 use agent_protocol::{
     AgentEvent, ApprovalDecision, ApprovalRequest, Conversation, Message, ModelInvocation,
     SubagentExecutionSummary, SubagentIdentity, Thread, ToolCall, ToolDefinition,
@@ -210,6 +219,13 @@ pub struct ToolExecutionContext {
     pub cancellation: CancellationToken,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct AgentRunContext {
+    pub tool: ToolExecutionContext,
+    pub middleware: Option<MiddlewareExecutionContext>,
+    pub initial_context: Vec<MiddlewareContextBlock>,
+}
+
 pub trait ToolRuntime: Send + Sync {
     fn definitions(&self) -> Vec<ToolDefinition>;
 
@@ -257,6 +273,7 @@ pub struct Agent<'a> {
     model: &'a dyn Model,
     system_prompt: String,
     tools: &'a dyn ToolRuntime,
+    middleware: AgentMiddlewareChain,
     max_tool_rounds: usize,
 }
 
@@ -266,6 +283,7 @@ impl fmt::Debug for Agent<'_> {
             .debug_struct("Agent")
             .field("system_prompt", &self.system_prompt)
             .field("tool_count", &self.tools.definitions().len())
+            .field("middleware", &self.middleware)
             .field("max_tool_rounds", &self.max_tool_rounds)
             .finish()
     }
@@ -285,6 +303,7 @@ impl<'a> Agent<'a> {
             model,
             system_prompt: system_prompt.into(),
             tools: &EMPTY_TOOL_RUNTIME,
+            middleware: AgentMiddlewareChain::default(),
             max_tool_rounds: DEFAULT_MAX_TOOL_ROUNDS,
         }
     }
@@ -298,8 +317,14 @@ impl<'a> Agent<'a> {
             model,
             system_prompt: system_prompt.into(),
             tools,
+            middleware: AgentMiddlewareChain::default(),
             max_tool_rounds: DEFAULT_MAX_TOOL_ROUNDS,
         }
+    }
+
+    pub fn with_middleware(mut self, middleware: AgentMiddlewareChain) -> Self {
+        self.middleware = middleware;
+        self
     }
 
     pub fn with_max_tool_rounds(mut self, max_tool_rounds: usize) -> Self {
@@ -322,9 +347,27 @@ impl<'a> Agent<'a> {
         prompt: impl Into<String>,
         tool_context: ToolExecutionContext,
     ) -> Result<AgentTurnStream<'b>, AgentError> {
+        self.run_turn_with_agent_context(
+            thread,
+            prompt,
+            AgentRunContext {
+                tool: tool_context,
+                ..AgentRunContext::default()
+            },
+        )
+        .await
+    }
+
+    pub async fn run_turn_with_agent_context<'b>(
+        &'b self,
+        thread: &Thread,
+        prompt: impl Into<String>,
+        run_context: AgentRunContext,
+    ) -> Result<AgentTurnStream<'b>, AgentError> {
         let user_message = Message::user(prompt.into());
         let mut conversation = Conversation::with_system_prompt(self.system_prompt.clone());
         conversation.messages.extend(thread.messages.clone());
+        append_middleware_context_message(&mut conversation, &run_context.initial_context);
         conversation.push(user_message.clone());
         // 工具定义在一个 turn 内保持不变，避免模型的后续调用看到不同的 schema。
         let tool_definitions = self.tools.definitions();
@@ -336,7 +379,9 @@ impl<'a> Agent<'a> {
         Ok(AgentTurnStream {
             model: self.model,
             tools: self.tools,
-            tool_context,
+            tool_context: run_context.tool,
+            middleware: self.middleware.clone(),
+            middleware_context: run_context.middleware,
             tool_definitions,
             max_tool_rounds: self.max_tool_rounds,
             conversation,
@@ -345,6 +390,7 @@ impl<'a> Agent<'a> {
             pending_tool_calls: VecDeque::new(),
             tool_futures: FuturesUnordered::new(),
             pending_tool_results: BTreeMap::new(),
+            pending_middleware_context: BTreeMap::new(),
             next_tool_result_index: 0,
             active_serial_tool: false,
             processing_tool_calls: false,
@@ -367,8 +413,21 @@ type ToolCallFuture = BoxFuture<'static, ToolCallOutcome>;
 struct ToolCallOutcome {
     index: usize,
     tool_call: ToolCall,
-    execution: ToolExecution,
+    phase: ToolCallPhase,
     serial: bool,
+}
+
+enum ToolCallPhase {
+    Before(GateRun),
+    Execution {
+        execution: ToolExecution,
+        approval_attempted: bool,
+    },
+    Permission(PermissionRun),
+    After {
+        result: ToolResult,
+        middleware: ObservationRun,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -376,12 +435,15 @@ struct PendingApproval {
     index: usize,
     tool_call: ToolCall,
     request: ApprovalRequest,
+    serial: bool,
 }
 
 pub struct AgentTurnStream<'a> {
     model: &'a dyn Model,
     tools: &'a dyn ToolRuntime,
     tool_context: ToolExecutionContext,
+    middleware: AgentMiddlewareChain,
+    middleware_context: Option<MiddlewareExecutionContext>,
     tool_definitions: Vec<ToolDefinition>,
     max_tool_rounds: usize,
     conversation: Conversation,
@@ -390,6 +452,7 @@ pub struct AgentTurnStream<'a> {
     pending_tool_calls: VecDeque<(usize, ToolCall)>,
     tool_futures: FuturesUnordered<ToolCallFuture>,
     pending_tool_results: BTreeMap<usize, (ToolCall, ToolExecution)>,
+    pending_middleware_context: BTreeMap<usize, Vec<MiddlewareContextBlock>>,
     next_tool_result_index: usize,
     active_serial_tool: bool,
     processing_tool_calls: bool,
@@ -469,17 +532,24 @@ impl AgentTurnStream<'_> {
             .push_back(AgentEvent::ApprovalResolved(decision.clone()));
 
         if decision.approved {
-            self.start_approved_tool_call(
+            self.active_serial_tool = true;
+            self.start_tool_execution(
                 pending_approval.index,
                 pending_approval.tool_call,
-                decision,
-                pending_approval.request,
+                pending_approval.serial,
+                Some(ToolApproval {
+                    decision,
+                    request: pending_approval.request,
+                }),
             );
         } else {
             let result = ToolResult::error("approval denied");
-            self.finish_tool_call(pending_approval.tool_call, result);
-            self.next_tool_result_index = pending_approval.index + 1;
-            self.emit_ready_tool_results();
+            self.active_serial_tool = false;
+            self.finish_tool_execution(
+                pending_approval.index,
+                pending_approval.tool_call,
+                ToolExecution::Completed(result),
+            );
             self.start_ready_tool_calls();
             self.maybe_finish_tool_batch();
         }
@@ -569,6 +639,7 @@ impl AgentTurnStream<'_> {
         });
         self.pending_tool_calls = tool_calls.into_iter().enumerate().collect();
         self.pending_tool_results.clear();
+        self.pending_middleware_context.clear();
         self.next_tool_result_index = 0;
         self.active_serial_tool = false;
         self.processing_tool_calls = true;
@@ -624,19 +695,27 @@ impl AgentTurnStream<'_> {
             }
         }
 
-        let call_for_result = tool_call.clone();
-        let execution =
-            self.tools
-                .execute(call_for_result.clone(), None, self.tool_context.clone());
         if serial {
             self.active_serial_tool = true;
         }
+        let Some(context) = self.middleware_context.clone() else {
+            self.start_tool_execution(index, tool_call, serial, None);
+            return;
+        };
+        let middleware = self.middleware.clone();
+        let call_for_result = tool_call.clone();
         self.tool_futures.push(
             async move {
+                let run = middleware
+                    .run_before_tool(BeforeToolInput {
+                        context,
+                        tool_call: call_for_result.clone(),
+                    })
+                    .await;
                 ToolCallOutcome {
                     index,
                     tool_call: call_for_result,
-                    execution: execution.await,
+                    phase: ToolCallPhase::Before(run),
                     serial,
                 }
             }
@@ -644,31 +723,250 @@ impl AgentTurnStream<'_> {
         );
     }
 
-    fn start_approved_tool_call(
+    fn start_tool_execution(
         &mut self,
         index: usize,
         tool_call: ToolCall,
-        decision: ApprovalDecision,
-        request: ApprovalRequest,
+        serial: bool,
+        approval: Option<ToolApproval>,
     ) {
         let call_for_result = tool_call.clone();
         let execution = self.tools.execute(
             call_for_result.clone(),
-            Some(ToolApproval { decision, request }),
+            approval.clone(),
             self.tool_context.clone(),
         );
-        self.active_serial_tool = true;
         self.tool_futures.push(
             async move {
                 ToolCallOutcome {
                     index,
                     tool_call: call_for_result,
-                    execution: execution.await,
-                    serial: true,
+                    phase: ToolCallPhase::Execution {
+                        execution: execution.await,
+                        approval_attempted: approval.is_some(),
+                    },
+                    serial,
                 }
             }
             .boxed(),
         );
+    }
+
+    fn start_permission_middleware(
+        &mut self,
+        index: usize,
+        tool_call: ToolCall,
+        request: ApprovalRequest,
+        serial: bool,
+    ) {
+        let Some(context) = self.middleware_context.clone() else {
+            self.pending_approval = Some(PendingApproval {
+                index,
+                tool_call,
+                request: request.clone(),
+                serial,
+            });
+            self.pending
+                .push_back(AgentEvent::ApprovalRequested(request));
+            return;
+        };
+        let middleware = self.middleware.clone();
+        let call_for_result = tool_call.clone();
+        let request_for_result = request.clone();
+        self.tool_futures.push(
+            async move {
+                let run = middleware
+                    .run_permission_request(PermissionRequestInput {
+                        context,
+                        tool_call: call_for_result.clone(),
+                        request: request_for_result,
+                    })
+                    .await;
+                ToolCallOutcome {
+                    index,
+                    tool_call: call_for_result,
+                    phase: ToolCallPhase::Permission(run),
+                    serial,
+                }
+            }
+            .boxed(),
+        );
+        self.pending_tool_results
+            .insert(index, (tool_call, ToolExecution::ApprovalRequired(request)));
+    }
+
+    fn start_after_tool_middleware(
+        &mut self,
+        index: usize,
+        tool_call: ToolCall,
+        result: ToolResult,
+        serial: bool,
+    ) {
+        let Some(context) = self.middleware_context.clone() else {
+            self.active_serial_tool &= !serial;
+            self.finish_tool_execution(index, tool_call, ToolExecution::Completed(result));
+            return;
+        };
+        let middleware = self.middleware.clone();
+        let call_for_result = tool_call.clone();
+        let result_for_input = result.clone();
+        self.tool_futures.push(
+            async move {
+                let run = middleware
+                    .run_after_tool(AfterToolInput {
+                        context,
+                        tool_call: call_for_result.clone(),
+                        result: result_for_input,
+                    })
+                    .await;
+                ToolCallOutcome {
+                    index,
+                    tool_call: call_for_result,
+                    phase: ToolCallPhase::After {
+                        result,
+                        middleware: run,
+                    },
+                    serial,
+                }
+            }
+            .boxed(),
+        );
+    }
+
+    fn handle_tool_outcome(&mut self, outcome: ToolCallOutcome) {
+        let ToolCallOutcome {
+            index,
+            tool_call,
+            phase,
+            serial,
+        } = outcome;
+        match phase {
+            ToolCallPhase::Before(run) => {
+                let denied = run.denied();
+                let cancelled = run.cancelled;
+                let denied_reasons = run.denied_reasons.clone();
+                self.record_middleware_run(index, run.events, run.context);
+                if cancelled {
+                    self.active_serial_tool &= !serial;
+                    return;
+                }
+                if denied {
+                    self.active_serial_tool &= !serial;
+                    self.finish_tool_execution(
+                        index,
+                        tool_call,
+                        ToolExecution::Completed(ToolResult::error(format!(
+                            "blocked by middleware: {}",
+                            denied_reasons.join("; ")
+                        ))),
+                    );
+                } else {
+                    self.start_tool_execution(index, tool_call, serial, None);
+                }
+            }
+            ToolCallPhase::Execution {
+                execution,
+                approval_attempted,
+            } => match execution {
+                ToolExecution::Completed(result) => {
+                    self.start_after_tool_middleware(index, tool_call, result, serial);
+                }
+                ToolExecution::ApprovalRequired(_request) if approval_attempted => {
+                    self.active_serial_tool &= !serial;
+                    self.finish_tool_execution(
+                        index,
+                        tool_call,
+                        ToolExecution::Completed(ToolResult::error(
+                            "tool requested approval again after an approval decision",
+                        )),
+                    );
+                }
+                ToolExecution::ApprovalRequired(request) => {
+                    self.start_permission_middleware(index, tool_call, request, serial);
+                }
+            },
+            ToolCallPhase::Permission(run) => {
+                let request = self
+                    .pending_tool_results
+                    .remove(&index)
+                    .and_then(|(_, execution)| match execution {
+                        ToolExecution::ApprovalRequired(request) => Some(request),
+                        ToolExecution::Completed(_) => None,
+                    })
+                    .expect("permission middleware must retain its approval request");
+                let decision = run.decision();
+                let cancelled = run.cancelled;
+                self.record_middleware_run(index, run.events, run.context);
+                if cancelled {
+                    self.active_serial_tool &= !serial;
+                    return;
+                }
+                match decision {
+                    PermissionDecision::Deny { reason } => {
+                        self.active_serial_tool &= !serial;
+                        self.finish_tool_execution(
+                            index,
+                            tool_call,
+                            ToolExecution::Completed(ToolResult::error(format!(
+                                "blocked by middleware: {reason}"
+                            ))),
+                        );
+                    }
+                    PermissionDecision::Approve { .. } => {
+                        self.active_serial_tool = true;
+                        self.start_tool_execution(
+                            index,
+                            tool_call,
+                            serial,
+                            Some(ToolApproval {
+                                decision: ApprovalDecision::approve(request.id.clone()),
+                                request,
+                            }),
+                        );
+                    }
+                    PermissionDecision::Continue => {
+                        self.pending_approval = Some(PendingApproval {
+                            index,
+                            tool_call,
+                            request: request.clone(),
+                            serial,
+                        });
+                        self.pending
+                            .push_back(AgentEvent::ApprovalRequested(request));
+                    }
+                }
+            }
+            ToolCallPhase::After { result, middleware } => {
+                let cancelled = middleware.cancelled;
+                let fatal_errors = middleware.fatal_errors.clone();
+                self.record_middleware_run(index, middleware.events, middleware.context);
+                self.active_serial_tool &= !serial;
+                if cancelled {
+                    return;
+                }
+                if !fatal_errors.is_empty() {
+                    self.fail_turn(format!(
+                        "after-tool middleware failed: {}",
+                        fatal_errors.join("; ")
+                    ));
+                    return;
+                }
+                self.finish_tool_execution(index, tool_call, ToolExecution::Completed(result));
+            }
+        }
+    }
+
+    fn record_middleware_run(
+        &mut self,
+        index: usize,
+        events: Vec<AgentEvent>,
+        context: Vec<MiddlewareContextBlock>,
+    ) {
+        self.pending.extend(events);
+        self.pending_middleware_context
+            .entry(index)
+            .or_default()
+            .extend(context);
     }
 
     fn emit_ready_tool_results(&mut self) {
@@ -689,6 +987,7 @@ impl AgentTurnStream<'_> {
                         index: self.next_tool_result_index,
                         tool_call,
                         request: request.clone(),
+                        serial: true,
                     });
                     self.pending
                         .push_back(AgentEvent::ApprovalRequested(request));
@@ -705,6 +1004,11 @@ impl AgentTurnStream<'_> {
             && self.pending_approval.is_none()
         {
             self.processing_tool_calls = false;
+            let context = std::mem::take(&mut self.pending_middleware_context)
+                .into_values()
+                .flatten()
+                .collect::<Vec<_>>();
+            append_middleware_context_message(&mut self.conversation, &context);
             self.start_next_model_call();
         }
     }
@@ -730,7 +1034,6 @@ impl AgentTurnStream<'_> {
         let ok = result.ok;
         let error = result.error.clone();
         let summary = result.summary.clone();
-        self.finish_tool_step(&tool_call, &result);
         let tool_message = Message::tool_result(id.clone(), result.content);
         self.conversation.push(tool_message.clone());
         self.turn_messages.push(tool_message.clone());
@@ -833,14 +1136,7 @@ impl Stream for AgentTurnStream<'_> {
             if !this.tool_futures.is_empty() {
                 match Pin::new(&mut this.tool_futures).poll_next(cx) {
                     Poll::Ready(Some(outcome)) => {
-                        if outcome.serial {
-                            this.active_serial_tool = false;
-                        }
-                        this.finish_tool_execution(
-                            outcome.index,
-                            outcome.tool_call,
-                            outcome.execution,
-                        );
+                        this.handle_tool_outcome(outcome);
                         this.start_ready_tool_calls();
                         this.maybe_finish_tool_batch();
                         if let Some(event) = this.pending.pop_front() {
@@ -914,6 +1210,34 @@ impl Stream for AgentTurnStream<'_> {
             return Poll::Ready(this.pending.pop_front());
         }
     }
+}
+
+fn append_middleware_context_message(
+    conversation: &mut Conversation,
+    blocks: &[MiddlewareContextBlock],
+) {
+    if blocks.is_empty() {
+        return;
+    }
+    let mut content = String::from(
+        "Additional middleware context for this operation. Each block is attributed to its source and is not part of the user's message or a tool result.",
+    );
+    for block in blocks {
+        content.push_str("\n\n[");
+        content.push_str(&block.middleware_id);
+        content.push('/');
+        content.push_str(match block.stage {
+            agent_protocol::MiddlewareStage::BeforePrompt => "before_prompt",
+            agent_protocol::MiddlewareStage::BeforeTool => "before_tool",
+            agent_protocol::MiddlewareStage::PermissionRequest => "permission_request",
+            agent_protocol::MiddlewareStage::AfterTool => "after_tool",
+            agent_protocol::MiddlewareStage::PreCompact => "pre_compact",
+            agent_protocol::MiddlewareStage::PostCompact => "post_compact",
+        });
+        content.push_str("]\n");
+        content.push_str(&block.content);
+    }
+    conversation.push(Message::system(content));
 }
 
 #[cfg(test)]

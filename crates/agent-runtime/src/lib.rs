@@ -1,3 +1,4 @@
+pub mod middleware;
 pub mod session_handle;
 pub mod session_projection;
 pub mod session_store;
@@ -5,12 +6,15 @@ pub mod subagent_store;
 pub mod subagent_supervisor;
 
 use agent_config::{ContextConfig, McpServerConfig, ModelContextLimits};
-use agent_core::{Agent, AgentError, ModelEvent, ModelFailure, ModelRequest, ToolExecutionContext};
+use agent_core::{
+    Agent, AgentError, AgentRunContext, MiddlewareContextBlock, MiddlewareExecutionContext,
+    ModelEvent, ModelFailure, ModelRequest, ToolExecutionContext,
+};
 use agent_protocol::{
     AgentEvent, AgentEventOrigin, ApprovalDecision, ApprovalRequest, Conversation, Message,
-    ModelInvocation, PermissionProfile, Session, SessionFact, SessionTurnStatus,
-    SubagentExecutionSummary, SubagentIdentity, Thread, ToolCall, ToolDefinition, TurnRecord,
-    TurnStatus, TurnStepKind,
+    MiddlewareAgentScope, ModelInvocation, PermissionMode, PermissionProfile, Session, SessionFact,
+    SessionTurnStatus, ShellPolicy, SubagentExecutionSummary, SubagentIdentity, Thread, ToolCall,
+    ToolDefinition, TurnRecord, TurnStatus, TurnStepKind,
 };
 use agent_tools::{SubagentExecutor, ToolRegistry, ToolRegistryError};
 use futures_util::StreamExt;
@@ -27,6 +31,10 @@ use thiserror::Error;
 
 pub use agent_core::{CancellationToken, Model};
 pub use agent_tools::{McpToolCache, SubagentController};
+pub use middleware::{
+    BeforePromptInput, CompactionCause, MiddlewareRegistry, PostCompactInput, PreCompactInput,
+    RuntimeMiddleware, RuntimeMiddlewareChain,
+};
 pub use session_handle::{SessionHandle, SessionSubscription};
 pub use session_projection::{
     SessionProjectionError, project_session, projection_to_legacy_session,
@@ -39,7 +47,7 @@ pub use subagent_store::{SubagentInstanceDocument, SubagentSessionStore, Subagen
 pub use subagent_supervisor::{
     DenySubagentObserver, MAX_CONCURRENT_SUBAGENT_RUNS, MAX_PERSISTENT_SUBAGENTS_PER_SESSION,
     SubagentObserver, SubagentRoleRuntime, SubagentSupervisor, build_role_runtimes,
-    subagent_store_for_session,
+    build_role_runtimes_with_middleware, subagent_store_for_session,
 };
 
 pub const EVENT_SCHEMA_VERSION: u32 = 8;
@@ -96,6 +104,13 @@ pub enum CompactionOutcome {
     Noop,
 }
 
+#[derive(Debug, Clone)]
+pub struct MiddlewareCompactionOutcome {
+    pub outcome: CompactionOutcome,
+    pub events: Vec<AgentEvent>,
+    pub additional_context: Vec<MiddlewareContextBlock>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentEventEnvelope {
     pub schema_version: u32,
@@ -132,6 +147,91 @@ pub struct RunAgentTurnOutcome {
     /// agent 或事件接收方错误。事件投递可能在 turn 完成后失败，因此这里为 Some
     /// 不等于 `TurnStatus::Failed`；最终状态应以 Session 中的 TurnRecord 为准。
     pub error: Option<String>,
+}
+
+struct MiddlewareRunConfig<'a> {
+    registry: &'a MiddlewareRegistry,
+    agent_scope: MiddlewareAgentScope,
+    initial_context: Vec<MiddlewareContextBlock>,
+    event_index: usize,
+}
+
+fn middleware_execution_context(
+    context: RunAgentTurnContext<'_>,
+    cancellation: &CancellationToken,
+    agent_scope: MiddlewareAgentScope,
+    operation_id: Option<String>,
+    turn_id: Option<String>,
+) -> MiddlewareExecutionContext {
+    MiddlewareExecutionContext {
+        session: context.session_name.to_string(),
+        workspace_root: context.workspace_root.to_path_buf(),
+        turn_index: context.turn_index,
+        operation_id,
+        turn_id,
+        model: context.model.clone(),
+        permissions: context.permissions,
+        agent_scope,
+        cancellation: cancellation.clone(),
+    }
+}
+
+async fn deliver_middleware_events(
+    context: RunAgentTurnContext<'_>,
+    handler: &mut impl TurnEventHandler,
+    handle: Option<&SessionHandle>,
+    events: Vec<AgentEvent>,
+    mut event_index: usize,
+) -> Result<usize, RuntimeError> {
+    for event in events {
+        if let AgentEvent::MiddlewareFinished(invocation) = &event
+            && let Some(handle) = handle
+        {
+            handle
+                .commit_fact(
+                    None,
+                    None,
+                    SessionFact::MiddlewareFinished {
+                        invocation: invocation.clone(),
+                    },
+                )
+                .await?;
+        }
+        let envelope = make_event_envelope(
+            context.session_name,
+            context.workspace_root,
+            context.turn_index,
+            event_index,
+            event,
+        );
+        event_index += 1;
+        handler.on_event(&envelope)?;
+    }
+    Ok(event_index)
+}
+
+async fn deliver_turn_middleware_events(
+    context: RunAgentTurnContext<'_>,
+    handler: &mut impl TurnEventHandler,
+    fact_run: &mut Option<&mut SessionFactRun<'_>>,
+    events: Vec<AgentEvent>,
+    event_index: &mut usize,
+) -> Result<(), RuntimeError> {
+    for event in events {
+        let envelope = make_event_envelope(
+            context.session_name,
+            context.workspace_root,
+            context.turn_index,
+            *event_index,
+            event.clone(),
+        );
+        *event_index += 1;
+        if let Some(run) = fact_run.as_deref_mut() {
+            run.persist_event(&event).await?;
+        }
+        handler.on_event(&envelope)?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -274,6 +374,10 @@ struct RuntimeSubagentExecutor {
     system_prompt: Arc<str>,
     workspace_root: Arc<PathBuf>,
     artifact_root: Option<Arc<PathBuf>>,
+    middleware: Arc<MiddlewareRegistry>,
+    invocation: ModelInvocation,
+    session_name: Arc<str>,
+    turn_index: usize,
     started: Arc<AtomicUsize>,
     timeout: Duration,
     max_result_chars: usize,
@@ -290,6 +394,16 @@ impl RuntimeSubagentExecutor {
             system_prompt: system_prompt.into(),
             workspace_root: workspace_root.into(),
             artifact_root: None,
+            middleware: Arc::new(MiddlewareRegistry::default()),
+            invocation: ModelInvocation {
+                provider_id: "unknown".to_string(),
+                provider_name: "Unknown".to_string(),
+                model_id: "unknown".to_string(),
+                model_name: "Unknown".to_string(),
+                reasoning: agent_protocol::ReasoningLevel::Off,
+            },
+            session_name: Arc::<str>::from("delegated"),
+            turn_index: 0,
             started: Arc::new(AtomicUsize::new(0)),
             timeout: SUBAGENT_TIMEOUT,
             max_result_chars: MAX_SUBAGENT_RESULT_CHARS,
@@ -298,6 +412,20 @@ impl RuntimeSubagentExecutor {
 
     fn with_artifact_root(mut self, artifact_root: Option<PathBuf>) -> Self {
         self.artifact_root = artifact_root.map(Arc::new);
+        self
+    }
+
+    fn with_middleware_context(
+        mut self,
+        middleware: Arc<MiddlewareRegistry>,
+        invocation: ModelInvocation,
+        session_name: impl Into<Arc<str>>,
+        turn_index: usize,
+    ) -> Self {
+        self.middleware = middleware;
+        self.invocation = invocation;
+        self.session_name = session_name.into();
+        self.turn_index = turn_index;
         self
     }
 
@@ -359,13 +487,55 @@ impl RuntimeSubagentExecutor {
             }
         };
         let system_prompt = format!("{}\n\n{CHILD_SUBAGENT_GUIDANCE}", self.system_prompt);
-        let agent = Agent::with_tools(self.model.as_ref(), system_prompt, &tools);
+        let permissions = PermissionProfile {
+            mode: PermissionMode::ReadOnly,
+            shell: ShellPolicy::Deny,
+        };
+        let middleware_context = MiddlewareExecutionContext {
+            session: self.session_name.to_string(),
+            workspace_root: self.workspace_root.as_ref().clone(),
+            turn_index: self.turn_index,
+            operation_id: None,
+            turn_id: None,
+            model: self.invocation.clone(),
+            permissions,
+            agent_scope: MiddlewareAgentScope::DelegatedSubagent,
+            cancellation: cancellation.clone(),
+        };
+        let before = self
+            .middleware
+            .runtime()
+            .run_before_prompt(BeforePromptInput {
+                context: middleware_context.clone(),
+                prompt: task.clone(),
+            })
+            .await;
+        if before.cancelled {
+            return SubagentExecutionSummary::failure(task, "subagent execution cancelled", 0, 0);
+        }
+        if before.denied() {
+            return SubagentExecutionSummary::failure(
+                task,
+                format!(
+                    "subagent prompt blocked by middleware: {}",
+                    before.denied_reasons.join("; ")
+                ),
+                0,
+                0,
+            );
+        }
+        let agent = Agent::with_tools(self.model.as_ref(), system_prompt, &tools)
+            .with_middleware(self.middleware.agent().clone());
         let mut stream = match agent
-            .run_turn_with_context(
+            .run_turn_with_agent_context(
                 &Thread::new(),
                 task.clone(),
-                ToolExecutionContext {
-                    cancellation: cancellation.clone(),
+                AgentRunContext {
+                    tool: ToolExecutionContext {
+                        cancellation: cancellation.clone(),
+                    },
+                    middleware: Some(middleware_context),
+                    initial_context: before.context,
                 },
             )
             .await
@@ -473,6 +643,31 @@ fn truncate_chars(value: String, max_chars: usize) -> (String, bool) {
     (value.chars().take(max_chars).collect(), true)
 }
 
+fn render_middleware_context(blocks: &[MiddlewareContextBlock], heading: &str) -> String {
+    let mut content = heading.to_string();
+    for block in blocks {
+        let _ = write!(
+            content,
+            "\n\n[{}/{}]\n{}",
+            block.middleware_id,
+            middleware_stage_name(block.stage),
+            block.content
+        );
+    }
+    content
+}
+
+fn middleware_stage_name(stage: agent_protocol::MiddlewareStage) -> &'static str {
+    match stage {
+        agent_protocol::MiddlewareStage::BeforePrompt => "before_prompt",
+        agent_protocol::MiddlewareStage::BeforeTool => "before_tool",
+        agent_protocol::MiddlewareStage::PermissionRequest => "permission_request",
+        agent_protocol::MiddlewareStage::AfterTool => "after_tool",
+        agent_protocol::MiddlewareStage::PreCompact => "pre_compact",
+        agent_protocol::MiddlewareStage::PostCompact => "post_compact",
+    }
+}
+
 pub async fn inspect_mcp_servers(
     workspace_root: &Path,
     servers: &[McpServerConfig],
@@ -540,6 +735,13 @@ impl<'a> SessionFactRun<'a> {
     async fn persist_event(&mut self, event: &AgentEvent) -> Result<(), RuntimeError> {
         let (fact, operation_update) = match event {
             AgentEvent::TurnStarted => (None, OperationUpdate::None),
+            AgentEvent::MiddlewareStarted(_) => (None, OperationUpdate::None),
+            AgentEvent::MiddlewareFinished(invocation) => (
+                Some(SessionFact::MiddlewareFinished {
+                    invocation: invocation.clone(),
+                }),
+                OperationUpdate::None,
+            ),
             AgentEvent::ModelCallStarted => {
                 let model_call_id = format!("model-call-{}", self.next_model_call_index);
                 self.next_model_call_index += 1;
@@ -703,6 +905,61 @@ pub async fn run_agent_turn(
         .await
 }
 
+pub async fn run_agent_turn_with_middleware(
+    context: RunAgentTurnContext<'_>,
+    session: &mut Session,
+    prompt: &str,
+    handler: &mut impl TurnEventHandler,
+    cancellation: CancellationToken,
+    middleware: &MiddlewareRegistry,
+    agent_scope: MiddlewareAgentScope,
+) -> Result<RunAgentTurnOutcome, RuntimeError> {
+    let execution_context =
+        middleware_execution_context(context, &cancellation, agent_scope, None, None);
+    let before = middleware
+        .runtime()
+        .run_before_prompt(BeforePromptInput {
+            context: execution_context,
+            prompt: prompt.to_string(),
+        })
+        .await;
+    let before_cancelled = before.cancelled;
+    let before_denied = before.denied();
+    let denied_reasons = before.denied_reasons.clone();
+    let event_index = deliver_middleware_events(context, handler, None, before.events, 0).await?;
+    if before_cancelled {
+        return Ok(RunAgentTurnOutcome {
+            session_changed: false,
+            error: Some("operation cancelled".to_string()),
+        });
+    }
+    if before_denied {
+        return Ok(RunAgentTurnOutcome {
+            session_changed: false,
+            error: Some(format!(
+                "prompt blocked by middleware: {}",
+                denied_reasons.join("; ")
+            )),
+        });
+    }
+    run_agent_turn_with_optional_controller_and_facts(
+        context,
+        session,
+        prompt,
+        handler,
+        cancellation,
+        None,
+        None,
+        MiddlewareRunConfig {
+            registry: middleware,
+            agent_scope,
+            initial_context: before.context,
+            event_index,
+        },
+    )
+    .await
+}
+
 pub async fn run_agent_turn_with_session_handle(
     context: RunAgentTurnContext<'_>,
     handle: &SessionHandle,
@@ -711,6 +968,108 @@ pub async fn run_agent_turn_with_session_handle(
     cancellation: CancellationToken,
     controller: Option<Arc<dyn SubagentController>>,
 ) -> Result<RunAgentTurnOutcome, RuntimeError> {
+    let middleware = MiddlewareRegistry::default();
+    run_agent_turn_with_session_handle_and_middleware(
+        context,
+        handle,
+        prompt,
+        handler,
+        cancellation,
+        controller,
+        &middleware,
+        MiddlewareAgentScope::Main,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_agent_turn_with_session_handle_and_middleware(
+    context: RunAgentTurnContext<'_>,
+    handle: &SessionHandle,
+    prompt: &str,
+    handler: &mut impl TurnEventHandler,
+    cancellation: CancellationToken,
+    controller: Option<Arc<dyn SubagentController>>,
+    middleware: &MiddlewareRegistry,
+    agent_scope: MiddlewareAgentScope,
+) -> Result<RunAgentTurnOutcome, RuntimeError> {
+    let prepared = prepare_session_turn_with_middleware(
+        context,
+        handle,
+        prompt,
+        handler,
+        &cancellation,
+        middleware,
+        agent_scope,
+    )
+    .await?;
+    let Some(prepared) = prepared else {
+        return Ok(RunAgentTurnOutcome {
+            session_changed: false,
+            error: Some("prompt blocked by middleware".to_string()),
+        });
+    };
+    run_agent_turn_with_prepared_session_handle_and_middleware(
+        context,
+        handle,
+        PreparedSessionTurn {
+            operation_id: prepared.operation_id,
+            turn_id: prepared.turn_id,
+            prompt,
+        },
+        handler,
+        cancellation,
+        controller,
+        middleware,
+        agent_scope,
+        prepared.initial_context,
+        prepared.event_index,
+    )
+    .await
+}
+
+pub struct PreparedMiddlewareSessionTurn {
+    pub operation_id: String,
+    pub turn_id: String,
+    pub initial_context: Vec<MiddlewareContextBlock>,
+    pub event_index: usize,
+}
+
+pub async fn prepare_session_turn_with_middleware(
+    context: RunAgentTurnContext<'_>,
+    handle: &SessionHandle,
+    prompt: &str,
+    handler: &mut impl TurnEventHandler,
+    cancellation: &CancellationToken,
+    middleware: &MiddlewareRegistry,
+    agent_scope: MiddlewareAgentScope,
+) -> Result<Option<PreparedMiddlewareSessionTurn>, RuntimeError> {
+    let execution_context =
+        middleware_execution_context(context, cancellation, agent_scope, None, None);
+    let before = middleware
+        .runtime()
+        .run_before_prompt(BeforePromptInput {
+            context: execution_context,
+            prompt: prompt.to_string(),
+        })
+        .await;
+    let before_cancelled = before.cancelled;
+    let before_denied = before.denied();
+    let denied_reasons = before.denied_reasons.clone();
+    let event_index =
+        deliver_middleware_events(context, handler, Some(handle), before.events, 0).await?;
+    if before_cancelled {
+        return Ok(None);
+    }
+    if before_denied {
+        handle
+            .notice(format!(
+                "prompt blocked by middleware: {}",
+                denied_reasons.join("; ")
+            ))
+            .await;
+        return Ok(None);
+    }
     let (operation_id, turn_id) = handle
         .begin_operation(
             Message::user(prompt),
@@ -718,19 +1077,12 @@ pub async fn run_agent_turn_with_session_handle(
             context.permissions,
         )
         .await?;
-    run_agent_turn_with_prepared_session_handle(
-        context,
-        handle,
-        PreparedSessionTurn {
-            operation_id,
-            turn_id,
-            prompt,
-        },
-        handler,
-        cancellation,
-        controller,
-    )
-    .await
+    Ok(Some(PreparedMiddlewareSessionTurn {
+        operation_id,
+        turn_id,
+        initial_context: before.context,
+        event_index,
+    }))
 }
 
 pub struct PreparedSessionTurn<'a> {
@@ -746,6 +1098,35 @@ pub async fn run_agent_turn_with_prepared_session_handle(
     handler: &mut impl TurnEventHandler,
     cancellation: CancellationToken,
     controller: Option<Arc<dyn SubagentController>>,
+) -> Result<RunAgentTurnOutcome, RuntimeError> {
+    let middleware = MiddlewareRegistry::default();
+    run_agent_turn_with_prepared_session_handle_and_middleware(
+        context,
+        handle,
+        prepared,
+        handler,
+        cancellation,
+        controller,
+        &middleware,
+        MiddlewareAgentScope::Main,
+        Vec::new(),
+        0,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_agent_turn_with_prepared_session_handle_and_middleware(
+    context: RunAgentTurnContext<'_>,
+    handle: &SessionHandle,
+    prepared: PreparedSessionTurn<'_>,
+    handler: &mut impl TurnEventHandler,
+    cancellation: CancellationToken,
+    controller: Option<Arc<dyn SubagentController>>,
+    middleware: &MiddlewareRegistry,
+    agent_scope: MiddlewareAgentScope,
+    initial_context: Vec<MiddlewareContextBlock>,
+    event_index: usize,
 ) -> Result<RunAgentTurnOutcome, RuntimeError> {
     let PreparedSessionTurn {
         operation_id,
@@ -766,6 +1147,12 @@ pub async fn run_agent_turn_with_prepared_session_handle(
         cancellation.clone(),
         controller,
         Some(&mut fact_run),
+        MiddlewareRunConfig {
+            registry: middleware,
+            agent_scope,
+            initial_context,
+            event_index,
+        },
     )
     .await;
 
@@ -814,8 +1201,18 @@ pub async fn run_agent_turn_with_cancellation(
     handler: &mut impl TurnEventHandler,
     cancellation: CancellationToken,
 ) -> Result<RunAgentTurnOutcome, RuntimeError> {
-    run_agent_turn_with_optional_controller(context, session, prompt, handler, cancellation, None)
-        .await
+    let middleware = MiddlewareRegistry::default();
+    run_agent_turn_with_optional_controller(
+        context,
+        session,
+        prompt,
+        handler,
+        cancellation,
+        None,
+        &middleware,
+        MiddlewareAgentScope::Main,
+    )
+    .await
 }
 
 pub async fn run_agent_turn_with_subagent_controller(
@@ -833,10 +1230,13 @@ pub async fn run_agent_turn_with_subagent_controller(
         handler,
         cancellation,
         Some(controller),
+        &MiddlewareRegistry::default(),
+        MiddlewareAgentScope::Main,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_agent_turn_with_optional_controller(
     context: RunAgentTurnContext<'_>,
     session: &mut Session,
@@ -844,6 +1244,8 @@ async fn run_agent_turn_with_optional_controller(
     handler: &mut impl TurnEventHandler,
     cancellation: CancellationToken,
     controller: Option<Arc<dyn SubagentController>>,
+    middleware: &MiddlewareRegistry,
+    agent_scope: MiddlewareAgentScope,
 ) -> Result<RunAgentTurnOutcome, RuntimeError> {
     run_agent_turn_with_optional_controller_and_facts(
         context,
@@ -853,10 +1255,17 @@ async fn run_agent_turn_with_optional_controller(
         cancellation,
         controller,
         None,
+        MiddlewareRunConfig {
+            registry: middleware,
+            agent_scope,
+            initial_context: Vec::new(),
+            event_index: 0,
+        },
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_agent_turn_with_optional_controller_and_facts(
     context: RunAgentTurnContext<'_>,
     session: &mut Session,
@@ -865,6 +1274,7 @@ async fn run_agent_turn_with_optional_controller_and_facts(
     cancellation: CancellationToken,
     controller: Option<Arc<dyn SubagentController>>,
     fact_run: Option<&mut SessionFactRun<'_>>,
+    middleware: MiddlewareRunConfig<'_>,
 ) -> Result<RunAgentTurnOutcome, RuntimeError> {
     // 所有状态先写入草稿；只有整个用例正常收束后才替换调用方持有的 Session。
     let mut draft = session.clone();
@@ -876,12 +1286,14 @@ async fn run_agent_turn_with_optional_controller_and_facts(
         &cancellation,
         controller,
         fact_run,
+        middleware,
     )
     .await?;
     *session = draft;
     Ok(outcome)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_agent_turn_inner(
     context: RunAgentTurnContext<'_>,
     session: &mut Session,
@@ -890,7 +1302,14 @@ async fn run_agent_turn_inner(
     cancellation: &CancellationToken,
     controller: Option<Arc<dyn SubagentController>>,
     mut fact_run: Option<&mut SessionFactRun<'_>>,
+    middleware: MiddlewareRunConfig<'_>,
 ) -> Result<RunAgentTurnOutcome, RuntimeError> {
+    let MiddlewareRunConfig {
+        registry: middleware_registry,
+        agent_scope,
+        mut initial_context,
+        event_index: initial_event_index,
+    } = middleware;
     let writer_lease = controller
         .as_ref()
         .and_then(|controller| controller.writer_lease());
@@ -924,6 +1343,12 @@ async fn run_agent_turn_inner(
                     Arc::<str>::from(context.system_prompt),
                     Arc::new(context.workspace_root.to_path_buf()),
                 )
+                .with_middleware_context(
+                    Arc::new(middleware_registry.clone()),
+                    context.model.clone(),
+                    Arc::<str>::from(context.session_name),
+                    context.turn_index,
+                )
                 .with_artifact_root(artifact_root),
             ),
             context.subagent_identities,
@@ -943,35 +1368,137 @@ async fn run_agent_turn_inner(
     };
     let tool_definitions = tools.definitions();
 
+    let operation_id = fact_run.as_deref().map(|run| run.operation_id.clone());
+    let turn_id = fact_run.as_deref().map(|run| run.turn_id.clone());
+    let middleware_context =
+        middleware_execution_context(context, cancellation, agent_scope, operation_id, turn_id);
+    let mut event_index = initial_event_index;
+
     let previous_summary = session.context.summary.clone();
     let previous_summarized_turns = session.context.summarized_turns;
-    let compaction = tokio::select! {
-        biased;
-        _ = cancellation.cancelled() => None,
-        result = maybe_auto_compact_with_tools(
-            context.client,
-            &effective_system_prompt,
-            session,
-            context.context_config,
-            context.model_limits,
-            prompt,
-            &tool_definitions,
-        ) => Some(result),
-    };
-    let Some(compaction) = compaction else {
-        return Ok(record_cancelled_turn(session, prompt, context.model));
-    };
-    if let Err(error) = compaction {
-        let message = format!("context compaction failed: {error}");
-        apply_turn_with_model(
-            session,
-            TurnRecord::failed_user_prompt(prompt, message.clone()),
-            context.model,
-        );
-        return Ok(RunAgentTurnOutcome {
-            session_changed: true,
-            error: Some(message),
-        });
+    if context.context_config.auto_compact {
+        let budget = auto_compact_trigger_tokens(context.model_limits, context.context_config);
+        let estimate =
+            estimate_context_tokens(&effective_system_prompt, session, prompt, &tool_definitions);
+        if estimate > budget {
+            let pre = middleware_registry
+                .runtime()
+                .run_pre_compact(PreCompactInput {
+                    context: middleware_context.clone(),
+                    cause: CompactionCause::Automatic,
+                    estimated_tokens: estimate,
+                    token_budget: Some(budget),
+                    current_summary: session.context.summary.clone(),
+                    summarized_turns: session.context.summarized_turns,
+                })
+                .await;
+            let pre_cancelled = pre.cancelled;
+            let pre_denied = pre.denied();
+            deliver_turn_middleware_events(
+                context,
+                handler,
+                &mut fact_run,
+                pre.events,
+                &mut event_index,
+            )
+            .await?;
+            if pre_cancelled {
+                return Ok(record_cancelled_turn(session, prompt, context.model));
+            }
+            if !pre_denied {
+                let mut compacted = session.clone();
+                let compaction = tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => None,
+                    result = compact_session_with_context(
+                        context.client,
+                        &mut compacted,
+                        context.context_config,
+                        &pre.context,
+                    ) => Some(result),
+                };
+                let Some(compaction) = compaction else {
+                    return Ok(record_cancelled_turn(session, prompt, context.model));
+                };
+                let compaction = match compaction {
+                    Ok(compaction) => compaction,
+                    Err(error) => {
+                        let message = format!("context compaction failed: {error}");
+                        apply_turn_with_model(
+                            session,
+                            TurnRecord::failed_user_prompt(prompt, message.clone()),
+                            context.model,
+                        );
+                        return Ok(RunAgentTurnOutcome {
+                            session_changed: true,
+                            error: Some(message),
+                        });
+                    }
+                };
+                if compaction == CompactionOutcome::Changed {
+                    let post = middleware_registry
+                        .runtime()
+                        .run_post_compact(PostCompactInput {
+                            context: middleware_context.clone(),
+                            cause: CompactionCause::Automatic,
+                            previous_summary: previous_summary.clone(),
+                            summary: compacted.context.summary.clone().unwrap_or_default(),
+                            summarized_turns: compacted.context.summarized_turns,
+                        })
+                        .await;
+                    let post_cancelled = post.cancelled;
+                    let fatal_errors = post.fatal_errors.clone();
+                    deliver_turn_middleware_events(
+                        context,
+                        handler,
+                        &mut fact_run,
+                        post.events,
+                        &mut event_index,
+                    )
+                    .await?;
+                    if post_cancelled {
+                        return Ok(record_cancelled_turn(session, prompt, context.model));
+                    }
+                    if !fatal_errors.is_empty() {
+                        let message = format!(
+                            "post-compact middleware failed: {}",
+                            fatal_errors.join("; ")
+                        );
+                        apply_turn_with_model(
+                            session,
+                            TurnRecord::failed_user_prompt(prompt, message.clone()),
+                            context.model,
+                        );
+                        return Ok(RunAgentTurnOutcome {
+                            session_changed: true,
+                            error: Some(message),
+                        });
+                    }
+                    initial_context.extend(post.context);
+                    *session = compacted;
+                }
+                let compacted_estimate = estimate_context_tokens(
+                    &effective_system_prompt,
+                    session,
+                    prompt,
+                    &tool_definitions,
+                );
+                if compacted_estimate > budget {
+                    let message = format!(
+                        "context compaction failed: context is still over token budget after compaction ({compacted_estimate} > {budget})"
+                    );
+                    apply_turn_with_model(
+                        session,
+                        TurnRecord::failed_user_prompt(prompt, message.clone()),
+                        context.model,
+                    );
+                    return Ok(RunAgentTurnOutcome {
+                        session_changed: true,
+                        error: Some(message),
+                    });
+                }
+            }
+        }
     }
     if (session.context.summary != previous_summary
         || session.context.summarized_turns != previous_summarized_turns)
@@ -980,11 +1507,11 @@ async fn run_agent_turn_inner(
         run.persist_compaction(session).await?;
     }
 
-    let agent = Agent::with_tools(context.client, effective_system_prompt, &tools);
+    let agent = Agent::with_tools(context.client, effective_system_prompt, &tools)
+        .with_middleware(middleware_registry.agent().clone());
     let mut agent_error = None;
     let mut handler_error = None;
     let mut turn_completed = false;
-    let mut event_index = 0;
 
     for diagnostic in diagnostics {
         let envelope = make_event_envelope(
@@ -1010,11 +1537,15 @@ async fn run_agent_turn_inner(
 
     {
         let mut stream = agent
-            .run_turn_with_context(
+            .run_turn_with_agent_context(
                 &session.active_thread,
                 prompt.to_string(),
-                ToolExecutionContext {
-                    cancellation: cancellation.clone(),
+                AgentRunContext {
+                    tool: ToolExecutionContext {
+                        cancellation: cancellation.clone(),
+                    },
+                    middleware: Some(middleware_context),
+                    initial_context,
                 },
             )
             .await?;
@@ -1058,6 +1589,8 @@ async fn run_agent_turn_inner(
                 }
                 AgentEvent::TurnStarted
                 | AgentEvent::ModelCallStarted
+                | AgentEvent::MiddlewareStarted(_)
+                | AgentEvent::MiddlewareFinished(_)
                 | AgentEvent::Warning(_)
                 | AgentEvent::ReasoningDelta(_)
                 | AgentEvent::TextDelta(_)
@@ -1234,6 +1767,100 @@ pub async fn maybe_auto_compact_with_tools(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+pub async fn maybe_auto_compact_with_tools_and_middleware(
+    client: &dyn Model,
+    system_prompt: &str,
+    session: &mut Session,
+    context_config: ContextConfig,
+    model_limits: ModelContextLimits,
+    prompt: &str,
+    tools: &[ToolDefinition],
+    context: MiddlewareExecutionContext,
+    middleware: &MiddlewareRegistry,
+) -> Result<MiddlewareCompactionOutcome, RuntimeError> {
+    if !context_config.auto_compact {
+        return Ok(MiddlewareCompactionOutcome {
+            outcome: CompactionOutcome::Noop,
+            events: Vec::new(),
+            additional_context: Vec::new(),
+        });
+    }
+    let budget = auto_compact_trigger_tokens(model_limits, context_config);
+    let estimate = estimate_context_tokens(system_prompt, session, prompt, tools);
+    if estimate <= budget {
+        return Ok(MiddlewareCompactionOutcome {
+            outcome: CompactionOutcome::Noop,
+            events: Vec::new(),
+            additional_context: Vec::new(),
+        });
+    }
+    let pre = middleware
+        .runtime()
+        .run_pre_compact(PreCompactInput {
+            context: context.clone(),
+            cause: CompactionCause::Automatic,
+            estimated_tokens: estimate,
+            token_budget: Some(budget),
+            current_summary: session.context.summary.clone(),
+            summarized_turns: session.context.summarized_turns,
+        })
+        .await;
+    let pre_cancelled = pre.cancelled;
+    let pre_denied = pre.denied();
+    let mut events = pre.events;
+    if pre_cancelled {
+        return Err(RuntimeError::AgentRun("operation cancelled".to_string()));
+    }
+    if pre_denied {
+        return Ok(MiddlewareCompactionOutcome {
+            outcome: CompactionOutcome::Noop,
+            events,
+            additional_context: Vec::new(),
+        });
+    }
+    let previous_summary = session.context.summary.clone();
+    let mut draft = session.clone();
+    let outcome =
+        compact_session_with_context(client, &mut draft, context_config, &pre.context).await?;
+    let mut additional_context = Vec::new();
+    if outcome == CompactionOutcome::Changed {
+        let post = middleware
+            .runtime()
+            .run_post_compact(PostCompactInput {
+                context,
+                cause: CompactionCause::Automatic,
+                previous_summary,
+                summary: draft.context.summary.clone().unwrap_or_default(),
+                summarized_turns: draft.context.summarized_turns,
+            })
+            .await;
+        events.extend(post.events);
+        if post.cancelled {
+            return Err(RuntimeError::AgentRun("operation cancelled".to_string()));
+        }
+        if !post.fatal_errors.is_empty() {
+            return Err(RuntimeError::AgentRun(format!(
+                "post-compact middleware failed: {}",
+                post.fatal_errors.join("; ")
+            )));
+        }
+        additional_context = post.context;
+        *session = draft;
+    }
+    let compacted_estimate = estimate_context_tokens(system_prompt, session, prompt, tools);
+    if compacted_estimate > budget {
+        return Err(RuntimeError::AgentRun(format!(
+            "context is still over token budget after compaction ({compacted_estimate} > {budget})"
+        )));
+    }
+    Ok(MiddlewareCompactionOutcome {
+        outcome,
+        events,
+        additional_context,
+    })
+}
+
 fn auto_compact_trigger_tokens(
     model_limits: ModelContextLimits,
     context_config: ContextConfig,
@@ -1249,6 +1876,85 @@ pub async fn compact_session(
     session: &mut Session,
     context_config: ContextConfig,
 ) -> Result<CompactionOutcome, RuntimeError> {
+    compact_session_with_context(client, session, context_config, &[]).await
+}
+
+pub async fn compact_session_with_middleware(
+    client: &dyn Model,
+    session: &mut Session,
+    context_config: ContextConfig,
+    context: MiddlewareExecutionContext,
+    middleware: &MiddlewareRegistry,
+) -> Result<MiddlewareCompactionOutcome, RuntimeError> {
+    let pre = middleware
+        .runtime()
+        .run_pre_compact(PreCompactInput {
+            context: context.clone(),
+            cause: CompactionCause::Manual,
+            estimated_tokens: 0,
+            token_budget: None,
+            current_summary: session.context.summary.clone(),
+            summarized_turns: session.context.summarized_turns,
+        })
+        .await;
+    let pre_cancelled = pre.cancelled;
+    let pre_denied = pre.denied();
+    let mut events = pre.events;
+    if pre_cancelled {
+        return Err(RuntimeError::AgentRun("operation cancelled".to_string()));
+    }
+    if pre_denied {
+        return Ok(MiddlewareCompactionOutcome {
+            outcome: CompactionOutcome::Noop,
+            events,
+            additional_context: Vec::new(),
+        });
+    }
+    let previous_summary = session.context.summary.clone();
+    let mut draft = session.clone();
+    let outcome =
+        compact_session_with_context(client, &mut draft, context_config, &pre.context).await?;
+    if outcome == CompactionOutcome::Noop {
+        return Ok(MiddlewareCompactionOutcome {
+            outcome,
+            events,
+            additional_context: Vec::new(),
+        });
+    }
+    let post = middleware
+        .runtime()
+        .run_post_compact(PostCompactInput {
+            context,
+            cause: CompactionCause::Manual,
+            previous_summary,
+            summary: draft.context.summary.clone().unwrap_or_default(),
+            summarized_turns: draft.context.summarized_turns,
+        })
+        .await;
+    events.extend(post.events);
+    if post.cancelled {
+        return Err(RuntimeError::AgentRun("operation cancelled".to_string()));
+    }
+    if !post.fatal_errors.is_empty() {
+        return Err(RuntimeError::AgentRun(format!(
+            "post-compact middleware failed: {}",
+            post.fatal_errors.join("; ")
+        )));
+    }
+    *session = draft;
+    Ok(MiddlewareCompactionOutcome {
+        outcome,
+        events,
+        additional_context: post.context,
+    })
+}
+
+async fn compact_session_with_context(
+    client: &dyn Model,
+    session: &mut Session,
+    context_config: ContextConfig,
+    middleware_context: &[MiddlewareContextBlock],
+) -> Result<CompactionOutcome, RuntimeError> {
     let prefix_len = compactable_prefix_len(session, context_config.retain_recent_turns);
     if prefix_len <= session.context.summarized_turns {
         return Ok(CompactionOutcome::Noop);
@@ -1262,6 +1968,7 @@ pub async fn compact_session(
         context_config.compact_max_retries,
         &records,
         session.context.summarized_turns,
+        middleware_context,
     )
     .await?;
 
@@ -1328,6 +2035,7 @@ async fn request_session_summary(
     max_attempts: usize,
     records: &[TurnRecord],
     first_turn_index: usize,
+    middleware_context: &[MiddlewareContextBlock],
 ) -> Result<String, RuntimeError> {
     let attempts = max_attempts.max(1);
     let mut repair_feedback = None;
@@ -1340,6 +2048,7 @@ async fn request_session_summary(
             repair_feedback.as_deref(),
             records,
             first_turn_index,
+            middleware_context,
         )
         .await
         {
@@ -1375,10 +2084,17 @@ async fn request_raw_session_summary(
     repair_feedback: Option<&str>,
     records: &[TurnRecord],
     first_turn_index: usize,
+    middleware_context: &[MiddlewareContextBlock],
 ) -> Result<String, RuntimeError> {
     let mut conversation = Conversation::with_system_prompt(
         "You compact long-running coding agent session history. Respond with text only. Do not call tools. Return one <analysis> block followed by one <summary> block.",
     );
+    if !middleware_context.is_empty() {
+        conversation.push(Message::system(render_middleware_context(
+            middleware_context,
+            "Additional middleware context for this compaction operation.",
+        )));
+    }
     conversation.push(Message::user(build_summary_prompt(
         existing_summary,
         target_tokens,
@@ -1770,6 +2486,7 @@ fn manifest_has_workspace_header(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_core::GateDecision;
     use agent_model::{OpenAiCompatClient, OpenAiCompatConfig};
     use agent_protocol::{FileChangeOperation, ReasoningLevel, SessionContext, Thread, Turn};
     use futures_util::future::BoxFuture;
@@ -2057,6 +2774,28 @@ compact test
         fn on_event(&mut self, event: &AgentEventEnvelope) -> Result<(), RuntimeError> {
             self.events.push(event.clone());
             Ok(())
+        }
+    }
+
+    struct PromptMiddleware {
+        decision: GateDecision,
+        context: Vec<agent_core::ContextBlock>,
+    }
+
+    impl RuntimeMiddleware for PromptMiddleware {
+        fn id(&self) -> &str {
+            "prompt-policy"
+        }
+
+        fn before_prompt(
+            &self,
+            _input: BeforePromptInput,
+        ) -> Option<agent_core::MiddlewareFuture<agent_core::GateOutput>> {
+            let output = agent_core::GateOutput {
+                decision: self.decision.clone(),
+                additional_context: self.context.clone(),
+            };
+            Some(async move { Ok(output) }.boxed())
         }
     }
 
@@ -2490,6 +3229,122 @@ compact test
             handler.events[3].event,
             AgentEvent::ModelMessageCommitted { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn denied_before_prompt_is_audited_without_persisting_prompt() {
+        let root = unique_dir("middleware-deny-workspace");
+        let sessions = unique_dir("middleware-deny-sessions");
+        let legacy = unique_dir("middleware-deny-legacy");
+        let store = SessionStore::new(&sessions, &legacy, &root, "default").expect("store");
+        let handle = SessionHandle::open(
+            store,
+            "default",
+            PermissionProfile::for_mode(PermissionMode::ReadOnly),
+        )
+        .expect("handle");
+        let client = client("http://127.0.0.1:1/v1".to_string());
+        let cache = McpToolCache::new();
+        let mut handler = RecordingHandler::default();
+        let mut middleware = MiddlewareRegistry::new();
+        middleware.register_runtime(Arc::new(PromptMiddleware {
+            decision: GateDecision::Deny {
+                reason: "secret detected".to_string(),
+            },
+            context: Vec::new(),
+        }));
+
+        let outcome = run_agent_turn_with_session_handle_and_middleware(
+            RunAgentTurnContext {
+                client: &client,
+                model: test_model_invocation(),
+                subagent_identities: &[],
+                system_prompt: "system",
+                context_config: context_config(2),
+                model_limits: model_limits(10_000),
+                workspace_root: &root,
+                permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
+                mcp_servers: &[],
+                mcp_cache: &cache,
+                session_name: "default",
+                turn_index: 0,
+            },
+            &handle,
+            "do not persist this secret",
+            &mut handler,
+            CancellationToken::new(),
+            None,
+            &middleware,
+            MiddlewareAgentScope::Main,
+        )
+        .await
+        .expect("middleware denial");
+
+        assert!(!outcome.session_changed);
+        assert!(outcome.error.is_some());
+        let projection = handle.projection().await;
+        assert!(projection.turns.is_empty());
+        assert_eq!(projection.middleware_audit.len(), 1);
+        assert_eq!(
+            projection.middleware_audit[0].outcome,
+            agent_protocol::MiddlewareOutcome::Deny
+        );
+        let exported =
+            String::from_utf8(handle.export_document_bytes().await.expect("export")).expect("utf8");
+        assert!(!exported.contains("do not persist this secret"));
+    }
+
+    #[tokio::test]
+    async fn before_prompt_context_is_sent_once_and_not_persisted() {
+        let root = unique_dir("middleware-context");
+        let (base_url, requests) = spawn_recording_sse_server(vec![sse_text_body("ok")]).await;
+        let client = client(base_url);
+        let cache = McpToolCache::new();
+        let mut session = Session::new();
+        let mut handler = RecordingHandler::default();
+        let mut middleware = MiddlewareRegistry::new();
+        middleware.register_runtime(Arc::new(PromptMiddleware {
+            decision: GateDecision::Continue,
+            context: vec![agent_core::ContextBlock::new("ephemeral policy")],
+        }));
+
+        let outcome = run_agent_turn_with_middleware(
+            RunAgentTurnContext {
+                client: &client,
+                model: test_model_invocation(),
+                subagent_identities: &[],
+                system_prompt: "system",
+                context_config: context_config(2),
+                model_limits: model_limits(10_000),
+                workspace_root: &root,
+                permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
+                mcp_servers: &[],
+                mcp_cache: &cache,
+                session_name: "default",
+                turn_index: 0,
+            },
+            &mut session,
+            "hello",
+            &mut handler,
+            CancellationToken::new(),
+            &middleware,
+            MiddlewareAgentScope::Main,
+        )
+        .await
+        .expect("run");
+
+        assert_eq!(outcome.error, None);
+        assert!(
+            requests.lock().expect("requests")[0].contains("ephemeral policy"),
+            "middleware context must reach the model request"
+        );
+        assert!(
+            session
+                .active_thread
+                .messages
+                .iter()
+                .all(|message| message.content.as_deref() != Some("ephemeral policy"))
+        );
     }
 
     #[tokio::test]

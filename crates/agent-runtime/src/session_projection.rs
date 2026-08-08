@@ -35,6 +35,7 @@ pub fn project_session(
     let mut covered_through_turn_id = None;
     let mut compaction_revision = None;
     let mut legacy_checkpoint = None::<(u64, Vec<Message>)>;
+    let mut middleware_audit = Vec::new();
     let mut diagnostics = Vec::new();
 
     for (index, envelope) in facts.iter().enumerate() {
@@ -103,6 +104,9 @@ pub fn project_session(
                     diagnostics.push(diagnostic.clone());
                 }
             }
+            SessionFact::MiddlewareFinished { invocation } => {
+                middleware_audit.push(invocation.clone());
+            }
             fact => {
                 let turn_id =
                     envelope
@@ -135,6 +139,7 @@ pub fn project_session(
         revision: facts.last().map_or(0, |fact| fact.revision),
         turns: turns.into_iter().map(|turn| turn.projection).collect(),
         context,
+        middleware_audit,
         diagnostics,
     })
 }
@@ -281,6 +286,7 @@ fn apply_turn_fact(turn: &mut ProjectedTurn, envelope: &SessionFactEnvelope, fac
         }
         SessionFact::TurnStarted { .. }
         | SessionFact::ContextCompacted { .. }
+        | SessionFact::MiddlewareFinished { .. }
         | SessionFact::LegacyContextCheckpoint { .. } => {}
     }
 }
@@ -650,5 +656,38 @@ mod tests {
             project_session(&header, &facts).expect("project deterministically"),
             projection
         );
+    }
+
+    #[test]
+    fn session_level_middleware_audit_does_not_require_a_turn() {
+        let header = SessionLogHeader {
+            schema_version: agent_protocol::SESSION_DOCUMENT_SCHEMA_VERSION,
+            session_id: "session-middleware".to_string(),
+            created_at_ms: 1,
+        };
+        let invocation = agent_protocol::MiddlewareInvocationFinished {
+            invocation_id: "middleware-1".to_string(),
+            middleware_id: "policy".to_string(),
+            source: agent_protocol::MiddlewareSource::Internal,
+            stage: agent_protocol::MiddlewareStage::BeforePrompt,
+            outcome: agent_protocol::MiddlewareOutcome::Deny,
+            started_at_ms: 1,
+            duration_ms: 2,
+            reason: Some("blocked".to_string()),
+        };
+        let facts = vec![SessionFactEnvelope {
+            revision: 1,
+            timestamp_ms: 3,
+            operation_id: None,
+            turn_id: None,
+            fact: SessionFact::MiddlewareFinished {
+                invocation: invocation.clone(),
+            },
+        }];
+
+        let projection = project_session(&header, &facts).expect("project audit");
+
+        assert!(projection.turns.is_empty());
+        assert_eq!(projection.middleware_audit, vec![invocation]);
     }
 }

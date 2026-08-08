@@ -36,7 +36,7 @@ function turn(status: TurnProjection['status'] = 'running'): TurnProjection {
 
 function snapshot(): SessionSnapshot {
   return {
-    schema_version: 2,
+    schema_version: 3,
     session_name: 'default',
     session_id: 'session-1',
     revision: 1,
@@ -46,6 +46,7 @@ function snapshot(): SessionSnapshot {
       revision: 1,
       turns: [turn()],
       context: { messages: [] },
+      middleware_audit: [],
       diagnostics: [],
     },
     active_operation: {
@@ -69,7 +70,7 @@ function event(sequence: number, update: SessionUpdate): SessionStreamFrame {
   return {
     type: 'event',
     data: {
-      schema_version: 2,
+      schema_version: 3,
       stream_id: 'stream-1',
       sequence,
       session_revision: 2,
@@ -174,5 +175,39 @@ describe('session timeline reducer', () => {
       content: 'partial',
       reasoning: 'thinking more',
     })
+  })
+
+  it('records redacted middleware audit entries in the timeline', () => {
+    const initial = reduceSessionFrame(emptySessionTimelineState(), {
+      type: 'snapshot',
+      data: snapshot(),
+    })
+    const next = reduceSessionFrame(
+      initial,
+      event(5, {
+        type: 'middleware_recorded',
+        data: {
+          invocation_id: 'middleware-1',
+          middleware_id: 'protect-shell',
+          source: 'project_command',
+          stage: 'before_tool',
+          outcome: 'deny',
+          started_at_ms: 10,
+          duration_ms: 4,
+          reason: 'blocked',
+        },
+      }),
+    )
+
+    expect(next.snapshot?.session.middleware_audit).toHaveLength(1)
+    expect(timelineFromSnapshot(next.snapshot)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: 'middleware-middleware-1',
+          tone: 'error',
+          title: 'Middleware before_tool · deny',
+        }),
+      ]),
+    )
   })
 })

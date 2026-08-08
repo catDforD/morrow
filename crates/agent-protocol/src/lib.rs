@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-pub const REMOTE_PROTOCOL_VERSION: u32 = 4;
+pub const REMOTE_PROTOCOL_VERSION: u32 = 5;
 pub const REMOTE_MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_SUBAGENT_PROMPT_SUFFIX_CHARS: usize = 4_000;
 pub const MIN_SUBAGENT_TIMEOUT_SECS: u64 = 30;
@@ -768,7 +768,7 @@ impl Thread {
 }
 
 pub const THREAD_DOCUMENT_SCHEMA_VERSION: u32 = 2;
-pub const SESSION_DOCUMENT_SCHEMA_VERSION: u32 = 5;
+pub const SESSION_DOCUMENT_SCHEMA_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ThreadDocument {
@@ -1376,7 +1376,7 @@ impl TurnRecord {
     }
 }
 
-pub const SESSION_STREAM_SCHEMA_VERSION: u32 = 2;
+pub const SESSION_STREAM_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct SessionLogHeader {
@@ -1443,6 +1443,9 @@ pub enum SessionFact {
     ContextCompacted {
         summary: String,
         covered_through_turn_id: String,
+    },
+    MiddlewareFinished {
+        invocation: MiddlewareInvocationFinished,
     },
     LegacyContextCheckpoint {
         source_schema: u32,
@@ -1538,6 +1541,8 @@ pub struct SessionProjection {
     pub turns: Vec<TurnProjection>,
     pub context: ModelContextProjection,
     #[serde(default)]
+    pub middleware_audit: Vec<MiddlewareInvocationFinished>,
+    #[serde(default)]
     pub diagnostics: Vec<String>,
 }
 
@@ -1613,6 +1618,7 @@ pub enum SessionUpdate {
     SubagentRemoved {
         instance_id: String,
     },
+    MiddlewareRecorded(MiddlewareInvocationFinished),
     Notice {
         message: String,
     },
@@ -1674,11 +1680,74 @@ pub enum AgentEventOrigin {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MiddlewareStage {
+    BeforePrompt,
+    BeforeTool,
+    PermissionRequest,
+    AfterTool,
+    PreCompact,
+    PostCompact,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MiddlewareSource {
+    Internal,
+    UserCommand,
+    ProjectCommand,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MiddlewareAgentScope {
+    Main,
+    DelegatedSubagent,
+    PersistentSubagent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MiddlewareOutcome {
+    Continue,
+    Approve,
+    Deny,
+    FailedOpen,
+    FailedClosed,
+    Cancelled,
+    SkippedUntrusted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct MiddlewareInvocationStarted {
+    pub invocation_id: String,
+    pub middleware_id: String,
+    pub source: MiddlewareSource,
+    pub stage: MiddlewareStage,
+    pub started_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct MiddlewareInvocationFinished {
+    pub invocation_id: String,
+    pub middleware_id: String,
+    pub source: MiddlewareSource,
+    pub stage: MiddlewareStage,
+    pub outcome: MiddlewareOutcome,
+    pub started_at_ms: u64,
+    pub duration_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum AgentEvent {
     TurnStarted,
     ModelCallStarted,
+    MiddlewareStarted(MiddlewareInvocationStarted),
+    MiddlewareFinished(MiddlewareInvocationFinished),
     Warning(String),
     ReasoningDelta(String),
     TextDelta(String),
@@ -1774,8 +1843,8 @@ mod tests {
     }
 
     #[test]
-    fn remote_turn_protocol_v4_carries_subagent_identities_and_role_runtimes() {
-        assert_eq!(REMOTE_PROTOCOL_VERSION, 4);
+    fn remote_turn_protocol_v5_carries_middleware_compatible_runtime_data() {
+        assert_eq!(REMOTE_PROTOCOL_VERSION, 5);
         let turn = RemoteTurnSpec {
             session: "default".to_string(),
             request_id: "request-1".to_string(),
@@ -1938,7 +2007,7 @@ mod tests {
         let document = SessionDocument::new(session.clone());
         let value = serde_json::to_value(&document).expect("serialize session document");
 
-        assert_eq!(value["schema_version"], json!(5));
+        assert_eq!(value["schema_version"], json!(6));
         assert_eq!(
             value["session"]["context"],
             json!({"summary": "Known facts", "summarized_turns": 1})
@@ -1981,6 +2050,7 @@ mod tests {
                 completed_at_ms: None,
             }],
             context: ModelContextProjection::default(),
+            middleware_audit: Vec::new(),
             diagnostics: Vec::new(),
         };
 
