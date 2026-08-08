@@ -14,25 +14,22 @@
 
 </div>
 
-Morrow streams model output, persists project-scoped sessions, reads and edits files, applies patches, runs shell commands behind explicit permissions, and can emit JSONL events for automation. Everything runs against your own OpenAI-compatible Chat Completions endpoint.
+Morrow reads and edits files, applies patches, runs shell commands behind explicit permissions, streams model output, and persists project-scoped sessions — all against your own OpenAI-compatible Chat Completions endpoint.
 
 ## Features
 
-- **Several faces, one runtime** — CLI one-shots, an interactive REPL, a local browser dashboard, and a Tauri 2 desktop app.
-- **Bring your own model** — OpenAI-compatible config via `--config`, local `morrow.toml`, or `~/.morrow/config.toml`; Web-only provider management with per-session model and reasoning selection.
-- **Persistent sessions** — named, project-scoped sessions you can list, rename, export, and resume.
+- **Several faces, one runtime** — CLI one-shots, interactive REPL, local web dashboard, and Tauri 2 desktop app.
+- **Bring your own model** — any OpenAI-compatible endpoint, configured per provider and per session.
 - **Real tools** — file reads/edits, patches, search, directory listing, and shell commands.
 - **Permission profiles** — read-only, workspace-write, and full-access modes, with shell controlled separately.
-- **MCP support** — stdio and Streamable HTTP MCP servers from TOML or the dashboard.
-- **Session-scoped subagents** — run persistent `explore`, `plan`, `worker`, and `reviewer` instances in the background, then inspect, continue, cancel, or delete them from Web/Desktop.
-- **Long-session friendly** — automatic context compaction.
-- **Scriptable** — JSONL event output for automation and integrations.
+- **MCP support** — stdio and Streamable HTTP MCP servers.
+- **Session-scoped subagents** — persistent `explore`, `plan`, `worker`, and `reviewer` instances running in the background.
+- **Long-session friendly** — named, resumable sessions with automatic context compaction.
+- **Scriptable** — JSONL event output for automation.
 
 ## Installation
 
 ### Desktop app (early access)
-
-The Tauri 2 desktop app uses the same dashboard and local agent runtime as `morrow server`. It does not install the `morrow` CLI.
 
 Download the installer from [GitHub Releases](https://github.com/catDforD/morrow/releases):
 
@@ -42,9 +39,7 @@ Download the installer from [GitHub Releases](https://github.com/catDforD/morrow
 | macOS 14+ (Apple Silicon) | `Morrow_<version>_aarch64.dmg` |
 | macOS 14+ (Intel) | `Morrow_<version>_x64.dmg` |
 
-These early builds are not formally signed or notarized — download only from this project's Release page. On Windows, if SmartScreen blocks the installer, verify the source and choose **Run anyway**. On macOS, first launch via Finder **Open**, or allow it under **System Settings → Privacy & Security**.
-
-The app restores the last workspace and offers **File → Open Folder** / **Open Recent**. Updates are manual (**Help → Download Latest Version** or GitHub Releases). Model settings, MCP settings, commands, and sessions remain in `~/.morrow`.
+Early builds are unsigned — download only from this project's Releases page, and confirm the OS security prompt on first launch. The desktop app bundles the same runtime as `morrow server` but does not include the CLI; settings and sessions live in `~/.morrow`.
 
 ### CLI
 
@@ -55,16 +50,9 @@ curl -fsSL https://raw.githubusercontent.com/catDforD/morrow/main/install.sh | s
 morrow init
 ```
 
-Specific version or custom install directory:
+Pin a version or install directory with `MORROW_VERSION` / `MORROW_INSTALL_DIR`. On Windows, download `morrow-x86_64-pc-windows-msvc.zip` from Releases, extract `morrow.exe` and `morrow-rg.exe` together, and add that directory to `PATH`.
 
-```bash
-MORROW_VERSION=v0.1.0 curl -fsSL https://raw.githubusercontent.com/catDforD/morrow/main/install.sh | sh
-MORROW_INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/catDforD/morrow/main/install.sh | sh
-```
-
-On Windows, download `morrow-x86_64-pc-windows-msvc.zip` from GitHub Releases, extract `morrow.exe` and `morrow-rg.exe` into the same directory, and put that directory on `PATH`.
-
-Install from source:
+From source:
 
 ```bash
 cargo install --git https://github.com/catDforD/morrow --locked -p agent-cli
@@ -74,99 +62,62 @@ cargo install --git https://github.com/catDforD/morrow --locked -p agent-cli
 
 ```bash
 morrow "summarize this repository"   # one-shot
-morrow                               # interactive
-morrow server                        # local web dashboard
+morrow                               # interactive REPL
+morrow server                        # web dashboard on 127.0.0.1:3000
 ```
 
-The dashboard listens on `127.0.0.1:3000` by default and uses the current workspace, config, sessions, and permissions. It is local-first and unauthenticated — do not bind it to a public interface. Customize with `morrow server --host 127.0.0.1 --port 3000`.
-
-The dashboard picks permissions per turn (default `workspace_write`, remembering the latest browser choice); `[permissions]` in `morrow.toml` applies to CLI only.
+The dashboard is local-first and unauthenticated — keep it bound to localhost. It picks permissions per turn in the browser; `[permissions]` in `morrow.toml` applies to the CLI only.
 
 ## Configuration
 
-```bash
-morrow init
-```
-
-Writes `~/.morrow/config.toml` and prompts for an API key. The generated key is stored inline — treat it as private and do not commit it. Use `morrow init --template` for a template without a real key, or `morrow init --force` to overwrite.
-
-Lookup order: `--config` → `morrow.toml` in the current directory → `~/.morrow/config.toml`.
+`morrow init` writes `~/.morrow/config.toml` and prompts for an API key. Lookup order: `--config` → `morrow.toml` in the current directory → `~/.morrow/config.toml`.
 
 ```toml
 [model]
 base_url = "https://api.openai.com/v1"
 model = "gpt-4.1"
 api_key_env = "OPENAI_API_KEY"
-timeout_secs = 120
-context_window_tokens = 128000
-reserved_output_tokens = 8192
-
-[agent]
-system_prompt = "You are a helpful assistant."
-
-[context]
-auto_compact = true
-auto_compact_threshold = 0.835
-retain_recent_turns = 6
-summary_target_tokens = 12000
-compact_max_retries = 2
 
 [permissions]
 mode = "read_only"
 shell = "deny"
 ```
 
-Inline `[model].OPENAI_API_KEY` wins when present; otherwise Morrow reads `api_key_env` (default `OPENAI_API_KEY`). CLI requires a valid model and API key. Without `--config`, `morrow server` can start with no config so the first provider can be set up in the browser.
-
-Web-only models, MCP servers, custom commands, and subagent settings are managed under **Settings → Models / MCP Servers / Commands / Subagents** and stored under `~/.morrow/`; they do not change the CLI TOML config. See [`morrow.example.toml`](morrow.example.toml) for more examples.
+An inline `api_key` wins when present; otherwise Morrow reads the `api_key_env` variable. Never commit a config containing a real key. Web-only settings (models, MCP servers, commands, subagents) are managed in the dashboard and stored under `~/.morrow/`. See [`morrow.example.toml`](morrow.example.toml) for the full set of options, including context compaction tuning.
 
 ### Project instructions
 
-When a workspace starts, Morrow reads `AGENTS.md` from the resolved workspace root and appends it to `[agent].system_prompt`. The same snapshot applies to the main agent, temporary delegated agents, and persistent subagents. Runtime role restrictions and permission enforcement still take precedence; `AGENTS.md` cannot grant additional tool access.
-
-Only the root `AGENTS.md` is loaded. It must be a regular UTF-8 file no larger than 32 KiB; symbolic links, nested files, and fallback names are not followed. Missing and empty files are ignored. Read failures produce a startup warning and appear under **Settings → About**, while the agent continues with the base system prompt.
-
-Changes take effect the next time the CLI/server starts or the desktop/WSL workspace is reopened. The instructions are sent to the configured model as part of the system prompt, so do not put secrets in `AGENTS.md`.
+Morrow reads `AGENTS.md` from the workspace root and appends it to the system prompt for the main agent and all subagents. It cannot grant tool access beyond the active permission profile, and it is sent to your model provider — don't put secrets in it.
 
 ### MCP tools
 
-Register stdio and Streamable HTTP MCP servers in config. Discovered tools are exposed as `mcp__server__tool`:
+Register stdio and Streamable HTTP MCP servers in config; their tools are exposed as `mcp__server__tool`:
 
 ```toml
 [mcp_servers.filesystem]
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
-env = {}
-cwd = "."
 enabled = true
-startup_timeout_sec = 10
-tool_timeout_sec = 60
 ```
 
-MCP tools are treated as explicitly trusted — review server commands and remote endpoints before enabling them.
+MCP tools are treated as trusted — review server commands and endpoints before enabling them.
 
 ### Subagents
 
-Web/Desktop sessions support persistent, background subagents through `spawn_subagent`, `send_subagent`, `inspect_subagent`, `wait_subagents`, and `cancel_subagent`. A parent turn can end while its subagents keep running. Users can inspect the complete transcript and event log, continue an idle or interrupted instance with preserved context, cancel active work, or delete a terminal instance from the Subagents inspector.
+Web/Desktop sessions can spawn persistent background subagents (`spawn_subagent`, `send_subagent`, `wait_subagents`, …) and inspect, continue, cancel, or delete them from the Subagents inspector. A parent turn can end while its subagents keep running.
 
 | Role | Built-in tools | Permission ceiling |
 | --- | --- | --- |
 | `explore` | Read, list, search | Read-only; shell denied |
 | `plan` | Read, list, search | Read-only; shell denied |
 | `worker` | File reads/writes, patches, shell | Workspace-write; shell always prompts |
-| `reviewer` | Read, list, search, shell | No file-write tools; every shell command prompts |
+| `reviewer` | Read, list, search, shell | No file writes; every shell command prompts |
 
-Effective access is the intersection of the parent permission profile, the role ceiling, and the role's explicit tool allowlist. Tools that are not permitted are omitted from the model request. Subagents never receive MCP or delegation tools. Role settings can override the model/reasoning level, append up to 4,000 prompt characters, set a 30–1,800 second timeout, and set 1–99 tool rounds. Changes affect new instances only; each instance snapshots its identity name, effective prompt, model, and permission ceiling when created.
-
-Each session retains at most eight persistent instances and runs at most four subagent runs concurrently. One workspace writer lease serializes parent file writes/shell commands, `worker` runs, and approved `reviewer` shell commands; reads remain parallel. Approval requests from parent and child runs share one FIFO queue and display their source. Approved file changes are revalidated immediately before commit, so a stale preview is rejected if the workspace changed.
-
-Persistent instances live under `~/.morrow/subagent-sessions/<workspace-scope>/<session>/`. Their event log stops storing streaming deltas after 16 MiB but keeps messages, tools, approvals, and terminal events. On restart, queued/running/waiting-for-approval runs become `interrupted`; approvals and leases are cleared, and unfinished operations are never replayed automatically. Remote model credentials are transmitted only when starting or continuing work and remain in memory; they are not written to the instance sidecar.
-
-The compatibility `delegate_task({task})` tool remains synchronous and strictly read-only. It creates a temporary `explore` agent, follows parent-turn cancellation, and does not consume persistent-instance capacity. CLI exposes this compatibility tool only; persistent lifecycle controls are currently Web/Desktop and remote-workspace features. Names and avatars remain separately configurable under **Settings → Subagents** (`~/.morrow/subagents.json`).
+Effective access is the intersection of the parent's permission profile, the role ceiling, and the role's tool allowlist; subagents never receive MCP or delegation tools. Each session keeps at most 8 instances and runs at most 4 concurrently. The synchronous, read-only `delegate_task` tool remains available everywhere (including the CLI) for quick one-off delegation. Per-role model, prompt, timeout, and identity settings live under **Settings → Subagents**.
 
 ### Web custom commands
 
-**Settings → Commands** manages slash commands in `~/.morrow/commands/*.md` (Web only). Type `/` in the composer to search; `$ARGUMENTS` is replaced with the supplied args.
+**Settings → Commands** manages slash commands stored in `~/.morrow/commands/*.md`. Type `/` in the composer to search; `$ARGUMENTS` is replaced with the supplied args.
 
 ## Permissions
 
@@ -182,29 +133,27 @@ The compatibility `delegate_task({task})` tool remains synchronous and strictly 
 | `prompt` | Shell needs approval |
 | `allow` | Shell runs without a prompt |
 
-Shell policy is an agent-level approval boundary, not an OS-level read-only sandbox. An approved command runs with the Morrow process user's operating-system permissions and may modify files on its own; inspect commands before approval and use an external sandbox when stronger isolation is required.
-
-Default from `morrow init`: `read_only` + `shell = "deny"`. Override for one run:
+Defaults from `morrow init`: `read_only` + `shell = "deny"`. Override per run with `--permission` / `--allow-shell`:
 
 ```bash
 morrow --permission workspace-write "update the README"
 morrow --allow-shell "run the test suite and explain failures"
 ```
 
+Shell policy is an approval boundary, not an OS sandbox — an approved command runs with your user permissions. Use an external sandbox when stronger isolation is required.
+
 ## Sessions
 
-Project-scoped sessions live under `~/.morrow/sessions/`:
+Named, project-scoped sessions persist under `~/.morrow/sessions/`:
 
 ```bash
 morrow --session work "continue the refactor"
 morrow session list
-morrow session show work
 morrow session export work --output work-session.json
 morrow session rename work backend-refactor
-morrow session delete backend-refactor
 ```
 
-Useful REPL commands: `/status`, `/permissions ...`, `/compact`, `/reset`, `/exit`. Compatibility aliases `--thread` / `--reset-thread` still work; prefer `--session` for new usage.
+Useful REPL commands: `/status`, `/permissions ...`, `/compact`, `/reset`, `/exit`. The legacy `--thread` aliases still work; prefer `--session`.
 
 ## Automation
 
@@ -212,7 +161,7 @@ Useful REPL commands: `/status`, `/permissions ...`, `/compact`, `/reset`, `/exi
 morrow --jsonl "inspect this crate" > events.jsonl
 ```
 
-JSONL mode requires a prompt and is not available for interactive mode or session subcommands.
+JSONL mode requires a prompt and is unavailable in interactive mode.
 
 ## Development
 
@@ -245,14 +194,13 @@ cargo run -p agent-cli -- "hello"
 cargo run -p agent-cli -- server
 ```
 
-Web dashboard:
+Web dashboard (with the server running in a separate terminal):
 
 ```bash
 cd crates/agent-server/web && pnpm install && pnpm dev
-# separate terminal: cargo run -p agent-cli -- server
 ```
 
-Desktop:
+Desktop app:
 
 ```bash
 pnpm --dir crates/agent-server/web install
@@ -260,15 +208,15 @@ pnpm --dir crates/agent-desktop install
 pnpm --dir crates/agent-desktop dev
 ```
 
-Native installers must be built on the target OS. Place the matching ripgrep binary under `crates/agent-desktop/src-tauri/binaries/`, then run `pnpm --dir crates/agent-desktop build:windows` or `build:macos`. Tagging the exact workspace version (e.g. `v0.3.0`) triggers GitHub Actions to publish CLI archives and desktop installers.
+Tagging the workspace version (e.g. `v0.3.0`) triggers GitHub Actions to publish CLI archives and desktop installers.
 
 ## Uninstall
 
-Remove the CLI binary or uninstall/delete the desktop app. Local private state is intentionally retained:
+Remove the CLI binary or delete the desktop app; local state under `~/.morrow` is retained intentionally:
 
 ```bash
 rm -f ~/.local/bin/morrow
-rm -rf ~/.morrow
+rm -rf ~/.morrow   # sessions, config, and keys — only if you want them gone
 ```
 
 ## License
