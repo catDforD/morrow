@@ -148,6 +148,17 @@ describe('App Session creation flow', () => {
           }
         case '/api/commands':
           return { commands: [], store_path: '/commands', diagnostics: [] }
+        case '/api/hooks':
+          return {
+            schema_version: 1,
+            user_config_path: '/home/test/.morrow/hooks.toml',
+            project_config_path: '/workspace/morrow/.morrow/hooks.toml',
+            trust_store_path: '/home/test/.morrow/hook-trust.json',
+            project_fingerprint: null,
+            project_trusted: false,
+            hooks: [],
+            diagnostics: [],
+          }
         case '/api/subagent-settings':
           return {
             profiles: [],
@@ -222,6 +233,7 @@ describe('App Session creation flow', () => {
   it('keeps task creation available when optional settings requests fail', async () => {
     failingUrls.add('/api/model-settings')
     failingUrls.add('/api/commands')
+    failingUrls.add('/api/hooks')
     failingUrls.add('/api/subagent-settings')
     await renderApp()
 

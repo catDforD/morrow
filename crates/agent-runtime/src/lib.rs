@@ -7,8 +7,8 @@ pub mod subagent_supervisor;
 
 use agent_config::{ContextConfig, McpServerConfig, ModelContextLimits};
 use agent_core::{
-    Agent, AgentError, AgentRunContext, MiddlewareContextBlock, MiddlewareExecutionContext,
-    ModelEvent, ModelFailure, ModelRequest, ToolExecutionContext,
+    Agent, AgentError, AgentRunContext, ModelEvent, ModelFailure, ModelRequest,
+    ToolExecutionContext,
 };
 use agent_protocol::{
     AgentEvent, AgentEventOrigin, ApprovalDecision, ApprovalRequest, Conversation, Message,
@@ -29,7 +29,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
-pub use agent_core::{CancellationToken, Model};
+pub use agent_core::{
+    CancellationToken, MiddlewareContextBlock, MiddlewareExecutionContext, Model,
+};
 pub use agent_tools::{McpToolCache, SubagentController};
 pub use middleware::{
     BeforePromptInput, CompactionCause, MiddlewareRegistry, PostCompactInput, PreCompactInput,
@@ -111,6 +113,20 @@ pub struct MiddlewareCompactionOutcome {
     pub additional_context: Vec<MiddlewareContextBlock>,
 }
 
+#[derive(Debug)]
+pub struct MiddlewareCompactionError {
+    pub error: RuntimeError,
+    pub events: Vec<AgentEvent>,
+}
+
+impl std::fmt::Display for MiddlewareCompactionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl std::error::Error for MiddlewareCompactionError {}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentEventEnvelope {
     pub schema_version: u32,
@@ -164,6 +180,7 @@ fn middleware_execution_context(
     turn_id: Option<String>,
 ) -> MiddlewareExecutionContext {
     MiddlewareExecutionContext {
+        invocation_id: None,
         session: context.session_name.to_string(),
         workspace_root: context.workspace_root.to_path_buf(),
         turn_index: context.turn_index,
@@ -492,6 +509,7 @@ impl RuntimeSubagentExecutor {
             shell: ShellPolicy::Deny,
         };
         let middleware_context = MiddlewareExecutionContext {
+            invocation_id: None,
             session: self.session_name.to_string(),
             workspace_root: self.workspace_root.as_ref().clone(),
             turn_index: self.turn_index,
@@ -1886,6 +1904,18 @@ pub async fn compact_session_with_middleware(
     context: MiddlewareExecutionContext,
     middleware: &MiddlewareRegistry,
 ) -> Result<MiddlewareCompactionOutcome, RuntimeError> {
+    compact_session_with_middleware_audit(client, session, context_config, context, middleware)
+        .await
+        .map_err(|failure| failure.error)
+}
+
+pub async fn compact_session_with_middleware_audit(
+    client: &dyn Model,
+    session: &mut Session,
+    context_config: ContextConfig,
+    context: MiddlewareExecutionContext,
+    middleware: &MiddlewareRegistry,
+) -> Result<MiddlewareCompactionOutcome, MiddlewareCompactionError> {
     let pre = middleware
         .runtime()
         .run_pre_compact(PreCompactInput {
@@ -1901,7 +1931,10 @@ pub async fn compact_session_with_middleware(
     let pre_denied = pre.denied();
     let mut events = pre.events;
     if pre_cancelled {
-        return Err(RuntimeError::AgentRun("operation cancelled".to_string()));
+        return Err(MiddlewareCompactionError {
+            error: RuntimeError::AgentRun("operation cancelled".to_string()),
+            events,
+        });
     }
     if pre_denied {
         return Ok(MiddlewareCompactionOutcome {
@@ -1912,8 +1945,17 @@ pub async fn compact_session_with_middleware(
     }
     let previous_summary = session.context.summary.clone();
     let mut draft = session.clone();
-    let outcome =
-        compact_session_with_context(client, &mut draft, context_config, &pre.context).await?;
+    let outcome = match compact_session_with_context(
+        client,
+        &mut draft,
+        context_config,
+        &pre.context,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => return Err(MiddlewareCompactionError { error, events }),
+    };
     if outcome == CompactionOutcome::Noop {
         return Ok(MiddlewareCompactionOutcome {
             outcome,
@@ -1933,13 +1975,19 @@ pub async fn compact_session_with_middleware(
         .await;
     events.extend(post.events);
     if post.cancelled {
-        return Err(RuntimeError::AgentRun("operation cancelled".to_string()));
+        return Err(MiddlewareCompactionError {
+            error: RuntimeError::AgentRun("operation cancelled".to_string()),
+            events,
+        });
     }
     if !post.fatal_errors.is_empty() {
-        return Err(RuntimeError::AgentRun(format!(
-            "post-compact middleware failed: {}",
-            post.fatal_errors.join("; ")
-        )));
+        return Err(MiddlewareCompactionError {
+            error: RuntimeError::AgentRun(format!(
+                "post-compact middleware failed: {}",
+                post.fatal_errors.join("; ")
+            )),
+            events,
+        });
     }
     *session = draft;
     Ok(MiddlewareCompactionOutcome {
@@ -2799,6 +2847,45 @@ compact test
         }
     }
 
+    struct FailingPostCompactMiddleware;
+
+    impl RuntimeMiddleware for FailingPostCompactMiddleware {
+        fn id(&self) -> &str {
+            "post-compact-policy"
+        }
+
+        fn post_compact(
+            &self,
+            _input: PostCompactInput,
+        ) -> Option<agent_core::MiddlewareFuture<agent_core::ObservationOutput>> {
+            Some(
+                async move { Err(agent_core::MiddlewareError::new("rejected compact draft")) }
+                    .boxed(),
+            )
+        }
+    }
+
+    struct ScopeRecordingMiddleware {
+        scopes: Arc<Mutex<Vec<MiddlewareAgentScope>>>,
+    }
+
+    impl RuntimeMiddleware for ScopeRecordingMiddleware {
+        fn id(&self) -> &str {
+            "scope-recorder"
+        }
+
+        fn before_prompt(
+            &self,
+            input: BeforePromptInput,
+        ) -> Option<agent_core::MiddlewareFuture<agent_core::GateOutput>> {
+            self.scopes
+                .lock()
+                .expect("scope recorder")
+                .push(input.context.agent_scope);
+            Some(async move { Ok(agent_core::GateOutput::default()) }.boxed())
+        }
+    }
+
     struct FailOnAgentMessage;
 
     impl TurnEventHandler for FailOnAgentMessage {
@@ -3024,6 +3111,39 @@ compact test
     }
 
     #[tokio::test]
+    async fn delegated_subagent_inherits_middleware_with_delegated_scope() {
+        let root = unique_dir("delegated-middleware-scope");
+        let scopes = Arc::new(Mutex::new(Vec::new()));
+        let mut middleware = MiddlewareRegistry::new();
+        middleware.register_runtime(Arc::new(ScopeRecordingMiddleware {
+            scopes: scopes.clone(),
+        }));
+        let executor = RuntimeSubagentExecutor::new(
+            Arc::new(ConstantModel {
+                text: "done".to_string(),
+            }),
+            Arc::<str>::from("system"),
+            Arc::new(root),
+        )
+        .with_middleware_context(
+            Arc::new(middleware),
+            test_model_invocation().clone(),
+            Arc::<str>::from("default"),
+            3,
+        );
+
+        let summary = executor
+            .execute("inspect".to_string(), CancellationToken::new())
+            .await;
+
+        assert!(summary.error.is_none(), "{:?}", summary.error);
+        assert_eq!(
+            *scopes.lock().expect("recorded scopes"),
+            vec![MiddlewareAgentScope::DelegatedSubagent]
+        );
+    }
+
+    #[tokio::test]
     async fn subagent_results_are_truncated_on_unicode_boundaries() {
         let root = unique_dir("subagent-truncate");
         let mut executor = RuntimeSubagentExecutor::new(
@@ -3122,6 +3242,47 @@ compact test
         assert_eq!(requests.len(), 1);
         assert!(requests[0].contains("failure reason"));
         assert!(requests[0].contains("Target length: at most 256 tokens"));
+    }
+
+    #[tokio::test]
+    async fn manual_post_compact_failure_keeps_draft_out_and_returns_audit_events() {
+        let root = unique_dir("manual-post-compact-failure");
+        let summary = valid_compact_summary("must be discarded");
+        let (base_url, _) = spawn_recording_sse_server(vec![sse_text_body(&summary)]).await;
+        let mut session = compactable_session();
+        let original = session.clone();
+        let mut middleware = MiddlewareRegistry::new();
+        middleware.register_runtime(Arc::new(FailingPostCompactMiddleware));
+
+        let failure = compact_session_with_middleware_audit(
+            &client(base_url),
+            &mut session,
+            context_config(2),
+            MiddlewareExecutionContext {
+                invocation_id: None,
+                session: "default".to_string(),
+                workspace_root: root,
+                turn_index: original.turns.len(),
+                operation_id: None,
+                turn_id: None,
+                model: test_model_invocation().clone(),
+                permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
+                agent_scope: MiddlewareAgentScope::Main,
+                cancellation: CancellationToken::new(),
+            },
+            &middleware,
+        )
+        .await
+        .expect_err("post compact must fail closed");
+
+        assert_eq!(session, original);
+        assert!(failure.to_string().contains("rejected compact draft"));
+        assert_eq!(failure.events.len(), 2);
+        assert!(matches!(
+            &failure.events[1],
+            AgentEvent::MiddlewareFinished(invocation)
+                if invocation.outcome == agent_protocol::MiddlewareOutcome::FailedClosed
+        ));
     }
 
     #[test]

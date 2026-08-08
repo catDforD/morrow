@@ -12,6 +12,7 @@ pub use subagent_settings::{
 };
 
 use agent_config::{ContextConfig, LoadedServerConfig, McpServerConfig};
+use agent_hooks::{HookManager, HookSettings};
 use agent_model::{ModelError, OpenAiCompatClient, OpenAiCompatConfig};
 use agent_protocol::{
     AgentEvent, AgentEventOrigin, ApprovalDecision, ApprovalOrigin, ApprovalRequest,
@@ -79,6 +80,7 @@ pub struct ServerOptions {
     pub mcp_store_path: PathBuf,
     pub command_store_path: PathBuf,
     pub subagent_store_path: PathBuf,
+    pub hook_home_dir: PathBuf,
     pub system_prompt: String,
     pub context_config: ContextConfig,
     pub workspace_root: PathBuf,
@@ -136,6 +138,7 @@ pub fn server_options_from_loaded_config(
         mcp_store_path: home.join(".morrow").join("web-mcp.json"),
         command_store_path: home.join(".morrow").join("commands"),
         subagent_store_path: home.join(".morrow").join("subagents.json"),
+        hook_home_dir: home.to_path_buf(),
         system_prompt: workspace_instructions.effective_system_prompt,
         context_config: loaded.config.context,
         workspace_root,
@@ -561,6 +564,13 @@ impl EmbeddedServer {
             .ok_or_else(|| "remote subagent runtime contains no models".to_string())?;
         let permissions =
             requested_permissions(self.service.inner.options.permissions, permission_mode);
+        let middleware = self
+            .service
+            .inner
+            .hook_manager
+            .load_snapshot()
+            .map_err(|error| error.to_string())?
+            .registry();
         let supervisor = prepare_subagent_supervisor_with_runtime(
             &self.service,
             &session,
@@ -569,6 +579,7 @@ impl EmbeddedServer {
             &subagent_identities,
             overrides,
             Some(models),
+            middleware,
         )
         .await?;
         if let Some(model) = resume_model {
@@ -963,6 +974,10 @@ fn build_router_with_settings(
     }
     .map_err(|error| ModelRegistryError::Validation(error.to_string()))?;
     let command_registry = CommandRegistry::new(options.command_store_path.clone());
+    let hook_manager = HookManager::new(
+        options.hook_home_dir.clone(),
+        options.workspace_root.clone(),
+    );
     let subagent_registry = if persistent_settings {
         SubagentRegistry::load(options.subagent_store_path.clone())
     } else {
@@ -977,6 +992,7 @@ fn build_router_with_settings(
             model_registry,
             mcp_registry,
             command_registry,
+            hook_manager,
             subagent_registry,
             sessions: Mutex::new(HashMap::new()),
             mcp_cache: RwLock::new(Arc::new(McpToolCache::new())),
@@ -991,6 +1007,9 @@ fn build_router_with_settings(
         .route("/style.css", get(style_css))
         .route("/assets/{*path}", get(asset))
         .route("/api/status", get(status))
+        .route("/api/hooks", get(hook_settings))
+        .route("/api/hooks/trust", post(trust_project_hooks))
+        .route("/api/hooks/revoke", post(revoke_project_hooks))
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/sessions/{name}/reset", post(reset_session))
         .route("/api/sessions/{name}/archive", post(archive_session))
@@ -1065,6 +1084,7 @@ struct ServerState {
     model_registry: ModelRegistry,
     mcp_registry: McpRegistry,
     command_registry: CommandRegistry,
+    hook_manager: HookManager,
     subagent_registry: SubagentRegistry,
     sessions: Mutex<HashMap<String, SessionRuntime>>,
     mcp_cache: RwLock<Arc<McpToolCache>>,
@@ -1586,6 +1606,49 @@ async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
 
 async fn model_settings(State(state): State<AppState>) -> Json<ModelSettingsResponse> {
     Json(state.inner.model_registry.settings().await)
+}
+
+async fn hook_settings(State(state): State<AppState>) -> Result<Json<HookSettings>, ApiError> {
+    state
+        .inner
+        .hook_manager
+        .settings()
+        .map(Json)
+        .map_err(hook_api_error)
+}
+
+async fn trust_project_hooks(
+    State(state): State<AppState>,
+) -> Result<Json<HookSettings>, ApiError> {
+    state
+        .inner
+        .hook_manager
+        .trust_project()
+        .map(Json)
+        .map_err(hook_api_error)
+}
+
+async fn revoke_project_hooks(
+    State(state): State<AppState>,
+) -> Result<Json<HookSettings>, ApiError> {
+    state
+        .inner
+        .hook_manager
+        .revoke_project()
+        .map(Json)
+        .map_err(hook_api_error)
+}
+
+fn hook_api_error(error: agent_hooks::HookError) -> ApiError {
+    match error {
+        agent_hooks::HookError::ProjectConfigNotFound => ApiError::not_found(error.to_string()),
+        agent_hooks::HookError::InvalidConfig { .. }
+        | agent_hooks::HookError::ConfigParse { .. }
+        | agent_hooks::HookError::UnsupportedConfigSchema { .. } => {
+            ApiError::bad_request(error.to_string())
+        }
+        _ => ApiError::internal(error.to_string()),
+    }
 }
 
 async fn create_model_provider(
@@ -2456,7 +2519,13 @@ async fn start_turn_inner(
         Some(overrides) => overrides,
         None => state.inner.subagent_registry.role_overrides().await,
     };
-    let supervisor = match prepare_subagent_supervisor_with_runtime(
+    let hooks = state
+        .inner
+        .hook_manager
+        .load_snapshot()
+        .map_err(|error| error.to_string())?;
+    let middleware = hooks.registry();
+    let supervisor = prepare_subagent_supervisor_with_runtime(
         &state,
         &session_name,
         &resolved_model,
@@ -2464,14 +2533,46 @@ async fn start_turn_inner(
         &subagent_identities,
         subagent_role_overrides,
         subagent_role_models,
+        middleware.clone(),
     )
-    .await
-    {
-        Ok(supervisor) => supervisor,
-        Err(error) => return Err(error),
-    };
+    .await?;
     let resources = ensure_session_resources(&state, &session_name).await?;
     let session_handle = resources.handle;
+    let projection = session_handle.projection().await;
+    let turn_index = projection.turns.len();
+    let mcp_cache = state.inner.mcp_cache.read().await.clone();
+    let hook_mcp_servers = mcp_servers.as_deref().unwrap_or(&[]);
+    let mut hook_handler = ServerTurnHandler {
+        state: state.clone(),
+        session_name: session_name.clone(),
+        turn_id: String::new(),
+        tx: tx.clone(),
+    };
+    let prepared = agent_runtime::prepare_session_turn_with_middleware(
+        RunAgentTurnContext {
+            client: &resolved_model.client,
+            model: &resolved_model.invocation,
+            subagent_identities: &subagent_identities,
+            system_prompt: &state.inner.options.system_prompt,
+            context_config: state.inner.options.context_config,
+            model_limits: resolved_model.limits,
+            workspace_root: &state.inner.options.workspace_root,
+            permissions,
+            mcp_servers: hook_mcp_servers,
+            mcp_cache: mcp_cache.as_ref(),
+            session_name: &session_name,
+            turn_index,
+        },
+        &session_handle,
+        &prompt,
+        &mut hook_handler,
+        &cancellation,
+        middleware.as_ref(),
+        agent_protocol::MiddlewareAgentScope::Main,
+    )
+    .await
+    .map_err(|error| error.to_string())?
+    .ok_or_else(|| "prompt blocked by middleware".to_string())?;
     let result = {
         let mut sessions = state.inner.sessions.lock().await;
         let runtime = sessions
@@ -2483,14 +2584,8 @@ async fn start_turn_inner(
         if runtime.running.is_some() {
             return Err("session already has a running turn".to_string());
         }
-        let (operation_id, turn_id) = session_handle
-            .begin_operation(
-                agent_protocol::Message::user(prompt.clone()),
-                resolved_model.invocation.clone(),
-                permissions,
-            )
-            .await
-            .map_err(|error| error.to_string())?;
+        let operation_id = prepared.operation_id;
+        let turn_id = prepared.turn_id;
         let result = (operation_id.clone(), turn_id.clone());
         let state_for_task = state.clone();
         let session_for_task = session_name.clone();
@@ -2513,6 +2608,9 @@ async fn start_turn_inner(
                 tx: tx_for_task,
                 session_handle: handle_for_task,
                 cancellation: cancellation_for_task,
+                middleware,
+                initial_context: prepared.initial_context,
+                event_index: prepared.event_index,
             })
             .await;
         });
@@ -2552,6 +2650,9 @@ struct TurnTaskContext {
     tx: broadcast::Sender<ServerMessage>,
     session_handle: Arc<SessionHandle>,
     cancellation: CancellationToken,
+    middleware: Arc<agent_runtime::MiddlewareRegistry>,
+    initial_context: Vec<agent_runtime::MiddlewareContextBlock>,
+    event_index: usize,
 }
 
 async fn run_turn_task(context: TurnTaskContext) {
@@ -2631,6 +2732,9 @@ async fn run_turn_task_inner(context: TurnTaskContext) -> Result<(), agent_runti
         tx,
         session_handle,
         cancellation,
+        middleware,
+        initial_context,
+        event_index,
     } = context;
     let options = state.inner.options.clone();
     let mcp_cache = state.inner.mcp_cache.read().await.clone();
@@ -2651,7 +2755,7 @@ async fn run_turn_task_inner(context: TurnTaskContext) -> Result<(), agent_runti
         tx: tx.clone(),
     };
 
-    let outcome = agent_runtime::run_agent_turn_with_prepared_session_handle(
+    let outcome = agent_runtime::run_agent_turn_with_prepared_session_handle_and_middleware(
         RunAgentTurnContext {
             client: &resolved_model.client,
             model: &resolved_model.invocation,
@@ -2675,6 +2779,10 @@ async fn run_turn_task_inner(context: TurnTaskContext) -> Result<(), agent_runti
         &mut handler,
         cancellation,
         Some(supervisor),
+        middleware.as_ref(),
+        agent_protocol::MiddlewareAgentScope::Main,
+        initial_context,
+        event_index,
     )
     .await?;
 
@@ -3386,6 +3494,12 @@ async fn prepare_subagent_supervisor(
     identities: &[SubagentIdentity],
 ) -> Result<Arc<SubagentSupervisor>, String> {
     let overrides = state.inner.subagent_registry.role_overrides().await;
+    let middleware = state
+        .inner
+        .hook_manager
+        .load_snapshot()
+        .map_err(|error| error.to_string())?
+        .registry();
     prepare_subagent_supervisor_with_runtime(
         state,
         session_name,
@@ -3394,10 +3508,12 @@ async fn prepare_subagent_supervisor(
         identities,
         overrides,
         None,
+        middleware,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn prepare_subagent_supervisor_with_runtime(
     state: &AppState,
     session_name: &str,
@@ -3406,6 +3522,7 @@ async fn prepare_subagent_supervisor_with_runtime(
     identities: &[SubagentIdentity],
     overrides: BTreeMap<SubagentRole, SubagentRoleOverride>,
     mut supplied_models: Option<BTreeMap<SubagentRole, ResolvedModel>>,
+    middleware: Arc<agent_runtime::MiddlewareRegistry>,
 ) -> Result<Arc<SubagentSupervisor>, String> {
     let resources = ensure_session_resources(state, session_name).await?;
     let mut roles = BTreeMap::new();
@@ -3438,7 +3555,7 @@ async fn prepare_subagent_supervisor_with_runtime(
                 role_config,
                 base_system_prompt: Arc::from(state.inner.options.system_prompt.clone()),
                 parent_permissions,
-                middleware: Arc::new(agent_runtime::MiddlewareRegistry::default()),
+                middleware: middleware.clone(),
             },
         );
     }
@@ -3658,6 +3775,7 @@ mod tests {
             mcp_store_path: root.join("web-mcp.json"),
             command_store_path: root.join("commands"),
             subagent_store_path: root.join("subagents.json"),
+            hook_home_dir: root.clone(),
             system_prompt: "system".to_string(),
             context_config: ContextConfig {
                 auto_compact: false,
@@ -3691,6 +3809,10 @@ mod tests {
             McpRegistry::load(options.mcp_store_path.clone(), options.mcp_servers.clone())
                 .expect("MCP registry");
         let command_registry = CommandRegistry::new(options.command_store_path.clone());
+        let hook_manager = HookManager::new(
+            options.hook_home_dir.clone(),
+            options.workspace_root.clone(),
+        );
         let subagent_registry =
             SubagentRegistry::load(options.subagent_store_path.clone()).expect("subagent registry");
         AppState {
@@ -3699,6 +3821,7 @@ mod tests {
                 model_registry,
                 mcp_registry,
                 command_registry,
+                hook_manager,
                 subagent_registry,
                 sessions: Mutex::new(HashMap::new()),
                 mcp_cache: RwLock::new(Arc::new(McpToolCache::new())),
@@ -3874,6 +3997,129 @@ mod tests {
                 .map(Vec::len),
             Some(22)
         );
+    }
+
+    #[tokio::test]
+    async fn embedded_hooks_routes_list_trust_and_revoke_project_configuration() {
+        let mut options = test_options();
+        options.workspace_root = unique_test_dir("hooks-api-workspace");
+        options.workspace_location = WorkspaceLocation::Local {
+            path: options.workspace_root.clone(),
+        };
+        let hook_home = unique_test_dir("hooks-api-home");
+        options.hook_home_dir = hook_home.clone();
+        let project_config = options.workspace_root.join(".morrow").join("hooks.toml");
+        fs::create_dir_all(project_config.parent().expect("project hook parent"))
+            .expect("create project hook parent");
+        fs::write(
+            &project_config,
+            "schema_version = 1\n[[hooks]]\nid = \"project\"\nevent = \"before_prompt\"\ncommand = [\"true\"]\n",
+        )
+        .expect("write project hooks");
+        let server = EmbeddedServer::new(options).expect("embedded server");
+
+        let listed = server
+            .request("GET", "/api/hooks", None)
+            .await
+            .expect("list hooks");
+        assert_eq!(listed.status, 200);
+        let listed = listed.body.expect("list body");
+        assert_eq!(listed["project_trusted"], false);
+        assert_eq!(listed["hooks"][0]["active"], false);
+
+        let trusted = server
+            .request("POST", "/api/hooks/trust", None)
+            .await
+            .expect("trust hooks");
+        assert_eq!(trusted.status, 200);
+        let trusted = trusted.body.expect("trust body");
+        assert_eq!(trusted["project_trusted"], true);
+        assert_eq!(trusted["hooks"][0]["active"], true);
+        assert!(hook_home.join(".morrow/hook-trust.json").is_file());
+
+        let revoked = server
+            .request("POST", "/api/hooks/revoke", None)
+            .await
+            .expect("revoke hooks");
+        assert_eq!(revoked.status, 200);
+        assert_eq!(revoked.body.expect("revoke body")["project_trusted"], false);
+    }
+
+    #[tokio::test]
+    async fn before_prompt_hook_denial_persists_audit_without_creating_turn() {
+        let _lock = ENV_LOCK.get_or_init(|| AsyncMutex::new(())).lock().await;
+        let session_home = unique_test_dir("before-prompt-deny-session-home");
+        let _home = HomeGuard::set(&session_home);
+        let mut options = test_options();
+        options.workspace_root = unique_test_dir("before-prompt-deny-workspace");
+        options.workspace_location = WorkspaceLocation::Local {
+            path: options.workspace_root.clone(),
+        };
+        let hook_home = unique_test_dir("before-prompt-deny-home");
+        options.hook_home_dir = hook_home.clone();
+        let script = options.workspace_root.join("deny-prompt-hook.sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s' '{\"decision\":\"deny\",\"reason\":\"blocked by policy\",\"additional_context\":[]}'\n",
+        )
+        .expect("write deny script");
+        let user_config = hook_home.join(".morrow/hooks.toml");
+        fs::create_dir_all(user_config.parent().expect("user hook parent"))
+            .expect("create user hook parent");
+        fs::write(
+            &user_config,
+            format!(
+                "schema_version = 1\n[[hooks]]\nid = \"deny-prompt\"\nevent = \"before_prompt\"\ncommand = [\"/bin/sh\", {:?}]\n",
+                script.to_string_lossy()
+            ),
+        )
+        .expect("write user hooks");
+        let state = test_state_with_options(options);
+        SessionStore::for_workspace(&state.inner.options.workspace_root, "default")
+            .expect("session store")
+            .reset()
+            .expect("create session");
+        let tx = session_sender(&state, "default").await;
+
+        let error = start_turn(
+            state.clone(),
+            "default".to_string(),
+            StartTurnRequest {
+                prompt: "do not persist this prompt".to_string(),
+                prompt_resolved: true,
+                permission_mode: None,
+                model_selection: None,
+                resolved_model: None,
+                mcp_servers: None,
+                subagent_identities: None,
+                subagent_role_overrides: None,
+                subagent_role_models: None,
+            },
+            tx,
+        )
+        .await
+        .expect_err("prompt must be denied");
+        assert!(error.contains("blocked by middleware"), "{error}");
+
+        let resources = ensure_session_resources(&state, "default")
+            .await
+            .expect("session resources");
+        let projection = resources.handle.projection().await;
+        assert!(projection.turns.is_empty());
+        assert_eq!(projection.middleware_audit.len(), 1);
+        assert_eq!(
+            projection.middleware_audit[0].outcome,
+            agent_protocol::MiddlewareOutcome::Deny
+        );
+        let exported = String::from_utf8(
+            resources
+                .handle
+                .export_document_bytes()
+                .await
+                .expect("export session"),
+        )
+        .expect("export UTF-8");
+        assert!(!exported.contains("do not persist this prompt"));
     }
 
     #[test]

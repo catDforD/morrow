@@ -167,6 +167,45 @@ export interface CommandWriteRequest {
   prompt: string
 }
 
+export type HookEvent =
+  | 'before_prompt'
+  | 'before_tool'
+  | 'permission_request'
+  | 'after_tool'
+  | 'pre_compact'
+  | 'post_compact'
+
+export type HookFailureMode = 'open' | 'closed'
+export type HookConfigSource = 'user' | 'project'
+export type MiddlewareAgentScope =
+  | 'main'
+  | 'delegated_subagent'
+  | 'persistent_subagent'
+
+export interface HookDefinitionStatus {
+  id: string
+  event: HookEvent
+  command: string[]
+  timeout_secs: number
+  failure_mode: HookFailureMode
+  tool_names?: string[] | null
+  agent_scopes?: MiddlewareAgentScope[] | null
+  source: HookConfigSource
+  trusted: boolean
+  active: boolean
+}
+
+export interface HookSettingsResponse {
+  schema_version: number
+  user_config_path: string
+  project_config_path: string
+  trust_store_path: string
+  project_fingerprint?: string | null
+  project_trusted: boolean
+  hooks: HookDefinitionStatus[]
+  diagnostics: string[]
+}
+
 export interface SubagentProfileResponse {
   id: string
   name: string

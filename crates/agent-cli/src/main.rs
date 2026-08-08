@@ -1,6 +1,7 @@
 use agent_config::{
     ContextConfig, McpServerConfig, ModelContextLimits, load_config, load_server_config,
 };
+use agent_hooks::{HookManager, HookSettings};
 use agent_model::{ModelError, OpenAiCompatClient, OpenAiCompatConfig};
 #[cfg(test)]
 use agent_protocol::Session;
@@ -85,6 +86,20 @@ enum CliCommand {
         #[command(subcommand)]
         command: SessionCommand,
     },
+    Hooks {
+        #[command(subcommand)]
+        command: HooksCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum HooksCommand {
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    Trust,
+    Revoke,
 }
 
 #[derive(Debug, Subcommand)]
@@ -123,6 +138,8 @@ enum CliError {
     Server(#[from] agent_server::ServerError),
     #[error(transparent)]
     SubagentSettings(#[from] agent_server::SubagentRegistryError),
+    #[error(transparent)]
+    Hooks(#[from] agent_hooks::HookError),
     #[error("agent run failed: {0}")]
     AgentRun(String),
     #[error("--session and --thread cannot be used together")]
@@ -458,13 +475,50 @@ async fn handle_repl_command(
         "/compact" => {
             let projection = context.session_handle.projection().await;
             let mut session = agent_runtime::projection_to_legacy_session(&projection);
-            match agent_runtime::compact_session(
+            let hooks = HookManager::for_workspace(context.workspace_root)?.load_snapshot()?;
+            let compaction = agent_runtime::compact_session_with_middleware_audit(
                 context.client,
                 &mut session,
                 context.context_config,
+                agent_runtime::MiddlewareExecutionContext {
+                    invocation_id: None,
+                    session: context.session_name.to_string(),
+                    workspace_root: context.workspace_root.to_path_buf(),
+                    turn_index: projection.turns.len(),
+                    operation_id: None,
+                    turn_id: None,
+                    model: context.model.clone(),
+                    permissions: *permissions,
+                    agent_scope: agent_protocol::MiddlewareAgentScope::Main,
+                    cancellation: agent_runtime::CancellationToken::new(),
+                },
+                hooks.registry().as_ref(),
             )
-            .await?
-            {
+            .await;
+            let events = match &compaction {
+                Ok(compaction) => &compaction.events,
+                Err(failure) => &failure.events,
+            };
+            for event in events {
+                if let AgentEvent::MiddlewareFinished(invocation) = event {
+                    context
+                        .session_handle
+                        .commit_fact(
+                            None,
+                            None,
+                            agent_protocol::SessionFact::MiddlewareFinished {
+                                invocation: invocation.clone(),
+                            },
+                        )
+                        .await?;
+                    eprintln!(
+                        "middleware {} {:?}: {:?}",
+                        invocation.middleware_id, invocation.stage, invocation.outcome
+                    );
+                }
+            }
+            let compaction = compaction.map_err(|failure| failure.error)?;
+            match compaction.outcome {
                 CompactionOutcome::Changed => {
                     let covered = projection
                         .turns
@@ -534,8 +588,9 @@ async fn run_persisted_agent_turn(
         OutputMode::Jsonl { session_name, .. } => session_name,
     };
     let mut handler = CliTurnHandler::new(context, stdout);
+    let hooks = HookManager::for_workspace(context.workspace_root)?.load_snapshot()?;
 
-    agent_runtime::run_agent_turn_with_session_handle(
+    agent_runtime::run_agent_turn_with_session_handle_and_middleware(
         agent_runtime::RunAgentTurnContext {
             client: context.client,
             model: context.model,
@@ -555,6 +610,8 @@ async fn run_persisted_agent_turn(
         &mut handler,
         agent_runtime::CancellationToken::new(),
         None,
+        hooks.registry().as_ref(),
+        agent_protocol::MiddlewareAgentScope::Main,
     )
     .await
     .map_err(CliError::from)
@@ -794,7 +851,78 @@ fn handle_cli_command(
         CliCommand::Session { command } => {
             handle_session_command(command, default_session_name, workspace_root, stdout)
         }
+        CliCommand::Hooks { command } => handle_hooks_command(command, workspace_root, stdout),
     }
+}
+
+fn handle_hooks_command(
+    command: &HooksCommand,
+    workspace_root: &Path,
+    stdout: &mut dyn Write,
+) -> Result<(), CliError> {
+    let manager = HookManager::for_workspace(workspace_root)?;
+    handle_hooks_command_with_manager(command, &manager, stdout)
+}
+
+fn handle_hooks_command_with_manager(
+    command: &HooksCommand,
+    manager: &HookManager,
+    stdout: &mut dyn Write,
+) -> Result<(), CliError> {
+    let settings = match command {
+        HooksCommand::List { json } => {
+            let settings = manager.settings()?;
+            if *json {
+                serde_json::to_writer_pretty(&mut *stdout, &settings)
+                    .map_err(CliError::JsonlSerialize)?;
+                stdout.write_all(b"\n").map_err(CliError::Stdout)?;
+                return stdout.flush().map_err(CliError::Stdout);
+            }
+            settings
+        }
+        HooksCommand::Trust => manager.trust_project()?,
+        HooksCommand::Revoke => manager.revoke_project()?,
+    };
+    write_hook_settings(stdout, &settings)?;
+    stdout.flush().map_err(CliError::Stdout)
+}
+
+fn write_hook_settings(stdout: &mut dyn Write, settings: &HookSettings) -> Result<(), CliError> {
+    let project_status = match (
+        settings.project_fingerprint.as_ref(),
+        settings.project_trusted,
+    ) {
+        (None, _) => "not configured",
+        (Some(_), true) => "trusted",
+        (Some(_), false) => "not trusted",
+    };
+    writeln!(
+        stdout,
+        "project hooks: {}{}",
+        project_status,
+        settings
+            .project_fingerprint
+            .as_ref()
+            .map(|fingerprint| format!(" ({fingerprint})"))
+            .unwrap_or_default()
+    )
+    .map_err(CliError::Stdout)?;
+    for hook in &settings.hooks {
+        writeln!(
+            stdout,
+            "{}\t{}\t{:?}\t{}\t{}",
+            hook.id,
+            hook.event.as_str(),
+            hook.source,
+            if hook.active { "active" } else { "disabled" },
+            hook.command.join(" ")
+        )
+        .map_err(CliError::Stdout)?;
+    }
+    for diagnostic in &settings.diagnostics {
+        writeln!(stdout, "warning: {diagnostic}").map_err(CliError::Stdout)?;
+    }
+    Ok(())
 }
 
 fn handle_init_command(
@@ -1576,6 +1704,79 @@ compact test
             })
         ));
         assert_eq!(resolve_session_name(&export_args).expect("session"), "work");
+    }
+
+    #[test]
+    fn parses_hooks_subcommands() {
+        let list =
+            Args::try_parse_from(["morrow", "hooks", "list", "--json"]).expect("parse hooks list");
+        assert!(matches!(
+            list.command,
+            Some(CliCommand::Hooks {
+                command: HooksCommand::List { json: true }
+            })
+        ));
+        let trust = Args::try_parse_from(["morrow", "hooks", "trust"]).expect("parse hooks trust");
+        assert!(matches!(
+            trust.command,
+            Some(CliCommand::Hooks {
+                command: HooksCommand::Trust
+            })
+        ));
+        let revoke =
+            Args::try_parse_from(["morrow", "hooks", "revoke"]).expect("parse hooks revoke");
+        assert!(matches!(
+            revoke.command,
+            Some(CliCommand::Hooks {
+                command: HooksCommand::Revoke
+            })
+        ));
+    }
+
+    #[test]
+    fn hooks_commands_list_trust_and_revoke_project_configuration() {
+        let home = unique_cli_dir("hooks-home");
+        let workspace = unique_cli_dir("hooks-workspace");
+        let manager = HookManager::new(&home, &workspace);
+        fs::create_dir_all(
+            manager
+                .project_config_path()
+                .parent()
+                .expect("project hook parent"),
+        )
+        .expect("create project hook parent");
+        fs::write(
+            manager.project_config_path(),
+            "schema_version = 1\n[[hooks]]\nid = \"project\"\nevent = \"before_prompt\"\ncommand = [\"true\"]\n",
+        )
+        .expect("write project hooks");
+
+        let mut json_output = Vec::new();
+        handle_hooks_command_with_manager(
+            &HooksCommand::List { json: true },
+            &manager,
+            &mut json_output,
+        )
+        .expect("list hooks");
+        let listed: serde_json::Value = serde_json::from_slice(&json_output).expect("hooks JSON");
+        assert_eq!(listed["project_trusted"], false);
+        assert_eq!(listed["hooks"][0]["active"], false);
+
+        let mut trust_output = Vec::new();
+        handle_hooks_command_with_manager(&HooksCommand::Trust, &manager, &mut trust_output)
+            .expect("trust hooks");
+        let trust_output = String::from_utf8(trust_output).expect("trust output");
+        assert!(trust_output.contains("project hooks: trusted"));
+        assert!(trust_output.contains("project\tbefore_prompt\tProject\tactive"));
+
+        let mut revoke_output = Vec::new();
+        handle_hooks_command_with_manager(&HooksCommand::Revoke, &manager, &mut revoke_output)
+            .expect("revoke hooks");
+        assert!(
+            String::from_utf8(revoke_output)
+                .expect("revoke output")
+                .contains("project hooks: not trusted")
+        );
     }
 
     #[test]

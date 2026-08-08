@@ -4706,6 +4706,114 @@ a:focus-visible {
   white-space: pre-wrap;
 }
 
+.hook-settings-page {
+  gap: 24px;
+}
+
+.hook-security-note {
+  background: var(--surface-warn);
+}
+
+.hook-section-heading {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.hook-section-heading > div {
+  display: grid;
+  gap: 4px;
+}
+
+.hook-section-heading button {
+  min-height: 34px;
+  flex: 0 0 auto;
+  padding: 0 10px;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.hook-source-meta {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border: 2px solid color-mix(in srgb, var(--border), transparent 54%);
+  border-radius: var(--radius);
+  background: var(--surface-panel-muted);
+  padding: 9px 11px;
+}
+
+.hook-source-meta > code,
+.hook-fingerprint code,
+.hook-list-copy > code {
+  font-family: var(--font-mono);
+}
+
+.hook-source-meta > code {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hook-fingerprint {
+  min-width: 0;
+  margin: -4px 2px 0;
+  color: var(--muted);
+  font-size: 9px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hook-list-row {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  border-bottom: 1px solid color-mix(in srgb, var(--border), transparent 78%);
+  padding: 13px 14px;
+}
+
+.hook-list-row:last-child {
+  border-bottom: 0;
+}
+
+.hook-list-copy > code {
+  overflow: hidden;
+  color: var(--foreground);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hook-row-status {
+  display: grid;
+  justify-items: end;
+  gap: 6px;
+}
+
+.hook-row-status > small {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.hook-empty {
+  min-height: 150px;
+}
+
+.hook-paths {
+  box-shadow: none;
+}
+
 .readonly-resource .settings-card {
   box-shadow: none;
 }
@@ -5084,6 +5192,29 @@ a:focus-visible {
     grid-template-columns: minmax(0, 1fr);
     gap: 6px;
     padding: 15px 13px;
+  }
+
+  .hook-section-heading,
+  .hook-source-meta {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .hook-section-heading button {
+    width: 100%;
+  }
+
+  .hook-source-meta .resource-status {
+    align-self: flex-start;
+  }
+
+  .hook-list-row {
+    grid-template-columns: 36px minmax(0, 1fr);
+  }
+
+  .hook-row-status {
+    grid-column: 2;
+    justify-items: start;
   }
 
   .settings-info-row dd {

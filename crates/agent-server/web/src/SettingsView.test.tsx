@@ -55,6 +55,7 @@ async function renderAbout(currentStatus: StatusResponse) {
         permissionMode="workspace_write"
         modelSettings={null}
         commandSettings={null}
+        hookSettings={null}
         subagentSettings={null}
         isSidebarOpen={false}
         isSidebarHidden={false}
@@ -66,6 +67,7 @@ async function renderAbout(currentStatus: StatusResponse) {
         onPermissionModeChange={vi.fn()}
         onModelSettingsChange={vi.fn()}
         onCommandSettingsChange={vi.fn()}
+        onHookSettingsChange={vi.fn()}
         onSubagentSettingsChange={vi.fn()}
       />,
     )

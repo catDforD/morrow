@@ -55,6 +55,7 @@ pub struct MiddlewareContextBlock {
 
 #[derive(Debug, Clone)]
 pub struct MiddlewareExecutionContext {
+    pub invocation_id: Option<String>,
     pub session: String,
     pub workspace_root: PathBuf,
     pub turn_index: usize,
@@ -261,11 +262,13 @@ impl AgentMiddlewareChain {
     pub async fn run_before_tool(&self, input: BeforeToolInput) -> GateRun {
         let mut run = GateRun::default();
         for entry in &self.entries {
-            let Some(future) = entry.middleware.before_tool(input.clone()) else {
-                continue;
-            };
             let audit =
                 AuditInvocation::start(entry.middleware.as_ref(), MiddlewareStage::BeforeTool);
+            let mut invocation_input = input.clone();
+            invocation_input.context.invocation_id = Some(audit.invocation_id.clone());
+            let Some(future) = entry.middleware.before_tool(invocation_input) else {
+                continue;
+            };
             run.events.push(audit.started_event());
             match await_middleware(future, &input.context.cancellation).await {
                 MiddlewareCall::Completed(Ok(output)) => {
@@ -305,13 +308,15 @@ impl AgentMiddlewareChain {
     pub async fn run_permission_request(&self, input: PermissionRequestInput) -> PermissionRun {
         let mut run = PermissionRun::default();
         for entry in &self.entries {
-            let Some(future) = entry.middleware.permission_request(input.clone()) else {
-                continue;
-            };
             let audit = AuditInvocation::start(
                 entry.middleware.as_ref(),
                 MiddlewareStage::PermissionRequest,
             );
+            let mut invocation_input = input.clone();
+            invocation_input.context.invocation_id = Some(audit.invocation_id.clone());
+            let Some(future) = entry.middleware.permission_request(invocation_input) else {
+                continue;
+            };
             run.events.push(audit.started_event());
             match await_middleware(future, &input.context.cancellation).await {
                 MiddlewareCall::Completed(Ok(output)) => {
@@ -366,11 +371,13 @@ impl AgentMiddlewareChain {
     pub async fn run_after_tool(&self, input: AfterToolInput) -> ObservationRun {
         let mut run = ObservationRun::default();
         for entry in &self.entries {
-            let Some(future) = entry.middleware.after_tool(input.clone()) else {
-                continue;
-            };
             let audit =
                 AuditInvocation::start(entry.middleware.as_ref(), MiddlewareStage::AfterTool);
+            let mut invocation_input = input.clone();
+            invocation_input.context.invocation_id = Some(audit.invocation_id.clone());
+            let Some(future) = entry.middleware.after_tool(invocation_input) else {
+                continue;
+            };
             run.events.push(audit.started_event());
             match await_middleware(future, &input.context.cancellation).await {
                 MiddlewareCall::Completed(Ok(output)) => {
@@ -577,6 +584,7 @@ mod tests {
 
     fn context() -> MiddlewareExecutionContext {
         MiddlewareExecutionContext {
+            invocation_id: None,
             session: "test".to_string(),
             workspace_root: PathBuf::from("/workspace"),
             turn_index: 0,

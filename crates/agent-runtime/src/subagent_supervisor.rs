@@ -801,6 +801,7 @@ impl SubagentSupervisor {
             SessionHandle::open(fact_store, instance_id.clone(), document.permission_ceiling)?;
         document.session = projection_to_legacy_session(&session_handle.projection().await);
         let middleware_context = MiddlewareExecutionContext {
+            invocation_id: None,
             session: instance_id.clone(),
             workspace_root: self.inner.workspace_root.clone(),
             turn_index,
@@ -1768,7 +1769,8 @@ pub fn subagent_store_for_session(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_core::{ModelEvent, ModelFailure, ModelRequest};
+    use crate::RuntimeMiddleware;
+    use agent_core::{GateOutput, ModelEvent, ModelFailure, ModelRequest};
     use agent_protocol::{PermissionMode, ReasoningLevel, ShellPolicy};
     use futures_util::stream::{self, StreamExt};
     use std::env;
@@ -1809,6 +1811,27 @@ mod tests {
     #[derive(Clone, Default)]
     struct PendingStreamModel {
         started: Arc<AtomicU64>,
+    }
+
+    struct ScopeRecordingMiddleware {
+        scopes: Arc<StdMutex<Vec<MiddlewareAgentScope>>>,
+    }
+
+    impl RuntimeMiddleware for ScopeRecordingMiddleware {
+        fn id(&self) -> &str {
+            "persistent-scope-recorder"
+        }
+
+        fn before_prompt(
+            &self,
+            input: BeforePromptInput,
+        ) -> Option<agent_core::MiddlewareFuture<GateOutput>> {
+            self.scopes
+                .lock()
+                .expect("record scopes")
+                .push(input.context.agent_scope);
+            Some(async move { Ok(GateOutput::default()) }.boxed())
+        }
     }
 
     impl Model for PendingStreamModel {
@@ -1980,6 +2003,37 @@ mod tests {
             .wait_instances(ids, Duration::from_secs(2))
             .await
             .expect("runs finish");
+        cleanup(supervisor, store_root, workspace);
+    }
+
+    #[tokio::test]
+    async fn persistent_subagent_inherits_middleware_with_persistent_scope() {
+        let scopes = Arc::new(StdMutex::new(Vec::new()));
+        let mut middleware = MiddlewareRegistry::new();
+        middleware.register_runtime(Arc::new(ScopeRecordingMiddleware {
+            scopes: scopes.clone(),
+        }));
+        let middleware = Arc::new(middleware);
+        let model: Arc<dyn Model> = Arc::new(ConstantModel::new("done"));
+        let mut roles = roles_with("middleware", |_| model.clone());
+        for runtime in roles.values_mut() {
+            runtime.middleware = middleware.clone();
+        }
+        let (supervisor, store_root, workspace) = test_supervisor("middleware-scope", roles);
+
+        let instance = supervisor
+            .spawn_instance(SubagentRole::Explore, "inspect".to_string())
+            .await
+            .expect("spawn persistent subagent");
+        supervisor
+            .wait_instances(vec![instance.id], Duration::from_secs(2))
+            .await
+            .expect("persistent run finishes");
+
+        assert_eq!(
+            *scopes.lock().expect("recorded scopes"),
+            vec![MiddlewareAgentScope::PersistentSubagent]
+        );
         cleanup(supervisor, store_root, workspace);
     }
 

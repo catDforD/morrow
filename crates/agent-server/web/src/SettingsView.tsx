@@ -23,20 +23,30 @@ import {
   Sun,
   Terminal,
   TriangleAlert,
+  Webhook,
   X,
 } from 'lucide-react'
 import type { PermissionMode, StatusResponse } from './types'
 import type {
   CommandSettingsResponse,
+  HookSettingsResponse,
   ModelSettingsResponse,
   SubagentSettingsResponse,
 } from './types'
 import CommandSettingsPanel from './CommandSettingsPanel'
+import HookSettingsPanel from './HookSettingsPanel'
 import McpSettingsPanel from './McpSettingsPanel'
 import ModelSettingsPanel from './ModelSettingsPanel'
 import SubagentSettingsPanel from './SubagentSettingsPanel'
 
-export type SettingsSection = 'general' | 'models' | 'subagents' | 'mcp' | 'commands' | 'about'
+export type SettingsSection =
+  | 'general'
+  | 'models'
+  | 'subagents'
+  | 'mcp'
+  | 'commands'
+  | 'hooks'
+  | 'about'
 export type ThemePreference = 'system' | 'light' | 'dark'
 
 type SettingsSelectOption<T extends string> = {
@@ -85,6 +95,7 @@ const navigationItems: SettingsNavigationItem[] = [
   { label: 'MCP 服务器', icon: <Server size={18} />, section: 'mcp' },
   { label: '插件管理', icon: <Plug size={18} />, section: null },
   { label: '命令', icon: <Terminal size={18} />, section: 'commands' },
+  { label: 'Hooks', icon: <Webhook size={18} />, section: 'hooks' },
   { label: '索引库', icon: <Database size={18} />, section: null },
   { label: '使用统计', icon: <BarChart3 size={18} />, section: null },
   { label: '关于', icon: <Info size={18} />, section: 'about' },
@@ -97,6 +108,7 @@ export default function SettingsView({
   permissionMode,
   modelSettings,
   commandSettings,
+  hookSettings,
   subagentSettings,
   isSidebarOpen,
   isSidebarHidden,
@@ -108,6 +120,7 @@ export default function SettingsView({
   onPermissionModeChange,
   onModelSettingsChange,
   onCommandSettingsChange,
+  onHookSettingsChange,
   onSubagentSettingsChange,
 }: {
   section: SettingsSection
@@ -116,6 +129,7 @@ export default function SettingsView({
   permissionMode: PermissionMode
   modelSettings: ModelSettingsResponse | null
   commandSettings: CommandSettingsResponse | null
+  hookSettings: HookSettingsResponse | null
   subagentSettings: SubagentSettingsResponse | null
   isSidebarOpen: boolean
   isSidebarHidden: boolean
@@ -127,6 +141,7 @@ export default function SettingsView({
   onPermissionModeChange: (mode: PermissionMode) => void
   onModelSettingsChange: () => Promise<void>
   onCommandSettingsChange: () => Promise<void>
+  onHookSettingsChange: () => Promise<void>
   onSubagentSettingsChange: () => Promise<void>
 }) {
   const title =
@@ -140,6 +155,8 @@ export default function SettingsView({
           ? 'MCP 服务器'
           : section === 'commands'
             ? '命令'
+            : section === 'hooks'
+              ? 'Hooks'
             : '常规'
 
   return (
@@ -257,6 +274,11 @@ export default function SettingsView({
             <CommandSettingsPanel
               settings={commandSettings}
               onChanged={onCommandSettingsChange}
+            />
+          ) : section === 'hooks' ? (
+            <HookSettingsPanel
+              settings={hookSettings}
+              onChanged={onHookSettingsChange}
             />
           ) : (
             <GeneralSettings

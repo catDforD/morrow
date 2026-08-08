@@ -109,7 +109,11 @@ impl RuntimeMiddlewareChain {
         self.run_gate(
             MiddlewareStage::BeforePrompt,
             input.context.clone(),
-            |middleware| middleware.before_prompt(input.clone()),
+            |middleware, context| {
+                let mut input = input.clone();
+                input.context = context;
+                middleware.before_prompt(input)
+            },
         )
         .await
     }
@@ -118,7 +122,11 @@ impl RuntimeMiddlewareChain {
         self.run_gate(
             MiddlewareStage::PreCompact,
             input.context.clone(),
-            |middleware| middleware.pre_compact(input.clone()),
+            |middleware, context| {
+                let mut input = input.clone();
+                input.context = context;
+                middleware.pre_compact(input)
+            },
         )
         .await
     }
@@ -126,14 +134,16 @@ impl RuntimeMiddlewareChain {
     pub async fn run_post_compact(&self, input: PostCompactInput) -> ObservationRun {
         let mut run = ObservationRun::default();
         for entry in &self.entries {
-            let Some(future) = entry.middleware.post_compact(input.clone()) else {
-                continue;
-            };
             let audit = AuditInvocation::start(
                 entry.middleware.id(),
                 entry.middleware.source(),
                 MiddlewareStage::PostCompact,
             );
+            let mut invocation_input = input.clone();
+            invocation_input.context.invocation_id = Some(audit.invocation_id.clone());
+            let Some(future) = entry.middleware.post_compact(invocation_input) else {
+                continue;
+            };
             run.events.push(audit.started_event());
             match await_middleware(future, &input.context).await {
                 MiddlewareCall::Completed(Ok(output)) => {
@@ -175,15 +185,20 @@ impl RuntimeMiddlewareChain {
         &self,
         stage: MiddlewareStage,
         context: MiddlewareExecutionContext,
-        future_for: impl Fn(&dyn RuntimeMiddleware) -> Option<MiddlewareFuture<GateOutput>>,
+        future_for: impl Fn(
+            &dyn RuntimeMiddleware,
+            MiddlewareExecutionContext,
+        ) -> Option<MiddlewareFuture<GateOutput>>,
     ) -> GateRun {
         let mut run = GateRun::default();
         for entry in &self.entries {
-            let Some(future) = future_for(entry.middleware.as_ref()) else {
-                continue;
-            };
             let audit =
                 AuditInvocation::start(entry.middleware.id(), entry.middleware.source(), stage);
+            let mut invocation_context = context.clone();
+            invocation_context.invocation_id = Some(audit.invocation_id.clone());
+            let Some(future) = future_for(entry.middleware.as_ref(), invocation_context) else {
+                continue;
+            };
             run.events.push(audit.started_event());
             match await_middleware(future, &context).await {
                 MiddlewareCall::Completed(Ok(output)) => {
