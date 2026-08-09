@@ -573,6 +573,9 @@ fn updates_for_fact(
     ) {
         updates.push(SessionUpdate::ContextReplaced(projection.context.clone()));
     }
+    if let SessionFact::MiddlewareFinished { invocation } = fact {
+        updates.push(SessionUpdate::MiddlewareRecorded(invocation.clone()));
+    }
     updates
 }
 

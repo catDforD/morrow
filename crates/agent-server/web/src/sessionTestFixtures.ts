@@ -57,7 +57,7 @@ export function sessionSnapshot(
   sequence = 0,
 ): SessionSnapshot {
   return {
-    schema_version: 2,
+    schema_version: 3,
     session_name: name,
     session_id: `session-${name}`,
     revision: 1,
@@ -67,6 +67,7 @@ export function sessionSnapshot(
       revision: 1,
       turns: [],
       context: { messages: [] },
+      middleware_audit: [],
       diagnostics: [],
     },
     active_operation: null,
@@ -91,7 +92,7 @@ export function eventFrame(
   return {
     type: 'event',
     data: {
-      schema_version: 2,
+      schema_version: 3,
       stream_id: `stream-${name}`,
       sequence,
       session_revision: 1,

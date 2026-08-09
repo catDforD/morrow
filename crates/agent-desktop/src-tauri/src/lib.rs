@@ -1225,6 +1225,7 @@ fn prepare_remote_settings(
         mcp_store_path: morrow_home.join("web-mcp.json"),
         command_store_path: morrow_home.join("commands"),
         subagent_store_path: morrow_home.join("subagents.json"),
+        hook_home_dir: runtime_home_for_hooks(&morrow_home),
         system_prompt: String::new(),
         context_config: ContextConfig {
             auto_compact: true,
@@ -1243,6 +1244,13 @@ fn prepare_remote_settings(
     };
     EmbeddedServer::new(options)
         .map_err(|error| DesktopError::BackendConfiguration(error.to_string()))
+}
+
+fn runtime_home_for_hooks(morrow_home: &Path) -> PathBuf {
+    morrow_home
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| morrow_home.to_path_buf())
 }
 
 async fn launch_server(

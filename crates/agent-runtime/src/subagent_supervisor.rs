@@ -1,18 +1,20 @@
 use crate::subagent_store::{SubagentInstanceDocument, SubagentSessionStore};
 use crate::{
-    AgentEventEnvelope, EVENT_SCHEMA_VERSION, RuntimeError, SessionFactRun, SessionHandle,
-    SessionStore, maybe_auto_compact_with_tools, projection_to_legacy_session, timestamp_ms,
+    AgentEventEnvelope, BeforePromptInput, EVENT_SCHEMA_VERSION, MiddlewareCompactionContext,
+    MiddlewareRegistry, RuntimeError, SessionFactRun, SessionHandle, SessionStore,
+    maybe_auto_compact_with_middleware_context, projection_to_legacy_session, timestamp_ms,
 };
 use agent_config::{ContextConfig, ModelContextLimits};
-use agent_core::{Agent, Model, ToolExecutionContext};
+use agent_core::{Agent, AgentRunContext, MiddlewareExecutionContext, Model, ToolExecutionContext};
 use agent_protocol::{
     AgentEvent, AgentEventOrigin, ApprovalDecision, ApprovalOrigin, ApprovalRequest,
     FileChangeSummary, MAX_SUBAGENT_PROMPT_SUFFIX_CHARS, MAX_SUBAGENT_TIMEOUT_SECS,
-    MAX_SUBAGENT_TOOL_ROUNDS, MIN_SUBAGENT_TIMEOUT_SECS, MIN_SUBAGENT_TOOL_ROUNDS, ModelInvocation,
-    PermissionProfile, Session, SessionFact, SessionTurnStatus, ShellCommandSummary,
-    SubagentIdentity, SubagentInstanceSnapshot, SubagentInstanceStatus, SubagentRole,
-    SubagentRoleOverride, SubagentRunRecord, SubagentRunStatus, SubagentRunSummary,
-    ToolExecutionSummary, TurnRecord, TurnStatus, TurnStepKind, default_subagent_identities,
+    MAX_SUBAGENT_TOOL_ROUNDS, MIN_SUBAGENT_TIMEOUT_SECS, MIN_SUBAGENT_TOOL_ROUNDS,
+    MiddlewareAgentScope, ModelInvocation, PermissionProfile, Session, SessionFact,
+    SessionTurnStatus, ShellCommandSummary, SubagentIdentity, SubagentInstanceSnapshot,
+    SubagentInstanceStatus, SubagentRole, SubagentRoleOverride, SubagentRunRecord,
+    SubagentRunStatus, SubagentRunSummary, ToolExecutionSummary, TurnRecord, TurnStatus,
+    TurnStepKind, default_subagent_identities,
 };
 use agent_tools::{
     BuiltInToolAllowlist, CancellationToken, MAX_SUBAGENT_TASK_CHARS, SubagentController,
@@ -67,6 +69,7 @@ pub struct SubagentRoleRuntime {
     pub role_config: SubagentRoleOverride,
     pub base_system_prompt: Arc<str>,
     pub parent_permissions: PermissionProfile,
+    pub middleware: Arc<MiddlewareRegistry>,
 }
 
 impl std::fmt::Debug for SubagentRoleRuntime {
@@ -77,6 +80,7 @@ impl std::fmt::Debug for SubagentRoleRuntime {
             .field("limits", &self.limits)
             .field("role_config", &self.role_config)
             .field("parent_permissions", &self.parent_permissions)
+            .field("middleware", &self.middleware)
             .finish_non_exhaustive()
     }
 }
@@ -488,6 +492,14 @@ impl SubagentSupervisor {
                     model.provider_name, model.model_name
                 )
             })?;
+        let middleware = self
+            .inner
+            .roles
+            .read()
+            .await
+            .get(&role)
+            .map(|runtime| runtime.middleware.clone())
+            .unwrap_or_else(|| Arc::new(MiddlewareRegistry::default()));
         let runtime = SubagentRoleRuntime {
             model: available.model,
             invocation: available.invocation,
@@ -495,6 +507,7 @@ impl SubagentSupervisor {
             role_config,
             base_system_prompt: Arc::from(system_prompt),
             parent_permissions: permission_ceiling,
+            middleware,
         };
         let run_id = next_run_id();
         let now = timestamp_ms();
@@ -787,6 +800,64 @@ impl SubagentSupervisor {
         let session_handle =
             SessionHandle::open(fact_store, instance_id.clone(), document.permission_ceiling)?;
         document.session = projection_to_legacy_session(&session_handle.projection().await);
+        let middleware_context = MiddlewareExecutionContext {
+            invocation_id: None,
+            session: instance_id.clone(),
+            workspace_root: self.inner.workspace_root.clone(),
+            turn_index,
+            operation_id: None,
+            turn_id: None,
+            model: document.model.clone(),
+            permissions: document.permission_ceiling,
+            agent_scope: MiddlewareAgentScope::PersistentSubagent,
+            cancellation: cancellation.clone(),
+        };
+        let before = runtime
+            .middleware
+            .runtime()
+            .run_before_prompt(BeforePromptInput {
+                context: middleware_context.clone(),
+                prompt: task.clone(),
+            })
+            .await;
+        let before_cancelled = before.cancelled;
+        let before_denied = before.denied();
+        let denied_reasons = before.denied_reasons.clone();
+        let mut event_index = 0usize;
+        for event in before.events {
+            if let AgentEvent::MiddlewareFinished(invocation) = &event {
+                session_handle
+                    .commit_fact(
+                        None,
+                        None,
+                        SessionFact::MiddlewareFinished {
+                            invocation: invocation.clone(),
+                        },
+                    )
+                    .await?;
+            }
+            self.emit_child_event(
+                &instance_id,
+                &run_id,
+                &document.snapshot,
+                turn_index,
+                event_index,
+                event,
+            )
+            .await;
+            event_index += 1;
+        }
+        if before_cancelled {
+            return Err(RuntimeError::AgentRun(
+                "subagent execution cancelled".to_string(),
+            ));
+        }
+        if before_denied {
+            return Err(RuntimeError::AgentRun(format!(
+                "subagent prompt blocked by middleware: {}",
+                denied_reasons.join("; ")
+            )));
+        }
         let (operation_id, turn_id) = session_handle
             .begin_operation(
                 agent_protocol::Message::user(task.clone()),
@@ -796,45 +867,73 @@ impl SubagentSupervisor {
             .await?;
         let mut fact_run =
             SessionFactRun::new(&session_handle, operation_id.clone(), turn_id.clone());
+        let turn_middleware_context = MiddlewareExecutionContext {
+            operation_id: Some(operation_id.clone()),
+            turn_id: Some(turn_id.clone()),
+            ..middleware_context
+        };
+        let mut initial_context = before.context;
         let previous_summary = document.session.context.summary.clone();
         let previous_summarized_turns = document.session.context.summarized_turns;
-        if let Err(error) = maybe_auto_compact_with_tools(
-            runtime.model.as_ref(),
-            &document.system_prompt,
+        let tool_definitions = tools.definitions();
+        let compaction = maybe_auto_compact_with_middleware_context(
             &mut document.session,
-            self.inner.context_config,
-            runtime.limits,
-            &task,
-            &tools.definitions(),
+            MiddlewareCompactionContext {
+                client: runtime.model.as_ref(),
+                system_prompt: &document.system_prompt,
+                context_config: self.inner.context_config,
+                model_limits: runtime.limits,
+                prompt: &task,
+                tools: &tool_definitions,
+                execution_context: turn_middleware_context.clone(),
+                registry: runtime.middleware.as_ref(),
+            },
         )
-        .await
-        {
-            let record = failed_record(&task, &document.model, error.to_string());
-            session_handle
-                .commit_fact(
-                    Some(operation_id.clone()),
-                    Some(turn_id.clone()),
-                    SessionFact::TurnFailed {
-                        error: error.to_string(),
-                    },
-                )
-                .await?;
-            let session = projection_to_legacy_session(&session_handle.projection().await);
-            session_handle.replace_operation(None).await;
-            let summary = failed_summary(
+        .await;
+        let compaction = match compaction {
+            Ok(compaction) => compaction,
+            Err(error) => {
+                let record = failed_record(&task, &document.model, error.to_string());
+                session_handle
+                    .commit_fact(
+                        Some(operation_id.clone()),
+                        Some(turn_id.clone()),
+                        SessionFact::TurnFailed {
+                            error: error.to_string(),
+                        },
+                    )
+                    .await?;
+                let session = projection_to_legacy_session(&session_handle.projection().await);
+                session_handle.replace_operation(None).await;
+                let summary = failed_summary(
+                    &instance_id,
+                    &run_id,
+                    document.snapshot.role,
+                    &task,
+                    error.to_string(),
+                    timestamp_ms(),
+                );
+                return Ok(ChildTurnOutcome {
+                    session,
+                    record,
+                    summary,
+                });
+            }
+        };
+        for event in compaction.events {
+            fact_run.persist_event(&event).await?;
+            self.emit_child_event(
                 &instance_id,
                 &run_id,
-                document.snapshot.role,
-                &task,
-                error.to_string(),
-                timestamp_ms(),
-            );
-            return Ok(ChildTurnOutcome {
-                session,
-                record,
-                summary,
-            });
+                &document.snapshot,
+                turn_index,
+                event_index,
+                event,
+            )
+            .await;
+            event_index += 1;
         }
+        initial_context.extend(compaction.additional_context);
         if document.session.context.summary != previous_summary
             || document.session.context.summarized_turns != previous_summarized_turns
         {
@@ -842,13 +941,18 @@ impl SubagentSupervisor {
         }
 
         let agent = Agent::with_tools(runtime.model.as_ref(), &document.system_prompt, &tools)
+            .with_middleware(runtime.middleware.agent().clone())
             .with_max_tool_rounds(document.role_config.max_tool_rounds);
         let mut stream = match agent
-            .run_turn_with_context(
+            .run_turn_with_agent_context(
                 &document.session.active_thread,
                 task.clone(),
-                ToolExecutionContext {
-                    cancellation: cancellation.clone(),
+                AgentRunContext {
+                    tool: ToolExecutionContext {
+                        cancellation: cancellation.clone(),
+                    },
+                    middleware: Some(turn_middleware_context),
+                    initial_context,
                 },
             )
             .await
@@ -869,7 +973,6 @@ impl SubagentSupervisor {
             }
         };
         let started_at_ms = timestamp_ms();
-        let mut event_index = 0usize;
         let mut cancellation_observed = false;
         let mut file_changes = Vec::new();
         let mut shell_commands = Vec::new();
@@ -1616,6 +1719,26 @@ pub fn build_role_runtimes(
     parent_permissions: PermissionProfile,
     overrides: &BTreeMap<SubagentRole, SubagentRoleOverride>,
 ) -> BTreeMap<SubagentRole, SubagentRoleRuntime> {
+    build_role_runtimes_with_middleware(
+        model,
+        invocation,
+        limits,
+        base_system_prompt,
+        parent_permissions,
+        overrides,
+        Arc::new(MiddlewareRegistry::default()),
+    )
+}
+
+pub fn build_role_runtimes_with_middleware(
+    model: Arc<dyn Model>,
+    invocation: ModelInvocation,
+    limits: ModelContextLimits,
+    base_system_prompt: impl Into<Arc<str>>,
+    parent_permissions: PermissionProfile,
+    overrides: &BTreeMap<SubagentRole, SubagentRoleOverride>,
+    middleware: Arc<MiddlewareRegistry>,
+) -> BTreeMap<SubagentRole, SubagentRoleRuntime> {
     let base_system_prompt = base_system_prompt.into();
     SubagentRole::ALL
         .into_iter()
@@ -1629,6 +1752,7 @@ pub fn build_role_runtimes(
                     role_config: overrides.get(&role).cloned().unwrap_or_default(),
                     base_system_prompt: base_system_prompt.clone(),
                     parent_permissions,
+                    middleware: middleware.clone(),
                 },
             )
         })
@@ -1648,7 +1772,8 @@ pub fn subagent_store_for_session(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_core::{ModelEvent, ModelFailure, ModelRequest};
+    use crate::RuntimeMiddleware;
+    use agent_core::{GateOutput, ModelEvent, ModelFailure, ModelRequest};
     use agent_protocol::{PermissionMode, ReasoningLevel, ShellPolicy};
     use futures_util::stream::{self, StreamExt};
     use std::env;
@@ -1689,6 +1814,27 @@ mod tests {
     #[derive(Clone, Default)]
     struct PendingStreamModel {
         started: Arc<AtomicU64>,
+    }
+
+    struct ScopeRecordingMiddleware {
+        scopes: Arc<StdMutex<Vec<MiddlewareAgentScope>>>,
+    }
+
+    impl RuntimeMiddleware for ScopeRecordingMiddleware {
+        fn id(&self) -> &str {
+            "persistent-scope-recorder"
+        }
+
+        fn before_prompt(
+            &self,
+            input: BeforePromptInput,
+        ) -> Option<agent_core::MiddlewareFuture<GateOutput>> {
+            self.scopes
+                .lock()
+                .expect("record scopes")
+                .push(input.context.agent_scope);
+            Some(async move { Ok(GateOutput::default()) }.boxed())
+        }
     }
 
     impl Model for PendingStreamModel {
@@ -1749,6 +1895,7 @@ mod tests {
                 mode: PermissionMode::WorkspaceWrite,
                 shell: ShellPolicy::Prompt,
             },
+            middleware: Arc::new(MiddlewareRegistry::default()),
         }
     }
 
@@ -1859,6 +2006,37 @@ mod tests {
             .wait_instances(ids, Duration::from_secs(2))
             .await
             .expect("runs finish");
+        cleanup(supervisor, store_root, workspace);
+    }
+
+    #[tokio::test]
+    async fn persistent_subagent_inherits_middleware_with_persistent_scope() {
+        let scopes = Arc::new(StdMutex::new(Vec::new()));
+        let mut middleware = MiddlewareRegistry::new();
+        middleware.register_runtime(Arc::new(ScopeRecordingMiddleware {
+            scopes: scopes.clone(),
+        }));
+        let middleware = Arc::new(middleware);
+        let model: Arc<dyn Model> = Arc::new(ConstantModel::new("done"));
+        let mut roles = roles_with("middleware", |_| model.clone());
+        for runtime in roles.values_mut() {
+            runtime.middleware = middleware.clone();
+        }
+        let (supervisor, store_root, workspace) = test_supervisor("middleware-scope", roles);
+
+        let instance = supervisor
+            .spawn_instance(SubagentRole::Explore, "inspect".to_string())
+            .await
+            .expect("spawn persistent subagent");
+        supervisor
+            .wait_instances(vec![instance.id], Duration::from_secs(2))
+            .await
+            .expect("persistent run finishes");
+
+        assert_eq!(
+            *scopes.lock().expect("recorded scopes"),
+            vec![MiddlewareAgentScope::PersistentSubagent]
+        );
         cleanup(supervisor, store_root, workspace);
     }
 

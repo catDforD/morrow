@@ -2,6 +2,7 @@ import type {
   RunStep,
   RunTrace,
   SessionSnapshot,
+  MiddlewareInvocationFinished,
   SessionStepProjection,
   SessionStreamFrame,
   SessionUpdateEnvelope,
@@ -10,7 +11,7 @@ import type {
   TurnProjection,
 } from './types'
 
-export const SESSION_STREAM_SCHEMA_VERSION = 2
+export const SESSION_STREAM_SCHEMA_VERSION = 3
 
 export interface SessionTimelineState {
   snapshot: SessionSnapshot | null
@@ -80,6 +81,7 @@ function applyEvent(
       ...current.session,
       revision: envelope.session_revision,
       turns: [...current.session.turns],
+      middleware_audit: [...current.session.middleware_audit],
     },
     approvals: [...current.approvals],
     subagents: [...current.subagents],
@@ -143,6 +145,9 @@ function applyEvent(
       )
       break
     }
+    case 'middleware_recorded':
+      snapshot.session.middleware_audit.push(envelope.update.data)
+      break
     case 'notice':
       lastNotice = envelope.update.data.message
       break
@@ -167,6 +172,9 @@ export function timelineFromSnapshot(
 ): TimelineItem[] {
   if (!snapshot) return []
   const items = snapshot.session.turns.flatMap((turn) => turnTimeline(turn, snapshot))
+  for (const invocation of snapshot.session.middleware_audit) {
+    items.unshift(middlewareTimelineItem(invocation))
+  }
   for (const diagnostic of snapshot.session.diagnostics) {
     items.unshift({
       kind: 'notice',
@@ -177,6 +185,27 @@ export function timelineFromSnapshot(
     })
   }
   return items
+}
+
+function middlewareTimelineItem(
+  invocation: MiddlewareInvocationFinished,
+): TimelineItem {
+  const failed = ['deny', 'failed_closed', 'cancelled'].includes(
+    invocation.outcome,
+  )
+  const detail = [
+    `${invocation.middleware_id} · ${invocation.source} · ${invocation.duration_ms} ms`,
+    invocation.reason,
+  ]
+    .filter(Boolean)
+    .join('\n')
+  return {
+    kind: 'notice',
+    id: `middleware-${invocation.invocation_id}`,
+    tone: failed ? 'error' : 'neutral',
+    title: `Middleware ${invocation.stage} · ${invocation.outcome}`,
+    detail,
+  }
 }
 
 function turnTimeline(

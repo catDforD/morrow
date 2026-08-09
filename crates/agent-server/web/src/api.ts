@@ -16,7 +16,7 @@ import type {
 } from './types'
 
 export const SESSION_DIRECTORY_SCHEMA_VERSION = 1
-export const SESSION_STREAM_SCHEMA_VERSION = 2
+export const SESSION_STREAM_SCHEMA_VERSION = 3
 
 export class SessionProtocolError extends Error {
   readonly fatal = true
@@ -472,6 +472,7 @@ function validateSnapshot(value: unknown, expectedSession?: string): SessionSnap
     typeof session.session_id !== 'string' ||
     !isNonNegativeInteger(session.revision) ||
     !Array.isArray(session.turns) ||
+    !Array.isArray(session.middleware_audit) ||
     !Array.isArray(session.diagnostics) ||
     !session.diagnostics.every((diagnostic) => typeof diagnostic === 'string')
   ) {
@@ -485,6 +486,9 @@ function validateSnapshot(value: unknown, expectedSession?: string): SessionSnap
   }
   validateContextProjection(session.context)
   for (const turn of session.turns) validateTurnProjection(turn)
+  for (const invocation of session.middleware_audit) {
+    validateMiddlewareInvocation(invocation)
+  }
   if (snapshot.active_operation !== undefined && snapshot.active_operation !== null) {
     validateOperationProjection(snapshot.active_operation)
   }
@@ -556,6 +560,9 @@ function validateSessionUpdate(value: unknown): void {
       }
       return
     }
+    case 'middleware_recorded':
+      validateMiddlewareInvocation(update.data)
+      return
     case 'notice': {
       const notice = expectRecord(update.data, 'session notice')
       if (typeof notice.message !== 'string') {
@@ -565,6 +572,39 @@ function validateSessionUpdate(value: unknown): void {
     }
     default:
       throw new SessionProtocolError(`unsupported session update ${update.type}`)
+  }
+}
+
+function validateMiddlewareInvocation(value: unknown): void {
+  const invocation = expectRecord(value, 'middleware invocation')
+  if (
+    typeof invocation.invocation_id !== 'string' ||
+    typeof invocation.middleware_id !== 'string' ||
+    !['internal', 'user_command', 'project_command'].includes(
+      String(invocation.source),
+    ) ||
+    ![
+      'before_prompt',
+      'before_tool',
+      'permission_request',
+      'after_tool',
+      'pre_compact',
+      'post_compact',
+    ].includes(String(invocation.stage)) ||
+    ![
+      'continue',
+      'approve',
+      'deny',
+      'failed_open',
+      'failed_closed',
+      'cancelled',
+      'skipped_untrusted',
+    ].includes(String(invocation.outcome)) ||
+    !isNonNegativeInteger(invocation.started_at_ms) ||
+    !isNonNegativeInteger(invocation.duration_ms) ||
+    !isOptionalString(invocation.reason)
+  ) {
+    throw new SessionProtocolError('invalid middleware invocation')
   }
 }
 

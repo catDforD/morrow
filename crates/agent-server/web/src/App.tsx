@@ -77,6 +77,7 @@ import type {
   ApprovalRequest,
   ClientMessage,
   CommandSettingsResponse,
+  HookSettingsResponse,
   Message,
   ModelSelection,
   ModelSettingsResponse,
@@ -184,6 +185,8 @@ export default function App() {
     useState<ModelSettingsResponse | null>(null)
   const [commandSettings, setCommandSettings] =
     useState<CommandSettingsResponse | null>(null)
+  const [hookSettings, setHookSettings] =
+    useState<HookSettingsResponse | null>(null)
   const [subagentSettings, setSubagentSettings] =
     useState<SubagentSettingsResponse | null>(null)
   const [isResolvingCommand, setIsResolvingCommand] = useState(false)
@@ -349,6 +352,12 @@ export default function App() {
     return settings
   }, [])
 
+  const loadHookSettings = useCallback(async () => {
+    const settings = await fetchJson<HookSettingsResponse>('/api/hooks')
+    setHookSettings(settings)
+    return settings
+  }, [])
+
   const loadSubagentSettings = useCallback(async () => {
     const settings = await fetchJson<SubagentSettingsResponse>('/api/subagent-settings')
     setSubagentSettings(settings)
@@ -473,6 +482,7 @@ export default function App() {
       }
       void loadModelSettings().catch(showError)
       void loadCommandSettings().catch(showError)
+      void loadHookSettings().catch(showError)
       void loadSubagentSettings().catch(showError)
     }
 
@@ -482,6 +492,7 @@ export default function App() {
     }
   }, [
     loadCommandSettings,
+    loadHookSettings,
     loadModelSettings,
     loadSubagentSettings,
     showError,
@@ -834,6 +845,7 @@ export default function App() {
             permissionMode={permissionMode}
             modelSettings={modelSettings}
             commandSettings={commandSettings}
+            hookSettings={hookSettings}
             subagentSettings={subagentSettings}
             isSidebarOpen={isSidebarOpen}
             isSidebarHidden={isNarrowViewport && !isSidebarOpen}
@@ -851,6 +863,9 @@ export default function App() {
             }}
             onCommandSettingsChange={async () => {
               await loadCommandSettings()
+            }}
+            onHookSettingsChange={async () => {
+              await loadHookSettings()
             }}
             onSubagentSettingsChange={async () => {
               await loadSubagentSettings()
@@ -3737,7 +3752,8 @@ function readAppLocation(): AppLocation {
       requestedSection === 'models' ||
       requestedSection === 'subagents' ||
       requestedSection === 'mcp' ||
-      requestedSection === 'commands')
+      requestedSection === 'commands' ||
+      requestedSection === 'hooks')
       ? requestedSection
       : 'general'
 

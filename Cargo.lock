@@ -13,6 +13,7 @@ name = "agent-cli"
 version = "0.3.1"
 dependencies = [
  "agent-config",
+ "agent-hooks",
  "agent-model",
  "agent-protocol",
  "agent-runtime",
@@ -72,6 +73,23 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "agent-hooks"
+version = "0.3.1"
+dependencies = [
+ "agent-core",
+ "agent-protocol",
+ "agent-runtime",
+ "dirs",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml 0.9.12+spec-1.1.0",
 ]
 
 [[package]]
@@ -142,6 +160,7 @@ name = "agent-server"
 version = "0.3.1"
 dependencies = [
  "agent-config",
+ "agent-hooks",
  "agent-model",
  "agent-protocol",
  "agent-runtime",

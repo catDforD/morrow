@@ -197,6 +197,7 @@ function buildTranscript(): SubagentTranscriptSnapshot {
       covered_through_turn_id: 'turn-1',
       messages: [{ role: 'system', content: 'compacted-only active thread' }],
     },
+    middleware_audit: [],
     diagnostics: [],
   }
   return {
