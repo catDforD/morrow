@@ -571,16 +571,16 @@ impl EmbeddedServer {
             .load_snapshot()
             .map_err(|error| error.to_string())?
             .registry();
-        let supervisor = prepare_subagent_supervisor_with_runtime(
-            &self.service,
-            &session,
-            &parent_model,
-            permissions,
-            &subagent_identities,
+        let supervisor = prepare_subagent_supervisor_with_runtime(SubagentSupervisorPreparation {
+            state: &self.service,
+            session_name: &session,
+            parent_model: &parent_model,
+            parent_permissions: permissions,
+            identities: &subagent_identities,
             overrides,
-            Some(models),
+            supplied_models: Some(models),
             middleware,
-        )
+        })
         .await?;
         if let Some(model) = resume_model {
             let resolved = match model {
@@ -2525,16 +2525,16 @@ async fn start_turn_inner(
         .load_snapshot()
         .map_err(|error| error.to_string())?;
     let middleware = hooks.registry();
-    let supervisor = prepare_subagent_supervisor_with_runtime(
-        &state,
-        &session_name,
-        &resolved_model,
-        permissions,
-        &subagent_identities,
-        subagent_role_overrides,
-        subagent_role_models,
-        middleware.clone(),
-    )
+    let supervisor = prepare_subagent_supervisor_with_runtime(SubagentSupervisorPreparation {
+        state: &state,
+        session_name: &session_name,
+        parent_model: &resolved_model,
+        parent_permissions: permissions,
+        identities: &subagent_identities,
+        overrides: subagent_role_overrides,
+        supplied_models: subagent_role_models,
+        middleware: middleware.clone(),
+    })
     .await?;
     let resources = ensure_session_resources(&state, &session_name).await?;
     let session_handle = resources.handle;
@@ -2548,27 +2548,29 @@ async fn start_turn_inner(
         turn_id: String::new(),
         tx: tx.clone(),
     };
-    let prepared = agent_runtime::prepare_session_turn_with_middleware(
-        RunAgentTurnContext {
-            client: &resolved_model.client,
-            model: &resolved_model.invocation,
-            subagent_identities: &subagent_identities,
-            system_prompt: &state.inner.options.system_prompt,
-            context_config: state.inner.options.context_config,
-            model_limits: resolved_model.limits,
-            workspace_root: &state.inner.options.workspace_root,
-            permissions,
-            mcp_servers: hook_mcp_servers,
-            mcp_cache: mcp_cache.as_ref(),
-            session_name: &session_name,
-            turn_index,
-        },
+    let prepared = agent_runtime::prepare_session_turn_with_middleware_context(
+        agent_runtime::MiddlewareAgentTurnContext::new(
+            RunAgentTurnContext {
+                client: &resolved_model.client,
+                model: &resolved_model.invocation,
+                subagent_identities: &subagent_identities,
+                system_prompt: &state.inner.options.system_prompt,
+                context_config: state.inner.options.context_config,
+                model_limits: resolved_model.limits,
+                workspace_root: &state.inner.options.workspace_root,
+                permissions,
+                mcp_servers: hook_mcp_servers,
+                mcp_cache: mcp_cache.as_ref(),
+                session_name: &session_name,
+                turn_index,
+            },
+            middleware.as_ref(),
+            agent_protocol::MiddlewareAgentScope::Main,
+        ),
         &session_handle,
         &prompt,
         &mut hook_handler,
         &cancellation,
-        middleware.as_ref(),
-        agent_protocol::MiddlewareAgentScope::Main,
     )
     .await
     .map_err(|error| error.to_string())?
@@ -2755,36 +2757,41 @@ async fn run_turn_task_inner(context: TurnTaskContext) -> Result<(), agent_runti
         tx: tx.clone(),
     };
 
-    let outcome = agent_runtime::run_agent_turn_with_prepared_session_handle_and_middleware(
-        RunAgentTurnContext {
-            client: &resolved_model.client,
-            model: &resolved_model.invocation,
-            subagent_identities: &subagent_identities,
-            system_prompt: &options.system_prompt,
-            context_config: options.context_config,
-            model_limits: resolved_model.limits,
-            workspace_root: &options.workspace_root,
-            permissions,
-            mcp_servers: &mcp_servers,
-            mcp_cache: mcp_cache.as_ref(),
-            session_name: &session_name,
-            turn_index,
-        },
-        &session_handle,
-        agent_runtime::PreparedSessionTurn {
-            operation_id,
-            turn_id: turn_id.clone(),
-            prompt: &prompt,
-        },
-        &mut handler,
-        cancellation,
-        Some(supervisor),
-        middleware.as_ref(),
-        agent_protocol::MiddlewareAgentScope::Main,
-        initial_context,
-        event_index,
-    )
-    .await?;
+    let outcome =
+        agent_runtime::run_agent_turn_with_prepared_session_handle_and_middleware_context(
+            agent_runtime::MiddlewareAgentTurnContext::new(
+                RunAgentTurnContext {
+                    client: &resolved_model.client,
+                    model: &resolved_model.invocation,
+                    subagent_identities: &subagent_identities,
+                    system_prompt: &options.system_prompt,
+                    context_config: options.context_config,
+                    model_limits: resolved_model.limits,
+                    workspace_root: &options.workspace_root,
+                    permissions,
+                    mcp_servers: &mcp_servers,
+                    mcp_cache: mcp_cache.as_ref(),
+                    session_name: &session_name,
+                    turn_index,
+                },
+                middleware.as_ref(),
+                agent_protocol::MiddlewareAgentScope::Main,
+            ),
+            &session_handle,
+            agent_runtime::PreparedMiddlewareTurn {
+                turn: agent_runtime::PreparedSessionTurn {
+                    operation_id,
+                    turn_id: turn_id.clone(),
+                    prompt: &prompt,
+                },
+                initial_context,
+                event_index,
+            },
+            &mut handler,
+            cancellation,
+            Some(supervisor),
+        )
+        .await?;
 
     if let Some(error) = outcome.error {
         broadcast_error(&tx, error);
@@ -3500,30 +3507,43 @@ async fn prepare_subagent_supervisor(
         .load_snapshot()
         .map_err(|error| error.to_string())?
         .registry();
-    prepare_subagent_supervisor_with_runtime(
+    prepare_subagent_supervisor_with_runtime(SubagentSupervisorPreparation {
         state,
         session_name,
         parent_model,
         parent_permissions,
         identities,
         overrides,
-        None,
+        supplied_models: None,
         middleware,
-    )
+    })
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn prepare_subagent_supervisor_with_runtime(
-    state: &AppState,
-    session_name: &str,
-    parent_model: &ResolvedModel,
+struct SubagentSupervisorPreparation<'a> {
+    state: &'a AppState,
+    session_name: &'a str,
+    parent_model: &'a ResolvedModel,
     parent_permissions: PermissionProfile,
-    identities: &[SubagentIdentity],
+    identities: &'a [SubagentIdentity],
     overrides: BTreeMap<SubagentRole, SubagentRoleOverride>,
-    mut supplied_models: Option<BTreeMap<SubagentRole, ResolvedModel>>,
+    supplied_models: Option<BTreeMap<SubagentRole, ResolvedModel>>,
     middleware: Arc<agent_runtime::MiddlewareRegistry>,
+}
+
+async fn prepare_subagent_supervisor_with_runtime(
+    preparation: SubagentSupervisorPreparation<'_>,
 ) -> Result<Arc<SubagentSupervisor>, String> {
+    let SubagentSupervisorPreparation {
+        state,
+        session_name,
+        parent_model,
+        parent_permissions,
+        identities,
+        overrides,
+        mut supplied_models,
+        middleware,
+    } = preparation;
     let resources = ensure_session_resources(state, session_name).await?;
     let mut roles = BTreeMap::new();
     for role in SubagentRole::ALL {

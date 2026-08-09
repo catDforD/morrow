@@ -1,18 +1,15 @@
+use agent_core::middleware_runner::{
+    MiddlewareCompletion, MiddlewareMetadata, append_context, attributed_reason,
+    run_middleware_chain,
+};
 use agent_core::{
-    ContextBlock, FailureMode, GateDecision, GateOutput, GateRun, MiddlewareContextBlock,
-    MiddlewareError, MiddlewareExecutionContext, MiddlewareFuture, ObservationOutput,
-    ObservationRun,
+    FailureMode, GateDecision, GateOutput, GateRun, MiddlewareExecutionContext, MiddlewareFuture,
+    ObservationOutput, ObservationRun,
 };
-use agent_protocol::{
-    AgentEvent, MiddlewareInvocationFinished, MiddlewareInvocationStarted, MiddlewareOutcome,
-    MiddlewareSource, MiddlewareStage,
-};
-use futures_util::future::{Either, FutureExt, select};
+use agent_protocol::{MiddlewareOutcome, MiddlewareSource, MiddlewareStage};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::AtomicU64;
 
-const MAX_AUDIT_REASON_CHARS: usize = 4_096;
 static RUNTIME_MIDDLEWARE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
@@ -75,6 +72,16 @@ struct RegisteredRuntimeMiddleware {
     failure_mode: FailureMode,
 }
 
+impl RegisteredRuntimeMiddleware {
+    fn metadata(&self) -> MiddlewareMetadata {
+        MiddlewareMetadata::new(
+            self.middleware.id(),
+            self.middleware.source(),
+            self.failure_mode,
+        )
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct RuntimeMiddlewareChain {
     entries: Vec<RegisteredRuntimeMiddleware>,
@@ -132,52 +139,40 @@ impl RuntimeMiddlewareChain {
     }
 
     pub async fn run_post_compact(&self, input: PostCompactInput) -> ObservationRun {
-        let mut run = ObservationRun::default();
-        for entry in &self.entries {
-            let audit = AuditInvocation::start(
-                entry.middleware.id(),
-                entry.middleware.source(),
-                MiddlewareStage::PostCompact,
-            );
-            let mut invocation_input = input.clone();
-            invocation_input.context.invocation_id = Some(audit.invocation_id.clone());
-            let Some(future) = entry.middleware.post_compact(invocation_input) else {
-                continue;
-            };
-            run.events.push(audit.started_event());
-            match await_middleware(future, &input.context).await {
-                MiddlewareCall::Completed(Ok(output)) => {
+        let chain = run_middleware_chain(
+            &self.entries,
+            &input.context,
+            MiddlewareStage::PostCompact,
+            &RUNTIME_MIDDLEWARE_COUNTER,
+            RegisteredRuntimeMiddleware::metadata,
+            |entry, context| {
+                let mut input = input.clone();
+                input.context = context;
+                entry.middleware.post_compact(input)
+            },
+            |_entry, metadata, result, run: &mut ObservationRun| match result {
+                Ok(output) => {
                     append_context(
                         &mut run.context,
-                        entry.middleware.as_ref(),
+                        metadata,
                         MiddlewareStage::PostCompact,
                         output.additional_context,
                     );
-                    run.events
-                        .push(audit.finished_event(MiddlewareOutcome::Continue, None));
+                    MiddlewareCompletion::new(MiddlewareOutcome::Continue, None)
                 }
-                MiddlewareCall::Completed(Err(error)) => {
+                Err(error) => {
                     let reason = error.to_string();
-                    let outcome = match entry.failure_mode {
-                        FailureMode::Open => MiddlewareOutcome::FailedOpen,
-                        FailureMode::Closed => {
-                            run.fatal_errors
-                                .push(format!("{}: {reason}", entry.middleware.id()));
-                            MiddlewareOutcome::FailedClosed
-                        }
-                    };
-                    run.events.push(audit.finished_event(outcome, Some(reason)));
+                    if metadata.failure_mode == FailureMode::Closed {
+                        run.fatal_errors.push(attributed_reason(metadata, &reason));
+                    }
+                    MiddlewareCompletion::new(metadata.failure_outcome(), Some(reason))
                 }
-                MiddlewareCall::Cancelled => {
-                    run.cancelled = true;
-                    run.events.push(audit.finished_event(
-                        MiddlewareOutcome::Cancelled,
-                        Some("operation cancelled".to_string()),
-                    ));
-                    break;
-                }
-            }
-        }
+            },
+        )
+        .await;
+        let mut run = chain.aggregate;
+        run.events = chain.events;
+        run.cancelled = chain.cancelled;
         run
     }
 
@@ -190,56 +185,39 @@ impl RuntimeMiddlewareChain {
             MiddlewareExecutionContext,
         ) -> Option<MiddlewareFuture<GateOutput>>,
     ) -> GateRun {
-        let mut run = GateRun::default();
-        for entry in &self.entries {
-            let audit =
-                AuditInvocation::start(entry.middleware.id(), entry.middleware.source(), stage);
-            let mut invocation_context = context.clone();
-            invocation_context.invocation_id = Some(audit.invocation_id.clone());
-            let Some(future) = future_for(entry.middleware.as_ref(), invocation_context) else {
-                continue;
-            };
-            run.events.push(audit.started_event());
-            match await_middleware(future, &context).await {
-                MiddlewareCall::Completed(Ok(output)) => {
+        let chain = run_middleware_chain(
+            &self.entries,
+            &context,
+            stage,
+            &RUNTIME_MIDDLEWARE_COUNTER,
+            RegisteredRuntimeMiddleware::metadata,
+            |entry, context| future_for(entry.middleware.as_ref(), context),
+            |_entry, metadata, result, run: &mut GateRun| match result {
+                Ok(output) => {
                     let (outcome, reason) = match &output.decision {
                         GateDecision::Continue => (MiddlewareOutcome::Continue, None),
                         GateDecision::Deny { reason } => {
-                            run.denied_reasons
-                                .push(format!("{}: {reason}", entry.middleware.id()));
+                            run.denied_reasons.push(attributed_reason(metadata, reason));
                             (MiddlewareOutcome::Deny, Some(reason.clone()))
                         }
                     };
-                    append_context(
-                        &mut run.context,
-                        entry.middleware.as_ref(),
-                        stage,
-                        output.additional_context,
-                    );
-                    run.events.push(audit.finished_event(outcome, reason));
+                    append_context(&mut run.context, metadata, stage, output.additional_context);
+                    MiddlewareCompletion::new(outcome, reason)
                 }
-                MiddlewareCall::Completed(Err(error)) => {
+                Err(error) => {
                     let reason = error.to_string();
-                    let outcome = match entry.failure_mode {
-                        FailureMode::Open => MiddlewareOutcome::FailedOpen,
-                        FailureMode::Closed => {
-                            run.denied_reasons
-                                .push(format!("{}: {reason}", entry.middleware.id()));
-                            MiddlewareOutcome::FailedClosed
-                        }
-                    };
-                    run.events.push(audit.finished_event(outcome, Some(reason)));
+                    if metadata.failure_mode == FailureMode::Closed {
+                        run.denied_reasons
+                            .push(attributed_reason(metadata, &reason));
+                    }
+                    MiddlewareCompletion::new(metadata.failure_outcome(), Some(reason))
                 }
-                MiddlewareCall::Cancelled => {
-                    run.cancelled = true;
-                    run.events.push(audit.finished_event(
-                        MiddlewareOutcome::Cancelled,
-                        Some("operation cancelled".to_string()),
-                    ));
-                    break;
-                }
-            }
-        }
+            },
+        )
+        .await;
+        let mut run = chain.aggregate;
+        run.events = chain.events;
+        run.cancelled = chain.cancelled;
         run
     }
 }
@@ -297,105 +275,5 @@ impl MiddlewareRegistry {
     ) {
         self.runtime
             .register_with_failure_mode(middleware, failure_mode);
-    }
-}
-
-enum MiddlewareCall<T> {
-    Completed(Result<T, MiddlewareError>),
-    Cancelled,
-}
-
-async fn await_middleware<T>(
-    future: MiddlewareFuture<T>,
-    context: &MiddlewareExecutionContext,
-) -> MiddlewareCall<T> {
-    let cancellation = context.cancellation.clone();
-    let cancelled = async move { cancellation.cancelled().await }.boxed();
-    match select(future, cancelled).await {
-        Either::Left((result, _)) => MiddlewareCall::Completed(result),
-        Either::Right(((), _)) => MiddlewareCall::Cancelled,
-    }
-}
-
-fn append_context(
-    target: &mut Vec<MiddlewareContextBlock>,
-    middleware: &dyn RuntimeMiddleware,
-    stage: MiddlewareStage,
-    blocks: Vec<ContextBlock>,
-) {
-    target.extend(blocks.into_iter().filter_map(|block| {
-        let content = block.content.trim().to_string();
-        (!content.is_empty()).then(|| MiddlewareContextBlock {
-            middleware_id: middleware.id().to_string(),
-            source: middleware.source(),
-            stage,
-            content,
-        })
-    }));
-}
-
-struct AuditInvocation {
-    invocation_id: String,
-    middleware_id: String,
-    source: MiddlewareSource,
-    stage: MiddlewareStage,
-    started_at_ms: u64,
-    started: Instant,
-}
-
-impl AuditInvocation {
-    fn start(id: &str, source: MiddlewareSource, stage: MiddlewareStage) -> Self {
-        Self {
-            invocation_id: next_invocation_id(),
-            middleware_id: id.to_string(),
-            source,
-            stage,
-            started_at_ms: timestamp_ms(),
-            started: Instant::now(),
-        }
-    }
-
-    fn started_event(&self) -> AgentEvent {
-        AgentEvent::MiddlewareStarted(MiddlewareInvocationStarted {
-            invocation_id: self.invocation_id.clone(),
-            middleware_id: self.middleware_id.clone(),
-            source: self.source,
-            stage: self.stage,
-            started_at_ms: self.started_at_ms,
-        })
-    }
-
-    fn finished_event(&self, outcome: MiddlewareOutcome, reason: Option<String>) -> AgentEvent {
-        AgentEvent::MiddlewareFinished(MiddlewareInvocationFinished {
-            invocation_id: self.invocation_id.clone(),
-            middleware_id: self.middleware_id.clone(),
-            source: self.source,
-            stage: self.stage,
-            outcome,
-            started_at_ms: self.started_at_ms,
-            duration_ms: self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
-            reason: reason.map(|reason| truncate_chars(reason, MAX_AUDIT_REASON_CHARS)),
-        })
-    }
-}
-
-fn next_invocation_id() -> String {
-    let counter = RUNTIME_MIDDLEWARE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("middleware-{:016x}-{counter:04x}", timestamp_ms())
-}
-
-fn timestamp_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .min(u128::from(u64::MAX)) as u64
-}
-
-fn truncate_chars(value: String, max_chars: usize) -> String {
-    if value.chars().count() <= max_chars {
-        value
-    } else {
-        value.chars().take(max_chars).collect()
     }
 }

@@ -589,29 +589,32 @@ async fn run_persisted_agent_turn(
     };
     let mut handler = CliTurnHandler::new(context, stdout);
     let hooks = HookManager::for_workspace(context.workspace_root)?.load_snapshot()?;
+    let middleware = hooks.registry();
 
-    agent_runtime::run_agent_turn_with_session_handle_and_middleware(
-        agent_runtime::RunAgentTurnContext {
-            client: context.client,
-            model: context.model,
-            subagent_identities: context.subagent_identities,
-            system_prompt: context.system_prompt,
-            context_config: context.context_config,
-            model_limits: context.model_limits,
-            workspace_root: context.workspace_root,
-            permissions: context.permissions,
-            mcp_servers: context.mcp_servers,
-            mcp_cache: context.mcp_cache,
-            session_name,
-            turn_index,
-        },
+    agent_runtime::run_agent_turn_with_session_handle_and_middleware_context(
+        agent_runtime::MiddlewareAgentTurnContext::new(
+            agent_runtime::RunAgentTurnContext {
+                client: context.client,
+                model: context.model,
+                subagent_identities: context.subagent_identities,
+                system_prompt: context.system_prompt,
+                context_config: context.context_config,
+                model_limits: context.model_limits,
+                workspace_root: context.workspace_root,
+                permissions: context.permissions,
+                mcp_servers: context.mcp_servers,
+                mcp_cache: context.mcp_cache,
+                session_name,
+                turn_index,
+            },
+            middleware.as_ref(),
+            agent_protocol::MiddlewareAgentScope::Main,
+        ),
         session_handle,
         prompt,
         &mut handler,
         agent_runtime::CancellationToken::new(),
         None,
-        hooks.registry().as_ref(),
-        agent_protocol::MiddlewareAgentScope::Main,
     )
     .await
     .map_err(CliError::from)

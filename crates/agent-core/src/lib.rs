@@ -1,4 +1,6 @@
 mod middleware;
+#[doc(hidden)]
+pub mod middleware_runner;
 
 pub use middleware::{
     AfterToolInput, AgentMiddleware, AgentMiddlewareChain, BeforeToolInput, ContextBlock,

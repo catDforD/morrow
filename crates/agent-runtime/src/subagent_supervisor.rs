@@ -1,8 +1,8 @@
 use crate::subagent_store::{SubagentInstanceDocument, SubagentSessionStore};
 use crate::{
-    AgentEventEnvelope, BeforePromptInput, EVENT_SCHEMA_VERSION, MiddlewareRegistry, RuntimeError,
-    SessionFactRun, SessionHandle, SessionStore, maybe_auto_compact_with_tools_and_middleware,
-    projection_to_legacy_session, timestamp_ms,
+    AgentEventEnvelope, BeforePromptInput, EVENT_SCHEMA_VERSION, MiddlewareCompactionContext,
+    MiddlewareRegistry, RuntimeError, SessionFactRun, SessionHandle, SessionStore,
+    maybe_auto_compact_with_middleware_context, projection_to_legacy_session, timestamp_ms,
 };
 use agent_config::{ContextConfig, ModelContextLimits};
 use agent_core::{Agent, AgentRunContext, MiddlewareExecutionContext, Model, ToolExecutionContext};
@@ -875,16 +875,19 @@ impl SubagentSupervisor {
         let mut initial_context = before.context;
         let previous_summary = document.session.context.summary.clone();
         let previous_summarized_turns = document.session.context.summarized_turns;
-        let compaction = maybe_auto_compact_with_tools_and_middleware(
-            runtime.model.as_ref(),
-            &document.system_prompt,
+        let tool_definitions = tools.definitions();
+        let compaction = maybe_auto_compact_with_middleware_context(
             &mut document.session,
-            self.inner.context_config,
-            runtime.limits,
-            &task,
-            &tools.definitions(),
-            turn_middleware_context.clone(),
-            runtime.middleware.as_ref(),
+            MiddlewareCompactionContext {
+                client: runtime.model.as_ref(),
+                system_prompt: &document.system_prompt,
+                context_config: self.inner.context_config,
+                model_limits: runtime.limits,
+                prompt: &task,
+                tools: &tool_definitions,
+                execution_context: turn_middleware_context.clone(),
+                registry: runtime.middleware.as_ref(),
+            },
         )
         .await;
         let compaction = match compaction {
