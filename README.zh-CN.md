@@ -23,6 +23,7 @@ Morrow 以流式方式输出模型结果，按项目持久化会话，可以读�
 - **持久化会话** —— 按项目划分的命名会话，支持列表、重命名、导出和续接。
 - **真实工具** —— 文件读写、补丁、搜索、目录列举与 shell 命令。
 - **权限档案** —— 只读、工作区写入、完全访问；shell 单独控制。
+- **策略 Hook** —— 在 `before_prompt`、`before_tool`、`permission_request`、`after_tool` 与压缩前后运行受信命令 Hook；项目 Hook 需要显式 `morrow hooks trust` 后才生效。
 - **MCP 支持** —— 通过 TOML 或仪表盘配置 stdio 与 Streamable HTTP MCP 服务器。
 - **会话级 Subagent** —— 在后台运行持久化的 `explore`、`plan`、`worker`、`reviewer` 实例，并可在 Web/Desktop 中查看、继续、取消或删除。
 - **长会话友好** —— 自动上下文压缩。
@@ -58,7 +59,7 @@ morrow init
 安装指定版本或自定义目录：
 
 ```bash
-MORROW_VERSION=v0.1.0 curl -fsSL https://raw.githubusercontent.com/catDforD/morrow/main/install.sh | sh
+MORROW_VERSION=v0.3.1 curl -fsSL https://raw.githubusercontent.com/catDforD/morrow/main/install.sh | sh
 MORROW_INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/catDforD/morrow/main/install.sh | sh
 ```
 
@@ -145,6 +146,10 @@ tool_timeout_sec = 60
 
 MCP 工具视为显式配置的受信工具，启用前请检查服务器命令与远程端点。
 
+### 策略 Hook
+
+命令 Hook 在上述生命周期边界执行。用户级配置位于 `~/.morrow/hooks.toml`，项目级配置位于 `<workspace>/.morrow/hooks.toml`。项目 Hook 默认禁用：只有对该精确配置执行 `morrow hooks trust`（按 SHA-256 指纹信任）后才生效，`morrow hooks revoke` 可撤销。Hook 以当前用户权限执行，请像审查 shell 命令一样审查后再信任。可用 `morrow hooks list | trust | revoke` 管理。
+
 ### Subagent
 
 Web/Desktop 会话通过 `spawn_subagent`、`send_subagent`、`inspect_subagent`、`wait_subagents` 和 `cancel_subagent` 管理可后台运行的持久 Subagent。父 turn 结束后子任务仍可继续。用户可以在 Subagents 检查器中查看完整消息与事件日志、使用保留的上下文继续空闲或中断实例、取消活跃任务，或删除终态实例。
@@ -204,7 +209,7 @@ morrow session rename work backend-refactor
 morrow session delete backend-refactor
 ```
 
-REPL 常用命令：`/status`、`/permissions ...`、`/compact`、`/reset`、`/exit`。兼容别名 `--thread` / `--reset-thread` 仍可用，新用法请优先 `--session`。
+REPL 常用命令：`/status`、`/permissions ...`、`/compact`、`/reset`、`/exit`。兼容别名 `--thread` / `--reset-thread` 仍可用，新用法请优先 `--session` / `--reset-session`。
 
 ## 自动化
 
@@ -224,12 +229,15 @@ crate 边界、turn 生命周期与扩展点见 [`ARCHITECTURE.md`](ARCHITECTURE
 
 | Crate | 职责 |
 | --- | --- |
-| `agent-cli` | CLI、REPL、JSONL、server 与配置装配 |
-| `agent-desktop` | Tauri 2 桌面外壳与本地 server 生命周期 |
+| `agent-cli` | CLI、REPL、JSONL、`session`/`hooks` 子命令与服务装配 |
+| `agent-desktop` | Tauri 2 桌面外壳、嵌入式 server 生命周期、WSL |
 | `agent-config` | 配置加载 |
-| `agent-core` | Turn 执行与事件流 |
+| `agent-core` | Turn 执行、端口、中间件与事件流 |
+| `agent-eval` | Agent 循环确定性回归套件 |
+| `agent-hooks` | 命令 Hook 与中间件适配器 |
 | `agent-model` | OpenAI 兼容客户端与流式解析 |
 | `agent-protocol` | 共享协议类型 |
+| `agent-remote` | Desktop/WSL 远程协议与转发 |
 | `agent-runtime` | 会话、压缩、工作区与 turn 辅助 |
 | `agent-server` | HTTP/WebSocket 与内嵌仪表盘 |
 | `agent-sandbox` | 权限判定 |
@@ -239,7 +247,8 @@ crate 边界、turn 生命周期与扩展点见 [`ARCHITECTURE.md`](ARCHITECTURE
 cargo build --workspace
 cargo test --workspace
 cargo fmt --check
-cargo clippy --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+cargo run -p agent-eval -- run   # agent 循环回归套件
 
 cargo run -p agent-cli -- "hello"
 cargo run -p agent-cli -- server
@@ -260,7 +269,7 @@ pnpm --dir crates/agent-desktop install
 pnpm --dir crates/agent-desktop dev
 ```
 
-原生安装包需在目标 OS 上构建，并将匹配的 ripgrep 二进制放入 `crates/agent-desktop/src-tauri/binaries/` 后执行 `pnpm --dir crates/agent-desktop build:windows` 或 `build:macos`。打与 workspace 版本一致的 tag（如 `v0.3.0`）会触发 GitHub Actions 发布 CLI 与桌面安装包。
+原生安装包需在目标 OS 上构建，并将匹配的 ripgrep 二进制放入 `crates/agent-desktop/src-tauri/binaries/` 后执行 `pnpm --dir crates/agent-desktop build:windows` 或 `build:macos`。打与 workspace 版本一致的 tag（如 `v0.3.1`）会触发 GitHub Actions 发布 CLI 与桌面安装包。
 
 ## 卸载
 

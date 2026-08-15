@@ -1,0 +1,16 @@
+[package]
+name = "agent-eval"
+description = "Deterministic, model-independent evaluation harness for the Morrow agent loop"
+version.workspace = true
+edition.workspace = true
+license = "MIT"
+
+[dependencies]
+agent-core.workspace = true
+agent-protocol.workspace = true
+clap.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true

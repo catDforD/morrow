@@ -1,6 +1,6 @@
 # Morrow Agent 架构
 
-本文面向刚接触 Rust 和 agent 工程的开发者，说明 Morrow 当前重构后的分层、依赖方向和主要扩展点。这里描述的是仓库正在落地的端口架构，不包含尚未实现的分布式会话协调或强制终止所有外部进程等能力。
+本文面向刚接触 Rust 和 agent 工程的开发者，说明 Morrow 当前重构后的分层、依赖方向和主要扩展点。这里描述的是仓库正在落地的端口架构，不包含尚未实现的分布式会话协调或强制终止所有外部进程等能力。运行时一致性协议（Session fact log、事件与订阅）见 [`docs/session-consistency-protocol.md`](docs/session-consistency-protocol.md)，确定性回归评估见 [`crates/agent-eval/README.md`](crates/agent-eval/README.md)。
 
 ## 1. 先理解三个概念
 
@@ -41,6 +41,8 @@ trait 由核心层拥有，具体适配器依赖并实现它，这就是依赖�
 │ 入口层                                                      │
 │ agent-cli                 agent-server                      │
 │ 参数、REPL、JSONL          HTTP、WebSocket、Web UI           │
+│ agent-desktop              agent-remote                      │
+│ Tauri 壳、WSL 生命周期      Desktop/WSL 转发                 │
 └──────────────────────────────┬──────────────────────────────┘
                                │
                                ▼
@@ -52,7 +54,7 @@ trait 由核心层拥有，具体适配器依赖并实现它，这就是依赖�
                                ▼
 ┌─────────────────────────────────────────────────────────────┐
 │ 核心层：agent-core                                          │
-│ Agent turn 状态机、Model 端口、ToolRuntime 端口              │
+│ Agent turn 状态机、Model 端口、ToolRuntime 端口、中间件链    │
 └───────────────────┬───────────────────────┬─────────────────┘
                     ▲                       ▲
                     │ implements            │ implements
@@ -62,37 +64,48 @@ trait 由核心层拥有，具体适配器依赖并实现它，这就是依赖�
 └──────────────────────────────┘  └──────────────┬────────────┘
                                                  │
                                                  ▼
-                                      ┌──────────────────────┐
-                                      │ agent-sandbox        │
-                                      │ 路径与权限策略判断   │
-                                      └──────────────────────┘
+                                       ┌──────────────────────┐
+                                       │ agent-sandbox        │
+                                       │ 路径与权限策略判断   │
+                                       └──────────────────────┘
 
 agent-protocol 位于底部，向各层提供共享数据类型。
 agent-config 负责把配置文件和环境变量转换成类型安全的配置。
+agent-hooks 是策略适配器：实现核心中间件接口，依赖 core/runtime/protocol。
+agent-eval 是验证层：依赖 core/protocol，用脚本化模型与工具固定循环不变量，
+不进入生产运行时。
 ```
 
 ## 3. 各 crate 的职责
 
 | Crate | 主要职责 | 不应该承担的职责 |
 | --- | --- | --- |
-| `agent-protocol` | `Message`、`ToolCall`、`Turn`、`Session`、审批和事件等共享类型 | HTTP、文件访问、模型调用和业务编排 |
-| `agent-core` | turn 状态机，以及 `Model`、`ToolRuntime` 两个核心端口 | OpenAI HTTP、MCP transport、CLI 和持久化 |
+| `agent-protocol` | `Message`、`ToolCall`、`Turn`、Session fact、审批和事件等共享类型 | HTTP、文件访问、模型调用和业务编排 |
+| `agent-core` | turn 状态机、`Model` / `ToolRuntime` 两个核心端口和中间件链 | OpenAI HTTP、MCP transport、CLI 和持久化 |
 | `agent-model` | OpenAI-compatible 请求、SSE 解析，实现 `Model` | Session 写入、工具调度和 UI 事件处理 |
 | `agent-tools` | 内置工具、工具注册、MCP 工具适配，实现 `ToolRuntime` | 决定一整个 turn 的状态流转 |
 | `agent-sandbox` | workspace 路径约束和权限决策 | 直接执行模型或管理 Session |
-| `agent-runtime` | 编排已注入的模型端口与工具系统、上下文压缩、turn 事件封装、Session 持久化 | 解析 CLI 参数、实现模型 HTTP 协议或渲染 Web UI |
+| `agent-runtime` | 编排已注入的模型端口与工具系统、上下文压缩、turn 事件封装、SessionStore 与 v6 fact log 持久化、Subagent 监督 | 解析 CLI 参数、实现模型 HTTP 协议或渲染 Web UI |
 | `agent-config` | 加载并校验 `morrow.toml` 和环境变量 | 执行 agent turn |
-| `agent-cli` | CLI 参数、REPL、终端输出、交互式审批 | 复制核心状态机 |
+| `agent-cli` | CLI 参数、REPL、终端输出、交互式审批、`session` / `hooks` 子命令和服务装配 | 复制核心状态机或实现会话持久化 |
 | `agent-server` | HTTP/WebSocket API、浏览器事件、远程审批和取消入口 | 实现模型协议或工具业务 |
+| `agent-desktop` | Tauri 2 桌面壳、嵌入式 server 生命周期、WSL 连接 | 执行 agent turn 或实现模型协议 |
+| `agent-hooks` | 命令 Hook 与中间件适配器、项目 Hook 指纹信任 | 修改 turn 状态机或实现 HTTP |
+| `agent-remote` | Desktop/WSL remote 协议、命令与事件转发 | 持有会话业务状态或执行 turn |
+| `agent-eval` | 确定性回归场景、脚本化模型与工具、效率基线 | 参与生产运行时或依赖真实模型 |
 
 ## 4. 编译依赖方向
 
 箭头 `A -> B` 表示 A 的代码可以导入 B：
 
 ```text
-agent-cli    -> agent-runtime, agent-server, agent-model, agent-config, agent-protocol
-agent-server -> agent-runtime, agent-model, agent-config, agent-protocol
-agent-runtime-> agent-core, agent-tools, agent-config, agent-protocol
+agent-cli    -> agent-hooks, agent-runtime, agent-server, agent-model, agent-config, agent-protocol
+agent-server -> agent-hooks, agent-runtime, agent-model, agent-config, agent-protocol
+agent-desktop-> agent-remote, agent-server, agent-config, agent-protocol
+agent-remote -> agent-server, agent-config, agent-protocol
+agent-runtime-> agent-core, agent-tools, agent-model, agent-config, agent-protocol
+agent-hooks  -> agent-core, agent-runtime, agent-protocol
+agent-eval   -> agent-core, agent-protocol
 
 agent-model  -> agent-core, agent-protocol
 agent-tools  -> agent-core, agent-sandbox, agent-config, agent-protocol
@@ -106,9 +119,10 @@ agent-protocol -> serde / serde_json
 
 1. `agent-core` 定义端口，但不依赖 `agent-model` 或 `agent-tools` 的具体类型。
 2. `agent-model` 和 `agent-tools` 依赖 `agent-core`，分别实现端口。
-3. `agent-cli` 和 `agent-server` 是模型适配器的组合根；它们创建客户端，再以 `dyn Model` 注入 runtime。
+3. `agent-cli`、`agent-server` 和 `agent-desktop` 是模型适配器的组合根；它们创建客户端，再以 `dyn Model` 注入 runtime。
 4. `agent-runtime` 负责用例编排和工具系统装配，但不知道具体模型供应商。
 5. `agent-protocol` 不反向依赖任何业务 crate。
+6. `agent-eval` 和 `agent-hooks` 可以依赖 `agent-core`，但 `agent-core` 不反向感知它们；`agent-eval` 绝不进入生产运行时。
 
 以后增加模型供应商或工具运行时，通常不需要修改 turn 状态机。
 
@@ -124,8 +138,9 @@ pub trait Model: Send + Sync {
 }
 ```
 
-`ModelRequest` 包含本次对话和工具定义。模型通过流返回三种核心事件：
+`ModelRequest` 包含本次对话和工具定义。模型通过流返回四种核心事件：
 
+- `ReasoningDelta`：一段增量推理内容（可选，写入最终 assistant message）。
 - `TextDelta`：一段增量文本。
 - `ToolCalls`：模型请求调用一个或多个工具。
 - `Completed`：本轮模型流正常结束。
@@ -163,9 +178,9 @@ pub trait ToolRuntime: Send + Sync {
 ## 6. 一次 turn 的完整时序
 
 ```text
-CLI / Server
+CLI / Server / Desktop
     │
-    │ prompt + Session + 配置
+    │ prompt + Session 投影 + 配置
     ▼
 agent-runtime
     │ 1. 构建内置工具并发现 MCP 工具
@@ -176,26 +191,27 @@ agent-core::Agent
     │ 4. system prompt + active_thread + user message
     ▼
 dyn Model
-    │ 5. TextDelta / ToolCalls / Completed
+    │ 5. ReasoningDelta / TextDelta / ToolCalls / Completed
     ▼
 AgentTurnStream
     │ 6. 如有工具调用，交给 dyn ToolRuntime
     │ 7. 如需审批，暂停并发批次，发出 ApprovalRequested
     │ 8. 工具结果写回对话，再次调用模型
-    │ 9. 最多执行八轮工具调用
+    │ 9. 默认最多 99 轮工具调用（Subagent 按角色配置 1–99），
+    │    超过后 turn 显式失败并记录错误
     ▼
 TurnRecord + AgentEvent
-    │ 10. Session::apply_turn
+    │ 10. runtime 校验并转换 turn 事实
     ▼
 agent-runtime / SessionStore
-    │ 11. 保存 Session v4
+    │ 11. 追加 v6 Session fact log 并 sync
     ▼
-CLI 输出或 WebSocket 广播
+CLI 输出、WebSocket 广播或 WSL 转发
 ```
 
 更具体地说：
 
-1. 入口层加载配置和 Session，并确定 workspace root 与权限档位。
+1. 入口层加载配置和 Session 投影，并确定 workspace root 与权限档位。
 2. runtime 创建 `ToolRegistry`。MCP 启动或发现失败会形成 warning，而不是让所有可用工具一起失效。
 3. runtime 把工具 schema 也计入 token 估算，再决定是否执行上下文压缩。
 4. core 创建 `Conversation`，其中 system prompt 不写入长期 Thread。
@@ -203,17 +219,19 @@ CLI 输出或 WebSocket 广播
 6. 模型请求工具时，core 先记录 assistant tool-call message，再调度工具。
 7. 工具结果被转换成 `tool` role message，随后进入下一次模型调用。
 8. 最终文本形成 assistant message，并生成完成的 `TurnRecord`。
-9. runtime 通过 Session 的单一追加 API 提交该记录，再由入口层保存。
+9. runtime 按副作用顺序把 `TurnStarted`、模型/工具事实与终态事实追加进 v6 fact log；只有已完成的 turn 消息才进入后续模型上下文。
 
-事件展示和 Session 持久化是两个概念。`AgentEvent` 用于实时观察执行过程，`TurnRecord` 才是会话历史的持久化事实。
+事件展示和 Session 持久化是两个概念。`AgentEvent` 用于实时观察执行过程，v6 Session fact 才是会话历史的持久化事实。
 
 事件接收方失败也不会回滚已经发生的领域事实：若投递在 turn 中途失败，runtime 会取消执行并提交一个 `Failed` record；若 turn 已经完成，则仍提交 `Completed` record，并通过 `RunAgentTurnOutcome.error` 把投递错误返回给入口层。这样 stdout/JSONL/WebSocket 的观察故障不会造成“副作用已经发生但 Session 没有审计记录”。
 
 ## 7. Session 与 Turn 不变量
 
-### 7.1 Session 的三个部分
+当前运行时的唯一持久化事实源是 append-only v6 fact log（见第 12 节和 `docs/session-consistency-protocol.md`）。`agent-protocol::Session` 是聚合投影类型，用于旧 v1–v4 数据迁移和导出兼容；下面的不变量对聚合投影与 fact 投影同时成立。
 
-Session v4 保持下面的 JSON 结构：
+### 7.1 Session 聚合投影的三个部分
+
+聚合 Session 文档（当前 schema v6）保持下面的 JSON 结构：
 
 ```text
 Session
@@ -230,7 +248,7 @@ Session
 - `turns` 保存所有完成或失败的 turn，供恢复、展示和排查错误。
 - `context` 记录压缩摘要，以及历史中已经被摘要覆盖的前缀长度。
 
-当前为了保持 Session v4 JSON 兼容，这些字段仍然公开。业务代码不应分别手动 `push`，而应使用 `Session::apply_turn(record)`。
+这些字段仍然公开，供旧文档迁移与导出使用。业务代码不应分别手动 `push`，而应使用 `Session::apply_turn(record)`；运行时持久化路径则通过 `SessionHandle` 追加 fact，再由纯投影器生成同样的结构。
 
 `apply_turn` 的规则是：
 
@@ -271,7 +289,7 @@ active_thread = summary system message
               + 尚未摘要的 Completed turn messages
 ```
 
-`summarized_turns` 是 turn 数组中的前缀边界，不是消息数量。失败 turn 可以被摘要覆盖，但不会直接重新加入 active Thread。
+`summarized_turns` 是 turn 数组中的前缀边界，不是消息数量。失败 turn 可以被摘要覆盖，但不会直接重新加入 active Thread。在 fact log 中，同一事实由 `ContextCompacted { summary, covered_through_turn_id }` 表达。
 
 ## 8. 如何扩展模型
 
@@ -350,24 +368,24 @@ CLI 没有独立的 turn cancellation 协议；进程级中断仍属于入口层
 
 ## 12. Session 持久化与事件协议
 
-`agent-runtime::SessionStore` 把 Session 保存为版本化 JSON 文档。当前写出 schema v4，并兼容读取旧的 v3 Session 与 v1/v2 Thread 文档。旧文档加载后会转换为当前 Session，再在下一次保存时写成 v4。
+`agent-runtime::SessionStore` 把 Session 保存为 append-only JSONL fact log。当前 canonical header 是 schema v6（`SESSION_DOCUMENT_SCHEMA_VERSION = 6`），并接受 v5 header（就地升级 header，不重写 facts）。旧的 v1/v2 Thread 文档和 v3/v4 Session 聚合文档只作为迁移输入；迁移产生 `LegacyContextCheckpoint` / `ContextCompacted` 等 fact 后即安装 v6 log，旧源原子移动为 `.legacy-vN.bak`。聚合 `SessionDocument`（schema v6）仅用于迁移与导出兼容，不作为运行时模型上下文的事实源。一致性细节见 [`docs/session-consistency-protocol.md`](docs/session-consistency-protocol.md)。
 
 每次 turn 的 runtime 上下文必须携带解析后的 `ModelInvocation`，并在 Turn 创建时写入记录；Web、CLI、Desktop、WSL 与远端入口不得在持久化后各自补写模型信息。这样实时展示和历史恢复都以同一份模型元数据为准。
 
-实时事件使用当前 schema v6 的 `AgentEventEnvelope` 包装，包含：
+实时事件使用当前 schema v8 的 `AgentEventEnvelope`（`agent-runtime::EVENT_SCHEMA_VERSION = 8`）包装，包含：
 
 - 事件 schema version。
 - Session 名称和 workspace root。
 - turn index 和 event index。
 - 时间戳与具体 `AgentEvent`。
 
-CLI 的 JSONL 和 server 的 WebSocket 共用该事件结构。修改事件 JSON 形状时需要把它当作外部协议变更，而不是普通内部重构。
+Session 订阅流当前为 schema v3（`SESSION_STREAM_SCHEMA_VERSION = 3`），remote 协议当前为 v5（`REMOTE_PROTOCOL_VERSION = 5`）。CLI 的 JSONL 和 server 的 WebSocket 共用 `AgentEventEnvelope`。修改任何事件/订阅 JSON 形状或版本号时，都需要把它当作外部协议变更，而不是普通内部重构。
 
 父模型每次真实开始请求时都会发送 `model_call_started`。Web 以该事件创建模型步骤，工具和 Subagent 的开始事件只结束当前模型步骤，不再自行推断新的模型调用；因此同一批并发工具不会产生重复的模型行。
 
-Subagent 身份遵守同样的单一来源规则：父 turn 启动时把 `SubagentIdentity { id, name }` 名单快照写入 `RunAgentTurnContext`，`ToolRegistry` 再按 tool-call ID 缓存随机分配结果，保证开始事件、结束事件和持久化工具结果使用同一身份。完整的姓名与头像配置由 `agent-server` 保存在全局 `~/.morrow/subagents.json`；协议和 Session 只携带 ID/姓名，不携带 Base64 头像。Desktop/WSL 通过 remote protocol v2 只把身份池发送给远端 runtime，头像始终留在 Windows 展示端。
+Subagent 身份遵守同样的单一来源规则：父 turn 启动时把 `SubagentIdentity { id, name }` 名单快照写入 `RunAgentTurnContext`，`ToolRegistry` 再按 tool-call ID 缓存随机分配结果，保证开始事件、结束事件和持久化工具结果使用同一身份。完整的姓名与头像配置由 `agent-server` 保存在全局 `~/.morrow/subagents.json`；协议和 Session 只携带 ID/姓名，不携带 Base64 头像。Desktop/WSL 通过 remote protocol v5 只把身份池发送给远端 runtime，头像始终留在 Windows 展示端。
 
-当前 SessionStore 是本地文件存储。server 会在单个进程内阻止同一 Session 同时启动两个 turn，但不要假设多个独立进程同时写同一个 Session 文件也是安全的。
+当前 SessionStore 是本地文件存储。SessionHandle 使用标准库跨进程文件锁保证单写者；server 还会在进程内阻止同一 Session 同时启动两个 turn。多个独立进程通过文件锁排队获取写租约，但不要绕过 `SessionHandle` 直接改写 fact log。
 
 ## 13. 新代码应该放在哪里
 
@@ -382,6 +400,9 @@ Subagent 身份遵守同样的单一来源规则：父 turn 启动时把 `Subage
 | 新增配置字段和校验 | `agent-config` |
 | 修改参数、REPL 或终端输出 | `agent-cli` |
 | 修改 HTTP、WebSocket 或 Web UI | `agent-server` |
+| 新增命令 Hook 或中间件策略 | `agent-hooks` |
+| 修改 Desktop/WSL 握手与转发 | `agent-remote`、`agent-desktop` |
+| 新增回归场景、断言或效率预算 | `agent-eval` |
 
 判断位置时可以问两个问题：
 
@@ -395,8 +416,9 @@ Subagent 身份遵守同样的单一来源规则：父 turn 启动时把 `Subage
 - `agent-core`：使用假的 `Model` 和 `ToolRuntime`，验证纯状态机、并发顺序、轮次上限和审批恢复。
 - `agent-model`：验证 HTTP 请求与 SSE 到 `ModelEvent` 的转换。
 - `agent-tools`：验证参数、路径、权限、副作用前审批和结构化结果。
-- `agent-runtime`：验证压缩、事件 envelope、`Session::apply_turn` 和持久化时机。
+- `agent-runtime`：验证压缩、事件 envelope、fact 追加顺序、恢复与迁移时机。
 - `agent-server`：验证同 Session 的运行限制、审批 request id、取消和 WebSocket 消息。
-- `agent-protocol`：锁定 Session v4、事件和消息的 JSON 契约。
+- `agent-protocol`：锁定 Session v6 fact/文档、Session stream v3、事件和消息的 JSON 契约。
+- `agent-eval`：以脚本化模型和脚本化工具端到端运行真实 turn 循环，锁定工具结果回灌、错误传播、审批、轮次上限、消息链和效率预算；CI 通过 `cargo run -p agent-eval -- run` 执行。
 
 端口架构的直接收益是：core 测试不需要启动 HTTP server、真实 MCP 进程或写入用户 Session，就可以覆盖绝大多数 agent 循环行为。

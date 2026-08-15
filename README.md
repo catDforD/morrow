@@ -22,6 +22,7 @@ Morrow reads and edits files, applies patches, runs shell commands behind explic
 - **Bring your own model** — any OpenAI-compatible endpoint, configured per provider and per session.
 - **Real tools** — file reads/edits, patches, search, directory listing, and shell commands.
 - **Permission profiles** — read-only, workspace-write, and full-access modes, with shell controlled separately.
+- **Policy hooks** — trusted command hooks at `before_prompt`, `before_tool`, `permission_request`, `after_tool`, and compaction boundaries; project hooks require an explicit `morrow hooks trust`.
 - **MCP support** — stdio and Streamable HTTP MCP servers.
 - **Session-scoped subagents** — persistent `explore`, `plan`, `worker`, and `reviewer` instances running in the background.
 - **Long-session friendly** — named, resumable sessions with automatic context compaction.
@@ -83,7 +84,7 @@ mode = "read_only"
 shell = "deny"
 ```
 
-An inline `api_key` wins when present; otherwise Morrow reads the `api_key_env` variable. Never commit a config containing a real key. Web-only settings (models, MCP servers, commands, subagents) are managed in the dashboard and stored under `~/.morrow/`. See [`morrow.example.toml`](morrow.example.toml) for the full set of options, including context compaction tuning.
+An inline `OPENAI_API_KEY` wins when present; otherwise Morrow reads the `api_key_env` variable. Never commit a config containing a real key. Web-only settings (models, MCP servers, commands, subagents) are managed in the dashboard and stored under `~/.morrow/`. See [`morrow.example.toml`](morrow.example.toml) for the full set of options, including context compaction tuning.
 
 ### Project instructions
 
@@ -101,6 +102,10 @@ enabled = true
 ```
 
 MCP tools are treated as trusted — review server commands and endpoints before enabling them.
+
+### Policy hooks
+
+Command hooks run at the lifecycle boundaries above. User-level hooks live in `~/.morrow/hooks.toml`; project hooks live in `<workspace>/.morrow/hooks.toml` and are **disabled until you run `morrow hooks trust`** for that exact hook configuration (fingerprint-pinned, `morrow hooks revoke` to remove). Hooks execute with your user permissions, so review them like shell commands. Manage them with `morrow hooks list | trust | revoke`.
 
 ### Subagents
 
@@ -148,12 +153,15 @@ Named, project-scoped sessions persist under `~/.morrow/sessions/`:
 
 ```bash
 morrow --session work "continue the refactor"
+morrow --session work --reset-session "start over in the same project"
 morrow session list
+morrow session show work
 morrow session export work --output work-session.json
 morrow session rename work backend-refactor
+morrow session delete backend-refactor
 ```
 
-Useful REPL commands: `/status`, `/permissions ...`, `/compact`, `/reset`, `/exit`. The legacy `--thread` aliases still work; prefer `--session`.
+Useful REPL commands: `/status`, `/permissions ...`, `/compact`, `/reset`, `/exit`. The legacy `--thread` / `--reset-thread` aliases still work; prefer `--session` / `--reset-session`.
 
 ## Automation
 
@@ -161,7 +169,7 @@ Useful REPL commands: `/status`, `/permissions ...`, `/compact`, `/reset`, `/exi
 morrow --jsonl "inspect this crate" > events.jsonl
 ```
 
-JSONL mode requires a prompt and is unavailable in interactive mode.
+JSONL mode requires a prompt and is unavailable in interactive mode or with session subcommands.
 
 ## Development
 
@@ -173,12 +181,15 @@ Crate boundaries, turn lifecycle, and extension points: [`ARCHITECTURE.md`](ARCH
 
 | Crate | Responsibility |
 | --- | --- |
-| `agent-cli` | CLI, REPL, JSONL, server, config wiring |
-| `agent-desktop` | Tauri 2 shell and local server lifecycle |
+| `agent-cli` | CLI, REPL, JSONL, session/hooks commands, server wiring |
+| `agent-desktop` | Tauri 2 shell, embedded server lifecycle, WSL |
 | `agent-config` | Config loading |
-| `agent-core` | Turn execution and event streams |
+| `agent-core` | Turn execution, ports, middleware, event streams |
+| `agent-eval` | Deterministic regression suite for the agent loop |
+| `agent-hooks` | Command hooks and middleware adapters |
 | `agent-model` | OpenAI-compatible client and streaming |
 | `agent-protocol` | Shared protocol types |
+| `agent-remote` | Desktop/WSL remote protocol and forwarding |
 | `agent-runtime` | Sessions, compaction, workspace, turn helpers |
 | `agent-server` | HTTP/WebSocket and embedded dashboard |
 | `agent-sandbox` | Permission evaluation |
@@ -188,7 +199,8 @@ Crate boundaries, turn lifecycle, and extension points: [`ARCHITECTURE.md`](ARCH
 cargo build --workspace
 cargo test --workspace
 cargo fmt --check
-cargo clippy --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+cargo run -p agent-eval -- run   # agent loop regression suite
 
 cargo run -p agent-cli -- "hello"
 cargo run -p agent-cli -- server
@@ -208,7 +220,7 @@ pnpm --dir crates/agent-desktop install
 pnpm --dir crates/agent-desktop dev
 ```
 
-Tagging the workspace version (e.g. `v0.3.0`) triggers GitHub Actions to publish CLI archives and desktop installers.
+Tagging the workspace version (e.g. `v0.3.1`) triggers GitHub Actions to publish CLI archives and desktop installers.
 
 ## Uninstall
 

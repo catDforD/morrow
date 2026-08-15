@@ -15,10 +15,10 @@
 
 | 层 | 版本 | 不兼容行为 |
 | --- | ---: | --- |
-| Session fact log | v5 | 非 v5 JSONL header 拒绝作为 canonical log 打开 |
+| Session fact log | v6 | canonical 接受 v6；v5 header 就地升级为 v6，其余版本拒绝 |
 | Agent execution event | v8 | 消费者必须认识完整模型消息和 tool result checkpoint 事件 |
-| Session stream | v2 | Snapshot/Event 的 schema 不匹配时重新订阅或拒绝 |
-| Remote protocol | v4 | Desktop 与 Workspace Agent 握手版本不同则拒绝连接 |
+| Session stream | v3 | Snapshot/Event 的 schema 不匹配时重新订阅或拒绝 |
+| Remote protocol | v5 | Desktop 与 Workspace Agent 握手版本不同则拒绝连接 |
 
 实现不同时生产新旧两套实时协议。旧聚合 Session 文档只作为迁移输入或兼容缓存，不能作为模型上下文或 timeline 的事实源。
 
@@ -37,7 +37,7 @@
 
 ## 4. 必须保持的不变量
 
-1. 磁盘上的 v5 Facts 是 Session 的唯一持久化事实源。
+1. 磁盘上的 v6 fact log（header schema v6）是 Session 的唯一持久化事实源。
 2. Revision 必须从 1 开始严格连续；重复、缺口和中间损坏是硬错误。
 3. Fact 必须在对应可恢复事件发布前完成 append、flush 和 sync。
 4. Snapshot 状态与 Snapshot cursor 必须在创建 receiver 的同一 Hub 锁内捕获。
@@ -48,12 +48,12 @@
 9. 已开始但没有结果 Fact 的 Tool 在恢复时为 `outcome_unknown`，不得自动重试。
 10. 流式 text/reasoning delta 只存在于当前 Operation snapshot 和实时事件中，不写入 Session fact log。
 
-## 5. v5 JSONL 格式
+## 5. v6 JSONL 格式
 
 文件位置沿用 canonical workspace scope，主 Session 文件名为 `<session>.jsonl`。首行为 header：
 
 ```json
-{"schema_version":5,"session_id":"session-...","created_at_ms":1785400000000}
+{"schema_version":6,"session_id":"session-...","created_at_ms":1785400000000}
 ```
 
 后续每行是一个 `SessionFactEnvelope`：
@@ -91,6 +91,7 @@
 - `TurnCancelled { reason }`
 - `TurnInterrupted { reason }`
 - `ContextCompacted { summary, covered_through_turn_id }`
+- `MiddlewareFinished { invocation }`
 - `LegacyContextCheckpoint { source_schema, messages, diagnostic }`
 
 `ModelMessageCommitted` 保存完整 assistant `Message`，包括 reasoning 和 tool calls。`ToolCallFinished` 保存完整 tool-role result message、执行状态与摘要。delta 不属于 Fact。
@@ -216,9 +217,9 @@ client                         SessionHandle / Hub
 
 ## 9. Web 与 Desktop
 
-Web 选择 Session 时直接打开 v2 订阅，不再先通过 REST 拉聚合历史。REST 只负责 Session 管理、列表和 canonical fact log 导出。
+Web 选择 Session 时直接打开 v3 订阅，不再先通过 REST 拉聚合历史。REST 只负责 Session 管理、列表和 canonical fact log 导出。
 
-Desktop 在发出 Remote v4 `SubscribeSession` 前生成 `subscription_id`。订阅响应返回前到达的相同 ID 事件先缓存；Snapshot 应用完成后再按到达顺序交给 reducer。Browser、Embedded Server、WSL、Tauri 和 JS 转发相同的 `SessionStreamFrame`。
+Desktop 在发出 Remote v5 `SubscribeSession` 前生成 `subscription_id`。订阅响应返回前到达的相同 ID 事件先缓存；Snapshot 应用完成后再按到达顺序交给 reducer。Browser、Embedded Server、WSL、Tauri 和 JS 转发相同的 `SessionStreamFrame`。
 
 命令接受/拒绝使用 `CommandResult`，`inspect_subagent` 等请求数据使用 `CommandData`。命令帧不参与 Session sequence；所有可恢复状态变化仍必须通过 ordered Update 表达。
 
@@ -227,7 +228,7 @@ Desktop 在发出 Remote v4 `SubscribeSession` 前生成 `subscription_id`。订
 打开可写 `SessionHandle` 时：
 
 1. 获取跨进程单写者文件锁；
-2. 验证或迁移 v5 log；
+2. 验证 canonical v6 log，或把旧文档迁移为 v6 log；
 3. 只修复最后一条未完成 JSONL 写入；
 4. 验证 revision 连续性和中间行完整性；
 5. 若发现无终态 Turn，追加 `TurnInterrupted`；
@@ -249,23 +250,23 @@ Fact 只有在持有正确租约并确认 expected revision 与磁盘 revision �
 - v1/v2 Thread：转为 `LegacyContextCheckpoint`，保留原消息序列。
 - v3/v4 Session：Turn 转为导入 Facts；summary 转为 `ContextCompacted`。
 - 若 `active_thread` 与 `turns + context` 投影不一致：追加一次性 `LegacyContextCheckpoint` 并记录诊断。
-- 迁移先在同目录生成并验证临时 v5 log，再把旧源原子移动为 `<session>.legacy-vN.bak`，最后安装 v5 log；安装失败会把 backup 原子移回旧路径。
+- 迁移先在同目录生成并验证临时 v6 log，再把旧源原子移动为 `<session>.legacy-vN.bak`，最后安装 v6 log；安装失败会把 backup 原子移回旧路径。
 - 迁移失败时旧源文件保持可读，不以部分聚合状态替代它。
 
-持久化 Subagent 的 metadata 文档不再序列化聚合 Session；其模型上下文和历史来自相同 v5 fact log。旧 Subagent 聚合 Session 在首次恢复时迁移为 Facts。独立 agent event log 仅用于诊断/inspect，不参与上下文或崩溃恢复。
+持久化 Subagent 的 metadata 文档不再序列化聚合 Session；其模型上下文和历史来自相同 v6 fact log。旧 Subagent 聚合 Session 在首次恢复时迁移为 Facts。独立 agent event log 仅用于诊断/inspect，不参与上下文或崩溃恢复。
 
 ## 13. Reset 与生命周期操作
 
-Reset 原子安装一个只有新 header 的 v5 log，生成新的 `session_id` 和 stream epoch，并清空 revision、Operation、审批与 Subagent stream snapshot。旧订阅看到 epoch 变化后必须重新订阅。
+Reset 原子安装一个只有新 header 的 v6 log，生成新的 `session_id` 和 stream epoch，并清空 revision、Operation、审批与 Subagent stream snapshot。旧订阅看到 epoch 变化后必须重新订阅。
 
 Rename、archive 和 delete 必须同时处理：
 
-- canonical v5 log；
+- canonical v6 log；
 - `.legacy-vN.bak`；
 - Subagent metadata、facts 和诊断事件；
 - 对应模型选择等 Session 级附属数据。
 
-`session export` 输出 canonical v5 JSONL，不输出投影缓存。
+`session export` 输出 canonical v6 JSONL，不输出投影缓存。
 
 ## 14. UI 状态边界
 

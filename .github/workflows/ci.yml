@@ -35,6 +35,9 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
+      - name: Eval agent loop
+        run: cargo run --locked -p agent-eval -- run
+
       - name: Build
         run: cargo build --workspace --locked
 
