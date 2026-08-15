@@ -10,3 +10,6 @@ crates/agent-desktop/node_modules/
 # 废止文档
 docs/*
 !docs/session-consistency-protocol.md
+!docs/architecture/
+docs/architecture/*
+!docs/architecture/architecture-ports.svg

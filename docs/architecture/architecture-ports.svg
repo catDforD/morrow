@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="960" height="780" viewBox="0 0 960 780" role="img" aria-label="Morrow Agent 架构图（端口视角）">
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="900" viewBox="0 0 960 900" role="img" aria-label="Morrow Agent 架构图（端口视角）">
   <style>
     :root {
       --bg: #ffffff; --box: #ffffff; --line: #d7dbe0;
@@ -45,7 +45,7 @@
     </marker>
   </defs>
 
-  <rect width="960" height="780" rx="12" fill="var(--bg)"/>
+  <rect width="960" height="900" rx="12" fill="var(--bg)"/>
 
   <text x="60" y="44" class="title">Morrow Agent 架构</text>
   <text x="60" y="66" class="tagline">核心定义端口，适配器实现端口，编排层注入实现</text>
@@ -62,7 +62,7 @@
   <text x="526" y="134" class="sub">Tauri 桌面端</text>
   <rect x="735" y="86" width="190" height="64" rx="10" class="box"/>
   <text x="751" y="112" class="name">agent-remote</text>
-  <text x="751" y="134" class="sub">remote protocol v2</text>
+  <text x="751" y="134" class="sub">remote protocol v5</text>
 
   <path class="flow" marker-end="url(#arr)" d="M155 150 L360 216"/>
   <path class="flow" marker-end="url(#arr)" d="M380 150 L440 216"/>
@@ -115,11 +115,21 @@
   <text x="528" y="694" class="name">agent-config</text>
   <text x="528" y="716" class="sub">配置加载与校验</text>
 
+  <!-- 验证与策略 -->
+  <path class="dep" marker-end="url(#arrF)" d="M330 756 L445 514"/>
+  <path class="dep" marker-end="url(#arrF)" d="M630 756 L515 514"/>
+  <rect x="170" y="756" width="280" height="64" rx="10" class="box"/>
+  <text x="188" y="782" class="name">agent-eval</text>
+  <text x="188" y="804" class="sub">确定性回归评估 · 预算棘轮</text>
+  <rect x="510" y="756" width="280" height="64" rx="10" class="box"/>
+  <text x="528" y="782" class="name">agent-hooks</text>
+  <text x="528" y="804" class="sub">命令 Hook · 中间件策略</text>
+
   <!-- 图例 -->
-  <line x1="60" y1="756" x2="92" y2="756" class="flow" marker-end="url(#arr)"/>
-  <text x="100" y="760" class="note">编译依赖</text>
-  <line x1="190" y1="756" x2="222" y2="756" class="impl" marker-end="url(#arrA)"/>
-  <text x="230" y="760" class="note">实现端口（依赖倒置）</text>
-  <line x1="410" y1="756" x2="442" y2="756" class="dep" marker-end="url(#arrF)"/>
-  <text x="450" y="760" class="note">共享类型 / 配置</text>
+  <line x1="60" y1="866" x2="92" y2="866" class="flow" marker-end="url(#arr)"/>
+  <text x="100" y="870" class="note">编译依赖</text>
+  <line x1="190" y1="866" x2="222" y2="866" class="impl" marker-end="url(#arrA)"/>
+  <text x="230" y="870" class="note">实现端口（依赖倒置）</text>
+  <line x1="410" y1="866" x2="442" y2="866" class="dep" marker-end="url(#arrF)"/>
+  <text x="450" y="870" class="note">共享类型 / 配置</text>
 </svg>
