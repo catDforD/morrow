@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "updated_at_ms": 1786783944834,
+  "budgets": {
+    "answer_without_tools": {
+      "max_model_calls": 1,
+      "max_tool_calls": 0,
+      "max_estimated_tokens": 33
+    },
+    "approval_denied_flows_to_model": {
+      "max_model_calls": 2,
+      "max_tool_calls": 1,
+      "max_estimated_tokens": 202
+    },
+    "approval_granted_executes_tool": {
+      "max_model_calls": 2,
+      "max_tool_calls": 1,
+      "max_estimated_tokens": 200
+    },
+    "duplicate_tool_call_id_rejected": {
+      "max_model_calls": 1,
+      "max_tool_calls": 0,
+      "max_estimated_tokens": 72
+    },
+    "empty_tool_call_list_rejected": {
+      "max_model_calls": 1,
+      "max_tool_calls": 0,
+      "max_estimated_tokens": 73
+    },
+    "mixed_serial_and_concurrent_tools": {
+      "max_model_calls": 2,
+      "max_tool_calls": 2,
+      "max_estimated_tokens": 298
+    },
+    "model_error_fails_turn": {
+      "max_model_calls": 1,
+      "max_tool_calls": 0,
+      "max_estimated_tokens": 30
+    },
+    "reads_two_files_in_order": {
+      "max_model_calls": 2,
+      "max_tool_calls": 2,
+      "max_estimated_tokens": 281
+    },
+    "reasoning_content_preserved": {
+      "max_model_calls": 1,
+      "max_tool_calls": 0,
+      "max_estimated_tokens": 37
+    },
+    "recovers_after_tool_error": {
+      "max_model_calls": 3,
+      "max_tool_calls": 2,
+      "max_estimated_tokens": 371
+    },
+    "runaway_tools_hit_round_limit": {
+      "max_model_calls": 3,
+      "max_tool_calls": 2,
+      "max_estimated_tokens": 308
+    },
+    "truncated_stream_fails_turn": {
+      "max_model_calls": 1,
+      "max_tool_calls": 0,
+      "max_estimated_tokens": 34
+    },
+    "unknown_tool_error_flows_to_model": {
+      "max_model_calls": 2,
+      "max_tool_calls": 1,
+      "max_estimated_tokens": 211
+    }
+  }
+}

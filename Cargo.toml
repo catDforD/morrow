@@ -3,6 +3,7 @@ members = [
     "crates/agent-cli",
     "crates/agent-config",
     "crates/agent-core",
+    "crates/agent-eval",
     "crates/agent-hooks",
     "crates/agent-desktop/src-tauri",
     "crates/agent-model",
@@ -22,6 +23,7 @@ edition = "2024"
 [workspace.dependencies]
 agent-config = { path = "crates/agent-config" }
 agent-core = { path = "crates/agent-core" }
+agent-eval = { path = "crates/agent-eval" }
 agent-hooks = { path = "crates/agent-hooks" }
 agent-model = { path = "crates/agent-model" }
 agent-protocol = { path = "crates/agent-protocol" }

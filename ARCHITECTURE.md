@@ -398,5 +398,6 @@ Subagent 身份遵守同样的单一来源规则：父 turn 启动时把 `Subage
 - `agent-runtime`：验证压缩、事件 envelope、`Session::apply_turn` 和持久化时机。
 - `agent-server`：验证同 Session 的运行限制、审批 request id、取消和 WebSocket 消息。
 - `agent-protocol`：锁定 Session v4、事件和消息的 JSON 契约。
+- `agent-eval`：以脚本化模型和脚本化工具端到端运行真实 turn 循环，锁定工具结果回灌、错误传播、审批、轮次上限、消息链和效率预算；CI 通过 `cargo run -p agent-eval -- run` 执行。
 
 端口架构的直接收益是：core 测试不需要启动 HTTP server、真实 MCP 进程或写入用户 Session，就可以覆盖绝大多数 agent 循环行为。

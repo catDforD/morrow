@@ -177,6 +177,7 @@ Crate boundaries, turn lifecycle, and extension points: [`ARCHITECTURE.md`](ARCH
 | `agent-desktop` | Tauri 2 shell and local server lifecycle |
 | `agent-config` | Config loading |
 | `agent-core` | Turn execution and event streams |
+| `agent-eval` | Deterministic regression suite for the agent loop |
 | `agent-model` | OpenAI-compatible client and streaming |
 | `agent-protocol` | Shared protocol types |
 | `agent-runtime` | Sessions, compaction, workspace, turn helpers |
@@ -189,6 +190,7 @@ cargo build --workspace
 cargo test --workspace
 cargo fmt --check
 cargo clippy --workspace --all-targets
+cargo run -p agent-eval -- run   # agent loop regression suite
 
 cargo run -p agent-cli -- "hello"
 cargo run -p agent-cli -- server
