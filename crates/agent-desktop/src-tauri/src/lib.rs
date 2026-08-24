@@ -23,7 +23,7 @@ use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex as StdMutex, RwLock};
+use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::Duration;
 use tauri::ipc::Channel;
 #[cfg(target_os = "macos")]
@@ -1228,6 +1228,9 @@ fn prepare_remote_settings(
         subagent_store_path: morrow_home.join("subagents.json"),
         hook_home_dir: runtime_home_for_hooks(&morrow_home),
         system_prompt: String::new(),
+        workspace_instructions: Arc::new(agent_runtime::WorkspaceInstructionsCache::new(
+            &workspace_scope,
+        )),
         context_config: ContextConfig {
             auto_compact: true,
             auto_compact_threshold: 0.835,

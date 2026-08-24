@@ -26,8 +26,8 @@ use agent_runtime::{
     AgentEventEnvelope, CancellationToken, McpInspection, McpToolCache, Model, RunAgentTurnContext,
     SessionHandle, SessionListingDiagnostic, SessionListingEntry, SessionStore,
     SessionSubscription, SubagentController, SubagentInstanceDocument, SubagentObserver,
-    SubagentRoleRuntime, SubagentSupervisor, TurnEventHandler, inspect_mcp_servers,
-    load_workspace_instructions, subagent_store_for_session,
+    SubagentRoleRuntime, SubagentSupervisor, TurnEventHandler, WorkspaceInstructionsCache,
+    inspect_mcp_servers, subagent_store_for_session,
 };
 use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -82,7 +82,11 @@ pub struct ServerOptions {
     pub command_store_path: PathBuf,
     pub subagent_store_path: PathBuf,
     pub hook_home_dir: PathBuf,
+    /// 配置层 base prompt（不含 AGENTS.md）；AGENTS.md 段落每个 turn 经
+    /// `workspace_instructions` 缓存重读后再拼接。
     pub system_prompt: String,
+    /// 每轮重读 AGENTS.md 的进程级缓存（mtime 未变时零文件读取）。
+    pub workspace_instructions: Arc<WorkspaceInstructionsCache>,
     pub context_config: ContextConfig,
     pub workspace_root: PathBuf,
     pub workspace_location: WorkspaceLocation,
@@ -107,10 +111,10 @@ pub fn server_options_from_loaded_config(
     loaded: LoadedServerConfig,
     default_session_name: String,
 ) -> Result<ServerOptions, ModelError> {
-    let workspace_instructions =
-        load_workspace_instructions(&workspace_root, &loaded.config.agent.system_prompt);
+    // 冷启动预热：收集 AGENTS.md 诊断并填充缓存；之后每个 turn 经缓存重读。
+    let workspace_instructions = Arc::new(WorkspaceInstructionsCache::new(&workspace_root));
     let mut config_diagnostics = loaded.diagnostics;
-    config_diagnostics.extend(workspace_instructions.diagnostics);
+    config_diagnostics.extend(workspace_instructions.prewarm());
     let fallback_model = loaded
         .model
         .map(|model| {
@@ -146,7 +150,8 @@ pub fn server_options_from_loaded_config(
         command_store_path: home.join(".morrow").join("commands"),
         subagent_store_path: home.join(".morrow").join("subagents.json"),
         hook_home_dir: home.to_path_buf(),
-        system_prompt: workspace_instructions.effective_system_prompt,
+        system_prompt: loaded.config.agent.system_prompt,
+        workspace_instructions,
         context_config: loaded.config.context,
         workspace_root,
         workspace_location,
@@ -2609,6 +2614,7 @@ async fn start_turn_inner(
                 context_config: state.inner.options.context_config,
                 model_limits: resolved_model.limits,
                 workspace_root: &state.inner.options.workspace_root,
+                workspace_instructions: Some(state.inner.options.workspace_instructions.as_ref()),
                 permissions,
                 mcp_servers: hook_mcp_servers,
                 mcp_cache: mcp_cache.as_ref(),
@@ -2644,6 +2650,7 @@ async fn start_turn_inner(
         }
         let operation_id = prepared.operation_id;
         let turn_id = prepared.turn_id;
+        let system_prompt = prepared.system_prompt;
         let result = (operation_id.clone(), turn_id.clone());
         let state_for_task = state.clone();
         let session_for_task = session_name.clone();
@@ -2658,6 +2665,7 @@ async fn start_turn_inner(
                 operation_id,
                 turn_id: turn_for_task,
                 prompt,
+                system_prompt,
                 permissions,
                 resolved_model,
                 mcp_servers,
@@ -2700,6 +2708,8 @@ struct TurnTaskContext {
     operation_id: String,
     turn_id: String,
     prompt: String,
+    /// prepare 阶段写入 `TurnStarted` fact 的 turn base prompt，运行阶段复用。
+    system_prompt: String,
     permissions: PermissionProfile,
     resolved_model: ResolvedModel,
     mcp_servers: Option<Vec<McpServerConfig>>,
@@ -2782,6 +2792,7 @@ async fn run_turn_task_inner(context: TurnTaskContext) -> Result<(), agent_runti
         operation_id,
         turn_id,
         prompt,
+        system_prompt,
         permissions,
         resolved_model,
         mcp_servers,
@@ -2824,6 +2835,7 @@ async fn run_turn_task_inner(context: TurnTaskContext) -> Result<(), agent_runti
                     context_config: options.context_config,
                     model_limits: resolved_model.limits,
                     workspace_root: &options.workspace_root,
+                    workspace_instructions: Some(options.workspace_instructions.as_ref()),
                     permissions,
                     mcp_servers: &mcp_servers,
                     mcp_cache: mcp_cache.as_ref(),
@@ -2841,6 +2853,7 @@ async fn run_turn_task_inner(context: TurnTaskContext) -> Result<(), agent_runti
                     operation_id,
                     turn_id: turn_id.clone(),
                     prompt: &prompt,
+                    system_prompt,
                 },
                 initial_context,
                 event_index,
@@ -3611,6 +3624,15 @@ async fn prepare_subagent_supervisor_with_runtime(
         middleware,
     } = preparation;
     let resources = ensure_session_resources(state, session_name).await?;
+    // 持久 subagent 的 base 在每次 turn 准备时经缓存重拼（spawn 时快照），
+    // 实例生命周期内沿用 spawn 时的 prompt，不再重读 AGENTS.md。
+    let subagent_base_prompt: Arc<str> = Arc::from(
+        state
+            .inner
+            .options
+            .workspace_instructions
+            .apply(&state.inner.options.system_prompt),
+    );
     let mut roles = BTreeMap::new();
     for role in SubagentRole::ALL {
         let role_config = overrides.get(&role).cloned().unwrap_or_default();
@@ -3639,7 +3661,7 @@ async fn prepare_subagent_supervisor_with_runtime(
                 invocation: resolved.invocation,
                 limits: resolved.limits,
                 role_config,
-                base_system_prompt: Arc::from(state.inner.options.system_prompt.clone()),
+                base_system_prompt: subagent_base_prompt.clone(),
                 parent_permissions,
                 middleware: middleware.clone(),
             },
@@ -3868,6 +3890,7 @@ mod tests {
             subagent_store_path: root.join("subagents.json"),
             hook_home_dir: root.clone(),
             system_prompt: "system".to_string(),
+            workspace_instructions: Arc::new(WorkspaceInstructionsCache::new(&root)),
             context_config: ContextConfig {
                 auto_compact: false,
                 auto_compact_threshold: 0.835,
@@ -3977,10 +4000,12 @@ mod tests {
             "default".to_string(),
         )
         .expect("server options");
-        assert!(options.system_prompt.starts_with("base system prompt"));
+        // options.system_prompt 只保留配置层 base；AGENTS.md 由缓存每轮拼装。
+        assert_eq!(options.system_prompt, "base system prompt");
         assert!(
             options
-                .system_prompt
+                .workspace_instructions
+                .apply(&options.system_prompt)
                 .contains("Use the workspace release checklist.")
         );
         assert_eq!(options.config_diagnostics, ["existing diagnostic"]);

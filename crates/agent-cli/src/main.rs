@@ -13,7 +13,7 @@ use agent_protocol::{
 };
 use agent_runtime::{
     AgentEventEnvelope, CompactionOutcome, McpToolCache, RunAgentTurnOutcome, SessionHandle,
-    SessionStore, SubagentSessionStore, TurnEventHandler, load_workspace_instructions,
+    SessionStore, SubagentSessionStore, TurnEventHandler, WorkspaceInstructionsCache,
 };
 use clap::{Parser, Subcommand};
 use futures_util::future::{BoxFuture, FutureExt};
@@ -262,10 +262,11 @@ async fn run() -> Result<(), CliError> {
     let home = dirs::home_dir().ok_or(CliError::HomeDirNotFound)?;
     let subagent_store_path = home.join(".morrow").join("subagents.json");
     let loaded = load_config(args.config.as_deref())?;
-    let workspace_instructions =
-        load_workspace_instructions(&workspace_root, &loaded.config.agent.system_prompt);
-    print_startup_diagnostics(&workspace_instructions.diagnostics);
-    let system_prompt = workspace_instructions.effective_system_prompt;
+    // 冷启动预热：打印 AGENTS.md 诊断并填充缓存；之后每个 turn 经缓存重读，
+    // 运行中的修改在下一个 turn 生效。turn context 只携带配置层 base prompt。
+    let workspace_instructions = WorkspaceInstructionsCache::new(&workspace_root);
+    print_startup_diagnostics(&workspace_instructions.prewarm());
+    let system_prompt = loaded.config.agent.system_prompt.clone();
     let model_limits = loaded.config.model.context_limits();
     let model_invocation = config_model_invocation(&loaded.config.model.model);
     let permissions =
@@ -299,6 +300,7 @@ async fn run() -> Result<(), CliError> {
                 client: &client,
                 model: &model_invocation,
                 system_prompt: &system_prompt,
+                workspace_instructions: &workspace_instructions,
                 context_config: loaded.config.context,
                 model_limits,
                 session_handle: &session_handle,
@@ -327,6 +329,7 @@ async fn run() -> Result<(), CliError> {
             model: &model_invocation,
             subagent_identities: &subagent_identities,
             system_prompt: &system_prompt,
+            workspace_instructions: Some(&workspace_instructions),
             context_config: loaded.config.context,
             model_limits,
             workspace_root: &workspace_root,
@@ -368,6 +371,7 @@ struct ReplContext<'a> {
     client: &'a OpenAiCompatClient,
     model: &'a ModelInvocation,
     system_prompt: &'a str,
+    workspace_instructions: &'a WorkspaceInstructionsCache,
     context_config: ContextConfig,
     model_limits: ModelContextLimits,
     session_handle: &'a SessionHandle,
@@ -388,6 +392,7 @@ struct RunAgentTurnContext<'a> {
     model: &'a ModelInvocation,
     subagent_identities: &'a [SubagentIdentity],
     system_prompt: &'a str,
+    workspace_instructions: Option<&'a WorkspaceInstructionsCache>,
     context_config: ContextConfig,
     model_limits: ModelContextLimits,
     workspace_root: &'a Path,
@@ -458,6 +463,7 @@ async fn run_repl(
                 model: context.model,
                 subagent_identities: &subagent_identities,
                 system_prompt: context.system_prompt,
+                workspace_instructions: Some(context.workspace_instructions),
                 context_config: context.context_config,
                 model_limits: context.model_limits,
                 workspace_root: context.workspace_root,
@@ -648,6 +654,7 @@ async fn run_persisted_agent_turn(
                 context_config: context.context_config,
                 model_limits: context.model_limits,
                 workspace_root: context.workspace_root,
+                workspace_instructions: context.workspace_instructions,
                 permissions: context.permissions,
                 mcp_servers: context.mcp_servers,
                 mcp_cache: context.mcp_cache,
@@ -694,6 +701,7 @@ async fn run_agent_turn(
             context_config: context.context_config,
             model_limits: context.model_limits,
             workspace_root: context.workspace_root,
+            workspace_instructions: context.workspace_instructions,
             permissions: context.permissions,
             mcp_servers: context.mcp_servers,
             mcp_cache: context.mcp_cache,
@@ -2101,6 +2109,7 @@ compact test
                 model: test_model_invocation(),
                 subagent_identities: &[],
                 system_prompt: "system",
+                workspace_instructions: None,
                 context_config: context_config(2),
                 model_limits: model_limits(10_000),
                 workspace_root: &root,
@@ -2155,6 +2164,7 @@ compact test
                 model: test_model_invocation(),
                 subagent_identities: &[],
                 system_prompt: "system",
+                workspace_instructions: None,
                 context_config: context_config(2),
                 model_limits: model_limits(10_000),
                 workspace_root: &root,
@@ -2276,6 +2286,7 @@ compact test
                 model: test_model_invocation(),
                 subagent_identities: &[],
                 system_prompt: "system",
+                workspace_instructions: None,
                 context_config: context_config(2),
                 model_limits: model_limits(10_000),
                 workspace_root: &root,
@@ -2339,6 +2350,7 @@ compact test
                 model: test_model_invocation(),
                 subagent_identities: &[],
                 system_prompt: "system",
+                workspace_instructions: None,
                 context_config: context_config(2),
                 model_limits: model_limits(10_000),
                 workspace_root: &root,
@@ -2392,6 +2404,7 @@ compact test
                 model: test_model_invocation(),
                 subagent_identities: &[],
                 system_prompt: "system",
+                workspace_instructions: None,
                 context_config: context_config(2),
                 model_limits: model_limits(1),
                 workspace_root: &root,

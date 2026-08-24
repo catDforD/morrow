@@ -123,11 +123,11 @@ Web 端的模型、MCP 服务器、自定义命令与 Subagent 设置分别在 *
 
 ### 项目指令
 
-工作区启动时，Morrow 会读取已解析工作区根目录下的 `AGENTS.md`，并将其追加到 `[agent].system_prompt`。同一份快照会应用于主 Agent、临时委派 Agent 和持久 Subagent。运行时角色限制与权限校验仍然优先，`AGENTS.md` 不能授予额外的工具访问权限。
+工作区启动时，Morrow 会读取已解析工作区根目录下的 `AGENTS.md`，并将其追加到 `[agent].system_prompt`。之后每个 turn 都会检查文件修改时间并重读（mtime 未变时零额外读取），运行中的修改在下一个 turn 生效，主 Agent、临时委派 Agent 和持久 Subagent 均以各自 turn/spawn 时的拼装结果为准。运行时角色限制与权限校验仍然优先，`AGENTS.md` 不能授予额外的工具访问权限。
 
 只加载根目录的 `AGENTS.md`。文件必须是普通 UTF-8 文件且不超过 32 KiB；不会跟随符号链接，也不会查找嵌套文件或备用文件名。文件缺失或为空时直接忽略；读取失败会在启动终端及 **设置 → 关于** 中显示告警，同时继续使用基础 system prompt。
 
-文件修改会在下次启动 CLI/server，或重新打开桌面/WSL 工作区时生效。其内容会作为 system prompt 的一部分发送给所配置的模型，因此不要在 `AGENTS.md` 中保存密钥等敏感信息。
+每个 turn 的 system prompt 尾部还会追加 `<environment>` 块（workspace 根目录、操作系统/架构、当前日期，以及可用时的当前 git 分支）。`AGENTS.md` 内容会作为 system prompt 的一部分发送给所配置的模型，因此不要在其中保存密钥等敏感信息。
 
 ### MCP 工具
 

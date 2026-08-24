@@ -47,7 +47,7 @@
 8. Tool 副作用前必须已有 `ToolCallStarted`；需要审批时，已批准的 `ApprovalResolved` 也必须已提交。
 9. 已开始但没有结果 Fact 的 Tool 在恢复时为 `outcome_unknown`，不得自动重试。
 10. 流式 text/reasoning delta 只存在于当前 Operation snapshot 和实时事件中，不写入 Session fact log。
-11. 模型可见即入日志：`TurnStarted.system_prompt` 必须等于当次模型请求实际携带的完整 system prompt（含 AGENTS.md 与 subagent guidance）；middleware 注入模型请求的上下文块必须记录在该次调用的 `MiddlewareFinished.injected_context`；被 before_prompt middleware 拒绝的 prompt 必须以 `PromptRejected` 落盘。
+11. 模型可见即入日志：`TurnStarted.system_prompt` 必须等于当次模型请求实际携带的完整 system prompt（含每轮重读的 AGENTS.md、`<environment>` 环境块与 subagent guidance）；middleware 注入模型请求的上下文块必须记录在该次调用的 `MiddlewareFinished.injected_context`；被 before_prompt middleware 拒绝的 prompt 必须以 `PromptRejected` 落盘。
 
 ## 5. v7 JSONL 格式
 
@@ -100,7 +100,7 @@
 
 v7 的 additive 变更（v6 日志行不带这些字段，读取时按 default 解析）：
 
-- `TurnStarted.system_prompt`：当次模型请求实际携带的完整 system prompt（base + AGENTS.md + subagent guidance）；恢复重建上下文时以日志为准可审计配置漂移。
+- `TurnStarted.system_prompt`：当次模型请求实际携带的完整 system prompt（base + 每轮重读的 AGENTS.md + `<environment>` 环境块 + subagent guidance）；恢复重建上下文时以日志为准可审计配置漂移。
 - `MiddlewareFinished.invocation.injected_context`：该次 middleware 调用实际注入模型请求的 `MiddlewareContextBlock` 列表（无注入为空）。
 - `PromptRejected`：before_prompt middleware 拒绝的 prompt 与归因理由。只作审计，不创建 Turn、不进入投影的模型上下文。
 

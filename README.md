@@ -88,7 +88,7 @@ An inline `OPENAI_API_KEY` wins when present; otherwise Morrow reads the `api_ke
 
 ### Project instructions
 
-Morrow reads `AGENTS.md` from the workspace root and appends it to the system prompt for the main agent and all subagents. It cannot grant tool access beyond the active permission profile, and it is sent to your model provider — don't put secrets in it.
+Morrow reads `AGENTS.md` from the workspace root and appends it to the system prompt for the main agent and all subagents. The file is re-read on every turn (mtime-cached), so edits take effect on the next turn without restarting. Each turn's system prompt also ends with an `<environment>` block (workspace root, OS/arch, current date, and the current git branch when available). `AGENTS.md` cannot grant tool access beyond the active permission profile, and it is sent to your model provider — don't put secrets in it.
 
 ### MCP tools
 
