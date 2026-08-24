@@ -3426,6 +3426,18 @@ function ApprovalBody({ request }: { request: ApprovalRequest }) {
     )
   }
 
+  if (request.action.kind === 'mcp_tool') {
+    return (
+      <pre className="approval-body">
+        {[
+          `server: ${request.action.server}`,
+          `tool: ${request.action.tool}`,
+          `arguments: ${request.action.arguments}`,
+        ].join('\n')}
+      </pre>
+    )
+  }
+
   return (
     <div className="approval-files">
       <div className="file-list">
@@ -3638,9 +3650,14 @@ function approvalSource(request: ApprovalRequest): string {
 }
 
 function approvalTitle(request: ApprovalRequest): string {
-  return request.action.kind === 'shell_command'
-    ? 'Shell command'
-    : 'File changes'
+  switch (request.action.kind) {
+    case 'shell_command':
+      return 'Shell command'
+    case 'mcp_tool':
+      return 'MCP tool'
+    default:
+      return 'File changes'
+  }
 }
 
 function compactText(text: string, length: number): string {

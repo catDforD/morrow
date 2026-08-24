@@ -1,6 +1,7 @@
 use crate::{TOOL_CANCELLED_ERROR, Tool, ToolExecution, ToolExecutionContext, ToolResult};
 use agent_config::{McpServerConfig, McpTransport};
-use agent_protocol::{ToolCall, ToolDefinition, ToolExecutionSummary};
+use agent_protocol::{ApprovalRequest, ToolCall, ToolDefinition, ToolExecutionSummary};
+use agent_sandbox::approval_id_for_tool_call;
 use async_trait::async_trait;
 use futures_util::future::join_all;
 use reqwest::StatusCode;
@@ -279,7 +280,13 @@ pub async fn discover_tools(
             .filter(|server| server.enabled)
             .map(|server| {
                 let cwd = resolve_cwd(workspace_root, server.cwd.as_deref());
-                async move { (server.name.clone(), cache.get_or_start(server, cwd).await) }
+                async move {
+                    (
+                        server.name.clone(),
+                        server.require_approval,
+                        cache.get_or_start(server, cwd).await,
+                    )
+                }
             }),
     )
     .await;
@@ -288,7 +295,7 @@ pub async fn discover_tools(
     let mut diagnostics = Vec::new();
     let mut emitted_names = BTreeSet::new();
 
-    for (server_name, result) in discoveries {
+    for (server_name, require_approval, result) in discoveries {
         let entry = match result {
             McpStartOutcome::Ready(entry) => entry,
             McpStartOutcome::Recovered(entry) => {
@@ -304,9 +311,13 @@ pub async fn discover_tools(
             McpStartOutcome::Cooldown => continue,
         };
 
-        if let Some(tool) =
-            build_tool_provider(&server_name, entry, &mut emitted_names, &mut diagnostics)
-        {
+        if let Some(tool) = build_tool_provider(
+            &server_name,
+            require_approval,
+            entry,
+            &mut emitted_names,
+            &mut diagnostics,
+        ) {
             tools.push(tool as Arc<dyn Tool>);
         }
     }
@@ -340,11 +351,12 @@ fn resolve_cwd(workspace_root: &Path, configured: Option<&Path>) -> PathBuf {
 
 fn build_tool_provider(
     server_name: &str,
+    require_approval: Option<bool>,
     entry: Arc<CachedMcpServer>,
     emitted_names: &mut BTreeSet<String>,
     diagnostics: &mut Vec<String>,
 ) -> Option<Arc<McpToolProvider>> {
-    let (definitions, lookup) =
+    let (definitions, lookup, read_only) =
         build_tool_definitions(server_name, &entry.listed_tools, emitted_names, diagnostics);
 
     (!definitions.is_empty()).then(|| {
@@ -352,6 +364,8 @@ fn build_tool_provider(
             runtime: entry.runtime.clone(),
             definitions,
             lookup,
+            read_only,
+            require_approval: require_approval.unwrap_or(true),
         })
     })
 }
@@ -361,10 +375,15 @@ fn build_tool_definitions(
     tools: &[ListedTool],
     emitted_names: &mut BTreeSet<String>,
     diagnostics: &mut Vec<String>,
-) -> (Vec<ToolDefinition>, HashMap<String, String>) {
+) -> (
+    Vec<ToolDefinition>,
+    HashMap<String, String>,
+    HashMap<String, bool>,
+) {
     let mut server_names = BTreeSet::new();
     let mut definitions = Vec::with_capacity(tools.len());
     let mut lookup = HashMap::with_capacity(tools.len());
+    let mut read_only = HashMap::with_capacity(tools.len());
 
     for tool in tools {
         let Some(normalized) = build_tool_name(server_name, &tool.name) else {
@@ -406,16 +425,45 @@ fn build_tool_definitions(
             description,
             parameters,
         ));
+        read_only.insert(
+            normalized.clone(),
+            tool.annotations
+                .as_ref()
+                .and_then(|annotations| annotations.read_only_hint)
+                .unwrap_or(false),
+        );
         lookup.insert(normalized, tool.name.clone());
     }
 
-    (definitions, lookup)
+    (definitions, lookup, read_only)
 }
 
 struct McpToolProvider {
     runtime: McpServerRuntime,
     definitions: Vec<ToolDefinition>,
     lookup: HashMap<String, String>,
+    read_only: HashMap<String, bool>,
+    require_approval: bool,
+}
+
+/// 非只读工具在 server 未关闭审批且本次调用未携带批准时，必须走审批管线。
+fn mcp_call_needs_approval(read_only: bool, require_approval: bool, has_approval: bool) -> bool {
+    require_approval && !read_only && !has_approval
+}
+
+impl McpToolProvider {
+    fn approval_request(&self, call: &ToolCall, original_name: &str) -> ApprovalRequest {
+        ApprovalRequest::mcp_tool(
+            approval_id_for_tool_call(&call.id),
+            self.runtime.name.clone(),
+            original_name.to_string(),
+            call.function.arguments.clone(),
+            format!(
+                "MCP tool '{original_name}' on server '{}' requires approval",
+                self.runtime.name
+            ),
+        )
+    }
 }
 
 #[async_trait]
@@ -427,7 +475,7 @@ impl Tool for McpToolProvider {
     async fn execute(
         &self,
         call: ToolCall,
-        _approval: Option<crate::ToolApproval>,
+        approval: Option<crate::ToolApproval>,
         context: ToolExecutionContext,
     ) -> ToolExecution {
         if context.cancellation.is_cancelled() {
@@ -445,6 +493,31 @@ impl Tool for McpToolProvider {
                 ));
             }
         };
+
+        let read_only = self
+            .read_only
+            .get(&call.function.name)
+            .copied()
+            .unwrap_or(false);
+        if mcp_call_needs_approval(read_only, self.require_approval, approval.is_some()) {
+            return ToolExecution::ApprovalRequired(self.approval_request(&call, original_name));
+        }
+        if let Some(approval) = approval
+            && self.require_approval
+            && !read_only
+        {
+            // 重入执行时校验审批决策确实对应本次调用。
+            let request = self.approval_request(&call, original_name);
+            if approval.decision.request_id != request.id {
+                return ToolExecution::error(format!(
+                    "approval decision {} does not match required approval {}",
+                    approval.decision.request_id, request.id
+                ));
+            }
+            if !approval.decision.approved {
+                return ToolExecution::error("MCP tool approval denied");
+            }
+        }
 
         let result = tokio::select! {
             _ = context.cancellation.cancelled() => {
@@ -1364,6 +1437,17 @@ struct ListedTool {
     description: Option<String>,
     #[serde(default, rename = "inputSchema")]
     input_schema: Option<Value>,
+    #[serde(default)]
+    annotations: Option<ListedToolAnnotations>,
+}
+
+/// MCP 规范的工具标注；`read_only_hint` 用于审批豁免，`destructive_hint` 目前仅解析保留。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListedToolAnnotations {
+    read_only_hint: Option<bool>,
+    #[allow(dead_code)]
+    destructive_hint: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1453,6 +1537,7 @@ fn tool_error_json_with_data(error: String, data: Value) -> ToolResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_protocol::{ApprovalAction, ApprovalDecision};
     use serde_json::json;
     use std::collections::VecDeque;
     use std::fs;
@@ -1597,6 +1682,8 @@ mod tests {
             runtime,
             definitions: Vec::new(),
             lookup: HashMap::from([("mcp__slow__wait".to_string(), "wait".to_string())]),
+            read_only: HashMap::new(),
+            require_approval: false,
         };
         let cancellation = crate::CancellationToken::new();
         let context = ToolExecutionContext {
@@ -1709,13 +1796,14 @@ mod tests {
 
         let mut emitted = BTreeSet::new();
         let mut diagnostics = Vec::new();
-        let (definitions, lookup) =
+        let (definitions, lookup, read_only) =
             build_tool_definitions("Docs", &tools, &mut emitted, &mut diagnostics);
 
         assert!(diagnostics.is_empty());
         assert_eq!(definitions[0].function.name, "mcp__docs__search");
         assert_eq!(definitions[1].function.name, "mcp__docs__fetch");
         assert_eq!(lookup["mcp__docs__search"], "search");
+        assert!(!read_only["mcp__docs__search"]);
     }
 
     #[tokio::test]
@@ -1762,17 +1850,20 @@ mod tests {
                 name: "Read File".into(),
                 description: None,
                 input_schema: None,
+                annotations: None,
             },
             ListedTool {
                 name: "read-file".into(),
                 description: None,
                 input_schema: None,
+                annotations: None,
             },
         ];
         let mut emitted = BTreeSet::new();
         let mut diagnostics = Vec::new();
 
-        let (definitions, _) = build_tool_definitions("fs", &tools, &mut emitted, &mut diagnostics);
+        let (definitions, _, _) =
+            build_tool_definitions("fs", &tools, &mut emitted, &mut diagnostics);
 
         assert_eq!(definitions.len(), 1);
         assert_eq!(diagnostics.len(), 1);
@@ -1785,18 +1876,20 @@ mod tests {
             name: "read".into(),
             description: None,
             input_schema: None,
+            annotations: None,
         }];
         let second_tools = vec![ListedTool {
             name: "read".into(),
             description: None,
             input_schema: None,
+            annotations: None,
         }];
         let mut emitted = BTreeSet::new();
         let mut diagnostics = Vec::new();
 
-        let (first, _) =
+        let (first, _, _) =
             build_tool_definitions("FS!", &first_tools, &mut emitted, &mut diagnostics);
-        let (second, _) =
+        let (second, _, _) =
             build_tool_definitions("FS?", &second_tools, &mut emitted, &mut diagnostics);
 
         assert_eq!(first.len(), 1);
@@ -1964,10 +2057,29 @@ mod tests {
             "mcp__remote__echo"
         );
 
+        let call = ToolCall::function("call_1", "mcp__remote__echo", r#"{"text":"hello"}"#);
+        let execution = discovery.tools[0]
+            .execute(call.clone(), None, ToolExecutionContext::default())
+            .await;
+        let ToolExecution::ApprovalRequired(request) = execution else {
+            panic!("expected approval request for non-read-only MCP tool");
+        };
+        assert_eq!(
+            request.action,
+            ApprovalAction::McpTool {
+                server: "remote".to_string(),
+                tool: "echo".to_string(),
+                arguments: r#"{"text":"hello"}"#.to_string(),
+            }
+        );
+
         let execution = discovery.tools[0]
             .execute(
-                ToolCall::function("call_1", "mcp__remote__echo", r#"{"text":"hello"}"#),
-                None,
+                call,
+                Some(crate::ToolApproval {
+                    decision: ApprovalDecision::approve(request.id.clone()),
+                    request,
+                }),
                 ToolExecutionContext::default(),
             )
             .await;
@@ -2014,6 +2126,197 @@ mod tests {
                 Some("session-1")
             );
         }
+    }
+
+    #[test]
+    fn listed_tool_annotations_parse_with_camel_case() {
+        let list: ListToolsResult = serde_json::from_value(json!({
+            "tools": [
+                {
+                    "name": "search",
+                    "annotations": {"readOnlyHint": true, "destructiveHint": false}
+                },
+                {"name": "write"}
+            ]
+        }))
+        .expect("parse tools/list");
+
+        assert_eq!(list.tools.len(), 2);
+        let annotations = list.tools[0].annotations.as_ref().expect("annotations");
+        assert_eq!(annotations.read_only_hint, Some(true));
+        assert_eq!(annotations.destructive_hint, Some(false));
+        assert!(list.tools[1].annotations.is_none());
+    }
+
+    #[test]
+    fn mcp_call_needs_approval_covers_policy_matrix() {
+        // 只读工具或 server 关闭审批时直接执行；非只读工具仅在未带批准时需要审批。
+        for has_approval in [false, true] {
+            assert!(!mcp_call_needs_approval(true, true, has_approval));
+            assert!(!mcp_call_needs_approval(true, false, has_approval));
+            assert!(!mcp_call_needs_approval(false, false, has_approval));
+        }
+        assert!(mcp_call_needs_approval(false, true, false));
+        assert!(!mcp_call_needs_approval(false, true, true));
+    }
+
+    #[tokio::test]
+    async fn read_only_mcp_tool_executes_without_approval() {
+        let server = TestHttpServer::start(vec![
+            TestHttpResponse::json(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {"protocolVersion": "2025-06-18"}
+            }))
+            .header("Mcp-Session-Id", "session-1"),
+            TestHttpResponse::accepted(),
+            TestHttpResponse::json(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "tools": [{
+                        "name": "search",
+                        "inputSchema": {"type": "object"},
+                        "annotations": {"readOnlyHint": true}
+                    }]
+                }
+            })),
+            TestHttpResponse::json(json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {"content": [{"type": "text", "text": "found"}]}
+            })),
+        ]);
+        let root = unique_dir("http-mcp-read-only");
+        let config = http_config("remote", server.url(), BTreeMap::new());
+        let cache = McpToolCache::new();
+
+        let discovery = discover_tools(&root, std::slice::from_ref(&config), &cache).await;
+        assert!(discovery.diagnostics.is_empty());
+        assert_eq!(discovery.tools.len(), 1);
+
+        let execution = discovery.tools[0]
+            .execute(
+                ToolCall::function("call_1", "mcp__remote__search", "{}"),
+                None,
+                ToolExecutionContext::default(),
+            )
+            .await;
+
+        let ToolExecution::Completed(result) = execution else {
+            panic!("read-only MCP tool must not require approval");
+        };
+        assert!(result.ok);
+        assert!(result.content.contains("found"));
+        assert_eq!(server.requests().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn mcp_tool_executes_without_approval_when_server_disables_it() {
+        let server = TestHttpServer::start(vec![
+            TestHttpResponse::json(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {"protocolVersion": "2025-06-18"}
+            }))
+            .header("Mcp-Session-Id", "session-1"),
+            TestHttpResponse::accepted(),
+            TestHttpResponse::json(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {"tools": [{"name": "write", "inputSchema": {"type": "object"}}]}
+            })),
+            TestHttpResponse::json(json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {"content": [{"type": "text", "text": "written"}]}
+            })),
+        ]);
+        let root = unique_dir("http-mcp-no-approval");
+        let mut config = http_config("remote", server.url(), BTreeMap::new());
+        config.require_approval = Some(false);
+        let cache = McpToolCache::new();
+
+        let discovery = discover_tools(&root, std::slice::from_ref(&config), &cache).await;
+        assert!(discovery.diagnostics.is_empty());
+        assert_eq!(discovery.tools.len(), 1);
+
+        let execution = discovery.tools[0]
+            .execute(
+                ToolCall::function("call_1", "mcp__remote__write", "{}"),
+                None,
+                ToolExecutionContext::default(),
+            )
+            .await;
+
+        let ToolExecution::Completed(result) = execution else {
+            panic!("require_approval = false must bypass approval");
+        };
+        assert!(result.ok);
+        assert!(result.content.contains("written"));
+        assert_eq!(server.requests().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn mismatched_or_denied_mcp_approval_is_rejected() {
+        let (tx, mut rx) = mpsc::channel(MCP_ACTOR_QUEUE_CAPACITY);
+        let runtime = McpServerRuntime {
+            name: "docs".to_string(),
+            tx,
+            healthy: Arc::new(AtomicBool::new(true)),
+            tool_timeout: Duration::from_secs(1),
+        };
+        let provider = McpToolProvider {
+            runtime,
+            definitions: Vec::new(),
+            lookup: HashMap::from([("mcp__docs__write".to_string(), "write".to_string())]),
+            read_only: HashMap::new(),
+            require_approval: true,
+        };
+        // 保持 actor 端存活；校验失败时不应发出任何命令。
+        let actor = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+        let call = ToolCall::function("call_1", "mcp__docs__write", "{}");
+        let request = provider.approval_request(&call, "write");
+
+        let mismatched = provider
+            .execute(
+                call.clone(),
+                Some(crate::ToolApproval {
+                    decision: ApprovalDecision::approve("approval-other"),
+                    request: request.clone(),
+                }),
+                ToolExecutionContext::default(),
+            )
+            .await;
+        let ToolExecution::Completed(result) = mismatched else {
+            panic!("mismatched approval must complete with an error result");
+        };
+        assert!(!result.ok);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .expect("mismatch error")
+                .contains("does not match required approval")
+        );
+
+        let denied = provider
+            .execute(
+                call,
+                Some(crate::ToolApproval {
+                    decision: ApprovalDecision::deny(request.id.clone()),
+                    request,
+                }),
+                ToolExecutionContext::default(),
+            )
+            .await;
+        let ToolExecution::Completed(result) = denied else {
+            panic!("denied approval must complete with an error result");
+        };
+        assert!(!result.ok);
+        assert_eq!(result.error.as_deref(), Some("MCP tool approval denied"));
+        actor.abort();
     }
 
     #[tokio::test]
@@ -2292,6 +2595,7 @@ done
                 enabled: true,
                 startup_timeout_sec: 1,
                 tool_timeout_sec: 1,
+                require_approval: None,
             },
         }
     }
@@ -2318,6 +2622,7 @@ done
             enabled: true,
             startup_timeout_sec: 5,
             tool_timeout_sec: 5,
+            require_approval: None,
         }
     }
 

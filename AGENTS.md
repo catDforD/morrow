@@ -54,4 +54,4 @@ cargo run -p agent-eval -- run
 
 ## 安全与配置提示
 
-不要提交本地密钥。`morrow.toml` 已被忽略，可能包含本地测试用 API key；优先使用 `OPENAI_API_KEY` 等环境变量。持久化 session 保存在 `~/.morrow/sessions/`，持久化 Subagent 保存在 `~/.morrow/subagent-sessions/`，其中可能包含用户输入和模型回复，应视为本地私有数据。项目 Hook（`<workspace>/.morrow/hooks.toml`）在显式 `morrow hooks trust` 前默认禁用；Hook 命令以用户身份执行，审查后再信任。
+不要提交本地密钥。`morrow.toml` 已被忽略，可能包含本地测试用 API key；优先使用 `OPENAI_API_KEY` 等环境变量。持久化 session 保存在 `~/.morrow/sessions/`，持久化 Subagent 保存在 `~/.morrow/subagent-sessions/`，其中可能包含用户输入和模型回复，应视为本地私有数据。项目 Hook（`<workspace>/.morrow/hooks.toml`）在显式 `morrow hooks trust` 前默认禁用；Hook 命令以用户身份执行，审查后再信任。MCP 工具默认纳入审批管线：server 标注 `readOnlyHint` 的只读工具直接执行，其余工具每次调用都需批准，除非在 `[mcp_servers.*]` 里显式 `require_approval = false`。

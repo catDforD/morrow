@@ -1251,6 +1251,21 @@ fn format_approval_request(request: &ApprovalRequest, permissions: PermissionPro
             let _ = writeln!(output, "permissions: {}", permission_summary(permissions));
             let _ = writeln!(output, "warning: approving this action will modify files.");
         }
+        ApprovalAction::McpTool {
+            server,
+            tool,
+            arguments,
+        } => {
+            let _ = writeln!(output, "action: mcp tool");
+            let _ = writeln!(output, "server: {server}");
+            let _ = writeln!(output, "tool: {tool}");
+            let _ = writeln!(output, "arguments: {arguments}");
+            let _ = writeln!(output, "permissions: {}", permission_summary(permissions));
+            let _ = writeln!(
+                output,
+                "warning: approving this action lets the MCP server perform side effects."
+            );
+        }
     }
     output
 }
@@ -1938,6 +1953,28 @@ compact test
     }
 
     #[test]
+    fn formats_mcp_tool_approval_request() {
+        let request = ApprovalRequest::mcp_tool(
+            "approval-call_1",
+            "docs",
+            "write_page",
+            r#"{"path":"/index","content":"hello"}"#,
+            "MCP tool 'write_page' on server 'docs' requires approval",
+        );
+
+        let text = format_approval_request(
+            &request,
+            PermissionProfile::for_mode(PermissionMode::WorkspaceWrite),
+        );
+
+        assert!(text.contains("action: mcp tool"));
+        assert!(text.contains("server: docs"));
+        assert!(text.contains("tool: write_page"));
+        assert!(text.contains(r#"arguments: {"path":"/index","content":"hello"}"#));
+        assert!(text.contains("permissions: mode=workspace_write, shell=prompt"));
+    }
+
+    #[test]
     fn formats_execution_summary_for_file_shell_subagent_and_error_results() {
         let records = vec![
             ExecutionRecord {
@@ -2203,6 +2240,7 @@ compact test
             enabled: true,
             startup_timeout_sec: 1,
             tool_timeout_sec: 1,
+            require_approval: None,
         }];
 
         let outcome = run_agent_turn(

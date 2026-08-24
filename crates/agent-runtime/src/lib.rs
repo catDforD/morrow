@@ -4013,6 +4013,7 @@ done
             enabled: true,
             startup_timeout_sec: 5,
             tool_timeout_sec: 5,
+            require_approval: None,
         };
 
         let inspection = inspect_mcp_servers(&root, &[server]).await;
@@ -4060,6 +4061,7 @@ done
             enabled: true,
             startup_timeout_sec: 5,
             tool_timeout_sec: 5,
+            require_approval: None,
         }];
 
         let outcome = run_agent_turn(
@@ -4111,6 +4113,7 @@ done
             enabled: true,
             startup_timeout_sec: 1,
             tool_timeout_sec: 1,
+            require_approval: None,
         }];
 
         let outcome = run_agent_turn(
@@ -4192,6 +4195,7 @@ done
             enabled: true,
             startup_timeout_sec: 5,
             tool_timeout_sec: 5,
+            require_approval: None,
         }];
 
         for (turn_index, prompt, handler) in [

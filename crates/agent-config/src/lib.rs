@@ -100,6 +100,8 @@ pub struct McpServerConfig {
     pub enabled: bool,
     pub startup_timeout_sec: u64,
     pub tool_timeout_sec: u64,
+    /// 非只读工具调用是否需要审批；`None` 等价于 `Some(true)`。
+    pub require_approval: Option<bool>,
 }
 
 impl std::fmt::Debug for McpServerConfig {
@@ -127,6 +129,7 @@ impl std::fmt::Debug for McpServerConfig {
             .field("enabled", &self.enabled)
             .field("startup_timeout_sec", &self.startup_timeout_sec)
             .field("tool_timeout_sec", &self.tool_timeout_sec)
+            .field("require_approval", &self.require_approval)
             .finish()
     }
 }
@@ -310,6 +313,7 @@ struct RawMcpServerConfig {
     enabled: Option<bool>,
     startup_timeout_sec: Option<u64>,
     tool_timeout_sec: Option<u64>,
+    require_approval: Option<bool>,
     url: Option<String>,
     bearer_token_env_var: Option<String>,
     #[serde(default)]
@@ -723,6 +727,7 @@ fn parse_mcp_servers(
                     enabled,
                     startup_timeout_sec,
                     tool_timeout_sec,
+                    require_approval: raw.require_approval,
                 });
             }
             McpTransport::Http => {
@@ -767,6 +772,7 @@ fn parse_mcp_servers(
                     enabled,
                     startup_timeout_sec,
                     tool_timeout_sec,
+                    require_approval: raw.require_approval,
                 });
             }
         }
@@ -1083,6 +1089,7 @@ env = { FOO = "bar" }
 cwd = "."
 startup_timeout_sec = 11
 tool_timeout_sec = 22
+require_approval = false
 "#,
         )
         .expect("write config");
@@ -1106,6 +1113,7 @@ tool_timeout_sec = 22
         assert!(server.enabled);
         assert_eq!(server.startup_timeout_sec, 11);
         assert_eq!(server.tool_timeout_sec, 22);
+        assert_eq!(server.require_approval, Some(false));
     }
 
     #[test]
@@ -1134,6 +1142,7 @@ enabled = false
         assert!(!server.enabled);
         assert_eq!(server.startup_timeout_sec, DEFAULT_MCP_STARTUP_TIMEOUT_SECS);
         assert_eq!(server.tool_timeout_sec, DEFAULT_MCP_TOOL_TIMEOUT_SECS);
+        assert_eq!(server.require_approval, None);
     }
 
     #[test]

@@ -1215,6 +1215,7 @@ fn prepare_remote_settings(
             enabled: server.enabled,
             startup_timeout_sec: server.startup_timeout_sec,
             tool_timeout_sec: server.tool_timeout_sec,
+            require_approval: None,
         })
         .collect();
     let options = ServerOptions {

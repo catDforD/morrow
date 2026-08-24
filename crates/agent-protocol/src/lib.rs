@@ -1000,6 +1000,11 @@ pub enum ApprovalAction {
         files: Vec<FileChangeSummary>,
         diff: String,
     },
+    McpTool {
+        server: String,
+        tool: String,
+        arguments: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
@@ -1078,10 +1083,43 @@ impl ApprovalRequest {
         }
     }
 
+    pub fn mcp_tool(
+        id: impl Into<String>,
+        server: impl Into<String>,
+        tool: impl Into<String>,
+        arguments: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            action: ApprovalAction::McpTool {
+                server: server.into(),
+                tool: tool.into(),
+                arguments: truncate_mcp_arguments(&arguments.into()),
+            },
+            reason: reason.into(),
+            origin: ApprovalOrigin::Unknown,
+        }
+    }
+
     pub fn with_origin(mut self, origin: ApprovalOrigin) -> Self {
         self.origin = origin;
         self
     }
+}
+
+/// MCP 工具审批请求展示的序列化参数上限，避免超大参数淹没审批界面。
+pub const MCP_ARGUMENTS_MAX_BYTES: usize = 2048;
+
+fn truncate_mcp_arguments(arguments: &str) -> String {
+    if arguments.len() <= MCP_ARGUMENTS_MAX_BYTES {
+        return arguments.to_string();
+    }
+    let mut end = MCP_ARGUMENTS_MAX_BYTES;
+    while !arguments.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…(truncated)", &arguments[..end])
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -2216,6 +2254,52 @@ mod tests {
                 }
             ])
         );
+    }
+
+    #[test]
+    fn mcp_tool_approval_roundtrips_and_truncates_arguments() {
+        let request = ApprovalRequest::mcp_tool(
+            "approval-call_1",
+            "docs",
+            "search",
+            r#"{"query":"morrow"}"#,
+            "MCP tool requires approval",
+        );
+
+        let value = serde_json::to_value(&request).expect("serialize mcp approval");
+        assert_eq!(
+            value,
+            json!({
+                "id": "approval-call_1",
+                "action": {
+                    "kind": "mcp_tool",
+                    "server": "docs",
+                    "tool": "search",
+                    "arguments": "{\"query\":\"morrow\"}"
+                },
+                "reason": "MCP tool requires approval"
+            })
+        );
+        let parsed: ApprovalRequest =
+            serde_json::from_value(value).expect("deserialize mcp approval");
+        assert_eq!(parsed, request);
+
+        let long = "x".repeat(MCP_ARGUMENTS_MAX_BYTES + 100);
+        let truncated = ApprovalRequest::mcp_tool("approval-call_2", "docs", "search", long, "r");
+        let ApprovalAction::McpTool { arguments, .. } = &truncated.action else {
+            panic!("expected mcp tool action");
+        };
+        assert!(arguments.ends_with("…(truncated)"));
+        assert!(arguments.len() <= MCP_ARGUMENTS_MAX_BYTES + "…(truncated)".len());
+
+        // 多字节字符跨越截断边界时回退到字符边界，不产生非法 UTF-8。
+        let boundary = format!("{}界", "a".repeat(MCP_ARGUMENTS_MAX_BYTES - 1));
+        let truncated =
+            ApprovalRequest::mcp_tool("approval-call_3", "docs", "search", boundary, "r");
+        let ApprovalAction::McpTool { arguments, .. } = &truncated.action else {
+            panic!("expected mcp tool action");
+        };
+        assert!(arguments.starts_with(&"a".repeat(MCP_ARGUMENTS_MAX_BYTES - 1)));
     }
 
     #[test]

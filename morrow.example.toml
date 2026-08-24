@@ -34,6 +34,9 @@ compact_max_retries = 2
 # enabled = true
 # startup_timeout_sec = 10
 # tool_timeout_sec = 60
+# Non-read-only tools require approval per call unless you opt out (default: true).
+# Tools marked readOnlyHint by the server always run without approval.
+# require_approval = true
 
 # MCP Streamable HTTP server example. OAuth is not supported yet.
 # [mcp_servers.remote]
@@ -44,3 +47,4 @@ compact_max_retries = 2
 # enabled = true
 # startup_timeout_sec = 10
 # tool_timeout_sec = 60
+# require_approval = true

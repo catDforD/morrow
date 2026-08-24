@@ -85,6 +85,7 @@ impl ManagedMcpServer {
             enabled: self.enabled,
             startup_timeout_sec: self.startup_timeout_sec,
             tool_timeout_sec: self.tool_timeout_sec,
+            require_approval: None,
         }
     }
 }
@@ -534,6 +535,7 @@ pub(crate) fn config_from_remote_spec(server: RemoteMcpServerSpec) -> McpServerC
         enabled: server.enabled,
         startup_timeout_sec: server.startup_timeout_sec,
         tool_timeout_sec: server.tool_timeout_sec,
+        require_approval: None,
     }
 }
 
@@ -943,6 +945,7 @@ mod tests {
             enabled: true,
             startup_timeout_sec: 10,
             tool_timeout_sec: 60,
+            require_approval: None,
         };
         let registry = McpRegistry::load(path, vec![fallback]).expect("registry");
 

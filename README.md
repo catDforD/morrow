@@ -101,7 +101,7 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
 enabled = true
 ```
 
-MCP tools are treated as trusted — review server commands and endpoints before enabling them.
+MCP tools that the server does not mark with `readOnlyHint` require per-call approval by default; set `require_approval = false` on a server to opt out. Review server commands and endpoints before enabling them or disabling approval.
 
 ### Policy hooks
 
