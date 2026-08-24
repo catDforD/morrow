@@ -56,6 +56,7 @@ use models::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::fmt::Write as _;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -158,17 +159,30 @@ fn reasoning_profile(model: &str) -> ReasoningProfile {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub enum ServerAccessPolicy {
-    #[default]
-    Browser,
+    /// Web dashboard access. `Some(token)` requires the bootstrap/cookie flow;
+    /// `None` disables authentication (only via explicit `--no-auth`).
+    Browser {
+        token: Option<String>,
+    },
     Desktop {
         token: Arc<str>,
     },
     Embedded,
 }
 
+impl Default for ServerAccessPolicy {
+    fn default() -> Self {
+        Self::Browser { token: None }
+    }
+}
+
 impl ServerAccessPolicy {
+    pub fn browser(token: Option<String>) -> Self {
+        Self::Browser { token }
+    }
+
     pub fn desktop(token: impl Into<String>) -> Self {
         Self::Desktop {
             token: Arc::from(token.into()),
@@ -179,7 +193,10 @@ impl ServerAccessPolicy {
 impl std::fmt::Debug for ServerAccessPolicy {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Browser => formatter.write_str("Browser"),
+            Self::Browser { token } => formatter
+                .debug_struct("Browser")
+                .field("token", &token.as_ref().map(|_| "<redacted>"))
+                .finish(),
             Self::Desktop { .. } => formatter
                 .debug_struct("Desktop")
                 .field("token", &"<redacted>")
@@ -187,6 +204,17 @@ impl std::fmt::Debug for ServerAccessPolicy {
             Self::Embedded => formatter.write_str("Embedded"),
         }
     }
+}
+
+/// Generate a cryptographically random browser session token.
+pub fn generate_browser_token() -> Result<String, ServerError> {
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes).map_err(|error| ServerError::Random(error.to_string()))?;
+    let mut token = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(&mut token, "{byte:02x}").expect("writing to a string cannot fail");
+    }
+    Ok(token)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -887,9 +915,14 @@ pub enum ServerError {
     Task(#[source] tokio::task::JoinError),
     #[error("server has {0} running turn(s)")]
     RunningTurns(usize),
+    #[error("failed to generate a browser session token: {0}")]
+    Random(String),
 }
 
-pub async fn serve(mut options: ServerOptions) -> Result<(), ServerError> {
+pub async fn serve(
+    mut options: ServerOptions,
+    access_policy: ServerAccessPolicy,
+) -> Result<(), ServerError> {
     let addr = SocketAddr::new(options.host, options.port);
     let listener = TcpListener::bind(addr)
         .await
@@ -899,13 +932,9 @@ pub async fn serve(mut options: ServerOptions) -> Result<(), ServerError> {
         .map_err(|source| ServerError::Bind { addr, source })?;
     options.host = bound_addr.ip();
     options.port = bound_addr.port();
-    axum::serve(listener, router(options)?)
+    axum::serve(listener, build_router(options, access_policy)?.0)
         .await
         .map_err(ServerError::Serve)
-}
-
-pub fn router(options: ServerOptions) -> Result<Router, ModelRegistryError> {
-    build_router(options, ServerAccessPolicy::Browser).map(|(router, _)| router)
 }
 
 pub async fn spawn_local(
@@ -1097,44 +1126,49 @@ async fn access_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    if matches!(state.inner.access_policy, ServerAccessPolicy::Embedded) {
-        return next.run(request).await;
-    }
-    let response = match &state.inner.access_policy {
-        ServerAccessPolicy::Browser => next.run(request).await,
-        ServerAccessPolicy::Embedded => next.run(request).await,
-        ServerAccessPolicy::Desktop { token } => {
-            let expected_host =
-                format!("{}:{}", state.inner.options.host, state.inner.options.port);
-            let host_matches = request
-                .headers()
-                .get(header::HOST)
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(|host| host == expected_host);
-            if !host_matches {
-                StatusCode::UNAUTHORIZED.into_response()
-            } else if is_bootstrap_request(&request, token) {
-                let mut response = StatusCode::SEE_OTHER.into_response();
-                response
-                    .headers_mut()
-                    .insert(header::LOCATION, HeaderValue::from_static("/"));
-                let cookie =
-                    format!("morrow_desktop_session={token}; HttpOnly; SameSite=Strict; Path=/");
-                if let Ok(value) = HeaderValue::from_str(&cookie) {
-                    response.headers_mut().insert(header::SET_COOKIE, value);
-                }
-                response
-            } else if !has_desktop_cookie(&request, token)
-                || !origin_is_allowed(&request, &expected_host)
-            {
-                StatusCode::UNAUTHORIZED.into_response()
-            } else {
-                next.run(request).await
-            }
+    let token: &str = match &state.inner.access_policy {
+        ServerAccessPolicy::Browser { token: Some(token) } => token.as_str(),
+        ServerAccessPolicy::Desktop { token } => token.as_ref(),
+        ServerAccessPolicy::Browser { token: None } | ServerAccessPolicy::Embedded => {
+            return with_security_headers(next.run(request).await);
         }
+    };
+    let expected_host = format!("{}:{}", state.inner.options.host, state.inner.options.port);
+    let response = match token_guard(&request, token, &expected_host) {
+        Some(rejection) => rejection,
+        None => next.run(request).await,
     };
 
     with_security_headers(response)
+}
+
+/// Shared Host/bootstrap/cookie/Origin guard for token-protected access policies.
+/// Returns `Some(response)` when the request is handled (bootstrap redirect or
+/// rejection) and `None` when it may proceed.
+fn token_guard(request: &Request<Body>, token: &str, expected_host: &str) -> Option<Response> {
+    let host_matches = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|host| host == expected_host);
+    if !host_matches {
+        return Some(StatusCode::UNAUTHORIZED.into_response());
+    }
+    if is_bootstrap_request(request, token) {
+        let mut response = StatusCode::SEE_OTHER.into_response();
+        response
+            .headers_mut()
+            .insert(header::LOCATION, HeaderValue::from_static("/"));
+        let cookie = format!("morrow_session={token}; HttpOnly; SameSite=Strict; Path=/");
+        if let Ok(value) = HeaderValue::from_str(&cookie) {
+            response.headers_mut().insert(header::SET_COOKIE, value);
+        }
+        return Some(response);
+    }
+    if !has_session_cookie(request, token) || !origin_is_allowed(request, expected_host) {
+        return Some(StatusCode::UNAUTHORIZED.into_response());
+    }
+    None
 }
 
 fn is_bootstrap_request(request: &Request<Body>, token: &str) -> bool {
@@ -1145,14 +1179,14 @@ fn is_bootstrap_request(request: &Request<Body>, token: &str) -> bool {
             .query()
             .and_then(|query| {
                 query.split('&').find_map(|pair| {
-                    pair.strip_prefix("desktop_bootstrap=")
+                    pair.strip_prefix("bootstrap=")
                         .filter(|value| !value.contains('='))
                 })
             })
             .is_some_and(|provided| constant_time_eq(provided.as_bytes(), token.as_bytes()))
 }
 
-fn has_desktop_cookie(request: &Request<Body>, token: &str) -> bool {
+fn has_session_cookie(request: &Request<Body>, token: &str) -> bool {
     request
         .headers()
         .get(header::COOKIE)
@@ -1161,7 +1195,7 @@ fn has_desktop_cookie(request: &Request<Body>, token: &str) -> bool {
             cookies.split(';').any(|cookie| {
                 cookie
                     .trim()
-                    .strip_prefix("morrow_desktop_session=")
+                    .strip_prefix("morrow_session=")
                     .is_some_and(|provided| constant_time_eq(provided.as_bytes(), token.as_bytes()))
             })
         })
@@ -3741,6 +3775,10 @@ mod tests {
 
     static ENV_LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
 
+    fn router(options: ServerOptions) -> Result<Router, ModelRegistryError> {
+        build_router(options, ServerAccessPolicy::browser(None)).map(|(router, _)| router)
+    }
+
     struct HomeGuard {
         previous: Option<std::ffi::OsString>,
     }
@@ -3845,7 +3883,7 @@ mod tests {
                 subagent_registry,
                 sessions: Mutex::new(HashMap::new()),
                 mcp_cache: RwLock::new(Arc::new(McpToolCache::new())),
-                access_policy: ServerAccessPolicy::Browser,
+                access_policy: ServerAccessPolicy::Browser { token: None },
                 shutting_down: AtomicBool::new(false),
             }),
         }
@@ -4422,7 +4460,7 @@ mod tests {
                 Request::builder()
                     .uri("/api/status")
                     .header(header::HOST, "localhost:43123")
-                    .header(header::COOKIE, "morrow_desktop_session=desktop-test-token")
+                    .header(header::COOKIE, "morrow_session=desktop-test-token")
                     .body(Body::empty())
                     .expect("request"),
             )
@@ -4434,7 +4472,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/?desktop_bootstrap=desktop-test-token")
+                    .uri("/?bootstrap=desktop-test-token")
                     .header(header::HOST, host)
                     .body(Body::empty())
                     .expect("request"),
@@ -4457,7 +4495,7 @@ mod tests {
                 Request::builder()
                     .uri("/api/status")
                     .header(header::HOST, host)
-                    .header(header::COOKIE, "morrow_desktop_session=desktop-test-token")
+                    .header(header::COOKIE, "morrow_session=desktop-test-token")
                     .body(Body::empty())
                     .expect("request"),
             )
@@ -4472,9 +4510,101 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn browser_access_remains_available_without_a_desktop_token() {
-        let response = router(test_options())
-            .expect("browser router")
+    async fn browser_access_with_token_requires_bootstrap_and_origin() {
+        let mut options = test_options();
+        options.port = 43125;
+        let (router, _) = build_router(
+            options,
+            ServerAccessPolicy::browser(Some("browser-test-token".to_string())),
+        )
+        .expect("browser router");
+        let host = "127.0.0.1:43125";
+
+        let unauthorized = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/status")
+                    .header(header::HOST, host)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let wrong_token = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/?bootstrap=wrong-token")
+                    .header(header::HOST, host)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(wrong_token.status(), StatusCode::UNAUTHORIZED);
+
+        let bootstrap = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/?bootstrap=browser-test-token")
+                    .header(header::HOST, host)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(bootstrap.status(), StatusCode::SEE_OTHER);
+        let cookie = bootstrap
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("session cookie")
+            .to_str()
+            .expect("cookie text")
+            .to_string();
+        assert!(cookie.contains("morrow_session=browser-test-token"));
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("SameSite=Strict"));
+
+        let authorized = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/status")
+                    .header(header::HOST, host)
+                    .header(header::COOKIE, "morrow_session=browser-test-token")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(authorized.status(), StatusCode::OK);
+
+        let cross_origin = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/commands/resolve")
+                    .header(header::HOST, host)
+                    .header(header::ORIGIN, "https://example.com")
+                    .header(header::COOKIE, "morrow_session=browser-test-token")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"input":"hello"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(cross_origin.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn browser_access_without_token_passes_through_for_no_auth() {
+        let (router, _) = build_router(test_options(), ServerAccessPolicy::browser(None))
+            .expect("browser router");
+        let response = router
             .oneshot(
                 Request::builder()
                     .uri("/api/status")
@@ -4498,7 +4628,7 @@ mod tests {
             .uri("/api/commands/resolve")
             .header(header::HOST, "127.0.0.1:43124")
             .header(header::ORIGIN, "https://example.com")
-            .header(header::COOKIE, "morrow_desktop_session=token")
+            .header(header::COOKIE, "morrow_session=token")
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(r#"{"input":"hello"}"#))
             .expect("request");
@@ -4510,7 +4640,7 @@ mod tests {
             .uri("/api/sessions/default/ws")
             .header(header::HOST, "127.0.0.1:43124")
             .header(header::ORIGIN, "https://example.com")
-            .header(header::COOKIE, "morrow_desktop_session=token")
+            .header(header::COOKIE, "morrow_session=token")
             .body(Body::empty())
             .expect("request");
         let response = router.oneshot(websocket).await.expect("response");
@@ -4519,7 +4649,7 @@ mod tests {
 
     #[tokio::test]
     async fn spawned_local_server_reports_address_and_shuts_down() {
-        let mut server = spawn_local(test_options(), ServerAccessPolicy::Browser)
+        let mut server = spawn_local(test_options(), ServerAccessPolicy::browser(None))
             .await
             .expect("spawn server");
 
@@ -4534,7 +4664,7 @@ mod tests {
 
     #[tokio::test]
     async fn require_idle_rejection_keeps_the_server_available() {
-        let mut server = spawn_local(test_options(), ServerAccessPolicy::Browser)
+        let mut server = spawn_local(test_options(), ServerAccessPolicy::browser(None))
             .await
             .expect("spawn server");
         let worker = tokio::spawn(std::future::pending::<()>());

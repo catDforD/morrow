@@ -1258,7 +1258,7 @@ async fn launch_server(
     bootstrap_token: &str,
 ) -> Result<StartedServer, DesktopError> {
     let access_policy = if cfg!(debug_assertions) {
-        ServerAccessPolicy::Browser
+        ServerAccessPolicy::browser(None)
     } else {
         ServerAccessPolicy::desktop(bootstrap_token)
     };
@@ -1267,7 +1267,7 @@ async fn launch_server(
         parse_url(VITE_DEV_URL)?
     } else {
         parse_url(&format!(
-            "{}/?desktop_bootstrap={bootstrap_token}",
+            "{}/?bootstrap={bootstrap_token}",
             server.base_url()
         ))?
     };

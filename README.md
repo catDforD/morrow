@@ -67,7 +67,7 @@ morrow                               # interactive REPL
 morrow server                        # web dashboard on 127.0.0.1:3000
 ```
 
-The dashboard is local-first and unauthenticated — keep it bound to localhost. It picks permissions per turn in the browser; `[permissions]` in `morrow.toml` applies to the CLI only.
+The dashboard is local-first — keep it bound to localhost. On startup it prints a one-time bootstrap URL that signs the browser in with an `HttpOnly` cookie; other local processes get `401`. Pass `--no-auth` to disable this for debugging. `[permissions]` in `morrow.toml` applies to the CLI only.
 
 ## Configuration
 
