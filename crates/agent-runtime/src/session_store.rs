@@ -312,7 +312,7 @@ impl SessionStore {
         self.validate_lease(lease)?;
         if self.path.is_file() {
             repair_log_tail(&self.path)?;
-            upgrade_v5_log_schema(&self.path)?;
+            upgrade_log_schema(&self.path)?;
             read_log_path(&self.path)?;
             return Ok(());
         }
@@ -330,7 +330,7 @@ impl SessionStore {
         self.validate_lease(lease)?;
         if self.path.is_file() {
             repair_log_tail(&self.path)?;
-            upgrade_v5_log_schema(&self.path)?;
+            upgrade_log_schema(&self.path)?;
             read_log_path(&self.path)?;
             return Ok(());
         }
@@ -1222,7 +1222,7 @@ fn read_log_path(
             source,
         }
     })?;
-    if !matches!(header.schema_version, 5 | SESSION_DOCUMENT_SCHEMA_VERSION) {
+    if !(5..=SESSION_DOCUMENT_SCHEMA_VERSION).contains(&header.schema_version) {
         return Err(SessionStoreError::UnsupportedSchemaVersion {
             path: path.to_path_buf(),
             version: header.schema_version,
@@ -1274,7 +1274,7 @@ fn read_log_header(path: &Path) -> Result<SessionLogHeader, SessionStoreError> {
             source,
         }
     })?;
-    if !matches!(header.schema_version, 5 | SESSION_DOCUMENT_SCHEMA_VERSION) {
+    if !(5..=SESSION_DOCUMENT_SCHEMA_VERSION).contains(&header.schema_version) {
         return Err(SessionStoreError::UnsupportedSchemaVersion {
             path: path.to_path_buf(),
             version: header.schema_version,
@@ -1343,7 +1343,7 @@ fn write_log_atomic(
     })
 }
 
-fn upgrade_v5_log_schema(path: &Path) -> Result<(), SessionStoreError> {
+fn upgrade_log_schema(path: &Path) -> Result<(), SessionStoreError> {
     let bytes = fs::read(path).map_err(|source| SessionStoreError::Read {
         path: path.to_path_buf(),
         source,
@@ -1364,7 +1364,9 @@ fn upgrade_v5_log_schema(path: &Path) -> Result<(), SessionStoreError> {
     if header.schema_version == SESSION_DOCUMENT_SCHEMA_VERSION {
         return Ok(());
     }
-    if header.schema_version != 5 {
+    // v5 之后的变更全部是 additive（新字段带 serde default），旧 facts 逐字节保留，
+    // 只就地重写 header 版本号。
+    if !(5..SESSION_DOCUMENT_SCHEMA_VERSION).contains(&header.schema_version) {
         return Err(SessionStoreError::UnsupportedSchemaVersion {
             path: path.to_path_buf(),
             version: header.schema_version,
@@ -1636,6 +1638,8 @@ fn append_legacy_turn(
             user_message: record.turn.user_message.clone(),
             model,
             permissions: PermissionProfile::default(),
+            // 旧聚合文档没有记录 system prompt，迁移时留空。
+            system_prompt: String::new(),
         },
     );
     let mut model_index = 0usize;
@@ -1804,7 +1808,7 @@ mod tests {
     }
 
     #[test]
-    fn saves_v6_jsonl_and_loads_projected_context() {
+    fn saves_v7_jsonl_and_loads_projected_context() {
         let root = unique_dir("save");
         let legacy = unique_dir("save-legacy");
         let cwd = unique_dir("save-cwd");
@@ -1817,39 +1821,38 @@ mod tests {
             Some("jsonl")
         );
         let (header, facts) = store.load_log().expect("load log");
-        assert_eq!(header.schema_version, 6);
+        assert_eq!(header.schema_version, 7);
         assert!(!facts.is_empty());
         assert_eq!(store.load().expect("load"), sample_session());
     }
 
-    #[test]
-    fn upgrades_v5_jsonl_header_without_rewriting_facts() {
-        let root = unique_dir("upgrade-v5");
-        let legacy = unique_dir("upgrade-v5-legacy");
-        let cwd = unique_dir("upgrade-v5-cwd");
+    fn assert_header_upgrade_preserves_facts(name: &str, from_version: u32) {
+        let root = unique_dir(name);
+        let legacy = unique_dir(&format!("{name}-legacy"));
+        let cwd = unique_dir(&format!("{name}-cwd"));
         let store = make_store(&root, &legacy, &cwd, "default");
         store.save(&sample_session()).expect("save");
 
-        let original = fs::read(store.path()).expect("read v6 log");
+        let original = fs::read(store.path()).expect("read saved log");
         let newline = original
             .iter()
             .position(|byte| *byte == b'\n')
             .expect("header newline");
         let mut header: SessionLogHeader =
             serde_json::from_slice(&original[..newline]).expect("parse header");
-        header.schema_version = 5;
-        let mut legacy_bytes = serde_json::to_vec(&header).expect("serialize v5 header");
+        header.schema_version = from_version;
+        let mut legacy_bytes = serde_json::to_vec(&header).expect("serialize old header");
         legacy_bytes.push(b'\n');
         legacy_bytes.extend_from_slice(&original[newline + 1..]);
-        fs::write(store.path(), &legacy_bytes).expect("write v5 log");
+        fs::write(store.path(), &legacy_bytes).expect("write old log");
 
         assert_eq!(
             store
                 .load_log()
-                .expect("read compatible v5")
+                .expect("read compatible old log")
                 .0
                 .schema_version,
-            5
+            from_version
         );
         let lease = store.acquire_writer().expect("lease");
         store.ensure_v5(&lease).expect("upgrade");
@@ -1870,6 +1873,16 @@ mod tests {
             &legacy_bytes[newline + 1..]
         );
         assert_eq!(store.load().expect("load upgraded"), sample_session());
+    }
+
+    #[test]
+    fn upgrades_v5_jsonl_header_without_rewriting_facts() {
+        assert_header_upgrade_preserves_facts("upgrade-v5", 5);
+    }
+
+    #[test]
+    fn upgrades_v6_jsonl_header_without_rewriting_facts() {
+        assert_header_upgrade_preserves_facts("upgrade-v6", 6);
     }
 
     #[test]

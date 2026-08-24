@@ -40,11 +40,22 @@ impl MiddlewareMetadata {
 pub struct MiddlewareCompletion {
     pub outcome: MiddlewareOutcome,
     pub reason: Option<String>,
+    /// 该次调用实际注入模型请求的上下文块（无注入为空）。
+    pub context: Vec<MiddlewareContextBlock>,
 }
 
 impl MiddlewareCompletion {
     pub fn new(outcome: MiddlewareOutcome, reason: Option<String>) -> Self {
-        Self { outcome, reason }
+        Self {
+            outcome,
+            reason,
+            context: Vec::new(),
+        }
+    }
+
+    pub fn with_context(mut self, context: Vec<MiddlewareContextBlock>) -> Self {
+        self.context = context;
+        self
     }
 }
 
@@ -91,15 +102,15 @@ where
         match await_middleware(future, context).await {
             MiddlewareCall::Completed(result) => {
                 let completion = complete(entry, &metadata, result, &mut run.aggregate);
-                run.events
-                    .push(audit.finished_event(completion.outcome, completion.reason));
+                run.events.push(audit.finished_event(completion));
             }
             MiddlewareCall::Cancelled => {
                 run.cancelled = true;
-                run.events.push(audit.finished_event(
-                    MiddlewareOutcome::Cancelled,
-                    Some("operation cancelled".to_string()),
-                ));
+                run.events
+                    .push(audit.finished_event(MiddlewareCompletion::new(
+                        MiddlewareOutcome::Cancelled,
+                        Some("operation cancelled".to_string()),
+                    )));
                 break;
             }
         }
@@ -114,15 +125,28 @@ pub fn append_context(
     stage: MiddlewareStage,
     blocks: Vec<ContextBlock>,
 ) {
-    target.extend(blocks.into_iter().filter_map(|block| {
-        let content = block.content.trim().to_string();
-        (!content.is_empty()).then(|| MiddlewareContextBlock {
-            middleware_id: metadata.id.clone(),
-            source: metadata.source,
-            stage,
-            content,
+    target.extend(collect_context(metadata, stage, blocks));
+}
+
+/// 把 middleware 返回的上下文块规范化为可持久化的 `MiddlewareContextBlock`
+/// （trim 后丢弃空块），供聚合与审计共用同一份内容。
+pub fn collect_context(
+    metadata: &MiddlewareMetadata,
+    stage: MiddlewareStage,
+    blocks: Vec<ContextBlock>,
+) -> Vec<MiddlewareContextBlock> {
+    blocks
+        .into_iter()
+        .filter_map(|block| {
+            let content = block.content.trim().to_string();
+            (!content.is_empty()).then(|| MiddlewareContextBlock {
+                middleware_id: metadata.id.clone(),
+                source: metadata.source,
+                stage,
+                content,
+            })
         })
-    }));
+        .collect()
 }
 
 pub fn attributed_reason(metadata: &MiddlewareMetadata, reason: &str) -> String {
@@ -181,16 +205,19 @@ impl AuditInvocation {
         })
     }
 
-    fn finished_event(&self, outcome: MiddlewareOutcome, reason: Option<String>) -> AgentEvent {
+    fn finished_event(&self, completion: MiddlewareCompletion) -> AgentEvent {
         AgentEvent::MiddlewareFinished(MiddlewareInvocationFinished {
             invocation_id: self.invocation_id.clone(),
             middleware_id: self.middleware_id.clone(),
             source: self.source,
             stage: self.stage,
-            outcome,
+            outcome: completion.outcome,
             started_at_ms: self.started_at_ms,
             duration_ms: self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
-            reason: reason.map(|reason| truncate_chars(reason, MAX_AUDIT_REASON_CHARS)),
+            reason: completion
+                .reason
+                .map(|reason| truncate_chars(reason, MAX_AUDIT_REASON_CHARS)),
+            injected_context: completion.context,
         })
     }
 }

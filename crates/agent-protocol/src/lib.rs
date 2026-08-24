@@ -768,7 +768,7 @@ impl Thread {
 }
 
 pub const THREAD_DOCUMENT_SCHEMA_VERSION: u32 = 2;
-pub const SESSION_DOCUMENT_SCHEMA_VERSION: u32 = 6;
+pub const SESSION_DOCUMENT_SCHEMA_VERSION: u32 = 7;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ThreadDocument {
@@ -1461,6 +1461,10 @@ pub enum SessionFact {
         user_message: Message,
         model: ModelInvocation,
         permissions: PermissionProfile,
+        /// 当次模型实际看到的完整 system prompt（含 AGENTS.md 与 subagent guidance）。
+        /// v6 及更早的日志行没有此字段，反序列化为空串。
+        #[serde(default)]
+        system_prompt: String,
     },
     NoticeRecorded {
         message: String,
@@ -1504,6 +1508,12 @@ pub enum SessionFact {
     },
     MiddlewareFinished {
         invocation: MiddlewareInvocationFinished,
+    },
+    /// before_prompt middleware 拒绝的 prompt。只作审计，不进入投影的模型上下文或
+    /// Turn 状态机。
+    PromptRejected {
+        prompt: String,
+        reasons: Vec<String>,
     },
     LegacyContextCheckpoint {
         source_schema: u32,
@@ -1777,6 +1787,16 @@ pub enum MiddlewareOutcome {
     SkippedUntrusted,
 }
 
+/// 一次 middleware 调用注入到模型请求的上下文块。定义在 protocol 层，使
+/// `MiddlewareInvocationFinished` 与 Session fact log 能直接持久化它。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct MiddlewareContextBlock {
+    pub middleware_id: String,
+    pub source: MiddlewareSource,
+    pub stage: MiddlewareStage,
+    pub content: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct MiddlewareInvocationStarted {
     pub invocation_id: String,
@@ -1797,6 +1817,9 @@ pub struct MiddlewareInvocationFinished {
     pub duration_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// 该次调用实际注入模型请求的上下文块；无注入或 v6 及更早的日志行为空。
+    #[serde(default)]
+    pub injected_context: Vec<MiddlewareContextBlock>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -2086,7 +2109,7 @@ mod tests {
         let document = SessionDocument::new(session.clone());
         let value = serde_json::to_value(&document).expect("serialize session document");
 
-        assert_eq!(value["schema_version"], json!(6));
+        assert_eq!(value["schema_version"], json!(7));
         assert_eq!(
             value["session"]["context"],
             json!({"summary": "Known facts", "summarized_turns": 1})
@@ -2654,5 +2677,111 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn v6_fact_lines_without_model_visible_fields_still_parse() {
+        // v6 的 TurnStarted 没有 system_prompt，MiddlewareFinished 没有 injected_context。
+        let turn_started: SessionFactEnvelope = serde_json::from_value(json!({
+            "revision": 1,
+            "timestamp_ms": 1,
+            "operation_id": "operation-1",
+            "turn_id": "turn-1",
+            "fact": {
+                "type": "turn_started",
+                "data": {
+                    "user_message": {"role": "user", "content": "hello"},
+                    "model": {
+                        "provider_id": "test",
+                        "provider_name": "Test",
+                        "model_id": "model",
+                        "model_name": "Model",
+                        "reasoning": "off"
+                    },
+                    "permissions": {"mode": "read_only", "shell": "deny"}
+                }
+            }
+        }))
+        .expect("parse v6 turn_started");
+        assert!(matches!(
+            turn_started.fact,
+            SessionFact::TurnStarted {
+                ref system_prompt,
+                ..
+            } if system_prompt.is_empty()
+        ));
+
+        let middleware_finished: SessionFactEnvelope = serde_json::from_value(json!({
+            "revision": 2,
+            "timestamp_ms": 2,
+            "fact": {
+                "type": "middleware_finished",
+                "data": {
+                    "invocation": {
+                        "invocation_id": "middleware-1",
+                        "middleware_id": "policy",
+                        "source": "internal",
+                        "stage": "before_prompt",
+                        "outcome": "continue",
+                        "started_at_ms": 1,
+                        "duration_ms": 2
+                    }
+                }
+            }
+        }))
+        .expect("parse v6 middleware_finished");
+        assert!(matches!(
+            middleware_finished.fact,
+            SessionFact::MiddlewareFinished {
+                ref invocation,
+            } if invocation.injected_context.is_empty()
+        ));
+    }
+
+    #[test]
+    fn model_visible_fact_fields_roundtrip() {
+        let invocation = MiddlewareInvocationFinished {
+            invocation_id: "middleware-1".to_string(),
+            middleware_id: "policy".to_string(),
+            source: MiddlewareSource::ProjectCommand,
+            stage: MiddlewareStage::BeforePrompt,
+            outcome: MiddlewareOutcome::Continue,
+            started_at_ms: 1,
+            duration_ms: 2,
+            reason: None,
+            injected_context: vec![MiddlewareContextBlock {
+                middleware_id: "policy".to_string(),
+                source: MiddlewareSource::ProjectCommand,
+                stage: MiddlewareStage::BeforePrompt,
+                content: "injected".to_string(),
+            }],
+        };
+        let facts = vec![
+            SessionFact::TurnStarted {
+                user_message: Message::user("hello"),
+                model: ModelInvocation {
+                    provider_id: "test".to_string(),
+                    provider_name: "Test".to_string(),
+                    model_id: "model".to_string(),
+                    model_name: "Model".to_string(),
+                    reasoning: ReasoningLevel::Off,
+                },
+                permissions: PermissionProfile::default(),
+                system_prompt: "base\n\nguidance".to_string(),
+            },
+            SessionFact::MiddlewareFinished {
+                invocation: invocation.clone(),
+            },
+            SessionFact::PromptRejected {
+                prompt: "secret prompt".to_string(),
+                reasons: vec!["policy: secret detected".to_string()],
+            },
+        ];
+
+        for fact in facts {
+            let bytes = serde_json::to_vec(&fact).expect("serialize fact");
+            let parsed: SessionFact = serde_json::from_slice(&bytes).expect("parse fact");
+            assert_eq!(parsed, fact);
+        }
     }
 }

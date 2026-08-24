@@ -853,6 +853,16 @@ impl SubagentSupervisor {
             ));
         }
         if before_denied {
+            session_handle
+                .commit_fact(
+                    None,
+                    None,
+                    SessionFact::PromptRejected {
+                        prompt: task.clone(),
+                        reasons: denied_reasons.clone(),
+                    },
+                )
+                .await?;
             return Err(RuntimeError::AgentRun(format!(
                 "subagent prompt blocked by middleware: {}",
                 denied_reasons.join("; ")
@@ -863,6 +873,7 @@ impl SubagentSupervisor {
                 agent_protocol::Message::user(task.clone()),
                 document.model.clone(),
                 document.permission_ceiling,
+                document.system_prompt.clone(),
             )
             .await?;
         let mut fact_run =

@@ -214,6 +214,7 @@ impl SessionHandle {
         user_message: agent_protocol::Message,
         model: agent_protocol::ModelInvocation,
         permissions: PermissionProfile,
+        system_prompt: String,
     ) -> Result<(String, String), SessionStoreError> {
         let _commit = self.commit_lock.lock().await;
         self.ensure_writable().await?;
@@ -237,6 +238,7 @@ impl SessionHandle {
             user_message,
             model,
             permissions,
+            system_prompt,
         };
         let expected_revision = self.state.lock().await.projection.revision;
         let envelope = {
@@ -628,6 +630,7 @@ mod tests {
                 Message::user("hello"),
                 model(),
                 PermissionProfile::default(),
+                "system".to_string(),
             )
             .await
             .expect("begin");
@@ -643,6 +646,7 @@ mod tests {
                     Message::user("second"),
                     model(),
                     PermissionProfile::default(),
+                    "system".to_string(),
                 )
                 .await,
             Err(SessionStoreError::OperationActive { .. })
@@ -670,6 +674,7 @@ mod tests {
                     Message::user("too late"),
                     model(),
                     PermissionProfile::default(),
+                    "system".to_string(),
                 )
                 .await,
             Err(SessionStoreError::HandleInvalidated { .. })

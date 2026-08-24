@@ -9,7 +9,7 @@
 - `crates/agent-eval`：确定性回归评估：脚本化模型与工具驱动真实 turn 循环，断言行为并执行效率预算棘轮。
 - `crates/agent-model`：OpenAI-compatible 模型客户端和 SSE 解析。
 - `crates/agent-protocol`：共享协议类型，例如 `Message`、`Thread`、`Turn`、Session fact 和事件。
-- `crates/agent-runtime`：一次 turn 的应用编排、上下文压缩、SessionStore 与 v6 fact log 持久化、MCP 装配和 Subagent 监督。
+- `crates/agent-runtime`：一次 turn 的应用编排、上下文压缩、SessionStore 与 v7 fact log 持久化、MCP 装配和 Subagent 监督。
 - `crates/agent-config`：`morrow.toml` 配置加载与校验。
 - `crates/agent-tools`：内置文件与 shell 工具、ToolRegistry、MCP 适配和 `web_fetch`。
 - `crates/agent-sandbox`：workspace 路径约束与权限判定。

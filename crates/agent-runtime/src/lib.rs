@@ -981,6 +981,25 @@ impl<'a> SessionFactRun<'a> {
     }
 }
 
+/// 模型当次实际看到的完整 system prompt：base（含 AGENTS.md）+ subagent guidance。
+/// `prepare_session_turn_with_middleware_context` 把它写入 `TurnStarted` fact，
+/// `run_agent_turn_inner` 用它发起模型请求，两边共用此函数保证日志与模型所见一致。
+fn effective_turn_system_prompt(
+    system_prompt: &str,
+    subagent_delegation: bool,
+    persistent_controller: bool,
+) -> String {
+    if !subagent_delegation {
+        return system_prompt.to_string();
+    }
+    let guidance = if persistent_controller {
+        format!("{PARENT_SUBAGENT_GUIDANCE}\n\n{PERSISTENT_SUBAGENT_GUIDANCE}")
+    } else {
+        PARENT_SUBAGENT_GUIDANCE.to_string()
+    };
+    format!("{system_prompt}\n\n{guidance}")
+}
+
 pub async fn run_agent_turn(
     context: RunAgentTurnContext<'_>,
     session: &mut Session,
@@ -1112,12 +1131,14 @@ pub async fn run_agent_turn_with_session_handle_and_middleware_context(
     cancellation: CancellationToken,
     controller: Option<Arc<dyn SubagentController>>,
 ) -> Result<RunAgentTurnOutcome, RuntimeError> {
+    let persistent_controller = controller.is_some();
     let prepared = prepare_session_turn_with_middleware_context(
         context,
         handle,
         prompt,
         handler,
         &cancellation,
+        persistent_controller,
     )
     .await?;
     let Some(prepared) = prepared else {
@@ -1179,6 +1200,7 @@ pub async fn prepare_session_turn_with_middleware(
         prompt,
         handler,
         cancellation,
+        false,
     )
     .await
 }
@@ -1189,6 +1211,7 @@ pub async fn prepare_session_turn_with_middleware_context(
     prompt: &str,
     handler: &mut impl TurnEventHandler,
     cancellation: &CancellationToken,
+    persistent_controller: bool,
 ) -> Result<Option<PreparedMiddlewareSessionTurn>, RuntimeError> {
     let execution_context = context.execution_context(cancellation, None, None);
     let before = context
@@ -1209,6 +1232,16 @@ pub async fn prepare_session_turn_with_middleware_context(
     }
     if before_denied {
         handle
+            .commit_fact(
+                None,
+                None,
+                SessionFact::PromptRejected {
+                    prompt: prompt.to_string(),
+                    reasons: denied_reasons.clone(),
+                },
+            )
+            .await?;
+        handle
             .notice(format!(
                 "prompt blocked by middleware: {}",
                 denied_reasons.join("; ")
@@ -1216,11 +1249,17 @@ pub async fn prepare_session_turn_with_middleware_context(
             .await;
         return Ok(None);
     }
+    let system_prompt = effective_turn_system_prompt(
+        context.turn.system_prompt,
+        context.turn.client.shared_clone().is_some(),
+        persistent_controller,
+    );
     let (operation_id, turn_id) = handle
         .begin_operation(
             Message::user(prompt),
             context.turn.model.clone(),
             context.turn.permissions,
+            system_prompt,
         )
         .await?;
     Ok(Some(PreparedMiddlewareSessionTurn {
@@ -1487,11 +1526,12 @@ async fn run_agent_turn_inner(
     let mut tools = build.registry;
     let diagnostics = build.diagnostics;
     let mut persistent_controller_registered = false;
-    let effective_system_prompt = if let Some(model) = context.client.shared_clone() {
+    let shared_model = context.client.shared_clone();
+    if let Some(model) = shared_model.as_ref() {
         tools.register_subagent(
             Arc::new(
                 RuntimeSubagentExecutor::new(
-                    model,
+                    model.clone(),
                     Arc::<str>::from(context.system_prompt),
                     Arc::new(context.workspace_root.to_path_buf()),
                 )
@@ -1509,15 +1549,12 @@ async fn run_agent_turn_inner(
             tools.register_subagent_controller(controller)?;
             persistent_controller_registered = true;
         }
-        let guidance = if persistent_controller_registered {
-            format!("{PARENT_SUBAGENT_GUIDANCE}\n\n{PERSISTENT_SUBAGENT_GUIDANCE}")
-        } else {
-            PARENT_SUBAGENT_GUIDANCE.to_string()
-        };
-        format!("{}\n\n{guidance}", context.system_prompt)
-    } else {
-        context.system_prompt.to_string()
-    };
+    }
+    let effective_system_prompt = effective_turn_system_prompt(
+        context.system_prompt,
+        shared_model.is_some(),
+        persistent_controller_registered,
+    );
     let tool_definitions = tools.definitions();
 
     let operation_id = fact_run.as_deref().map(|run| run.operation_id.clone());
@@ -3559,7 +3596,7 @@ compact test
     }
 
     #[tokio::test]
-    async fn denied_before_prompt_is_audited_without_persisting_prompt() {
+    async fn denied_before_prompt_is_logged_and_still_broadcast() {
         let root = unique_dir("middleware-deny-workspace");
         let sessions = unique_dir("middleware-deny-sessions");
         let legacy = unique_dir("middleware-deny-legacy");
@@ -3570,6 +3607,7 @@ compact test
             PermissionProfile::for_mode(PermissionMode::ReadOnly),
         )
         .expect("handle");
+        let mut subscription = handle.subscribe().await.expect("subscribe");
         let client = client("http://127.0.0.1:1/v1".to_string());
         let cache = McpToolCache::new();
         let mut handler = RecordingHandler::default();
@@ -3601,7 +3639,7 @@ compact test
                 MiddlewareAgentScope::Main,
             ),
             &handle,
-            "do not persist this secret",
+            "persist this rejected secret",
             &mut handler,
             CancellationToken::new(),
             None,
@@ -3618,9 +3656,33 @@ compact test
             projection.middleware_audit[0].outcome,
             agent_protocol::MiddlewareOutcome::Deny
         );
+        // 拒绝仍通过原有 notice 广播通知订阅者。
+        let notice = loop {
+            let envelope = subscription.recv().await.expect("subscription event");
+            if let agent_protocol::SessionUpdate::Notice { message } = envelope.update {
+                break message;
+            }
+        };
+        assert!(notice.contains("prompt blocked by middleware"));
+        // 被拒 prompt 以 PromptRejected fact 落盘，只作审计，不进入投影。
         let exported =
             String::from_utf8(handle.export_document_bytes().await.expect("export")).expect("utf8");
-        assert!(!exported.contains("do not persist this secret"));
+        assert!(exported.contains("persist this rejected secret"));
+        let facts = exported_facts(&exported);
+        let rejected = facts
+            .iter()
+            .find(|line| line["fact"]["type"] == "prompt_rejected")
+            .expect("prompt_rejected fact");
+        assert_eq!(
+            rejected["fact"]["data"]["prompt"],
+            json!("persist this rejected secret")
+        );
+        assert_eq!(
+            rejected["fact"]["data"]["reasons"],
+            json!(["prompt-policy: secret detected"])
+        );
+        assert!(projection.turns.is_empty());
+        assert!(projection.context.messages.is_empty());
     }
 
     #[tokio::test]
@@ -3676,6 +3738,165 @@ compact test
                 .iter()
                 .all(|message| message.content.as_deref() != Some("ephemeral policy"))
         );
+    }
+
+    fn exported_facts(exported: &str) -> Vec<serde_json::Value> {
+        exported
+            .lines()
+            .skip(1)
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn turn_started_fact_records_the_effective_system_prompt() {
+        let root = unique_dir("system-prompt-workspace");
+        let sessions = unique_dir("system-prompt-sessions");
+        let legacy = unique_dir("system-prompt-legacy");
+        let (base_url, requests) = spawn_recording_sse_server(vec![sse_text_body("ok")]).await;
+        let client = client(base_url);
+        let cache = McpToolCache::new();
+        let store = SessionStore::new(&sessions, &legacy, &root, "default").expect("store");
+        let handle = SessionHandle::open(
+            store,
+            "default",
+            PermissionProfile::for_mode(PermissionMode::ReadOnly),
+        )
+        .expect("handle");
+        let mut handler = RecordingHandler::default();
+        let middleware = MiddlewareRegistry::new();
+
+        let outcome = run_agent_turn_with_session_handle_and_middleware_context(
+            MiddlewareAgentTurnContext::new(
+                RunAgentTurnContext {
+                    client: &client,
+                    model: test_model_invocation(),
+                    subagent_identities: &[],
+                    system_prompt: "base prompt",
+                    context_config: context_config(2),
+                    model_limits: model_limits(10_000),
+                    workspace_root: &root,
+                    permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
+                    mcp_servers: &[],
+                    mcp_cache: &cache,
+                    session_name: "default",
+                    turn_index: 0,
+                },
+                &middleware,
+                MiddlewareAgentScope::Main,
+            ),
+            &handle,
+            "hello",
+            &mut handler,
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("run");
+
+        assert_eq!(outcome.error, None);
+        let exported =
+            String::from_utf8(handle.export_document_bytes().await.expect("export")).expect("utf8");
+        let facts = exported_facts(&exported);
+        let turn_started = facts
+            .iter()
+            .find(|line| line["fact"]["type"] == "turn_started")
+            .expect("turn_started fact");
+        let logged_prompt = turn_started["fact"]["data"]["system_prompt"]
+            .as_str()
+            .expect("system prompt string");
+        // 无持久 subagent controller 时，模型可见 prompt = base + 委派 guidance。
+        let expected = format!("base prompt\n\n{PARENT_SUBAGENT_GUIDANCE}");
+        assert_eq!(logged_prompt, expected);
+        // 与模型请求实际携带的 system 消息逐字节一致。
+        let request = requests.lock().expect("requests")[0].clone();
+        let body = request.split("\r\n\r\n").nth(1).expect("request body");
+        let body: serde_json::Value = serde_json::from_str(body).expect("parse request body");
+        assert_eq!(body["messages"][0]["role"], json!("system"));
+        assert_eq!(body["messages"][0]["content"], json!(expected));
+    }
+
+    #[tokio::test]
+    async fn middleware_injected_context_is_logged_with_the_invocation() {
+        let root = unique_dir("middleware-log-workspace");
+        let sessions = unique_dir("middleware-log-sessions");
+        let legacy = unique_dir("middleware-log-legacy");
+        let (base_url, requests) = spawn_recording_sse_server(vec![sse_text_body("ok")]).await;
+        let client = client(base_url);
+        let cache = McpToolCache::new();
+        let store = SessionStore::new(&sessions, &legacy, &root, "default").expect("store");
+        let handle = SessionHandle::open(
+            store,
+            "default",
+            PermissionProfile::for_mode(PermissionMode::ReadOnly),
+        )
+        .expect("handle");
+        let mut handler = RecordingHandler::default();
+        let mut middleware = MiddlewareRegistry::new();
+        middleware.register_runtime(Arc::new(PromptMiddleware {
+            decision: GateDecision::Continue,
+            context: vec![agent_core::ContextBlock::new("ephemeral policy")],
+        }));
+
+        let outcome = run_agent_turn_with_session_handle_and_middleware_context(
+            MiddlewareAgentTurnContext::new(
+                RunAgentTurnContext {
+                    client: &client,
+                    model: test_model_invocation(),
+                    subagent_identities: &[],
+                    system_prompt: "system",
+                    context_config: context_config(2),
+                    model_limits: model_limits(10_000),
+                    workspace_root: &root,
+                    permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
+                    mcp_servers: &[],
+                    mcp_cache: &cache,
+                    session_name: "default",
+                    turn_index: 0,
+                },
+                &middleware,
+                MiddlewareAgentScope::Main,
+            ),
+            &handle,
+            "hello",
+            &mut handler,
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("run");
+
+        assert_eq!(outcome.error, None);
+        assert!(
+            requests.lock().expect("requests")[0].contains("ephemeral policy"),
+            "middleware context must reach the model request"
+        );
+        let projection = handle.projection().await;
+        let before_prompt = projection
+            .middleware_audit
+            .iter()
+            .find(|invocation| invocation.stage == agent_protocol::MiddlewareStage::BeforePrompt)
+            .expect("before_prompt audit");
+        assert_eq!(before_prompt.injected_context.len(), 1);
+        assert_eq!(
+            before_prompt.injected_context[0].content,
+            "ephemeral policy"
+        );
+        assert_eq!(
+            before_prompt.injected_context[0].middleware_id,
+            "prompt-policy"
+        );
+        // 注入内容只留在审计 fact 中，不进入模型上下文投影。
+        assert!(
+            projection
+                .context
+                .messages
+                .iter()
+                .all(|message| message.content.as_deref() != Some("ephemeral policy"))
+        );
+        let exported =
+            String::from_utf8(handle.export_document_bytes().await.expect("export")).expect("utf8");
+        assert!(exported.contains("ephemeral policy"));
     }
 
     #[tokio::test]

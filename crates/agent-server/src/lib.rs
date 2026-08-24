@@ -2617,6 +2617,9 @@ async fn start_turn_inner(
         &prompt,
         &mut hook_handler,
         &cancellation,
+        // 该 turn 随后一定以 `Some(supervisor)` 运行，TurnStarted 需记录含持久
+        // subagent guidance 的完整 system prompt。
+        true,
     )
     .await
     .map_err(|error| error.to_string())?
@@ -4165,7 +4168,7 @@ mod tests {
             state.clone(),
             "default".to_string(),
             StartTurnRequest {
-                prompt: "do not persist this prompt".to_string(),
+                prompt: "blocked prompt content".to_string(),
                 prompt_resolved: true,
                 permission_mode: None,
                 model_selection: None,
@@ -4199,7 +4202,26 @@ mod tests {
                 .expect("export session"),
         )
         .expect("export UTF-8");
-        assert!(!exported.contains("do not persist this prompt"));
+        // 被拒 prompt 以 prompt_rejected fact 落盘（只作审计，不创建 turn）。
+        let rejected = exported
+            .lines()
+            .skip(1)
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|line| line["fact"]["type"] == "prompt_rejected")
+            .expect("prompt_rejected fact");
+        assert_eq!(
+            rejected["fact"]["data"]["prompt"],
+            serde_json::json!("blocked prompt content")
+        );
+        assert!(
+            rejected["fact"]["data"]["reasons"]
+                .as_array()
+                .expect("reasons array")
+                .iter()
+                .any(|reason| reason
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("blocked by policy")))
+        );
     }
 
     #[test]

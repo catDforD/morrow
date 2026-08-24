@@ -1,8 +1,9 @@
 use crate::middleware_runner::{
-    MiddlewareCompletion, MiddlewareMetadata, append_context, attributed_reason,
+    MiddlewareCompletion, MiddlewareMetadata, attributed_reason, collect_context,
     run_middleware_chain,
 };
 use crate::{CancellationToken, ToolResult};
+pub use agent_protocol::MiddlewareContextBlock;
 use agent_protocol::{
     ApprovalRequest, MiddlewareAgentScope, MiddlewareOutcome, MiddlewareSource, MiddlewareStage,
     ModelInvocation, PermissionProfile, ToolCall,
@@ -44,14 +45,6 @@ impl ContextBlock {
             content: content.into(),
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MiddlewareContextBlock {
-    pub middleware_id: String,
-    pub source: MiddlewareSource,
-    pub stage: MiddlewareStage,
-    pub content: String,
 }
 
 #[derive(Debug, Clone)]
@@ -291,13 +284,14 @@ impl AgentMiddlewareChain {
                             MiddlewareOutcome::Deny
                         }
                     };
-                    append_context(
-                        &mut run.context,
+                    let blocks = collect_context(
                         metadata,
                         MiddlewareStage::BeforeTool,
                         output.additional_context,
                     );
+                    run.context.extend(blocks.iter().cloned());
                     MiddlewareCompletion::new(outcome, gate_reason(&output.decision))
+                        .with_context(blocks)
                 }
                 Err(error) => {
                     let reason = error.to_string();
@@ -344,13 +338,13 @@ impl AgentMiddlewareChain {
                             (MiddlewareOutcome::Deny, Some(reason.clone()))
                         }
                     };
-                    append_context(
-                        &mut run.context,
+                    let blocks = collect_context(
                         metadata,
                         MiddlewareStage::PermissionRequest,
                         output.additional_context,
                     );
-                    MiddlewareCompletion::new(outcome, reason)
+                    run.context.extend(blocks.iter().cloned());
+                    MiddlewareCompletion::new(outcome, reason).with_context(blocks)
                 }
                 Err(error) => {
                     let reason = error.to_string();
@@ -383,13 +377,14 @@ impl AgentMiddlewareChain {
             },
             |_entry, metadata, result, run: &mut ObservationRun| match result {
                 Ok(output) => {
-                    append_context(
-                        &mut run.context,
+                    let blocks = collect_context(
                         metadata,
                         MiddlewareStage::AfterTool,
                         output.additional_context,
                     );
+                    run.context.extend(blocks.iter().cloned());
                     MiddlewareCompletion::new(MiddlewareOutcome::Continue, None)
+                        .with_context(blocks)
                 }
                 Err(error) => {
                     let reason = error.to_string();
