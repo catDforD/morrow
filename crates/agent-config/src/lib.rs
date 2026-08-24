@@ -27,6 +27,46 @@ pub struct AppConfig {
     pub context: ContextConfig,
     pub permissions: PermissionProfile,
     pub mcp_servers: Vec<McpServerConfig>,
+    pub tools: ToolsConfig,
+}
+
+/// 工具级 allow/deny：`deny` 优先于 `allow`，空 `allow` 表示全部允许。
+/// 条目支持内置工具名精确匹配、`mcp__server`（整个 server）与 `mcp__server__*` 前缀通配。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolsConfig {
+    pub allow: Vec<String>,
+    pub deny: Vec<String>,
+}
+
+impl ToolsConfig {
+    pub fn allows(&self, tool_name: &str) -> bool {
+        if self
+            .deny
+            .iter()
+            .any(|pattern| tool_name_matches_pattern(pattern, tool_name))
+        {
+            return false;
+        }
+        self.allow.is_empty()
+            || self
+                .allow
+                .iter()
+                .any(|pattern| tool_name_matches_pattern(pattern, tool_name))
+    }
+}
+
+fn tool_name_matches_pattern(pattern: &str, tool_name: &str) -> bool {
+    let pattern = pattern.trim();
+    if pattern.is_empty() {
+        return false;
+    }
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        return tool_name.starts_with(prefix);
+    }
+    tool_name == pattern
+        || tool_name
+            .strip_prefix(pattern)
+            .is_some_and(|rest| rest.starts_with("__"))
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -155,6 +195,7 @@ pub struct ServerAppConfig {
     pub permissions: PermissionProfile,
     pub mcp_servers: Vec<McpServerConfig>,
     pub server: ServerConfig,
+    pub tools: ToolsConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -262,6 +303,7 @@ struct RawAppConfig {
     context: Option<RawContextConfig>,
     permissions: Option<RawPermissionsConfig>,
     server: Option<RawServerConfig>,
+    tools: Option<RawToolsConfig>,
     #[serde(default)]
     mcp_servers: BTreeMap<String, RawMcpServerConfig>,
 }
@@ -308,6 +350,13 @@ struct RawPermissionsConfig {
 #[serde(deny_unknown_fields)]
 struct RawServerConfig {
     permission_ceiling: Option<PermissionMode>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawToolsConfig {
+    allow: Option<Vec<String>>,
+    deny: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -376,9 +425,10 @@ fn load_server_config_from_locations(
         context,
         permissions,
         server,
+        tools,
         mcp_servers,
     } = raw;
-    let config = parse_server_app_config(agent, context, permissions, server, mcp_servers)?;
+    let config = parse_server_app_config(agent, context, permissions, server, tools, mcp_servers)?;
     let mut diagnostics = Vec::new();
     let model = model.and_then(|model| match parse_model_config(model) {
         Ok((config, inline_api_key)) => {
@@ -510,10 +560,12 @@ impl TryFrom<RawAppConfig> for AppConfig {
             context,
             permissions,
             server,
+            tools,
             mcp_servers,
         } = value;
         let (model, _) = parse_model_config(model.unwrap_or_default())?;
-        let server = parse_server_app_config(agent, context, permissions, server, mcp_servers)?;
+        let server =
+            parse_server_app_config(agent, context, permissions, server, tools, mcp_servers)?;
 
         Ok(Self {
             model,
@@ -521,6 +573,7 @@ impl TryFrom<RawAppConfig> for AppConfig {
             context: server.context,
             permissions: server.permissions,
             mcp_servers: server.mcp_servers,
+            tools: server.tools,
         })
     }
 }
@@ -573,6 +626,7 @@ fn parse_server_app_config(
     context: Option<RawContextConfig>,
     permissions: Option<RawPermissionsConfig>,
     server: Option<RawServerConfig>,
+    tools: Option<RawToolsConfig>,
     mcp_servers: BTreeMap<String, RawMcpServerConfig>,
 ) -> Result<ServerAppConfig, ConfigError> {
     let agent = agent.unwrap_or_default();
@@ -584,6 +638,7 @@ fn parse_server_app_config(
         permissions_profile.shell = shell;
     }
     let server = server.unwrap_or_default();
+    let tools = tools.unwrap_or_default();
 
     Ok(ServerAppConfig {
         agent: AgentConfig {
@@ -598,6 +653,10 @@ fn parse_server_app_config(
             permission_ceiling: server
                 .permission_ceiling
                 .unwrap_or(PermissionMode::DangerFullAccess),
+        },
+        tools: ToolsConfig {
+            allow: tools.allow.unwrap_or_default(),
+            deny: tools.deny.unwrap_or_default(),
         },
     })
 }
@@ -1589,5 +1648,141 @@ http_headers = { Authorization = "Bearer mcp-secret" }
         assert!(!debug.contains("url-secret"));
         assert!(debug.contains("<redacted>"));
         assert!(debug.contains("Authorization"));
+    }
+
+    #[test]
+    fn loads_tools_allow_deny_config() {
+        let root = unique_dir("tools-allow-deny");
+        let config = root.join("morrow.toml");
+        fs::write(
+            &config,
+            r#"
+[model]
+model = "test-model"
+api_key_env = "MORROW_TOOLS_CONFIG_KEY"
+context_window_tokens = 65536
+
+[tools]
+allow = ["read_file", "mcp__docs__*"]
+deny = ["shell_command"]
+"#,
+        )
+        .expect("write config");
+        set_env("MORROW_TOOLS_CONFIG_KEY", "secret");
+
+        let loaded = load_config_from_locations(Some(&config), &root, None).expect("load config");
+
+        assert_eq!(
+            loaded.config.tools,
+            ToolsConfig {
+                allow: vec!["read_file".to_string(), "mcp__docs__*".to_string()],
+                deny: vec!["shell_command".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn tools_config_defaults_to_allowing_everything() {
+        let root = unique_dir("tools-default");
+        let config = root.join("morrow.toml");
+        fs::write(
+            &config,
+            r#"
+[model]
+model = "test-model"
+api_key_env = "MORROW_TOOLS_DEFAULT_KEY"
+context_window_tokens = 65536
+"#,
+        )
+        .expect("write config");
+        set_env("MORROW_TOOLS_DEFAULT_KEY", "secret");
+
+        let loaded = load_config_from_locations(Some(&config), &root, None).expect("load config");
+
+        assert_eq!(loaded.config.tools, ToolsConfig::default());
+        assert!(loaded.config.tools.allows("shell_command"));
+        assert!(loaded.config.tools.allows("mcp__docs__read"));
+    }
+
+    #[test]
+    fn tools_config_rejects_unknown_fields() {
+        let root = unique_dir("tools-unknown-field");
+        let config = root.join("morrow.toml");
+        fs::write(
+            &config,
+            r#"
+[model]
+model = "test-model"
+api_key_env = "MORROW_TOOLS_UNKNOWN_KEY"
+context_window_tokens = 65536
+
+[tools]
+allowed = ["read_file"]
+"#,
+        )
+        .expect("write config");
+        set_env("MORROW_TOOLS_UNKNOWN_KEY", "secret");
+
+        let err = load_config_from_locations(Some(&config), &root, None).expect_err("must fail");
+
+        assert!(matches!(err, ConfigError::Parse { .. }));
+    }
+
+    #[test]
+    fn tools_config_matching_matrix() {
+        let config = ToolsConfig::default();
+        assert!(config.allows("read_file"));
+        assert!(config.allows("mcp__docs__read"));
+
+        // 内置工具名精确匹配。
+        let config = ToolsConfig {
+            allow: vec!["read_file".to_string()],
+            deny: Vec::new(),
+        };
+        assert!(config.allows("read_file"));
+        assert!(!config.allows("read_file_extra"));
+        assert!(!config.allows("write_file"));
+
+        // mcp__server 匹配整个 server，要求 "__" 边界。
+        let config = ToolsConfig {
+            allow: vec!["mcp__docs".to_string()],
+            deny: Vec::new(),
+        };
+        assert!(config.allows("mcp__docs"));
+        assert!(config.allows("mcp__docs__read"));
+        assert!(!config.allows("mcp__docs2__read"));
+        assert!(!config.allows("mcp__fs__read"));
+
+        // 前缀通配。
+        let config = ToolsConfig {
+            allow: vec!["mcp__docs__*".to_string()],
+            deny: Vec::new(),
+        };
+        assert!(config.allows("mcp__docs__read"));
+        assert!(!config.allows("mcp__fs__read"));
+        assert!(!config.allows("read_file"));
+
+        // deny 优先于 allow。
+        let config = ToolsConfig {
+            allow: vec!["mcp__docs".to_string()],
+            deny: vec!["mcp__docs__write".to_string()],
+        };
+        assert!(config.allows("mcp__docs__read"));
+        assert!(!config.allows("mcp__docs__write"));
+
+        // 空 allow + deny 内置工具。
+        let config = ToolsConfig {
+            allow: Vec::new(),
+            deny: vec!["shell_command".to_string()],
+        };
+        assert!(!config.allows("shell_command"));
+        assert!(config.allows("read_file"));
+
+        // 空条目与空白条目不匹配任何工具。
+        let config = ToolsConfig {
+            allow: vec![String::new()],
+            deny: vec!["  ".to_string()],
+        };
+        assert!(!config.allows("read_file"));
     }
 }

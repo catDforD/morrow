@@ -11,7 +11,7 @@ pub use subagent_settings::{
     load_subagent_identities,
 };
 
-use agent_config::{ContextConfig, LoadedServerConfig, McpServerConfig};
+use agent_config::{ContextConfig, LoadedServerConfig, McpServerConfig, ToolsConfig};
 use agent_hooks::{HookManager, HookSettings};
 use agent_model::{DEFAULT_MAX_RETRIES, ModelError, OpenAiCompatClient, OpenAiCompatConfig};
 use agent_protocol::{
@@ -93,6 +93,7 @@ pub struct ServerOptions {
     /// Cap on the permission mode web clients may request per turn.
     pub permission_ceiling: PermissionMode,
     pub mcp_servers: Vec<McpServerConfig>,
+    pub tools: ToolsConfig,
     pub default_session_name: String,
 }
 
@@ -152,6 +153,7 @@ pub fn server_options_from_loaded_config(
         permissions: PermissionProfile::for_mode(DEFAULT_WEB_PERMISSION_MODE),
         permission_ceiling: loaded.config.server.permission_ceiling,
         mcp_servers: loaded.config.mcp_servers,
+        tools: loaded.config.tools,
         default_session_name,
     })
 }
@@ -2607,6 +2609,7 @@ async fn start_turn_inner(
                 permissions,
                 mcp_servers: hook_mcp_servers,
                 mcp_cache: mcp_cache.as_ref(),
+                tools: Some(&state.inner.options.tools),
                 session_name: &session_name,
                 turn_index,
             },
@@ -2820,6 +2823,7 @@ async fn run_turn_task_inner(context: TurnTaskContext) -> Result<(), agent_runti
                     permissions,
                     mcp_servers: &mcp_servers,
                     mcp_cache: mcp_cache.as_ref(),
+                    tools: Some(&options.tools),
                     session_name: &session_name,
                     turn_index,
                 },
@@ -3873,6 +3877,7 @@ mod tests {
             permissions: PermissionProfile::for_mode(DEFAULT_WEB_PERMISSION_MODE),
             permission_ceiling: PermissionMode::DangerFullAccess,
             mcp_servers: Vec::new(),
+            tools: ToolsConfig::default(),
             default_session_name: "default".to_string(),
         }
     }
@@ -3948,6 +3953,7 @@ mod tests {
                 permissions: PermissionProfile::for_mode(DEFAULT_WEB_PERMISSION_MODE),
                 mcp_servers: Vec::new(),
                 server: ServerConfig::default(),
+                tools: ToolsConfig::default(),
             },
             path: None,
             model: None,

@@ -5,7 +5,7 @@ pub mod session_store;
 pub mod subagent_store;
 pub mod subagent_supervisor;
 
-use agent_config::{ContextConfig, McpServerConfig, ModelContextLimits};
+use agent_config::{ContextConfig, McpServerConfig, ModelContextLimits, ToolsConfig};
 use agent_core::tokens::{
     apply_request_padding, estimate_message_tokens, estimate_role_text_tokens,
     estimate_tool_definitions_tokens,
@@ -163,6 +163,8 @@ pub struct RunAgentTurnContext<'a> {
     pub permissions: PermissionProfile,
     pub mcp_servers: &'a [McpServerConfig],
     pub mcp_cache: &'a McpToolCache,
+    /// `[tools] allow/deny` 过滤；`None` 等价于全量允许。
+    pub tools: Option<&'a ToolsConfig>,
     pub session_name: &'a str,
     pub turn_index: usize,
 }
@@ -1511,16 +1513,25 @@ async fn run_agent_turn_inner(
     let artifact_root = SessionStore::for_workspace(context.workspace_root, context.session_name)
         .ok()
         .and_then(|store| store.artifact_root().ok());
+    let allow_all_tools;
+    let tool_filter = match context.tools {
+        Some(tools) => tools,
+        None => {
+            allow_all_tools = ToolsConfig::default();
+            &allow_all_tools
+        }
+    };
     let build = tokio::select! {
         biased;
         _ = cancellation.cancelled() => None,
-        result = ToolRegistry::with_mcp_cache_and_writer_lease_and_artifact_root_async(
+        result = ToolRegistry::with_mcp_cache_and_writer_lease_and_artifact_root_and_tool_filter_async(
             context.workspace_root,
             context.permissions,
             context.mcp_servers,
             context.mcp_cache,
             writer_lease,
             artifact_root.clone(),
+            tool_filter,
         ) => Some(result),
     };
     let Some(build) = build else {
@@ -3548,6 +3559,7 @@ compact test
                 permissions: PermissionProfile::for_mode(agent_protocol::PermissionMode::ReadOnly),
                 mcp_servers: &[],
                 mcp_cache: &mcp_cache,
+                tools: None,
                 session_name: "default",
                 turn_index: 0,
             },
@@ -3633,6 +3645,7 @@ compact test
                     permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
                     mcp_servers: &[],
                     mcp_cache: &cache,
+                    tools: None,
                     session_name: "default",
                     turn_index: 0,
                 },
@@ -3713,6 +3726,7 @@ compact test
                     permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
                     mcp_servers: &[],
                     mcp_cache: &cache,
+                    tools: None,
                     session_name: "default",
                     turn_index: 0,
                 },
@@ -3780,6 +3794,7 @@ compact test
                     permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
                     mcp_servers: &[],
                     mcp_cache: &cache,
+                    tools: None,
                     session_name: "default",
                     turn_index: 0,
                 },
@@ -3852,6 +3867,7 @@ compact test
                     permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
                     mcp_servers: &[],
                     mcp_cache: &cache,
+                    tools: None,
                     session_name: "default",
                     turn_index: 0,
                 },
@@ -3948,6 +3964,7 @@ compact test
                 ),
                 mcp_servers: &[],
                 mcp_cache: &mcp_cache,
+                tools: None,
                 session_name: "default",
                 turn_index: 0,
             },
@@ -4053,6 +4070,7 @@ compact test
                 permissions: PermissionProfile::for_mode(agent_protocol::PermissionMode::ReadOnly),
                 mcp_servers: &[],
                 mcp_cache: &mcp_cache,
+                tools: None,
                 session_name: "default",
                 turn_index: 0,
             },
@@ -4107,6 +4125,7 @@ compact test
                 permissions: PermissionProfile::for_mode(agent_protocol::PermissionMode::ReadOnly),
                 mcp_servers: &[],
                 mcp_cache: &mcp_cache,
+                tools: None,
                 session_name: "default",
                 turn_index: 0,
             },
@@ -4166,6 +4185,7 @@ compact test
                 permissions: PermissionProfile::for_mode(agent_protocol::PermissionMode::ReadOnly),
                 mcp_servers: &[],
                 mcp_cache: &mcp_cache,
+                tools: None,
                 session_name: "default",
                 turn_index: 0,
             },
@@ -4299,6 +4319,7 @@ done
                 permissions: PermissionProfile::for_mode(agent_protocol::PermissionMode::ReadOnly),
                 mcp_servers: &mcp_servers,
                 mcp_cache: &mcp_cache,
+                tools: None,
                 session_name: "default",
                 turn_index: 0,
             },
@@ -4351,6 +4372,7 @@ done
                 permissions: PermissionProfile::for_mode(agent_protocol::PermissionMode::ReadOnly),
                 mcp_servers: &mcp_servers,
                 mcp_cache: &mcp_cache,
+                tools: None,
                 session_name: "default",
                 turn_index: 0,
             },
@@ -4439,6 +4461,7 @@ done
                     ),
                     mcp_servers: &mcp_servers,
                     mcp_cache: &mcp_cache,
+                    tools: None,
                     session_name: "default",
                     turn_index,
                 },
@@ -4493,6 +4516,7 @@ done
                 ),
                 mcp_servers: &[],
                 mcp_cache: &mcp_cache,
+                tools: None,
                 session_name: "default",
                 turn_index: 0,
             },
@@ -4539,11 +4563,13 @@ done
                 subagent_identities: &[],
                 system_prompt: "system",
                 context_config: context_config(2),
-                model_limits: model_limits(2_000),
+                // 工具定义计入上下文估算；窗口要同时触发压缩并容纳回退压缩后的保留内容。
+                model_limits: model_limits(4_000),
                 workspace_root: &root,
                 permissions: PermissionProfile::for_mode(agent_protocol::PermissionMode::ReadOnly),
                 mcp_servers: &[],
                 mcp_cache: &mcp_cache,
+                tools: None,
                 session_name: "default",
                 turn_index: session.turns.len(),
             },

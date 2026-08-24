@@ -1,5 +1,8 @@
-use crate::{TOOL_CANCELLED_ERROR, Tool, ToolExecution, ToolExecutionContext, ToolResult};
-use agent_config::{McpServerConfig, McpTransport};
+use crate::{
+    TOOL_CANCELLED_ERROR, Tool, ToolExecution, ToolExecutionContext, ToolResult,
+    invalid_arguments_message,
+};
+use agent_config::{McpServerConfig, McpTransport, ToolsConfig};
 use agent_protocol::{ApprovalRequest, ToolCall, ToolDefinition, ToolExecutionSummary};
 use agent_sandbox::approval_id_for_tool_call;
 use async_trait::async_trait;
@@ -274,6 +277,15 @@ pub async fn discover_tools(
     servers: &[McpServerConfig],
     cache: &McpToolCache,
 ) -> McpDiscovery {
+    discover_tools_with_filter(workspace_root, servers, cache, &ToolsConfig::default()).await
+}
+
+pub async fn discover_tools_with_filter(
+    workspace_root: &Path,
+    servers: &[McpServerConfig],
+    cache: &McpToolCache,
+    tool_filter: &ToolsConfig,
+) -> McpDiscovery {
     let discoveries = join_all(
         servers
             .iter()
@@ -315,6 +327,7 @@ pub async fn discover_tools(
             &server_name,
             require_approval,
             entry,
+            tool_filter,
             &mut emitted_names,
             &mut diagnostics,
         ) {
@@ -353,11 +366,17 @@ fn build_tool_provider(
     server_name: &str,
     require_approval: Option<bool>,
     entry: Arc<CachedMcpServer>,
+    tool_filter: &ToolsConfig,
     emitted_names: &mut BTreeSet<String>,
     diagnostics: &mut Vec<String>,
 ) -> Option<Arc<McpToolProvider>> {
-    let (definitions, lookup, read_only) =
-        build_tool_definitions(server_name, &entry.listed_tools, emitted_names, diagnostics);
+    let (definitions, lookup, read_only) = build_tool_definitions(
+        server_name,
+        &entry.listed_tools,
+        tool_filter,
+        emitted_names,
+        diagnostics,
+    );
 
     (!definitions.is_empty()).then(|| {
         Arc::new(McpToolProvider {
@@ -373,6 +392,7 @@ fn build_tool_provider(
 fn build_tool_definitions(
     server_name: &str,
     tools: &[ListedTool],
+    tool_filter: &ToolsConfig,
     emitted_names: &mut BTreeSet<String>,
     diagnostics: &mut Vec<String>,
 ) -> (
@@ -393,6 +413,13 @@ fn build_tool_definitions(
             ));
             continue;
         };
+
+        if !tool_filter.allows(&normalized) {
+            diagnostics.push(format!(
+                "mcp server {server_name}: skipped tool {normalized}: blocked by [tools] allow/deny configuration"
+            ));
+            continue;
+        }
 
         if !server_names.insert(normalized.clone()) {
             diagnostics.push(format!(
@@ -487,9 +514,15 @@ impl Tool for McpToolProvider {
         let arguments = match serde_json::from_str::<Value>(&call.function.arguments) {
             Ok(arguments) => arguments,
             Err(error) => {
-                return ToolExecution::error(format!(
-                    "invalid arguments for tool {}: {error}",
-                    call.function.name
+                let parameters = self
+                    .definitions
+                    .iter()
+                    .find(|definition| definition.function.name == call.function.name)
+                    .map(|definition| &definition.function.parameters);
+                return ToolExecution::error(invalid_arguments_message(
+                    &call.function.name,
+                    &error,
+                    parameters,
                 ));
             }
         };
@@ -1796,8 +1829,13 @@ mod tests {
 
         let mut emitted = BTreeSet::new();
         let mut diagnostics = Vec::new();
-        let (definitions, lookup, read_only) =
-            build_tool_definitions("Docs", &tools, &mut emitted, &mut diagnostics);
+        let (definitions, lookup, read_only) = build_tool_definitions(
+            "Docs",
+            &tools,
+            &ToolsConfig::default(),
+            &mut emitted,
+            &mut diagnostics,
+        );
 
         assert!(diagnostics.is_empty());
         assert_eq!(definitions[0].function.name, "mcp__docs__search");
@@ -1862,12 +1900,125 @@ mod tests {
         let mut emitted = BTreeSet::new();
         let mut diagnostics = Vec::new();
 
-        let (definitions, _, _) =
-            build_tool_definitions("fs", &tools, &mut emitted, &mut diagnostics);
+        let (definitions, _, _) = build_tool_definitions(
+            "fs",
+            &tools,
+            &ToolsConfig::default(),
+            &mut emitted,
+            &mut diagnostics,
+        );
 
         assert_eq!(definitions.len(), 1);
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].contains("skipped duplicate tool"));
+    }
+
+    #[test]
+    fn tools_filter_skips_blocked_mcp_tools_with_diagnostics() {
+        let tools = vec![
+            ListedTool {
+                name: "read".into(),
+                description: None,
+                input_schema: None,
+                annotations: None,
+            },
+            ListedTool {
+                name: "write".into(),
+                description: None,
+                input_schema: None,
+                annotations: None,
+            },
+        ];
+
+        let mut emitted = BTreeSet::new();
+        let mut diagnostics = Vec::new();
+        let (definitions, _, _) = build_tool_definitions(
+            "docs",
+            &tools,
+            &ToolsConfig {
+                allow: Vec::new(),
+                deny: vec!["mcp__docs".to_string()],
+            },
+            &mut emitted,
+            &mut diagnostics,
+        );
+        assert!(definitions.is_empty());
+        assert_eq!(diagnostics.len(), 2);
+        assert!(diagnostics[0].contains("blocked by [tools]"));
+
+        let mut emitted = BTreeSet::new();
+        let mut diagnostics = Vec::new();
+        let (definitions, _, _) = build_tool_definitions(
+            "docs",
+            &tools,
+            &ToolsConfig {
+                allow: Vec::new(),
+                deny: vec!["mcp__docs__w*".to_string()],
+            },
+            &mut emitted,
+            &mut diagnostics,
+        );
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(definitions[0].function.name, "mcp__docs__read");
+        assert_eq!(diagnostics.len(), 1);
+
+        let mut emitted = BTreeSet::new();
+        let mut diagnostics = Vec::new();
+        let (definitions, _, _) = build_tool_definitions(
+            "docs",
+            &tools,
+            &ToolsConfig {
+                allow: vec!["mcp__docs__read".to_string()],
+                deny: Vec::new(),
+            },
+            &mut emitted,
+            &mut diagnostics,
+        );
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(definitions[0].function.name, "mcp__docs__read");
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].contains("mcp__docs__write"));
+    }
+
+    #[tokio::test]
+    async fn mcp_invalid_arguments_error_echoes_tool_schema() {
+        let (tx, _rx) = mpsc::channel(MCP_ACTOR_QUEUE_CAPACITY);
+        let runtime = McpServerRuntime {
+            name: "docs".to_string(),
+            tx,
+            healthy: Arc::new(AtomicBool::new(true)),
+            tool_timeout: Duration::from_secs(1),
+        };
+        let provider = McpToolProvider {
+            runtime,
+            definitions: vec![ToolDefinition::function(
+                "mcp__docs__read",
+                "MCP tool from server 'docs'.",
+                json!({
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"]
+                }),
+            )],
+            lookup: HashMap::from([("mcp__docs__read".to_string(), "read".to_string())]),
+            read_only: HashMap::from([("mcp__docs__read".to_string(), true)]),
+            require_approval: true,
+        };
+        let call = ToolCall::function("call_1", "mcp__docs__read", "not json");
+
+        let ToolExecution::Completed(result) = provider
+            .execute(call, None, ToolExecutionContext::default())
+            .await
+        else {
+            panic!("expected completed tool execution");
+        };
+        let error = result.error.as_deref().expect("error");
+        assert!(
+            error.contains("invalid arguments for tool mcp__docs__read"),
+            "{error}"
+        );
+        assert!(error.contains("required: [path]"), "{error}");
+        assert!(error.contains("path: string"), "{error}");
     }
 
     #[test]
@@ -1887,10 +2038,20 @@ mod tests {
         let mut emitted = BTreeSet::new();
         let mut diagnostics = Vec::new();
 
-        let (first, _, _) =
-            build_tool_definitions("FS!", &first_tools, &mut emitted, &mut diagnostics);
-        let (second, _, _) =
-            build_tool_definitions("FS?", &second_tools, &mut emitted, &mut diagnostics);
+        let (first, _, _) = build_tool_definitions(
+            "FS!",
+            &first_tools,
+            &ToolsConfig::default(),
+            &mut emitted,
+            &mut diagnostics,
+        );
+        let (second, _, _) = build_tool_definitions(
+            "FS?",
+            &second_tools,
+            &ToolsConfig::default(),
+            &mut emitted,
+            &mut diagnostics,
+        );
 
         assert_eq!(first.len(), 1);
         assert!(second.is_empty());

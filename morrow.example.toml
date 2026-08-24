@@ -14,6 +14,14 @@ reserved_output_tokens = 8192
 mode = "read_only"
 shell = "deny"
 
+# Tool-level allow/deny for the main agent.
+# Entries match built-in tool names exactly (e.g. "shell_command"), a whole MCP
+# server ("mcp__filesystem"), or a prefix wildcard ("mcp__filesystem__*").
+# deny wins over allow; an empty allow list (the default) allows everything.
+# [tools]
+# allow = ["read_file", "list_files", "search_text", "web_fetch", "mcp__docs__*"]
+# deny = ["shell_command"]
+
 # Web dashboard (`morrow server`) settings.
 # [server]
 # Cap on the permission mode browser clients may pick per turn.

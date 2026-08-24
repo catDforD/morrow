@@ -3,7 +3,7 @@ mod state;
 mod wsl;
 
 use agent_config::{
-    ContextConfig, McpServerConfig, McpTransport, load_server_config_for_workspace,
+    ContextConfig, McpServerConfig, McpTransport, ToolsConfig, load_server_config_for_workspace,
 };
 use agent_protocol::{
     PermissionMode, PermissionProfile, RemoteEnvelope, RemoteEvent, RemoteMcpTransport,
@@ -1243,6 +1243,7 @@ fn prepare_remote_settings(
         permissions: PermissionProfile::for_mode(agent_server::DEFAULT_WEB_PERMISSION_MODE),
         permission_ceiling: PermissionMode::DangerFullAccess,
         mcp_servers: fallback_mcp_servers,
+        tools: ToolsConfig::default(),
         default_session_name: "default".to_string(),
     };
     EmbeddedServer::new(options)

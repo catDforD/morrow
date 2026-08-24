@@ -1,7 +1,7 @@
 pub mod mcp;
 mod web_fetch;
 
-use agent_config::McpServerConfig;
+use agent_config::{McpServerConfig, ToolsConfig};
 pub use agent_core::{
     CancellationToken, ToolApproval, ToolExecution, ToolExecutionContext, ToolExecutionKind,
     ToolExecutionMode, ToolFuture, ToolResult, ToolRuntime,
@@ -130,6 +130,18 @@ impl BuiltInToolAllowlist {
     pub fn new(names: impl IntoIterator<Item = impl Into<String>>) -> Self {
         Self {
             names: names.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    /// 按 `[tools] allow/deny` 裁剪内置工具集合。
+    pub fn filtered(&self, tools: &ToolsConfig) -> Self {
+        Self {
+            names: self
+                .names
+                .iter()
+                .filter(|name| tools.allows(name))
+                .cloned()
+                .collect(),
         }
     }
 
@@ -533,15 +545,36 @@ impl ToolRegistry {
         writer_lease: Option<Arc<Semaphore>>,
         artifact_root: Option<PathBuf>,
     ) -> Result<ToolRegistryBuild, ToolRegistryError> {
+        Self::with_mcp_cache_and_writer_lease_and_artifact_root_and_tool_filter_async(
+            root,
+            permissions,
+            mcp_servers,
+            mcp_cache,
+            writer_lease,
+            artifact_root,
+            &ToolsConfig::default(),
+        )
+        .await
+    }
+
+    pub async fn with_mcp_cache_and_writer_lease_and_artifact_root_and_tool_filter_async(
+        root: impl Into<PathBuf>,
+        permissions: PermissionProfile,
+        mcp_servers: &[McpServerConfig],
+        mcp_cache: &McpToolCache,
+        writer_lease: Option<Arc<Semaphore>>,
+        artifact_root: Option<PathBuf>,
+        tools: &ToolsConfig,
+    ) -> Result<ToolRegistryBuild, ToolRegistryError> {
         let root = root.into();
         let mut registry = Self::built_in_with_allowlist_and_writer_lease_and_artifact_root(
             &root,
             permissions,
-            BuiltInToolAllowlist::all(),
+            BuiltInToolAllowlist::all().filtered(tools),
             writer_lease,
             artifact_root,
         )?;
-        let discovery = mcp::discover_tools(&root, mcp_servers, mcp_cache).await;
+        let discovery = mcp::discover_tools_with_filter(&root, mcp_servers, mcp_cache, tools).await;
         for tool in discovery.tools {
             registry.register(tool)?;
         }
@@ -676,9 +709,48 @@ impl ToolRegistry {
             .find(|registered| registered.definition.function.name == call.function.name)
         {
             Some(registered) => registered.tool.execute(call, approval, context).await,
-            None => ToolExecution::error(format!("unknown tool {:?}", call.function.name)),
+            None => ToolExecution::error(self.unknown_tool_message(&call.function.name)),
         }
     }
+
+    fn unknown_tool_message(&self, name: &str) -> String {
+        let mut available = self
+            .tools
+            .iter()
+            .map(|registered| registered.definition.function.name.as_str())
+            .collect::<Vec<_>>();
+        available.sort_unstable();
+        let mut message = format!(
+            "unknown tool {name:?}. Available tools: {}",
+            available.join(", ")
+        );
+        let suggestions = available
+            .iter()
+            .copied()
+            .filter(|candidate| tool_names_overlap(name, candidate))
+            .take(3)
+            .collect::<Vec<_>>();
+        if !suggestions.is_empty() {
+            message.push_str(&format!(". Did you mean: {}?", suggestions.join(", ")));
+        }
+        message
+    }
+}
+
+fn tool_names_overlap(requested: &str, candidate: &str) -> bool {
+    if requested.is_empty() {
+        return false;
+    }
+    candidate.contains(requested)
+        || requested.contains(candidate)
+        || common_prefix_len(requested, candidate) >= 3
+}
+
+fn common_prefix_len(left: &str, right: &str) -> usize {
+    left.bytes()
+        .zip(right.bytes())
+        .take_while(|(left, right)| left == right)
+        .count()
 }
 
 impl ToolRuntime for ToolRegistry {
@@ -820,22 +892,7 @@ impl BuiltInTools {
 #[async_trait]
 impl Tool for DelegateTaskTool {
     fn definitions(&self) -> Vec<ToolDefinition> {
-        vec![ToolDefinition::function(
-            DELEGATE_TASK_TOOL_NAME,
-            "Delegate one self-contained, read-only workspace investigation to an isolated subagent. The call waits for the result. Issue multiple delegate_task calls in the same response when independent investigations can run in parallel; use direct tools for simple lookups.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "task": {
-                        "type": "string",
-                        "minLength": 1,
-                        "maxLength": MAX_SUBAGENT_TASK_CHARS
-                    }
-                },
-                "required": ["task"],
-                "additionalProperties": false
-            }),
-        )]
+        vec![delegate_task_definition()]
     }
 
     fn execution_kind(&self, call: &ToolCall) -> ToolExecutionKind {
@@ -889,80 +946,7 @@ impl Tool for DelegateTaskTool {
 #[async_trait]
 impl Tool for SubagentLifecycleTools {
     fn definitions(&self) -> Vec<ToolDefinition> {
-        let role_schema = json!({
-            "type": "string",
-            "enum": ["explore", "plan", "worker", "reviewer"]
-        });
-        vec![
-            ToolDefinition::function(
-                SPAWN_SUBAGENT_TOOL_NAME,
-                "Start a persistent session-scoped subagent in the background. Returns immediately with its instance and run identifiers.",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "role": role_schema,
-                        "task": {"type": "string", "minLength": 1, "maxLength": MAX_SUBAGENT_TASK_CHARS}
-                    },
-                    "required": ["role", "task"],
-                    "additionalProperties": false
-                }),
-            ),
-            ToolDefinition::function(
-                SEND_SUBAGENT_TOOL_NAME,
-                "Send a follow-up message to an existing persistent subagent and start its next background run.",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "instance_id": {"type": "string", "minLength": 1},
-                        "message": {"type": "string", "minLength": 1, "maxLength": MAX_SUBAGENT_TASK_CHARS}
-                    },
-                    "required": ["instance_id", "message"],
-                    "additionalProperties": false
-                }),
-            ),
-            ToolDefinition::function(
-                INSPECT_SUBAGENT_TOOL_NAME,
-                "Inspect one persistent subagent or list all persistent subagents in the current session. Only bounded summaries are returned.",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "instance_id": {"type": "string", "minLength": 1}
-                    },
-                    "additionalProperties": false
-                }),
-            ),
-            ToolDefinition::function(
-                WAIT_SUBAGENTS_TOOL_NAME,
-                "Wait for one or more persistent subagents to stop running. A timeout returns current statuses without cancelling them.",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "instance_ids": {
-                            "type": "array",
-                            "minItems": 1,
-                            "maxItems": 8,
-                            "uniqueItems": true,
-                            "items": {"type": "string", "minLength": 1}
-                        },
-                        "timeout_secs": {"type": "integer", "minimum": 0, "maximum": MAX_SUBAGENT_WAIT_SECS}
-                    },
-                    "required": ["instance_ids"],
-                    "additionalProperties": false
-                }),
-            ),
-            ToolDefinition::function(
-                CANCEL_SUBAGENT_TOOL_NAME,
-                "Cancel a queued or running persistent subagent. Cancelling an already idle or terminal instance is a successful no-op.",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "instance_id": {"type": "string", "minLength": 1}
-                    },
-                    "required": ["instance_id"],
-                    "additionalProperties": false
-                }),
-            ),
-        ]
+        subagent_lifecycle_definitions()
     }
 
     fn execution_mode(&self, _call: &ToolCall) -> ToolExecutionMode {
@@ -1932,6 +1916,105 @@ impl BuiltInTools {
     }
 }
 
+fn delegate_task_definition() -> ToolDefinition {
+    ToolDefinition::function(
+        DELEGATE_TASK_TOOL_NAME,
+        "Delegate one self-contained, read-only workspace investigation to an isolated subagent. The call waits for the result. Issue multiple delegate_task calls in the same response when independent investigations can run in parallel; use direct tools for simple lookups.",
+        json!({
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_SUBAGENT_TASK_CHARS,
+                    "description": format!("Self-contained investigation task for the subagent: what to look at and what to report back (at most {MAX_SUBAGENT_TASK_CHARS} characters).")
+                }
+            },
+            "required": ["task"],
+            "additionalProperties": false
+        }),
+    )
+}
+
+fn subagent_lifecycle_definitions() -> Vec<ToolDefinition> {
+    let role_schema = json!({
+        "type": "string",
+        "enum": ["explore", "plan", "worker", "reviewer"],
+        "description": "Subagent role, which determines its tool profile: explore and plan are read-only investigators, worker can edit files and run commands, reviewer reads and runs commands."
+    });
+    vec![
+        ToolDefinition::function(
+            SPAWN_SUBAGENT_TOOL_NAME,
+            "Start a persistent session-scoped subagent in the background. Returns immediately with its instance and run identifiers.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "role": role_schema,
+                    "task": {"type": "string", "minLength": 1, "maxLength": MAX_SUBAGENT_TASK_CHARS, "description": format!("Initial task for the subagent (at most {MAX_SUBAGENT_TASK_CHARS} characters).")}
+                },
+                "required": ["role", "task"],
+                "additionalProperties": false
+            }),
+        ),
+        ToolDefinition::function(
+            SEND_SUBAGENT_TOOL_NAME,
+            "Send a follow-up message to an existing persistent subagent and start its next background run.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "instance_id": {"type": "string", "minLength": 1, "description": "Instance identifier returned by spawn_subagent."},
+                    "message": {"type": "string", "minLength": 1, "maxLength": MAX_SUBAGENT_TASK_CHARS, "description": format!("Follow-up instruction for the subagent's next run (at most {MAX_SUBAGENT_TASK_CHARS} characters).")}
+                },
+                "required": ["instance_id", "message"],
+                "additionalProperties": false
+            }),
+        ),
+        ToolDefinition::function(
+            INSPECT_SUBAGENT_TOOL_NAME,
+            "Inspect one persistent subagent or list all persistent subagents in the current session. Only bounded summaries are returned.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "instance_id": {"type": "string", "minLength": 1, "description": "Inspect only this subagent instance. Omit to list all subagents in the session."}
+                },
+                "additionalProperties": false
+            }),
+        ),
+        ToolDefinition::function(
+            WAIT_SUBAGENTS_TOOL_NAME,
+            "Wait for one or more persistent subagents to stop running. A timeout returns current statuses without cancelling them.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "instance_ids": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 8,
+                        "uniqueItems": true,
+                        "items": {"type": "string", "minLength": 1},
+                        "description": "Instance identifiers of the subagents to wait for (1 to 8 entries)."
+                    },
+                    "timeout_secs": {"type": "integer", "minimum": 0, "maximum": MAX_SUBAGENT_WAIT_SECS, "description": format!("Maximum time to wait in seconds (0..={MAX_SUBAGENT_WAIT_SECS}). Defaults to {MAX_SUBAGENT_WAIT_SECS}; on timeout the call returns the current statuses without cancelling anything.")}
+                },
+                "required": ["instance_ids"],
+                "additionalProperties": false
+            }),
+        ),
+        ToolDefinition::function(
+            CANCEL_SUBAGENT_TOOL_NAME,
+            "Cancel a queued or running persistent subagent. Cancelling an already idle or terminal instance is a successful no-op.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "instance_id": {"type": "string", "minLength": 1, "description": "Instance identifier of the subagent to cancel."}
+                },
+                "required": ["instance_id"],
+                "additionalProperties": false
+            }),
+        ),
+    ]
+}
+
 fn built_in_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition::function(
@@ -1940,9 +2023,9 @@ fn built_in_definitions() -> Vec<ToolDefinition> {
             json!({
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string"},
-                    "start_line": {"type": "integer", "minimum": 1},
-                    "max_lines": {"type": "integer", "minimum": 1, "maximum": MAX_READ_LINES}
+                    "path": {"type": "string", "description": "File path relative to the workspace root."},
+                    "start_line": {"type": "integer", "minimum": 1, "description": format!("First line to return (1-based). Defaults to 1. Combine with max_lines to page through large files; the returned output reports the file's total line count.")},
+                    "max_lines": {"type": "integer", "minimum": 1, "maximum": MAX_READ_LINES, "description": format!("Maximum number of lines to return (1..={MAX_READ_LINES}). Defaults to {DEFAULT_READ_LINES}.")}
                 },
                 "required": ["path"],
                 "additionalProperties": false
@@ -1954,9 +2037,9 @@ fn built_in_definitions() -> Vec<ToolDefinition> {
             json!({
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string"},
-                    "recursive": {"type": "boolean"},
-                    "max_entries": {"type": "integer", "minimum": 1, "maximum": MAX_LIST_ENTRIES}
+                    "path": {"type": "string", "description": "Directory to list, relative to the workspace root. Defaults to the workspace root."},
+                    "recursive": {"type": "boolean", "description": "List entries recursively. Defaults to false (only the directory's immediate children)."},
+                    "max_entries": {"type": "integer", "minimum": 1, "maximum": MAX_LIST_ENTRIES, "description": format!("Maximum number of entries to return (1..={MAX_LIST_ENTRIES}). Defaults to {DEFAULT_LIST_ENTRIES}; the output notes when the listing was truncated.")}
                 },
                 "additionalProperties": false
             }),
@@ -1967,10 +2050,10 @@ fn built_in_definitions() -> Vec<ToolDefinition> {
             json!({
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string"},
-                    "path": {"type": "string"},
-                    "case_sensitive": {"type": "boolean"},
-                    "max_results": {"type": "integer", "minimum": 1, "maximum": MAX_SEARCH_RESULTS}
+                    "query": {"type": "string", "description": "Literal string to search for (fixed string, not a regular expression)."},
+                    "path": {"type": "string", "description": "File or directory to search, relative to the workspace root. Defaults to the whole workspace."},
+                    "case_sensitive": {"type": "boolean", "description": "Match case sensitively. Defaults to false."},
+                    "max_results": {"type": "integer", "minimum": 1, "maximum": MAX_SEARCH_RESULTS, "description": format!("Maximum number of matching lines to return (1..={MAX_SEARCH_RESULTS}). Defaults to {DEFAULT_SEARCH_RESULTS}.")}
                 },
                 "required": ["query"],
                 "additionalProperties": false
@@ -1978,13 +2061,13 @@ fn built_in_definitions() -> Vec<ToolDefinition> {
         ),
         ToolDefinition::function(
             "edit_file",
-            "Edit a UTF-8 text file by replacing text that matches exactly once.",
+            "Edit a UTF-8 text file by replacing text that matches exactly once. Prefer this for single-point, exact replacements in an existing file; use apply_patch to create or delete files or to change several files at once.",
             json!({
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string"},
-                    "old_text": {"type": "string", "minLength": 1},
-                    "new_text": {"type": "string"}
+                    "path": {"type": "string", "description": "File path relative to the workspace root."},
+                    "old_text": {"type": "string", "minLength": 1, "description": "Exact text to replace. It must occur exactly once in the file; include more surrounding context when a shorter snippet is ambiguous."},
+                    "new_text": {"type": "string", "description": "Replacement text. May be empty to delete the matched text."}
                 },
                 "required": ["path", "old_text", "new_text"],
                 "additionalProperties": false
@@ -1996,9 +2079,9 @@ fn built_in_definitions() -> Vec<ToolDefinition> {
             json!({
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string"},
-                    "content": {"type": "string"},
-                    "overwrite": {"type": "boolean"}
+                    "path": {"type": "string", "description": "File path relative to the workspace root. The parent directory must already exist."},
+                    "content": {"type": "string", "description": "Full content to write into the file."},
+                    "overwrite": {"type": "boolean", "description": "Allow replacing an existing file. Defaults to false; the call fails when the file already exists and overwrite is not set."}
                 },
                 "required": ["path", "content"],
                 "additionalProperties": false
@@ -2006,13 +2089,13 @@ fn built_in_definitions() -> Vec<ToolDefinition> {
         ),
         ToolDefinition::function(
             "apply_patch",
-            "Apply a patch to add, update, or delete files.",
+            "Apply a patch to add, update, or delete files. Prefer this for new files, deletions, and changes spanning multiple files; use edit_file for single-point, exact replacements in one existing file.",
             json!({
                 "type": "object",
                 "properties": {
                     "patch": {
                         "type": "string",
-                        "description": "Patch text to apply."
+                        "description": "Patch text to apply. The patch must start with *** Begin Patch, then contain one or more *** Add File / *** Update File / *** Delete File sections, and end with *** End Patch. The whole patch is validated before any file is touched."
                     }
                 },
                 "required": ["patch"],
@@ -2025,8 +2108,8 @@ fn built_in_definitions() -> Vec<ToolDefinition> {
             json!({
                 "type": "object",
                 "properties": {
-                    "command": {"type": "string"},
-                    "timeout_secs": {"type": "integer", "minimum": 1, "maximum": MAX_SHELL_TIMEOUT_SECS}
+                    "command": {"type": "string", "description": "Shell command to run with the workspace root as the working directory."},
+                    "timeout_secs": {"type": "integer", "minimum": 1, "maximum": MAX_SHELL_TIMEOUT_SECS, "description": format!("Timeout in seconds (1..={MAX_SHELL_TIMEOUT_SECS}). Defaults to {DEFAULT_SHELL_TIMEOUT_SECS}.")}
                 },
                 "required": ["command"],
                 "additionalProperties": false
@@ -2065,8 +2148,100 @@ fn delegate_task_label(call: &ToolCall) -> String {
 }
 
 fn parse_args<T: DeserializeOwned>(call: &ToolCall) -> Result<T, String> {
-    serde_json::from_str(&call.function.arguments)
-        .map_err(|err| format!("invalid arguments for tool {}: {err}", call.function.name))
+    serde_json::from_str(&call.function.arguments).map_err(|err| {
+        invalid_arguments_message(
+            &call.function.name,
+            &err,
+            known_tool_parameters(&call.function.name).as_ref(),
+        )
+    })
+}
+
+fn known_tool_parameters(name: &str) -> Option<Value> {
+    built_in_definitions()
+        .into_iter()
+        .chain(std::iter::once(delegate_task_definition()))
+        .chain(subagent_lifecycle_definitions())
+        .chain(std::iter::once(web_fetch::web_fetch_definition()))
+        .find(|definition| definition.function.name == name)
+        .map(|definition| definition.function.parameters)
+}
+
+const MAX_ERROR_MESSAGE_CHARS: usize = 1_024;
+
+/// 参数解析失败时回显合法输入：required 字段列表 + 属性名:类型 紧凑摘要，整体截断。
+pub(crate) fn invalid_arguments_message(
+    tool_name: &str,
+    error: &serde_json::Error,
+    parameters: Option<&Value>,
+) -> String {
+    let mut message = format!("invalid arguments for tool {tool_name}: {error}");
+    if let Some(parameters) = parameters {
+        let summary = summarize_parameters_schema(parameters);
+        if !summary.is_empty() {
+            message.push_str(". Tool schema: ");
+            message.push_str(&summary);
+        }
+    }
+    if message.chars().count() > MAX_ERROR_MESSAGE_CHARS {
+        let truncated: String = message.chars().take(MAX_ERROR_MESSAGE_CHARS).collect();
+        message = format!("{truncated}...");
+    }
+    message
+}
+
+fn summarize_parameters_schema(parameters: &Value) -> String {
+    let mut parts = Vec::new();
+    if let Some(required) = parameters.get("required").and_then(Value::as_array) {
+        let fields = required
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!("required: [{fields}]"));
+    } else if let Some(variants) = parameters.get("oneOf").and_then(Value::as_array) {
+        let branches = variants
+            .iter()
+            .filter_map(|variant| variant.get("required")?.as_array())
+            .map(|required| {
+                format!(
+                    "[{}]",
+                    required
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })
+            .collect::<Vec<_>>();
+        if !branches.is_empty() {
+            parts.push(format!(
+                "required (exactly one of): {}",
+                branches.join(" | ")
+            ));
+        }
+    }
+    if let Some(properties) = parameters.get("properties").and_then(Value::as_object) {
+        let props = properties
+            .iter()
+            .map(|(name, schema)| format!("{name}: {}", schema_type_label(schema)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!("properties: {{{props}}}"));
+    }
+    parts.join("; ")
+}
+
+fn schema_type_label(schema: &Value) -> String {
+    match schema.get("type") {
+        Some(Value::String(kind)) => kind.clone(),
+        Some(Value::Array(kinds)) => kinds
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join("|"),
+        _ => "any".to_string(),
+    }
 }
 
 fn clamp_limit(value: Option<usize>, default: usize, max: usize) -> Result<usize, String> {
@@ -5067,5 +5242,161 @@ mod tests {
 
         assert_eq!(value["ok"], true);
         assert_eq!(value["data"]["content"], "secret");
+    }
+
+    #[test]
+    fn all_tool_schemas_describe_every_property() {
+        let definitions = built_in_definitions()
+            .into_iter()
+            .chain(std::iter::once(delegate_task_definition()))
+            .chain(subagent_lifecycle_definitions())
+            .chain(std::iter::once(web_fetch::web_fetch_definition()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(definitions.len(), 14);
+        for definition in &definitions {
+            let name = definition.function.name.as_str();
+            let properties = definition.function.parameters["properties"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{name} schema has no properties object"));
+            assert!(
+                !properties.is_empty(),
+                "{name} schema must declare its properties"
+            );
+            for (property, schema) in properties {
+                let description = schema["description"].as_str().unwrap_or_default();
+                assert!(
+                    !description.trim().is_empty(),
+                    "{name}.{property} is missing a description"
+                );
+            }
+        }
+
+        let edit_file = definitions
+            .iter()
+            .find(|definition| definition.function.name == EDIT_FILE_TOOL_NAME)
+            .expect("edit_file definition");
+        assert!(edit_file.function.description.contains("apply_patch"));
+        let apply_patch = definitions
+            .iter()
+            .find(|definition| definition.function.name == APPLY_PATCH_TOOL_NAME)
+            .expect("apply_patch definition");
+        assert!(apply_patch.function.description.contains("edit_file"));
+    }
+
+    #[test]
+    fn invalid_arguments_error_echoes_required_fields_and_schema() {
+        let root = unique_dir("invalid-args-root");
+        let tools = registry(&root);
+
+        let result = completed_result(tools.execute(&call("read_file", json!({"path": 42}))));
+        let error = result.error.as_deref().expect("error");
+
+        assert!(
+            error.contains("invalid arguments for tool read_file"),
+            "{error}"
+        );
+        assert!(error.contains("required: [path]"), "{error}");
+        assert!(error.contains("path: string"), "{error}");
+        assert!(error.contains("start_line: integer"), "{error}");
+        assert!(error.contains("max_lines: integer"), "{error}");
+        assert!(error.len() <= MAX_ERROR_MESSAGE_CHARS + 3, "{error}");
+    }
+
+    #[test]
+    fn unknown_tool_error_lists_available_tools_and_suggestions() {
+        let root = unique_dir("unknown-tool-root");
+        let tools = registry(&root);
+
+        let result = completed_result(tools.execute(&call("read_fil", json!({}))));
+        let error = result.error.as_deref().expect("error");
+
+        assert!(error.contains("unknown tool \"read_fil\""), "{error}");
+        assert!(error.contains("Available tools:"), "{error}");
+        assert!(error.contains("write_file"), "{error}");
+        assert!(error.contains("Did you mean: read_file"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn tool_filter_trims_built_in_tool_definitions() {
+        let root = unique_dir("tool-filter-root");
+        let cache = McpToolCache::new();
+        let names = |build: &ToolRegistryBuild| {
+            let mut names = build
+                .registry
+                .definitions()
+                .into_iter()
+                .map(|definition| definition.function.name)
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        };
+
+        let all =
+            ToolRegistry::with_mcp_cache_and_writer_lease_and_artifact_root_and_tool_filter_async(
+                &root,
+                PermissionProfile::for_mode(PermissionMode::WorkspaceWrite),
+                &[],
+                &cache,
+                None,
+                None,
+                &ToolsConfig::default(),
+            )
+            .await
+            .expect("registry");
+        assert!(names(&all).contains(&SHELL_COMMAND_TOOL_NAME.to_string()));
+
+        let denied =
+            ToolRegistry::with_mcp_cache_and_writer_lease_and_artifact_root_and_tool_filter_async(
+                &root,
+                PermissionProfile::for_mode(PermissionMode::WorkspaceWrite),
+                &[],
+                &cache,
+                None,
+                None,
+                &ToolsConfig {
+                    allow: Vec::new(),
+                    deny: vec!["shell_command".to_string()],
+                },
+            )
+            .await
+            .expect("registry");
+        let denied_names = names(&denied);
+        assert!(!denied_names.contains(&SHELL_COMMAND_TOOL_NAME.to_string()));
+        assert!(denied_names.contains(&READ_FILE_TOOL_NAME.to_string()));
+
+        let allow_only =
+            ToolRegistry::with_mcp_cache_and_writer_lease_and_artifact_root_and_tool_filter_async(
+                &root,
+                PermissionProfile::for_mode(PermissionMode::WorkspaceWrite),
+                &[],
+                &cache,
+                None,
+                None,
+                &ToolsConfig {
+                    allow: vec!["read_file".to_string()],
+                    deny: Vec::new(),
+                },
+            )
+            .await
+            .expect("registry");
+        assert_eq!(names(&allow_only), [READ_FILE_TOOL_NAME.to_string()]);
+
+        let deny_wins =
+            ToolRegistry::with_mcp_cache_and_writer_lease_and_artifact_root_and_tool_filter_async(
+                &root,
+                PermissionProfile::for_mode(PermissionMode::WorkspaceWrite),
+                &[],
+                &cache,
+                None,
+                None,
+                &ToolsConfig {
+                    allow: vec!["read_file".to_string(), "shell_command".to_string()],
+                    deny: vec!["shell_command".to_string()],
+                },
+            )
+            .await
+            .expect("registry");
+        assert_eq!(names(&deny_wins), [READ_FILE_TOOL_NAME.to_string()]);
     }
 }

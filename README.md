@@ -103,6 +103,8 @@ enabled = true
 
 MCP tools that the server does not mark with `readOnlyHint` require per-call approval by default; set `require_approval = false` on a server to opt out. Review server commands and endpoints before enabling them or disabling approval.
 
+Use `[tools] allow` / `deny` in `morrow.toml` to restrict which tools the main agent sees at all. Entries match built-in tool names exactly, a whole MCP server (`mcp__filesystem`), or a prefix wildcard (`mcp__filesystem__*`); `deny` wins over `allow`, and an empty `allow` list allows everything. Skipped MCP tools are reported as startup diagnostics.
+
 ### Policy hooks
 
 Command hooks run at the lifecycle boundaries above. User-level hooks live in `~/.morrow/hooks.toml`; project hooks live in `<workspace>/.morrow/hooks.toml` and are **disabled until you run `morrow hooks trust`** for that exact hook configuration (fingerprint-pinned, `morrow hooks revoke` to remove). Hooks execute with your user permissions, so review them like shell commands. Manage them with `morrow hooks list | trust | revoke`.

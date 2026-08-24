@@ -1,5 +1,6 @@
 use agent_config::{
-    ContextConfig, McpServerConfig, ModelContextLimits, load_config, load_server_config,
+    ContextConfig, McpServerConfig, ModelContextLimits, ToolsConfig, load_config,
+    load_server_config,
 };
 use agent_hooks::{HookManager, HookSettings};
 use agent_model::{DEFAULT_MAX_RETRIES, ModelError, OpenAiCompatClient, OpenAiCompatConfig};
@@ -306,6 +307,7 @@ async fn run() -> Result<(), CliError> {
                 config_path: &loaded.path,
                 mcp_servers: &loaded.config.mcp_servers,
                 mcp_cache: &mcp_cache,
+                tools: &loaded.config.tools,
                 subagent_store_path: &subagent_store_path,
             },
             &mut permissions,
@@ -329,6 +331,7 @@ async fn run() -> Result<(), CliError> {
             permissions,
             mcp_servers: &loaded.config.mcp_servers,
             mcp_cache: &mcp_cache,
+            tools: &loaded.config.tools,
             interactive_approvals: io::stdin().is_terminal(),
             output: if args.jsonl {
                 OutputMode::Jsonl {
@@ -371,6 +374,7 @@ struct ReplContext<'a> {
     config_path: &'a Path,
     mcp_servers: &'a [McpServerConfig],
     mcp_cache: &'a McpToolCache,
+    tools: &'a ToolsConfig,
     subagent_store_path: &'a Path,
 }
 
@@ -386,6 +390,7 @@ struct RunAgentTurnContext<'a> {
     permissions: PermissionProfile,
     mcp_servers: &'a [McpServerConfig],
     mcp_cache: &'a McpToolCache,
+    tools: &'a ToolsConfig,
     interactive_approvals: bool,
     output: OutputMode<'a>,
 }
@@ -454,6 +459,7 @@ async fn run_repl(
                 permissions: *permissions,
                 mcp_servers: context.mcp_servers,
                 mcp_cache: context.mcp_cache,
+                tools: context.tools,
                 interactive_approvals: io::stdin().is_terminal(),
                 output: OutputMode::Human,
             },
@@ -639,6 +645,7 @@ async fn run_persisted_agent_turn(
                 permissions: context.permissions,
                 mcp_servers: context.mcp_servers,
                 mcp_cache: context.mcp_cache,
+                tools: Some(context.tools),
                 session_name,
                 turn_index,
             },
@@ -683,6 +690,7 @@ async fn run_agent_turn(
             permissions: context.permissions,
             mcp_servers: context.mcp_servers,
             mcp_cache: context.mcp_cache,
+            tools: Some(context.tools),
             session_name,
             turn_index,
         },
@@ -2091,6 +2099,7 @@ compact test
                 permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
                 mcp_servers: &[],
                 mcp_cache: &mcp_cache,
+                tools: &ToolsConfig::default(),
                 interactive_approvals: false,
                 output: OutputMode::Human,
             },
@@ -2143,6 +2152,7 @@ compact test
                 permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
                 mcp_servers: &[],
                 mcp_cache: &mcp_cache,
+                tools: &ToolsConfig::default(),
                 interactive_approvals: false,
                 output: OutputMode::Jsonl {
                     session_name: "default",
@@ -2262,6 +2272,7 @@ compact test
                 permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
                 mcp_servers: &mcp_servers,
                 mcp_cache: &mcp_cache,
+                tools: &ToolsConfig::default(),
                 interactive_approvals: false,
                 output: OutputMode::Jsonl {
                     session_name: "default",
@@ -2323,6 +2334,7 @@ compact test
                 permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
                 mcp_servers: &[],
                 mcp_cache: &mcp_cache,
+                tools: &ToolsConfig::default(),
                 interactive_approvals: false,
                 output: OutputMode::Jsonl {
                     session_name: "default",
@@ -2374,6 +2386,7 @@ compact test
                 permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
                 mcp_servers: &[],
                 mcp_cache: &mcp_cache,
+                tools: &ToolsConfig::default(),
                 interactive_approvals: false,
                 output: OutputMode::Human,
             },
