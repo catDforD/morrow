@@ -2,7 +2,7 @@ use crate::model::{RecordedModelRequest, ScriptedModel};
 use crate::report::{Baseline, EVAL_REPORT_SCHEMA_VERSION, ScenarioMetrics, SuiteReport};
 use crate::scenario::{ApprovalPolicy, Scenario};
 use crate::tools::ScenarioToolRuntime;
-use agent_core::Agent;
+use agent_core::{Agent, AgentRunContext};
 use agent_protocol::{AgentEvent, ApprovalDecision, Message, TurnStatus};
 use futures_util::StreamExt;
 use std::time::Instant;
@@ -83,7 +83,14 @@ pub async fn run_scenario(scenario: &Scenario) -> ScenarioMetrics {
         .with_max_tool_rounds(scenario.max_tool_rounds);
 
     let mut stream = match agent
-        .run_turn(&scenario.thread, scenario.prompt.clone())
+        .run_turn_with_agent_context(
+            &scenario.thread,
+            scenario.prompt.clone(),
+            AgentRunContext {
+                context_token_limit: scenario.context_token_limit,
+                ..AgentRunContext::default()
+            },
+        )
         .await
     {
         Ok(stream) => stream,
@@ -446,6 +453,22 @@ fn evaluate_expectations(
             failures.push(format!(
                 "model request {} does not contain {:?}",
                 assertion.model_call_index, assertion.contains
+            ));
+        }
+    }
+
+    for model_call_index in &expectations.model_requests_without_tools {
+        let Some(request) = requests.get(*model_call_index) else {
+            failures.push(format!(
+                "model request assertion out of range: call {model_call_index} requested but only {} requests recorded",
+                requests.len()
+            ));
+            continue;
+        };
+        if !request.tool_definitions.is_empty() {
+            failures.push(format!(
+                "model request {model_call_index} carries {} tool definitions, expected none",
+                request.tool_definitions.len()
             ));
         }
     }

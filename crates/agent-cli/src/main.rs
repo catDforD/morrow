@@ -1546,6 +1546,7 @@ mod tests {
             retain_recent_turns,
             summary_target_tokens: 256,
             compact_max_retries: 2,
+            max_context_tokens: Some(300_000),
         }
     }
 

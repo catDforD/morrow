@@ -1234,6 +1234,7 @@ fn prepare_remote_settings(
             retain_recent_turns: 6,
             summary_target_tokens: 12_000,
             compact_max_retries: 2,
+            max_context_tokens: Some(300_000),
         },
         workspace_root: workspace_scope,
         workspace_location: location.clone(),

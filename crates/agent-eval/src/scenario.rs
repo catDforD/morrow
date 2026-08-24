@@ -187,6 +187,8 @@ pub struct Expectations {
     pub message_roles: Option<Vec<Role>>,
     /// Substring assertions against recorded model request messages.
     pub model_request_contains: Vec<RequestAssertion>,
+    /// Asserts that these recorded model requests carried no tool definitions.
+    pub model_requests_without_tools: Vec<usize>,
     /// Exact number of approval requests surfaced to the harness.
     pub approvals_requested: Option<usize>,
 }
@@ -257,6 +259,14 @@ impl Expectations {
         self
     }
 
+    /// Assert that the recorded model request at `model_call_index` carried no
+    /// tool definitions. This pins the mid-turn wrap-up call of the context
+    /// guard: it must be a plain completion with `tools = []`.
+    pub fn request_without_tools(mut self, model_call_index: usize) -> Self {
+        self.model_requests_without_tools.push(model_call_index);
+        self
+    }
+
     pub fn approvals_requested(mut self, count: usize) -> Self {
         self.approvals_requested = Some(count);
         self
@@ -305,6 +315,8 @@ pub struct Scenario {
     pub tools: Vec<ScenarioTool>,
     pub script: Vec<ModelScript>,
     pub max_tool_rounds: usize,
+    /// turn 内上下文护栏上限；`None` 关闭护栏（默认）。
+    pub context_token_limit: Option<usize>,
     pub approval_policy: ApprovalPolicy,
     pub expectations: Expectations,
     pub budget: Budget,
@@ -325,6 +337,7 @@ impl Scenario {
             tools: Vec::new(),
             script: Vec::new(),
             max_tool_rounds: 99,
+            context_token_limit: None,
             approval_policy: ApprovalPolicy::Deny,
             expectations: Expectations::completed(),
             budget: Budget::default(),
@@ -353,6 +366,11 @@ impl Scenario {
 
     pub fn with_max_tool_rounds(mut self, rounds: usize) -> Self {
         self.max_tool_rounds = rounds.max(1);
+        self
+    }
+
+    pub fn with_context_token_limit(mut self, limit: usize) -> Self {
+        self.context_token_limit = Some(limit);
         self
     }
 

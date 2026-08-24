@@ -1,6 +1,7 @@
 mod middleware;
 #[doc(hidden)]
 pub mod middleware_runner;
+pub mod tokens;
 
 pub use middleware::{
     AfterToolInput, AgentMiddleware, AgentMiddlewareChain, BeforeToolInput, ContextBlock,
@@ -27,6 +28,9 @@ use thiserror::Error;
 
 const DEFAULT_MAX_TOOL_ROUNDS: usize = 99;
 const MAX_CONCURRENT_TOOL_CALLS: usize = 4;
+/// turn 内护栏触发后注入的收尾指令：要求模型停止使用工具并总结进展。
+const CONTEXT_LIMIT_WRAP_UP_PROMPT: &str = "The conversation has reached its context token limit for this turn and cannot grow further. Do not call any more tools. Using only the information already gathered, summarize your progress so far, the partial results you have, and any remaining blockers or unfinished work, then stop.";
+const CONTEXT_LIMIT_FAILURE: &str = "context limit exceeded mid-turn";
 
 #[derive(Debug, Clone)]
 pub struct ModelRequest {
@@ -226,6 +230,10 @@ pub struct AgentRunContext {
     pub tool: ToolExecutionContext,
     pub middleware: Option<MiddlewareExecutionContext>,
     pub initial_context: Vec<MiddlewareContextBlock>,
+    /// turn 内上下文护栏的绝对 token 上限。每次发起后续模型调用前估算当前
+    /// conversation；超限则进入一次性收尾模式（无工具的总结调用）。
+    /// `None` 关闭护栏。
+    pub context_token_limit: Option<usize>,
 }
 
 pub trait ToolRuntime: Send + Sync {
@@ -386,6 +394,8 @@ impl<'a> Agent<'a> {
             middleware_context: run_context.middleware,
             tool_definitions,
             max_tool_rounds: self.max_tool_rounds,
+            context_token_limit: run_context.context_token_limit,
+            wrap_up_started: false,
             conversation,
             model_stream: None,
             model_start: Some(model_start),
@@ -448,6 +458,8 @@ pub struct AgentTurnStream<'a> {
     middleware_context: Option<MiddlewareExecutionContext>,
     tool_definitions: Vec<ToolDefinition>,
     max_tool_rounds: usize,
+    context_token_limit: Option<usize>,
+    wrap_up_started: bool,
     conversation: Conversation,
     model_stream: Option<ModelStream>,
     model_start: Option<ModelStartFuture>,
@@ -587,6 +599,11 @@ impl AgentTurnStream<'_> {
     }
 
     fn handle_tool_calls(&mut self, tool_calls: Vec<ToolCall>) {
+        if self.wrap_up_started {
+            // 收尾调用只有无工具的总结一次机会；仍请求工具则直接失败。
+            self.fail_turn(CONTEXT_LIMIT_FAILURE);
+            return;
+        }
         if self.tool_rounds >= self.max_tool_rounds {
             self.fail_turn(format!(
                 "tool call round limit exceeded ({})",
@@ -1098,13 +1115,40 @@ impl AgentTurnStream<'_> {
     }
 
     fn start_next_model_call(&mut self) {
+        // turn 内护栏：发起后续模型调用前估算水位，超限则进入一次性收尾模式。
+        if let Some(limit) = self.context_token_limit
+            && !self.wrap_up_started
+            && tokens::estimate_model_request_tokens(&self.conversation, &self.tool_definitions)
+                > limit
+        {
+            self.wrap_up_started = true;
+            // 收尾指令只注入本次模型调用的 conversation，不写入 turn 记录，
+            // 避免把一次性的停止指令带进后续 turn 的历史。
+            self.conversation
+                .push(Message::system(CONTEXT_LIMIT_WRAP_UP_PROMPT));
+        }
+        let tools = if self.wrap_up_started {
+            // 收尾调用不提供工具，强制模型直接总结。
+            Vec::new()
+        } else {
+            self.tool_definitions.clone()
+        };
         self.turn.steps.push(TurnStep::running_model_call());
         self.model_call_index += 1;
         self.pending.push_back(AgentEvent::ModelCallStarted);
         self.model_start = Some(self.model.stream(ModelRequest {
             conversation: self.conversation.clone(),
-            tools: self.tool_definitions.clone(),
+            tools,
         }));
+    }
+
+    /// 模型调用失败；若处于护栏收尾模式，统一以上下文超限作为失败原因。
+    fn fail_model_call(&mut self, error: impl ToString) {
+        if self.wrap_up_started {
+            self.fail_turn(CONTEXT_LIMIT_FAILURE);
+        } else {
+            self.fail_turn(error);
+        }
     }
 }
 
@@ -1164,7 +1208,7 @@ impl Stream for AgentTurnStream<'_> {
                     }
                     Poll::Ready(Err(err)) => {
                         this.model_start = None;
-                        this.fail_turn(err);
+                        this.fail_model_call(err);
                         return Poll::Ready(this.pending.pop_front());
                     }
                     Poll::Pending => return Poll::Pending,
@@ -1196,12 +1240,12 @@ impl Stream for AgentTurnStream<'_> {
                     }
                     Poll::Ready(Some(Err(err))) => {
                         this.model_stream = None;
-                        this.fail_turn(err);
+                        this.fail_model_call(err);
                         return Poll::Ready(this.pending.pop_front());
                     }
                     Poll::Ready(None) => {
                         this.model_stream = None;
-                        this.fail_turn("model stream ended before completion");
+                        this.fail_model_call("model stream ended before completion");
                         return Poll::Ready(this.pending.pop_front());
                     }
                     Poll::Pending => return Poll::Pending,
@@ -3036,5 +3080,188 @@ mod tests {
 
         let requests = requests.lock().expect("requests lock poisoned");
         assert_eq!(requests.len(), TEST_MAX_TOOL_ROUNDS + 1);
+    }
+
+    #[derive(Debug)]
+    struct BigOutputTools;
+
+    impl ToolRuntime for BigOutputTools {
+        fn definitions(&self) -> Vec<ToolDefinition> {
+            vec![ToolDefinition::function(
+                "big_read",
+                "Reads a large blob",
+                json!({}),
+            )]
+        }
+
+        fn execution_mode(&self, _call: &ToolCall) -> ToolExecutionMode {
+            ToolExecutionMode::Concurrent
+        }
+
+        fn execute(
+            &self,
+            _call: ToolCall,
+            _approval: Option<ToolApproval>,
+            _context: ToolExecutionContext,
+        ) -> ToolFuture {
+            async {
+                ToolExecution::Completed(ToolResult {
+                    ok: true,
+                    content: "x".repeat(8_000),
+                    error: None,
+                    summary: None,
+                })
+            }
+            .boxed()
+        }
+    }
+
+    fn big_output_turn_setup(
+        second_response: ScriptedResponse,
+    ) -> (ScriptedModel, BigOutputTools, Thread) {
+        let model = ScriptedModel::new(vec![
+            ScriptedResponse::Events(vec![Ok(ModelEvent::ToolCalls(vec![ToolCall::function(
+                "call-1", "big_read", "{}",
+            )]))]),
+            second_response,
+        ]);
+        (model, BigOutputTools, Thread::new())
+    }
+
+    #[tokio::test]
+    async fn context_limit_triggers_wrap_up_call_without_tools() {
+        let (model, tools, mut thread) = big_output_turn_setup(ScriptedResponse::Events(vec![
+            Ok(ModelEvent::TextDelta("partial summary".to_string())),
+            Ok(ModelEvent::Completed),
+        ]));
+        let requests = model.recorded_requests();
+        let agent = Agent::with_tools(&model, "system", &tools);
+
+        let stream = agent
+            .run_turn_with_agent_context(
+                &thread,
+                "read the big blob",
+                AgentRunContext {
+                    context_token_limit: Some(200),
+                    ..AgentRunContext::default()
+                },
+            )
+            .await
+            .expect("run turn");
+        let (events, turn) = collect_events(stream, &mut thread).await;
+
+        assert_eq!(turn.status, TurnStatus::Completed);
+        assert!(matches!(events.last(), Some(AgentEvent::TurnCompleted)));
+        assert_eq!(
+            thread.messages,
+            vec![
+                Message::user("read the big blob"),
+                Message::assistant_tool_calls(vec![ToolCall::function("call-1", "big_read", "{}")]),
+                Message::tool_result("call-1", "x".repeat(8_000)),
+                Message::assistant("partial summary"),
+            ]
+        );
+
+        let requests = requests.lock().expect("requests lock poisoned");
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains(r#""name":"big_read""#));
+        // 收尾调用不带工具，且 conversation 中注入了停止用工具的收尾指令。
+        assert!(requests[1].contains(r#""tools":[]"#));
+        assert!(requests[1].contains("context token limit"));
+    }
+
+    #[tokio::test]
+    async fn wrap_up_call_that_requests_tools_fails_turn() {
+        let (model, tools, mut thread) = big_output_turn_setup(ScriptedResponse::Events(vec![Ok(
+            ModelEvent::ToolCalls(vec![ToolCall::function("call-2", "big_read", "{}")]),
+        )]));
+        let requests = model.recorded_requests();
+        let agent = Agent::with_tools(&model, "system", &tools);
+
+        let stream = agent
+            .run_turn_with_agent_context(
+                &thread,
+                "read the big blob",
+                AgentRunContext {
+                    context_token_limit: Some(200),
+                    ..AgentRunContext::default()
+                },
+            )
+            .await
+            .expect("run turn");
+        let (events, turn) = collect_events(stream, &mut thread).await;
+
+        assert_eq!(turn.status, TurnStatus::Failed);
+        assert_eq!(
+            turn.error.as_deref(),
+            Some("context limit exceeded mid-turn")
+        );
+        assert!(matches!(events.last(), Some(AgentEvent::Error(_))));
+        assert!(thread.messages.is_empty());
+
+        let requests = requests.lock().expect("requests lock poisoned");
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].contains(r#""tools":[]"#));
+    }
+
+    #[tokio::test]
+    async fn wrap_up_call_stream_error_reports_context_limit() {
+        let (model, tools, mut thread) =
+            big_output_turn_setup(ScriptedResponse::Events(vec![Err(
+                "upstream provider returned 500".to_string(),
+            )]));
+        let agent = Agent::with_tools(&model, "system", &tools);
+
+        let stream = agent
+            .run_turn_with_agent_context(
+                &thread,
+                "read the big blob",
+                AgentRunContext {
+                    context_token_limit: Some(200),
+                    ..AgentRunContext::default()
+                },
+            )
+            .await
+            .expect("run turn");
+        let (_events, turn) = collect_events(stream, &mut thread).await;
+
+        assert_eq!(turn.status, TurnStatus::Failed);
+        assert_eq!(
+            turn.error.as_deref(),
+            Some("context limit exceeded mid-turn")
+        );
+        assert!(thread.messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn context_limit_above_watermark_keeps_tools_available() {
+        let (model, tools, mut thread) = big_output_turn_setup(ScriptedResponse::Events(vec![
+            Ok(ModelEvent::TextDelta("done".to_string())),
+            Ok(ModelEvent::Completed),
+        ]));
+        let requests = model.recorded_requests();
+        let agent = Agent::with_tools(&model, "system", &tools);
+
+        let stream = agent
+            .run_turn_with_agent_context(
+                &thread,
+                "read the big blob",
+                AgentRunContext {
+                    context_token_limit: Some(1_000_000),
+                    ..AgentRunContext::default()
+                },
+            )
+            .await
+            .expect("run turn");
+        let (events, turn) = collect_events(stream, &mut thread).await;
+
+        assert_eq!(turn.status, TurnStatus::Completed);
+        assert!(matches!(events.last(), Some(AgentEvent::TurnCompleted)));
+
+        let requests = requests.lock().expect("requests lock poisoned");
+        assert_eq!(requests.len(), 2);
+        // 水位未超限时后续调用仍带工具定义，也不注入收尾指令。
+        assert!(requests[1].contains(r#""name":"big_read""#));
+        assert!(!requests[1].contains("context token limit"));
     }
 }

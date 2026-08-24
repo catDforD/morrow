@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "updated_at_ms": 1786783944834,
+  "updated_at_ms": 1787580374506,
   "budgets": {
     "answer_without_tools": {
       "max_model_calls": 1,
@@ -16,6 +16,11 @@
       "max_model_calls": 2,
       "max_tool_calls": 1,
       "max_estimated_tokens": 200
+    },
+    "context_limit_wraps_up_turn": {
+      "max_model_calls": 2,
+      "max_tool_calls": 1,
+      "max_estimated_tokens": 2232
     },
     "duplicate_tool_call_id_rejected": {
       "max_model_calls": 1,

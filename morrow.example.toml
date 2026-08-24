@@ -25,6 +25,12 @@ shell = "deny"
 [context]
 auto_compact = true
 auto_compact_threshold = 0.835
+# Absolute context water-level ceiling in estimated tokens (default: 300000).
+# Auto-compaction triggers at min(context_window * threshold, max_context_tokens),
+# so even million-token windows settle around this ceiling; the same budget backs
+# the mid-turn guard, which forces a tool-less wrap-up call when a turn's tool
+# loop would grow the conversation past it. Disabled together with auto_compact.
+# max_context_tokens = 300000
 retain_recent_turns = 2
 summary_target_tokens = 12000
 compact_max_retries = 2

@@ -26,6 +26,7 @@ pub fn builtin_suite() -> Vec<Scenario> {
         approval_denied_flows_to_model(),
         approval_granted_executes_tool(),
         runaway_tools_hit_round_limit(),
+        context_limit_wraps_up_turn(),
         model_error_fails_turn(),
         truncated_stream_fails_turn(),
         duplicate_tool_call_id_rejected(),
@@ -308,6 +309,48 @@ fn runaway_tools_hit_round_limit() -> Scenario {
             .tool_calls_failed(0),
     )
     .with_budget(Budget::new(3, 2, 1_500))
+}
+
+fn context_limit_wraps_up_turn() -> Scenario {
+    Scenario::new(
+        "context_limit_wraps_up_turn",
+        "A huge tool result trips the mid-turn context guard; the turn wraps up with one final tool-less model call instead of growing unbounded.",
+        "read the big file and summarize it",
+    )
+    .with_tool(ScenarioTool::new(
+        "read_big",
+        "Reads a very large file",
+        ToolExecutionMode::Concurrent,
+        ToolBehavior::ok("x".repeat(8_000)),
+    ))
+    .with_script(ModelScript::new(vec![ModelStep::tool_calls(vec![
+        tool_call("read-1", "read_big", r#"{"path":"big.txt"}"#),
+    ])]))
+    .with_script(ModelScript::new(vec![
+        ModelStep::text("partial summary of what was read"),
+        ModelStep::completed(),
+    ]))
+    .with_context_token_limit(200)
+    .with_expectations(
+        Expectations::completed()
+            .equals("partial summary of what was read")
+            .tool_sequence(vec!["read_big"])
+            .model_calls(2)
+            .tool_calls_started(1)
+            .tool_calls_failed(0)
+            // 消息链保持合法：收尾 system 指令只进 conversation，不落 TurnRecord。
+            .message_roles(vec![
+                Role::User,
+                Role::Assistant,
+                Role::Tool,
+                Role::Assistant,
+            ])
+            // 收尾调用的请求带护栏注入的收尾指令，且不带任何工具定义。
+            .request_contains(1, "context token limit")
+            .request_contains(1, "x".repeat(64).as_str())
+            .request_without_tools(1),
+    )
+    .with_budget(Budget::new(2, 1, 4_000))
 }
 
 fn model_error_fails_turn() -> Scenario {

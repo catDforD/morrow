@@ -16,6 +16,7 @@ const DEFAULT_AUTO_COMPACT_THRESHOLD: f32 = 0.835;
 const DEFAULT_RETAIN_RECENT_TURNS: usize = 6;
 const DEFAULT_SUMMARY_TARGET_TOKENS: usize = 12_000;
 const DEFAULT_COMPACT_MAX_RETRIES: usize = 2;
+const DEFAULT_MAX_CONTEXT_TOKENS: usize = 300_000;
 const DEFAULT_MCP_STARTUP_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_MCP_TOOL_TIMEOUT_SECS: u64 = 60;
 
@@ -82,6 +83,9 @@ pub struct ContextConfig {
     pub retain_recent_turns: usize,
     pub summary_target_tokens: usize,
     pub compact_max_retries: usize,
+    /// 上下文水位的绝对上限：压缩触发点与 turn 内护栏都不会超过它。
+    /// `None` 只保留模型窗口百分比阈值（TOML 配置始终解析为 `Some(_)`）。
+    pub max_context_tokens: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -290,6 +294,7 @@ struct RawContextConfig {
     retain_recent_turns: Option<usize>,
     summary_target_tokens: Option<usize>,
     compact_max_retries: Option<usize>,
+    max_context_tokens: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -629,6 +634,13 @@ impl TryFrom<RawContextConfig> for ContextConfig {
                 .compact_max_retries
                 .unwrap_or(DEFAULT_COMPACT_MAX_RETRIES),
         )?;
+        let max_context_tokens = match value.max_context_tokens {
+            Some(value) => Some(positive_config_value(
+                "[context].max_context_tokens",
+                value,
+            )?),
+            None => Some(DEFAULT_MAX_CONTEXT_TOKENS),
+        };
 
         Ok(Self {
             auto_compact: value.auto_compact.unwrap_or(DEFAULT_AUTO_COMPACT),
@@ -636,6 +648,7 @@ impl TryFrom<RawContextConfig> for ContextConfig {
             retain_recent_turns,
             summary_target_tokens,
             compact_max_retries,
+            max_context_tokens,
         })
     }
 }
@@ -878,6 +891,7 @@ auto_compact_threshold = 0.75
 retain_recent_turns = 2
 summary_target_tokens = 256
 compact_max_retries = 3
+max_context_tokens = 150000
 "#
             ),
         )
@@ -1067,6 +1081,7 @@ system_prompt = "Desktop workspace"
                 retain_recent_turns: DEFAULT_RETAIN_RECENT_TURNS,
                 summary_target_tokens: DEFAULT_SUMMARY_TARGET_TOKENS,
                 compact_max_retries: DEFAULT_COMPACT_MAX_RETRIES,
+                max_context_tokens: Some(DEFAULT_MAX_CONTEXT_TOKENS),
             }
         );
         assert_eq!(
@@ -1412,6 +1427,7 @@ permission_ceiling = "workspace_write"
                 retain_recent_turns: 2,
                 summary_target_tokens: 256,
                 compact_max_retries: 3,
+                max_context_tokens: Some(150_000),
             }
         );
         assert_eq!(loaded.config.model.context_window_tokens, 131_072);
@@ -1489,6 +1505,35 @@ auto_compact_threshold = 1.5
         let err = load_config_from_locations(Some(&config), &root, None).expect_err("must fail");
 
         assert!(matches!(err, ConfigError::InvalidAutoCompactThreshold));
+    }
+
+    #[test]
+    fn rejects_zero_max_context_tokens() {
+        let root = unique_dir("context-max-tokens");
+        let config = root.join("morrow.toml");
+        fs::write(
+            &config,
+            r#"
+[model]
+model = "test-model"
+api_key_env = "MORROW_CONTEXT_MAX_TOKENS_KEY"
+context_window_tokens = 65536
+
+[context]
+max_context_tokens = 0
+"#,
+        )
+        .expect("write config");
+        set_env("MORROW_CONTEXT_MAX_TOKENS_KEY", "secret");
+
+        let err = load_config_from_locations(Some(&config), &root, None).expect_err("must fail");
+
+        assert!(matches!(
+            err,
+            ConfigError::InvalidPositiveValue {
+                field: "[context].max_context_tokens"
+            }
+        ));
     }
 
     #[test]

@@ -2,7 +2,8 @@ use crate::subagent_store::{SubagentInstanceDocument, SubagentSessionStore};
 use crate::{
     AgentEventEnvelope, BeforePromptInput, EVENT_SCHEMA_VERSION, MiddlewareCompactionContext,
     MiddlewareRegistry, RuntimeError, SessionFactRun, SessionHandle, SessionStore,
-    maybe_auto_compact_with_middleware_context, projection_to_legacy_session, timestamp_ms,
+    maybe_auto_compact_with_middleware_context, mid_turn_context_token_limit,
+    projection_to_legacy_session, timestamp_ms,
 };
 use agent_config::{ContextConfig, ModelContextLimits};
 use agent_core::{Agent, AgentRunContext, MiddlewareExecutionContext, Model, ToolExecutionContext};
@@ -964,6 +965,11 @@ impl SubagentSupervisor {
                     },
                     middleware: Some(turn_middleware_context),
                     initial_context,
+                    // 持久化 subagent 与主 agent 共用同一套水位预算与护栏。
+                    context_token_limit: mid_turn_context_token_limit(
+                        self.inner.context_config,
+                        runtime.limits,
+                    ),
                 },
             )
             .await
@@ -1937,6 +1943,7 @@ mod tests {
                 retain_recent_turns: 6,
                 summary_target_tokens: 12_000,
                 compact_max_retries: 2,
+                max_context_tokens: Some(300_000),
             },
             store,
             roles,

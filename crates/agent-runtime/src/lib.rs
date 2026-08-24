@@ -6,6 +6,10 @@ pub mod subagent_store;
 pub mod subagent_supervisor;
 
 use agent_config::{ContextConfig, McpServerConfig, ModelContextLimits};
+use agent_core::tokens::{
+    apply_request_padding, estimate_message_tokens, estimate_role_text_tokens,
+    estimate_tool_definitions_tokens,
+};
 use agent_core::{
     Agent, AgentError, AgentRunContext, ModelEvent, ModelFailure, ModelRequest,
     ToolExecutionContext,
@@ -56,10 +60,6 @@ pub const EVENT_SCHEMA_VERSION: u32 = 8;
 const AGENTS_MD_FILE_NAME: &str = "AGENTS.md";
 const MAX_AGENTS_MD_BYTES: u64 = 32 * 1024;
 const PROJECT_INSTRUCTIONS_PREFIX: &str = "Project instructions from AGENTS.md. Follow them for work in this workspace unless they conflict with runtime safety or role constraints:\n<project_instructions>";
-const MESSAGE_BASE_TOKENS: usize = 6;
-const TOOL_CALL_BASE_TOKENS: usize = 12;
-const REQUEST_PADDING_NUMERATOR: usize = 4;
-const REQUEST_PADDING_DENOMINATOR: usize = 3;
 const REQUIRED_SUMMARY_SECTIONS: [&str; 7] = [
     "User Goals and Constraints",
     "Important Decisions",
@@ -622,6 +622,9 @@ impl RuntimeSubagentExecutor {
                     },
                     middleware: Some(middleware_context),
                     initial_context: before.context,
+                    // delegate executor 每个任务起新 Thread 且只读、有超时，
+                    // 不启用 turn 内上下文护栏。
+                    context_token_limit: None,
                 },
             )
             .await
@@ -1735,6 +1738,10 @@ async fn run_agent_turn_inner(
                     },
                     middleware: Some(middleware_context),
                     initial_context,
+                    context_token_limit: mid_turn_context_token_limit(
+                        context.context_config,
+                        context.model_limits,
+                    ),
                 },
             )
             .await?;
@@ -2088,7 +2095,23 @@ fn auto_compact_trigger_tokens(
     let input_window = model_limits
         .context_window_tokens
         .saturating_sub(model_limits.reserved_output_tokens);
-    ((input_window as f64) * f64::from(context_config.auto_compact_threshold)).floor() as usize
+    let window_trigger =
+        ((input_window as f64) * f64::from(context_config.auto_compact_threshold)).floor() as usize;
+    // 绝对上限封顶：即使模型窗口很大，水位也主动收敛到 max_context_tokens 以内。
+    match context_config.max_context_tokens {
+        Some(max) => window_trigger.min(max),
+        None => window_trigger,
+    }
+}
+
+/// turn 内护栏上限：跟随自动压缩预算；关闭 auto_compact 时不启用护栏。
+fn mid_turn_context_token_limit(
+    context_config: ContextConfig,
+    model_limits: ModelContextLimits,
+) -> Option<usize> {
+    context_config
+        .auto_compact
+        .then(|| auto_compact_trigger_tokens(model_limits, context_config))
 }
 
 pub async fn compact_session(
@@ -2640,73 +2663,17 @@ fn estimate_context_tokens(
     prompt: &str,
     tools: &[ToolDefinition],
 ) -> usize {
-    let tool_tokens = serde_json::to_string(tools)
-        .map(|definitions| estimate_text_tokens(&definitions))
-        .unwrap_or_default();
-    let raw_total = message_text_tokens(agent_protocol::Role::System, system_prompt)
-        + message_text_tokens(agent_protocol::Role::User, prompt)
+    let tool_tokens = estimate_tool_definitions_tokens(tools);
+    let raw_total = estimate_role_text_tokens(agent_protocol::Role::System, system_prompt)
+        + estimate_role_text_tokens(agent_protocol::Role::User, prompt)
         + tool_tokens
         + session
             .active_thread
             .messages
             .iter()
-            .map(message_context_tokens)
+            .map(estimate_message_tokens)
             .sum::<usize>();
-    raw_total
-        .saturating_mul(REQUEST_PADDING_NUMERATOR)
-        .div_ceil(REQUEST_PADDING_DENOMINATOR)
-}
-
-fn message_context_tokens(message: &Message) -> usize {
-    let mut total = MESSAGE_BASE_TOKENS + estimate_text_tokens(message_role_label(message));
-    if let Some(content) = message.content.as_ref() {
-        total += estimate_text_tokens(content);
-    }
-    if let Some(reasoning_content) = message.reasoning_content.as_ref() {
-        total += estimate_text_tokens(reasoning_content);
-    }
-    if let Some(tool_call_id) = message.tool_call_id.as_ref() {
-        total += estimate_text_tokens(tool_call_id);
-    }
-    if let Some(tool_calls) = message.tool_calls.as_ref() {
-        total += TOOL_CALL_BASE_TOKENS
-            + serde_json::to_string(tool_calls)
-                .map(|value| estimate_text_tokens(&value))
-                .unwrap_or_default();
-    }
-    total
-}
-
-fn message_text_tokens(role: agent_protocol::Role, content: &str) -> usize {
-    let mut total = MESSAGE_BASE_TOKENS + estimate_text_tokens(role_label(role));
-    total += estimate_text_tokens(content);
-    total
-}
-
-fn estimate_text_tokens(text: &str) -> usize {
-    if text.is_empty() {
-        return 0;
-    }
-
-    let mut ascii_chars = 0usize;
-    let mut non_ascii_tokens = 0usize;
-    for ch in text.chars() {
-        if ch.is_ascii() {
-            ascii_chars += 1;
-        } else {
-            non_ascii_tokens += 1;
-        }
-    }
-    ascii_chars.div_ceil(4) + non_ascii_tokens
-}
-
-fn role_label(role: agent_protocol::Role) -> &'static str {
-    match role {
-        agent_protocol::Role::System => "system",
-        agent_protocol::Role::User => "user",
-        agent_protocol::Role::Assistant => "assistant",
-        agent_protocol::Role::Tool => "tool",
-    }
+    apply_request_padding(raw_total)
 }
 
 fn message_role_label(message: &Message) -> &'static str {
@@ -2944,6 +2911,7 @@ mod tests {
             retain_recent_turns,
             summary_target_tokens: 256,
             compact_max_retries: 2,
+            max_context_tokens: Some(300_000),
         }
     }
 
@@ -3396,6 +3364,38 @@ compact test
         let with = estimate_context_tokens("system", &with_reasoning, "hello", &[]);
 
         assert!(with > without + 1_000);
+    }
+
+    #[test]
+    fn auto_compact_trigger_is_capped_by_max_context_tokens() {
+        let mut config = context_config(6);
+        // 窗口阈值：(1_000_000 - 1) * 0.835 = 834_999，远超绝对上限。
+        let limits = model_limits(1_000_000);
+
+        config.max_context_tokens = Some(300_000);
+        assert_eq!(auto_compact_trigger_tokens(limits, config), 300_000);
+
+        // 窗口阈值低于上限时不受上限影响。
+        config.max_context_tokens = Some(900_000);
+        assert_eq!(auto_compact_trigger_tokens(limits, config), 834_999);
+
+        // None 只保留窗口百分比阈值。
+        config.max_context_tokens = None;
+        assert_eq!(auto_compact_trigger_tokens(limits, config), 834_999);
+    }
+
+    #[test]
+    fn mid_turn_guard_follows_auto_compact_switch() {
+        let mut config = context_config(6);
+        let limits = model_limits(131_072);
+
+        assert_eq!(
+            mid_turn_context_token_limit(config, limits),
+            Some(auto_compact_trigger_tokens(limits, config))
+        );
+
+        config.auto_compact = false;
+        assert_eq!(mid_turn_context_token_limit(config, limits), None);
     }
 
     #[test]
