@@ -5,7 +5,7 @@ use crate::{
     maybe_auto_compact_with_middleware_context, mid_turn_context_token_limit,
     projection_to_legacy_session, timestamp_ms,
 };
-use agent_config::{ContextConfig, ModelContextLimits};
+use agent_config::{ContextConfig, ModelContextLimits, ToolsConfig};
 use agent_core::{Agent, AgentRunContext, MiddlewareExecutionContext, Model, ToolExecutionContext};
 use agent_protocol::{
     AgentEvent, AgentEventOrigin, ApprovalDecision, ApprovalOrigin, ApprovalRequest,
@@ -96,6 +96,8 @@ struct SubagentSupervisorInner {
     session_name: String,
     artifact_root: Option<PathBuf>,
     context_config: ContextConfig,
+    /// 主会话 `[tools] allow/deny` 过滤，叠加在角色 allowlist 之上（两者取交集）。
+    tools: ToolsConfig,
     store: SubagentSessionStore,
     observer: Arc<dyn SubagentObserver>,
     roles: RwLock<BTreeMap<SubagentRole, SubagentRoleRuntime>>,
@@ -138,6 +140,7 @@ struct SubagentSupervisorInit {
     workspace_root: PathBuf,
     session_name: String,
     context_config: ContextConfig,
+    tools: ToolsConfig,
     store: SubagentSessionStore,
     roles: BTreeMap<SubagentRole, SubagentRoleRuntime>,
     identities: Vec<SubagentIdentity>,
@@ -169,9 +172,12 @@ impl SubagentSupervisor {
             identities,
             observer,
             Arc::new(Semaphore::new(1)),
+            ToolsConfig::default(),
         )
     }
 
+    // 与 ToolRegistry 的逐级装配链一致，参数偏多；options 结构体重构留待后续。
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_writer_lease(
         workspace_root: impl Into<PathBuf>,
         session_name: impl Into<String>,
@@ -180,6 +186,7 @@ impl SubagentSupervisor {
         identities: Vec<SubagentIdentity>,
         observer: Arc<dyn SubagentObserver>,
         writer_slot: Arc<Semaphore>,
+        tools: ToolsConfig,
     ) -> Result<Self, RuntimeError> {
         let workspace_root = workspace_root.into();
         let session_name = session_name.into();
@@ -188,6 +195,7 @@ impl SubagentSupervisor {
             workspace_root,
             session_name,
             context_config,
+            tools,
             store,
             roles,
             identities,
@@ -234,6 +242,7 @@ impl SubagentSupervisor {
                 session_name: init.session_name,
                 artifact_root,
                 context_config: init.context_config,
+                tools: init.tools,
                 store: init.store,
                 observer: init.observer,
                 roles: RwLock::new(init.roles),
@@ -784,7 +793,8 @@ impl SubagentSupervisor {
             termination_code,
         } = request;
         let allowed =
-            BuiltInToolAllowlist::for_subagent(document.snapshot.role, document.permission_ceiling);
+            BuiltInToolAllowlist::for_subagent(document.snapshot.role, document.permission_ceiling)
+                .filtered(&self.inner.tools);
         let writer_lease = (document.snapshot.role == SubagentRole::Reviewer)
             .then(|| self.inner.writer_slot.clone());
         let tools = ToolRegistry::built_in_with_allowlist_and_writer_lease_and_artifact_root(
@@ -793,6 +803,9 @@ impl SubagentSupervisor {
             allowed,
             writer_lease,
             self.inner.artifact_root.clone(),
+            // 持久化子代理无人值守运行，审批只会被 auto-deny；边界由
+            // permission_ceiling 与角色 allowlist 承担，workspace 内写直接放行。
+            true,
         )?;
         let fact_store = self.inner.store.fact_store(&instance_id)?;
         if !fact_store.path().is_file() {
@@ -1930,6 +1943,14 @@ mod tests {
         label: &str,
         roles: BTreeMap<SubagentRole, SubagentRoleRuntime>,
     ) -> (SubagentSupervisor, PathBuf, PathBuf) {
+        test_supervisor_with_tools(label, roles, ToolsConfig::default())
+    }
+
+    fn test_supervisor_with_tools(
+        label: &str,
+        roles: BTreeMap<SubagentRole, SubagentRoleRuntime>,
+        tools: ToolsConfig,
+    ) -> (SubagentSupervisor, PathBuf, PathBuf) {
         let store_root = unique_dir(&format!("{label}-store"));
         let workspace = unique_dir(&format!("{label}-workspace"));
         let store = SubagentSessionStore::new(&store_root, &workspace, "default")
@@ -1945,6 +1966,7 @@ mod tests {
                 compact_max_retries: 2,
                 max_context_tokens: Some(300_000),
             },
+            tools,
             store,
             roles,
             identities: default_subagent_identities(),
@@ -2251,6 +2273,45 @@ mod tests {
                 .lock()
                 .expect("replacement requests")
                 .is_empty()
+        );
+        drop(requests);
+        cleanup(supervisor, store_root, workspace);
+    }
+
+    #[tokio::test]
+    async fn tools_config_filter_intersects_with_subagent_role_allowlist() {
+        let model = ConstantModel::new("done");
+        let requests = model.requests.clone();
+        let model: Arc<dyn Model> = Arc::new(model);
+        let roles = roles_with("tools-filter", |_| model.clone());
+        let (supervisor, store_root, workspace) = test_supervisor_with_tools(
+            "tools-filter",
+            roles,
+            ToolsConfig {
+                allow: Vec::new(),
+                deny: vec![agent_tools::WEB_FETCH_TOOL_NAME.to_string()],
+            },
+        );
+        let instance = supervisor
+            .spawn_instance(SubagentRole::Explore, "filtered tools".to_string())
+            .await
+            .expect("spawn instance");
+        supervisor
+            .wait_instances(vec![instance.id], Duration::from_secs(2))
+            .await
+            .expect("run finishes");
+
+        let requests = requests.lock().expect("requests");
+        let tools = &requests[0].tools;
+        assert!(
+            !tools
+                .iter()
+                .any(|tool| tool.function.name == agent_tools::WEB_FETCH_TOOL_NAME)
+        );
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool.function.name == agent_tools::READ_FILE_TOOL_NAME)
         );
         drop(requests);
         cleanup(supervisor, store_root, workspace);

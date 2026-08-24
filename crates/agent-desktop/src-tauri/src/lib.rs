@@ -1241,6 +1241,7 @@ fn prepare_remote_settings(
         config_path: None,
         config_diagnostics: Vec::new(),
         permissions: PermissionProfile::for_mode(agent_server::DEFAULT_WEB_PERMISSION_MODE),
+        auto_approve_workspace_writes: true,
         permission_ceiling: PermissionMode::DangerFullAccess,
         mcp_servers: fallback_mcp_servers,
         tools: ToolsConfig::default(),

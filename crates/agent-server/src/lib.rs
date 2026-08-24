@@ -90,6 +90,8 @@ pub struct ServerOptions {
     pub config_diagnostics: Vec<String>,
     /// Default for legacy clients that do not select a permission mode per turn.
     pub permissions: PermissionProfile,
+    /// workspace_write 模式下 workspace 内文件变更是否自动放行（配置回退开关的取反值）。
+    pub auto_approve_workspace_writes: bool,
     /// Cap on the permission mode web clients may request per turn.
     pub permission_ceiling: PermissionMode,
     pub mcp_servers: Vec<McpServerConfig>,
@@ -151,6 +153,7 @@ pub fn server_options_from_loaded_config(
         config_path: loaded.path,
         config_diagnostics,
         permissions: PermissionProfile::for_mode(DEFAULT_WEB_PERMISSION_MODE),
+        auto_approve_workspace_writes: !loaded.config.workspace_write_require_approval,
         permission_ceiling: loaded.config.server.permission_ceiling,
         mcp_servers: loaded.config.mcp_servers,
         tools: loaded.config.tools,
@@ -2610,6 +2613,7 @@ async fn start_turn_inner(
                 mcp_servers: hook_mcp_servers,
                 mcp_cache: mcp_cache.as_ref(),
                 tools: Some(&state.inner.options.tools),
+                auto_approve_workspace_writes: state.inner.options.auto_approve_workspace_writes,
                 session_name: &session_name,
                 turn_index,
             },
@@ -2824,6 +2828,7 @@ async fn run_turn_task_inner(context: TurnTaskContext) -> Result<(), agent_runti
                     mcp_servers: &mcp_servers,
                     mcp_cache: mcp_cache.as_ref(),
                     tools: Some(&options.tools),
+                    auto_approve_workspace_writes: options.auto_approve_workspace_writes,
                     session_name: &session_name,
                     turn_index,
                 },
@@ -3271,6 +3276,7 @@ async fn ensure_session_resources(
             identities,
             observer,
             runtime.writer_lease.clone(),
+            state.inner.options.tools.clone(),
         )
         .map_err(|error| error.to_string())?;
         runtime.supervisor = Some(Arc::new(supervisor));
@@ -3875,6 +3881,7 @@ mod tests {
             config_path: Some(root.join("morrow.toml")),
             config_diagnostics: Vec::new(),
             permissions: PermissionProfile::for_mode(DEFAULT_WEB_PERMISSION_MODE),
+            auto_approve_workspace_writes: true,
             permission_ceiling: PermissionMode::DangerFullAccess,
             mcp_servers: Vec::new(),
             tools: ToolsConfig::default(),
@@ -3951,6 +3958,7 @@ mod tests {
                     max_context_tokens: Some(300_000),
                 },
                 permissions: PermissionProfile::for_mode(DEFAULT_WEB_PERMISSION_MODE),
+                workspace_write_require_approval: false,
                 mcp_servers: Vec::new(),
                 server: ServerConfig::default(),
                 tools: ToolsConfig::default(),

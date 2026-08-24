@@ -13,8 +13,12 @@ reserved_output_tokens = 8192
 [permissions]
 mode = "read_only"
 shell = "deny"
+# In workspace_write mode, file changes inside the workspace are auto-approved
+# (only shell commands and non-read-only MCP tools still prompt). Set to true
+# to restore the old behavior of confirming every file change.
+# workspace_write_require_approval = false
 
-# Tool-level allow/deny for the main agent.
+# Tool-level allow/deny for the main agent and persistent subagents.
 # Entries match built-in tool names exactly (e.g. "shell_command"), a whole MCP
 # server ("mcp__filesystem"), or a prefix wildcard ("mcp__filesystem__*").
 # deny wins over allow; an empty allow list (the default) allows everything.

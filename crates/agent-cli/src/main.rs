@@ -270,6 +270,7 @@ async fn run() -> Result<(), CliError> {
     let model_invocation = config_model_invocation(&loaded.config.model.model);
     let permissions =
         effective_permissions(loaded.config.permissions, args.permission, args.allow_shell);
+    let auto_approve_workspace_writes = !loaded.config.workspace_write_require_approval;
     let client = OpenAiCompatClient::new(OpenAiCompatConfig {
         base_url: loaded.config.model.base_url,
         model: loaded.config.model.model,
@@ -308,6 +309,7 @@ async fn run() -> Result<(), CliError> {
                 mcp_servers: &loaded.config.mcp_servers,
                 mcp_cache: &mcp_cache,
                 tools: &loaded.config.tools,
+                auto_approve_workspace_writes,
                 subagent_store_path: &subagent_store_path,
             },
             &mut permissions,
@@ -332,6 +334,7 @@ async fn run() -> Result<(), CliError> {
             mcp_servers: &loaded.config.mcp_servers,
             mcp_cache: &mcp_cache,
             tools: &loaded.config.tools,
+            auto_approve_workspace_writes,
             interactive_approvals: io::stdin().is_terminal(),
             output: if args.jsonl {
                 OutputMode::Jsonl {
@@ -375,6 +378,7 @@ struct ReplContext<'a> {
     mcp_servers: &'a [McpServerConfig],
     mcp_cache: &'a McpToolCache,
     tools: &'a ToolsConfig,
+    auto_approve_workspace_writes: bool,
     subagent_store_path: &'a Path,
 }
 
@@ -391,6 +395,7 @@ struct RunAgentTurnContext<'a> {
     mcp_servers: &'a [McpServerConfig],
     mcp_cache: &'a McpToolCache,
     tools: &'a ToolsConfig,
+    auto_approve_workspace_writes: bool,
     interactive_approvals: bool,
     output: OutputMode<'a>,
 }
@@ -460,6 +465,7 @@ async fn run_repl(
                 mcp_servers: context.mcp_servers,
                 mcp_cache: context.mcp_cache,
                 tools: context.tools,
+                auto_approve_workspace_writes: context.auto_approve_workspace_writes,
                 interactive_approvals: io::stdin().is_terminal(),
                 output: OutputMode::Human,
             },
@@ -646,6 +652,7 @@ async fn run_persisted_agent_turn(
                 mcp_servers: context.mcp_servers,
                 mcp_cache: context.mcp_cache,
                 tools: Some(context.tools),
+                auto_approve_workspace_writes: context.auto_approve_workspace_writes,
                 session_name,
                 turn_index,
             },
@@ -691,6 +698,7 @@ async fn run_agent_turn(
             mcp_servers: context.mcp_servers,
             mcp_cache: context.mcp_cache,
             tools: Some(context.tools),
+            auto_approve_workspace_writes: context.auto_approve_workspace_writes,
             session_name,
             turn_index,
         },
@@ -2100,6 +2108,7 @@ compact test
                 mcp_servers: &[],
                 mcp_cache: &mcp_cache,
                 tools: &ToolsConfig::default(),
+                auto_approve_workspace_writes: true,
                 interactive_approvals: false,
                 output: OutputMode::Human,
             },
@@ -2153,6 +2162,7 @@ compact test
                 mcp_servers: &[],
                 mcp_cache: &mcp_cache,
                 tools: &ToolsConfig::default(),
+                auto_approve_workspace_writes: true,
                 interactive_approvals: false,
                 output: OutputMode::Jsonl {
                     session_name: "default",
@@ -2273,6 +2283,7 @@ compact test
                 mcp_servers: &mcp_servers,
                 mcp_cache: &mcp_cache,
                 tools: &ToolsConfig::default(),
+                auto_approve_workspace_writes: true,
                 interactive_approvals: false,
                 output: OutputMode::Jsonl {
                     session_name: "default",
@@ -2335,6 +2346,7 @@ compact test
                 mcp_servers: &[],
                 mcp_cache: &mcp_cache,
                 tools: &ToolsConfig::default(),
+                auto_approve_workspace_writes: true,
                 interactive_approvals: false,
                 output: OutputMode::Jsonl {
                     session_name: "default",
@@ -2387,6 +2399,7 @@ compact test
                 mcp_servers: &[],
                 mcp_cache: &mcp_cache,
                 tools: &ToolsConfig::default(),
+                auto_approve_workspace_writes: true,
                 interactive_approvals: false,
                 output: OutputMode::Human,
             },

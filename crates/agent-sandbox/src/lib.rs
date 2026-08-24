@@ -29,6 +29,7 @@ pub struct PermissionEvaluator {
     root: PathBuf,
     read_roots: Vec<PathBuf>,
     profile: PermissionProfile,
+    auto_approve_workspace_writes: bool,
 }
 
 impl PermissionEvaluator {
@@ -63,7 +64,15 @@ impl PermissionEvaluator {
             root,
             read_roots,
             profile,
+            auto_approve_workspace_writes: true,
         })
+    }
+
+    /// workspace_write 模式下 workspace 内文件变更是否自动放行（DSH/Codex 语义）。
+    /// 默认开启；关闭后恢复逐次 Prompt 的旧行为。
+    pub fn with_auto_approve_workspace_writes(mut self, enabled: bool) -> Self {
+        self.auto_approve_workspace_writes = enabled;
+        self
     }
 
     pub fn root(&self) -> &Path {
@@ -182,6 +191,11 @@ impl PermissionEvaluator {
     ) -> PermissionDecision {
         match self.profile.mode {
             PermissionMode::DangerFullAccess => PermissionDecision::Allow,
+            // 写路径已由 resolve_write_path 限定在 workspace root 内，workspace 内写属于
+            // 低风险操作；只有显式关闭自动放行时才逐次确认。
+            PermissionMode::WorkspaceWrite if self.auto_approve_workspace_writes => {
+                PermissionDecision::Allow
+            }
             PermissionMode::WorkspaceWrite => {
                 PermissionDecision::Prompt(ApprovalRequest::file_changes(
                     approval_id_for_tool_call(tool_call_id),
@@ -294,8 +308,8 @@ mod tests {
     }
 
     #[test]
-    fn workspace_write_prompts_for_file_changes_and_danger_allows() {
-        let root = unique_dir("file-change-approval");
+    fn workspace_write_auto_approves_file_changes_by_default_and_danger_allows() {
+        let root = unique_dir("file-change-auto-approve");
         let file = FileChangeSummary {
             path: "note.txt".to_string(),
             operation: FileChangeOperation::Add,
@@ -315,6 +329,38 @@ mod tests {
         )
         .expect("danger eval");
 
+        assert_eq!(
+            workspace.file_changes_decision(
+                "call_1",
+                vec![file.clone()],
+                "--- /dev/null\n+++ note.txt\n".to_string(),
+            ),
+            PermissionDecision::Allow
+        );
+        assert_eq!(
+            danger.file_changes_decision("call_1", vec![file], String::new()),
+            PermissionDecision::Allow
+        );
+    }
+
+    #[test]
+    fn workspace_write_prompts_for_file_changes_when_auto_approve_disabled() {
+        let root = unique_dir("file-change-approval");
+        let file = FileChangeSummary {
+            path: "note.txt".to_string(),
+            operation: FileChangeOperation::Add,
+            replacements: 0,
+            created: true,
+            overwritten: false,
+            deleted: false,
+        };
+        let workspace = PermissionEvaluator::new(
+            &root,
+            PermissionProfile::for_mode(PermissionMode::WorkspaceWrite),
+        )
+        .expect("workspace eval")
+        .with_auto_approve_workspace_writes(false);
+
         let decision = workspace.file_changes_decision(
             "call_1",
             vec![file.clone()],
@@ -328,13 +374,9 @@ mod tests {
         assert_eq!(
             request.action,
             ApprovalAction::FileChanges {
-                files: vec![file.clone()],
+                files: vec![file],
                 diff: "--- /dev/null\n+++ note.txt\n".to_string(),
             }
-        );
-        assert_eq!(
-            danger.file_changes_decision("call_1", vec![file], String::new()),
-            PermissionDecision::Allow
         );
     }
 

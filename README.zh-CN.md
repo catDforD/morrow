@@ -170,7 +170,7 @@ Web/Desktop 会话通过 `spawn_subagent`、`send_subagent`、`inspect_subagent`
 | `worker` | 文件读写、补丁、shell | 工作区写入；shell 始终审批 |
 | `reviewer` | 读取、列目录、搜索、shell | 不提供文件写工具；每条 shell 都审批 |
 
-有效权限取父权限、角色上限和显式工具 allowlist 的交集；权限不足的工具不会出现在模型请求中。Subagent 不会获得 MCP 或继续委派的工具。每个角色可覆盖模型/推理级别、追加最多 4,000 字符的提示词、设置 30–1,800 秒超时和 1–99 个工具轮次。设置变更只影响新实例；实例创建时会快照身份名称、有效提示词、模型与权限上限。
+有效权限取父权限、角色上限、显式工具 allowlist 与 `[tools] allow/deny` 过滤的交集；权限不足的工具不会出现在模型请求中。Subagent 不会获得 MCP 或继续委派的工具。Subagent run 无人值守执行，因此其工作区内写入始终自动放行，不受 `workspace_write_require_approval` 影响。每个角色可覆盖模型/推理级别、追加最多 4,000 字符的提示词、设置 30–1,800 秒超时和 1–99 个工具轮次。设置变更只影响新实例；实例创建时会快照身份名称、有效提示词、模型与权限上限。
 
 每个会话最多保留 8 个持久实例，同时最多执行 4 个 Subagent run。父智能体的文件写入与 shell、`worker` run、获批的 `reviewer` shell 共用一个 workspace writer lease；读取仍可并行。父子审批请求进入同一个 FIFO 队列并显示来源。文件修改获批后会在真正写入前重新验证预览，工作区已变化时旧审批会被拒绝。
 
@@ -187,7 +187,7 @@ Web/Desktop 会话通过 `spawn_subagent`、`send_subagent`、`inspect_subagent`
 | `permissions.mode` | 行为 |
 | --- | --- |
 | `read_only` | 拒绝写入类工具 |
-| `workspace_write` | 文件修改需批准，且限制在工作区内 |
+| `workspace_write` | 文件修改限制在工作区内并自动放行（可用下文 `workspace_write_require_approval` 恢复逐次审批） |
 | `danger_full_access` | 可访问工作区外路径 |
 
 | `permissions.shell` | 行为 |
@@ -197,6 +197,13 @@ Web/Desktop 会话通过 `spawn_subagent`、`send_subagent`、`inspect_subagent`
 | `allow` | shell 直接执行 |
 
 Shell 策略是 Agent 层的审批边界，不是 OS 级只读沙箱。获批命令会继承 Morrow 进程用户的操作系统权限，命令本身仍可能修改文件；批准前应检查命令，需要更强隔离时请配合外部沙箱。
+
+`workspace_write` 模式下，解析到工作区内的写入自动放行——只有 shell 命令、越界写入（直接拒绝）和非只读 MCP 工具仍需审批。如需恢复旧的逐次确认行为：
+
+```toml
+[permissions]
+workspace_write_require_approval = true
+```
 
 默认配置为 `read_only` + `shell = "deny"`。单次运行可覆盖：
 

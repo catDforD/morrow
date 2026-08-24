@@ -129,7 +129,7 @@ Web/Desktop sessions can spawn persistent background subagents (`spawn_subagent`
 | `worker` | File reads/writes, patches, shell | Workspace-write; shell always prompts |
 | `reviewer` | Read, list, search, shell | No file writes; every shell command prompts |
 
-Effective access is the intersection of the parent's permission profile, the role ceiling, and the role's tool allowlist; subagents never receive MCP or delegation tools. Each session keeps at most 8 instances and runs at most 4 concurrently. The synchronous, read-only `delegate_task` tool remains available everywhere (including the CLI) for quick one-off delegation. Per-role model, prompt, timeout, and identity settings live under **Settings → Subagents**.
+Effective access is the intersection of the parent's permission profile, the role ceiling, the role's tool allowlist, and the `[tools] allow/deny` filter; subagents never receive MCP or delegation tools. Subagent runs are unattended, so in-workspace writes are auto-approved for them regardless of `workspace_write_require_approval`. Each session keeps at most 8 instances and runs at most 4 concurrently. The synchronous, read-only `delegate_task` tool remains available everywhere (including the CLI) for quick one-off delegation. Per-role model, prompt, timeout, and identity settings live under **Settings → Subagents**.
 
 ### Web custom commands
 
@@ -140,7 +140,7 @@ Effective access is the intersection of the parent's permission profile, the rol
 | `permissions.mode` | Behavior |
 | --- | --- |
 | `read_only` | Write tools denied |
-| `workspace_write` | File changes need approval and stay in the workspace |
+| `workspace_write` | File changes stay in the workspace and run without approval (see `workspace_write_require_approval` below to restore per-change prompts) |
 | `danger_full_access` | File I/O may leave the workspace |
 
 | `permissions.shell` | Behavior |
@@ -157,6 +157,13 @@ morrow --allow-shell "run the test suite and explain failures"
 ```
 
 Shell policy is an approval boundary, not an OS sandbox — an approved command runs with your user permissions. Use an external sandbox when stronger isolation is required.
+
+In `workspace_write` mode, writes that resolve inside the workspace are auto-approved — only shell commands, out-of-workspace writes (rejected outright), and non-read-only MCP tools still gate on approval. To restore the old per-change confirmation:
+
+```toml
+[permissions]
+workspace_write_require_approval = true
+```
 
 ## Sessions
 

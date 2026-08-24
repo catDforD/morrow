@@ -26,6 +26,9 @@ pub struct AppConfig {
     pub agent: AgentConfig,
     pub context: ContextConfig,
     pub permissions: PermissionProfile,
+    /// workspace_write 模式下 workspace 内文件变更是否仍需逐次审批；
+    /// 默认 false（自动放行），设为 true 恢复旧的逐次确认行为。
+    pub workspace_write_require_approval: bool,
     pub mcp_servers: Vec<McpServerConfig>,
     pub tools: ToolsConfig,
 }
@@ -193,6 +196,8 @@ pub struct ServerAppConfig {
     pub agent: AgentConfig,
     pub context: ContextConfig,
     pub permissions: PermissionProfile,
+    /// 见 AppConfig::workspace_write_require_approval。
+    pub workspace_write_require_approval: bool,
     pub mcp_servers: Vec<McpServerConfig>,
     pub server: ServerConfig,
     pub tools: ToolsConfig,
@@ -344,6 +349,7 @@ struct RawContextConfig {
 struct RawPermissionsConfig {
     mode: Option<PermissionMode>,
     shell: Option<ShellPolicy>,
+    workspace_write_require_approval: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -572,6 +578,7 @@ impl TryFrom<RawAppConfig> for AppConfig {
             agent: server.agent,
             context: server.context,
             permissions: server.permissions,
+            workspace_write_require_approval: server.workspace_write_require_approval,
             mcp_servers: server.mcp_servers,
             tools: server.tools,
         })
@@ -648,6 +655,9 @@ fn parse_server_app_config(
         },
         context,
         permissions: permissions_profile,
+        workspace_write_require_approval: permissions
+            .workspace_write_require_approval
+            .unwrap_or(false),
         mcp_servers: parse_mcp_servers(mcp_servers)?,
         server: ServerConfig {
             permission_ceiling: server
@@ -1428,6 +1438,27 @@ oauth_client_id = "client"
                 shell: ShellPolicy::Deny,
             }
         );
+        assert!(!loaded.config.workspace_write_require_approval);
+    }
+
+    #[test]
+    fn loads_workspace_write_require_approval() {
+        let root = unique_dir("workspace-write-require-approval");
+        let config = root.join("morrow.toml");
+        fs::write(
+            &config,
+            r#"
+[permissions]
+mode = "workspace_write"
+workspace_write_require_approval = true
+"#,
+        )
+        .expect("write config");
+
+        let loaded = load_server_config_from_locations(Some(&config), &root, None)
+            .expect("load server config");
+
+        assert!(loaded.config.workspace_write_require_approval);
     }
 
     #[test]

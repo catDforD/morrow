@@ -460,6 +460,7 @@ impl ToolRegistry {
             allowed,
             writer_lease,
             None,
+            true,
         )
     }
 
@@ -469,12 +470,14 @@ impl ToolRegistry {
         allowed: BuiltInToolAllowlist,
         writer_lease: Option<Arc<Semaphore>>,
         artifact_root: Option<PathBuf>,
+        auto_approve_workspace_writes: bool,
     ) -> Result<Self, ToolRegistryError> {
         let evaluator = PermissionEvaluator::new_with_read_roots(
             root,
             permissions,
             artifact_root.iter().cloned(),
-        )?;
+        )?
+        .with_auto_approve_workspace_writes(auto_approve_workspace_writes);
         let mut registry = Self::empty();
         registry.register(Arc::new(BuiltInTools {
             evaluator,
@@ -506,6 +509,7 @@ impl ToolRegistry {
             BuiltInToolAllowlist::research(),
             None,
             artifact_root,
+            true,
         )
     }
 
@@ -553,10 +557,13 @@ impl ToolRegistry {
             writer_lease,
             artifact_root,
             &ToolsConfig::default(),
+            true,
         )
         .await
     }
 
+    // 逐级透传的装配参数本就偏多，引入 options 结构体重构留给后续统一处理。
+    #[allow(clippy::too_many_arguments)]
     pub async fn with_mcp_cache_and_writer_lease_and_artifact_root_and_tool_filter_async(
         root: impl Into<PathBuf>,
         permissions: PermissionProfile,
@@ -565,6 +572,7 @@ impl ToolRegistry {
         writer_lease: Option<Arc<Semaphore>>,
         artifact_root: Option<PathBuf>,
         tools: &ToolsConfig,
+        auto_approve_workspace_writes: bool,
     ) -> Result<ToolRegistryBuild, ToolRegistryError> {
         let root = root.into();
         let mut registry = Self::built_in_with_allowlist_and_writer_lease_and_artifact_root(
@@ -573,6 +581,7 @@ impl ToolRegistry {
             BuiltInToolAllowlist::all().filtered(tools),
             writer_lease,
             artifact_root,
+            auto_approve_workspace_writes,
         )?;
         let discovery = mcp::discover_tools_with_filter(&root, mcp_servers, mcp_cache, tools).await;
         for tool in discovery.tools {
@@ -3652,6 +3661,19 @@ mod tests {
         .expect("tool registry")
     }
 
+    /// 旧行为：workspace_write 下文件变更仍需逐次审批（`workspace_write_require_approval = true`）。
+    fn registry_requiring_approval(root: &Path) -> ToolRegistry {
+        ToolRegistry::built_in_with_allowlist_and_writer_lease_and_artifact_root(
+            root,
+            PermissionProfile::for_mode(PermissionMode::WorkspaceWrite),
+            BuiltInToolAllowlist::all(),
+            None,
+            None,
+            false,
+        )
+        .expect("tool registry")
+    }
+
     fn registry_with_permissions(root: &Path, permissions: PermissionProfile) -> ToolRegistry {
         ToolRegistry::built_in(root, permissions).expect("tool registry")
     }
@@ -3868,6 +3890,7 @@ mod tests {
             BuiltInToolAllowlist::all(),
             None,
             Some(current.clone()),
+            true,
         )
         .expect("artifact-aware registry");
         fs::create_dir_all(&current).expect("create current artifacts after registry");
@@ -4141,7 +4164,7 @@ mod tests {
     fn edit_file_replaces_unique_match() {
         let root = unique_dir("edit-root");
         fs::write(root.join("note.txt"), "before old after\n").expect("write file");
-        let tools = registry(&root);
+        let tools = registry_requiring_approval(&root);
         let call = call(
             "edit_file",
             json!({"path": "note.txt", "old_text": "old", "new_text": "new"}),
@@ -4246,7 +4269,7 @@ mod tests {
     #[test]
     fn write_file_creates_new_file() {
         let root = unique_dir("write-create-root");
-        let tools = registry(&root);
+        let tools = registry_requiring_approval(&root);
         let call = call(
             "write_file",
             json!({"path": "note.txt", "content": "created\n"}),
@@ -4273,9 +4296,51 @@ mod tests {
     }
 
     #[test]
+    fn workspace_write_auto_approves_file_changes_without_approval() {
+        let root = unique_dir("write-auto-approve-root");
+        fs::write(root.join("note.txt"), "before old after\n").expect("write file");
+        let tools = registry(&root);
+
+        // content() 只在 Completed 时返回，ApprovalRequired 会直接 panic。
+        let written = content(tools.execute(&call(
+            "write_file",
+            json!({"path": "created.txt", "content": "created\n"}),
+        )));
+        assert_eq!(written["ok"], true);
+        assert_eq!(
+            fs::read_to_string(root.join("created.txt")).expect("read created"),
+            "created\n"
+        );
+
+        let edited = content(tools.execute(&call(
+            "edit_file",
+            json!({"path": "note.txt", "old_text": "old", "new_text": "new"}),
+        )));
+        assert_eq!(edited["ok"], true);
+        assert_eq!(
+            fs::read_to_string(root.join("note.txt")).expect("read edited"),
+            "before new after\n"
+        );
+
+        let patched = content(tools.execute(&patch_call(
+            r#"*** Begin Patch
+*** Update File: note.txt
+@@
+-before new after
++AFTER new after
+*** End Patch"#,
+        )));
+        assert_eq!(patched["ok"], true);
+        assert_eq!(
+            fs::read_to_string(root.join("note.txt")).expect("read patched"),
+            "AFTER new after\n"
+        );
+    }
+
+    #[test]
     fn file_change_approval_returns_diff_summary() {
         let root = unique_dir("write-summary-root");
-        let tools = registry(&root);
+        let tools = registry_requiring_approval(&root);
         let call = call(
             "write_file",
             json!({"path": "note.txt", "content": "created\n"}),
@@ -4330,7 +4395,7 @@ mod tests {
     fn write_file_overwrites_existing_file_when_requested() {
         let root = unique_dir("write-overwrite-root");
         fs::write(root.join("note.txt"), "old\n").expect("write file");
-        let tools = registry(&root);
+        let tools = registry_requiring_approval(&root);
         let call = call(
             "write_file",
             json!({"path": "note.txt", "content": "new\n", "overwrite": true}),
@@ -4361,7 +4426,7 @@ mod tests {
     fn file_change_approval_rejects_drift_before_commit() {
         let root = unique_dir("approval-drift-root");
         fs::write(root.join("note.txt"), "old\n").expect("write file");
-        let tools = registry(&root);
+        let tools = registry_requiring_approval(&root);
         let call = call(
             "edit_file",
             json!({"path": "note.txt", "old_text": "old", "new_text": "new"}),
@@ -4392,7 +4457,7 @@ mod tests {
     fn cancelled_approved_file_change_does_not_commit() {
         let root = unique_dir("cancelled-file-change-root");
         fs::write(root.join("note.txt"), "old\n").expect("write file");
-        let tools = registry(&root);
+        let tools = registry_requiring_approval(&root);
         let call = call(
             "write_file",
             json!({"path": "note.txt", "content": "new\n", "overwrite": true}),
@@ -4533,7 +4598,7 @@ mod tests {
         let root = unique_dir("patch-basic-root");
         fs::write(root.join("update.txt"), "alpha\nbeta\ngamma\n").expect("write update");
         fs::write(root.join("delete.txt"), "delete me\n").expect("write delete");
-        let tools = registry(&root);
+        let tools = registry_requiring_approval(&root);
 
         let call = patch_call(
             r#"*** Begin Patch
@@ -4586,7 +4651,7 @@ mod tests {
         let root = unique_dir("patch-multi-root");
         fs::write(root.join("a.txt"), "one\ntwo\nthree\nfour\n").expect("write a");
         fs::write(root.join("b.txt"), "red\nblue\n").expect("write b");
-        let tools = registry(&root);
+        let tools = registry_requiring_approval(&root);
 
         let call = patch_call(
             r#"*** Begin Patch
@@ -5341,6 +5406,7 @@ mod tests {
                 None,
                 None,
                 &ToolsConfig::default(),
+                true,
             )
             .await
             .expect("registry");
@@ -5358,6 +5424,7 @@ mod tests {
                     allow: Vec::new(),
                     deny: vec!["shell_command".to_string()],
                 },
+                true,
             )
             .await
             .expect("registry");
@@ -5377,6 +5444,7 @@ mod tests {
                     allow: vec!["read_file".to_string()],
                     deny: Vec::new(),
                 },
+                true,
             )
             .await
             .expect("registry");
@@ -5394,6 +5462,7 @@ mod tests {
                     allow: vec!["read_file".to_string(), "shell_command".to_string()],
                     deny: vec!["shell_command".to_string()],
                 },
+                true,
             )
             .await
             .expect("registry");
