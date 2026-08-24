@@ -873,6 +873,26 @@ pub enum PermissionMode {
     DangerFullAccess,
 }
 
+impl PermissionMode {
+    /// Severity rank: read_only < workspace_write < danger_full_access.
+    pub fn severity(self) -> u8 {
+        match self {
+            Self::ReadOnly => 0,
+            Self::WorkspaceWrite => 1,
+            Self::DangerFullAccess => 2,
+        }
+    }
+
+    /// The more restrictive of `self` and `ceiling`.
+    pub fn clamp(self, ceiling: Self) -> Self {
+        if self.severity() <= ceiling.severity() {
+            self
+        } else {
+            ceiling
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningLevel {
@@ -1798,6 +1818,27 @@ pub enum AgentEvent {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn permission_mode_clamp_picks_the_more_restrictive_mode() {
+        assert_eq!(
+            PermissionMode::DangerFullAccess.clamp(PermissionMode::WorkspaceWrite),
+            PermissionMode::WorkspaceWrite
+        );
+        assert_eq!(
+            PermissionMode::ReadOnly.clamp(PermissionMode::DangerFullAccess),
+            PermissionMode::ReadOnly
+        );
+        assert_eq!(
+            PermissionMode::WorkspaceWrite.clamp(PermissionMode::WorkspaceWrite),
+            PermissionMode::WorkspaceWrite
+        );
+        assert!(
+            PermissionMode::ReadOnly.severity() < PermissionMode::WorkspaceWrite.severity()
+                && PermissionMode::WorkspaceWrite.severity()
+                    < PermissionMode::DangerFullAccess.severity()
+        );
+    }
 
     #[test]
     fn remote_runtime_debug_output_redacts_managed_secrets() {

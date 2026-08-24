@@ -90,6 +90,8 @@ pub struct ServerOptions {
     pub config_diagnostics: Vec<String>,
     /// Default for legacy clients that do not select a permission mode per turn.
     pub permissions: PermissionProfile,
+    /// Cap on the permission mode web clients may request per turn.
+    pub permission_ceiling: PermissionMode,
     pub mcp_servers: Vec<McpServerConfig>,
     pub default_session_name: String,
 }
@@ -147,6 +149,7 @@ pub fn server_options_from_loaded_config(
         config_path: loaded.path,
         config_diagnostics,
         permissions: PermissionProfile::for_mode(DEFAULT_WEB_PERMISSION_MODE),
+        permission_ceiling: loaded.config.server.permission_ceiling,
         mcp_servers: loaded.config.mcp_servers,
         default_session_name,
     })
@@ -590,8 +593,11 @@ impl EmbeddedServer {
             .cloned()
             .or_else(|| models.values().next().cloned())
             .ok_or_else(|| "remote subagent runtime contains no models".to_string())?;
-        let permissions =
-            requested_permissions(self.service.inner.options.permissions, permission_mode);
+        let permissions = requested_permissions(
+            self.service.inner.options.permissions,
+            permission_mode,
+            self.service.inner.options.permission_ceiling,
+        );
         let middleware = self
             .service
             .inner
@@ -2511,7 +2517,11 @@ async fn start_turn_inner(
     }
 
     let cancellation = CancellationToken::new();
-    let permissions = requested_permissions(state.inner.options.permissions, permission_mode);
+    let permissions = requested_permissions(
+        state.inner.options.permissions,
+        permission_mode,
+        state.inner.options.permission_ceiling,
+    );
     if running_snapshot(&state, &session_name).await.is_some() {
         return Err("session already has a running turn".to_string());
     }
@@ -3521,10 +3531,17 @@ fn session_entry_for_name(
 fn requested_permissions(
     default: PermissionProfile,
     requested_mode: Option<PermissionMode>,
+    ceiling: PermissionMode,
 ) -> PermissionProfile {
-    requested_mode
-        .map(PermissionProfile::for_mode)
-        .unwrap_or(default)
+    match requested_mode {
+        // Derive the profile from the clamped mode so a reduced mode cannot
+        // keep the escalated shell policy of the requested one.
+        Some(mode) => PermissionProfile::for_mode(mode.clamp(ceiling)),
+        None => PermissionProfile {
+            mode: default.mode.clamp(ceiling),
+            ..default
+        },
+    }
 }
 
 async fn prepare_subagent_supervisor(
@@ -3761,7 +3778,7 @@ fn broadcast_error(tx: &broadcast::Sender<ServerMessage>, message: impl ToString
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_config::{AgentConfig, ModelContextLimits, ServerAppConfig};
+    use agent_config::{AgentConfig, ModelContextLimits, ServerAppConfig, ServerConfig};
     use agent_model::{OpenAiCompatClient, OpenAiCompatConfig};
     use agent_protocol::{
         ModelInvocation, PermissionMode, ReasoningLevel, ReasoningProfile, ShellPolicy,
@@ -3847,6 +3864,7 @@ mod tests {
             config_path: Some(root.join("morrow.toml")),
             config_diagnostics: Vec::new(),
             permissions: PermissionProfile::for_mode(DEFAULT_WEB_PERMISSION_MODE),
+            permission_ceiling: PermissionMode::DangerFullAccess,
             mcp_servers: Vec::new(),
             default_session_name: "default".to_string(),
         }
@@ -3921,6 +3939,7 @@ mod tests {
                 },
                 permissions: PermissionProfile::for_mode(DEFAULT_WEB_PERMISSION_MODE),
                 mcp_servers: Vec::new(),
+                server: ServerConfig::default(),
             },
             path: None,
             model: None,
@@ -5230,21 +5249,54 @@ mod tests {
     }
 
     #[test]
-    fn requested_permissions_allow_all_web_modes() {
+    fn requested_permissions_clamp_requested_mode_to_the_ceiling() {
         let read_only = PermissionProfile {
             mode: PermissionMode::ReadOnly,
             shell: ShellPolicy::Deny,
         };
 
         assert_eq!(
-            requested_permissions(read_only, Some(PermissionMode::WorkspaceWrite)),
+            requested_permissions(
+                read_only,
+                Some(PermissionMode::WorkspaceWrite),
+                PermissionMode::DangerFullAccess
+            ),
             PermissionProfile::for_mode(PermissionMode::WorkspaceWrite)
         );
         assert_eq!(
-            requested_permissions(read_only, Some(PermissionMode::DangerFullAccess)),
+            requested_permissions(
+                read_only,
+                Some(PermissionMode::DangerFullAccess),
+                PermissionMode::DangerFullAccess
+            ),
             PermissionProfile::for_mode(PermissionMode::DangerFullAccess)
         );
-        assert_eq!(requested_permissions(read_only, None), read_only);
+        assert_eq!(
+            requested_permissions(
+                read_only,
+                Some(PermissionMode::DangerFullAccess),
+                PermissionMode::WorkspaceWrite
+            ),
+            PermissionProfile::for_mode(PermissionMode::WorkspaceWrite)
+        );
+        assert_eq!(
+            requested_permissions(
+                read_only,
+                Some(PermissionMode::WorkspaceWrite),
+                PermissionMode::ReadOnly
+            ),
+            PermissionProfile::for_mode(PermissionMode::ReadOnly)
+        );
+        assert_eq!(
+            requested_permissions(read_only, None, PermissionMode::DangerFullAccess),
+            read_only
+        );
+        // The ceiling also caps the server-side default profile.
+        let workspace_write = PermissionProfile::for_mode(PermissionMode::WorkspaceWrite);
+        assert_eq!(
+            requested_permissions(workspace_write, None, PermissionMode::ReadOnly).mode,
+            PermissionMode::ReadOnly
+        );
         assert_eq!(DEFAULT_WEB_PERMISSION_MODE, PermissionMode::WorkspaceWrite);
     }
 

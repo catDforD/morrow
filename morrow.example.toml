@@ -10,6 +10,14 @@ reserved_output_tokens = 8192
 mode = "read_only"
 shell = "deny"
 
+# Web dashboard (`morrow server`) settings.
+# [server]
+# Cap on the permission mode browser clients may pick per turn.
+# One of "read_only", "workspace_write", "danger_full_access".
+# Defaults to "danger_full_access" (no cap); "workspace_write" is a good
+# choice when the dashboard is reachable by other users or machines.
+# permission_ceiling = "workspace_write"
+
 [context]
 auto_compact = true
 auto_compact_threshold = 0.835

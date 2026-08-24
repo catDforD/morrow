@@ -86,6 +86,12 @@ enum CliCommand {
             help = "Disable browser session authentication (local debugging only)"
         )]
         no_auth: bool,
+        #[arg(
+            long,
+            value_parser = parse_permission_mode,
+            help = "Cap the permission mode web clients may request per turn"
+        )]
+        permission_ceiling: Option<PermissionMode>,
     },
     Session {
         #[command(subcommand)]
@@ -219,11 +225,12 @@ async fn run() -> Result<(), CliError> {
         host,
         port,
         no_auth,
+        permission_ceiling,
     }) = args.command.as_ref()
     {
         let loaded = load_server_config(args.config.as_deref())?;
         let home = dirs::home_dir().ok_or(CliError::HomeDirNotFound)?;
-        let options = agent_server::server_options_from_loaded_config(
+        let mut options = agent_server::server_options_from_loaded_config(
             *host,
             *port,
             workspace_root,
@@ -231,6 +238,9 @@ async fn run() -> Result<(), CliError> {
             loaded,
             session_name,
         )?;
+        if let Some(ceiling) = permission_ceiling {
+            options.permission_ceiling = *ceiling;
+        }
         print_startup_diagnostics(&options.config_diagnostics);
         eprintln!("morrow server listening on http://{host}:{port}");
         let access_policy = if *no_auth {
@@ -1684,16 +1694,29 @@ compact test
         let default_args = Args::try_parse_from(["morrow", "server"]).expect("parse server");
         assert!(matches!(
             default_args.command,
-            Some(CliCommand::Server { no_auth: false, .. })
+            Some(CliCommand::Server {
+                no_auth: false,
+                permission_ceiling: None,
+                ..
+            })
         ));
 
-        let args = Args::try_parse_from(["morrow", "server", "--port", "3100", "--no-auth"])
-            .expect("parse server flags");
+        let args = Args::try_parse_from([
+            "morrow",
+            "server",
+            "--port",
+            "3100",
+            "--no-auth",
+            "--permission-ceiling",
+            "workspace-write",
+        ])
+        .expect("parse server flags");
         assert!(matches!(
             args.command,
             Some(CliCommand::Server {
                 port: 3100,
                 no_auth: true,
+                permission_ceiling: Some(PermissionMode::WorkspaceWrite),
                 ..
             })
         ));

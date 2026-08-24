@@ -144,6 +144,21 @@ pub struct ServerAppConfig {
     pub context: ContextConfig,
     pub permissions: PermissionProfile,
     pub mcp_servers: Vec<McpServerConfig>,
+    pub server: ServerConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerConfig {
+    /// Cap on the permission mode web clients may request per turn.
+    pub permission_ceiling: PermissionMode,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            permission_ceiling: PermissionMode::DangerFullAccess,
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -236,6 +251,7 @@ struct RawAppConfig {
     agent: Option<RawAgentConfig>,
     context: Option<RawContextConfig>,
     permissions: Option<RawPermissionsConfig>,
+    server: Option<RawServerConfig>,
     #[serde(default)]
     mcp_servers: BTreeMap<String, RawMcpServerConfig>,
 }
@@ -274,6 +290,12 @@ struct RawContextConfig {
 struct RawPermissionsConfig {
     mode: Option<PermissionMode>,
     shell: Option<ShellPolicy>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawServerConfig {
+    permission_ceiling: Option<PermissionMode>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -340,9 +362,10 @@ fn load_server_config_from_locations(
         agent,
         context,
         permissions,
+        server,
         mcp_servers,
     } = raw;
-    let config = parse_server_app_config(agent, context, permissions, mcp_servers)?;
+    let config = parse_server_app_config(agent, context, permissions, server, mcp_servers)?;
     let mut diagnostics = Vec::new();
     let model = model.and_then(|model| match parse_model_config(model) {
         Ok((config, inline_api_key)) => {
@@ -473,10 +496,11 @@ impl TryFrom<RawAppConfig> for AppConfig {
             agent,
             context,
             permissions,
+            server,
             mcp_servers,
         } = value;
         let (model, _) = parse_model_config(model.unwrap_or_default())?;
-        let server = parse_server_app_config(agent, context, permissions, mcp_servers)?;
+        let server = parse_server_app_config(agent, context, permissions, server, mcp_servers)?;
 
         Ok(Self {
             model,
@@ -534,6 +558,7 @@ fn parse_server_app_config(
     agent: Option<RawAgentConfig>,
     context: Option<RawContextConfig>,
     permissions: Option<RawPermissionsConfig>,
+    server: Option<RawServerConfig>,
     mcp_servers: BTreeMap<String, RawMcpServerConfig>,
 ) -> Result<ServerAppConfig, ConfigError> {
     let agent = agent.unwrap_or_default();
@@ -544,6 +569,7 @@ fn parse_server_app_config(
     if let Some(shell) = permissions.shell {
         permissions_profile.shell = shell;
     }
+    let server = server.unwrap_or_default();
 
     Ok(ServerAppConfig {
         agent: AgentConfig {
@@ -554,6 +580,11 @@ fn parse_server_app_config(
         context,
         permissions: permissions_profile,
         mcp_servers: parse_mcp_servers(mcp_servers)?,
+        server: ServerConfig {
+            permission_ceiling: server
+                .permission_ceiling
+                .unwrap_or(PermissionMode::DangerFullAccess),
+        },
     })
 }
 
@@ -1284,6 +1315,45 @@ oauth_client_id = "client"
             PermissionProfile {
                 mode: PermissionMode::WorkspaceWrite,
                 shell: ShellPolicy::Deny,
+            }
+        );
+    }
+
+    #[test]
+    fn loads_server_permission_ceiling() {
+        let root = unique_dir("server-ceiling");
+        let config = root.join("morrow.toml");
+        fs::write(
+            &config,
+            r#"
+[server]
+permission_ceiling = "workspace_write"
+"#,
+        )
+        .expect("write config");
+
+        let loaded = load_server_config_from_locations(Some(&config), &root, None)
+            .expect("load server config");
+
+        assert_eq!(
+            loaded.config.server.permission_ceiling,
+            PermissionMode::WorkspaceWrite
+        );
+    }
+
+    #[test]
+    fn server_permission_ceiling_defaults_to_no_cap() {
+        let root = unique_dir("server-ceiling-default");
+        let config = root.join("morrow.toml");
+        fs::write(&config, "").expect("write config");
+
+        let loaded = load_server_config_from_locations(Some(&config), &root, None)
+            .expect("load server config");
+
+        assert_eq!(
+            loaded.config.server,
+            ServerConfig {
+                permission_ceiling: PermissionMode::DangerFullAccess,
             }
         );
     }

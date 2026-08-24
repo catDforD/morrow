@@ -6,8 +6,8 @@ use agent_config::{
     ContextConfig, McpServerConfig, McpTransport, load_server_config_for_workspace,
 };
 use agent_protocol::{
-    PermissionProfile, RemoteEnvelope, RemoteEvent, RemoteMcpTransport, RemoteMessage,
-    RemoteRequest, RemoteResponse, RemoteWorkspaceConfiguration, WorkspaceLocation,
+    PermissionMode, PermissionProfile, RemoteEnvelope, RemoteEvent, RemoteMcpTransport,
+    RemoteMessage, RemoteRequest, RemoteResponse, RemoteWorkspaceConfiguration, WorkspaceLocation,
 };
 use agent_server::{
     EmbeddedServer, FallbackModel, RunningServer, ServerAccessPolicy, ServerOptions,
@@ -1239,6 +1239,7 @@ fn prepare_remote_settings(
         config_path: None,
         config_diagnostics: Vec::new(),
         permissions: PermissionProfile::for_mode(agent_server::DEFAULT_WEB_PERMISSION_MODE),
+        permission_ceiling: PermissionMode::DangerFullAccess,
         mcp_servers: fallback_mcp_servers,
         default_session_name: "default".to_string(),
     };
