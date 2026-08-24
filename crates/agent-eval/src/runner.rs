@@ -1,10 +1,18 @@
 use crate::model::{RecordedModelRequest, ScriptedModel};
 use crate::report::{Baseline, EVAL_REPORT_SCHEMA_VERSION, ScenarioMetrics, SuiteReport};
-use crate::scenario::{ApprovalPolicy, Scenario};
+use crate::scenario::{AfterTurnAction, ApprovalPolicy, Scenario};
 use crate::tools::ScenarioToolRuntime;
-use agent_core::{Agent, AgentRunContext};
-use agent_protocol::{AgentEvent, ApprovalDecision, Message, TurnStatus};
+use agent_core::{
+    AfterTurnInput, AfterTurnOutput, Agent, AgentMiddleware, AgentMiddlewareChain, AgentRunContext,
+    CancellationToken, ContextBlock, MiddlewareExecutionContext, MiddlewareFuture,
+};
+use agent_protocol::{
+    AgentEvent, ApprovalDecision, Message, MiddlewareAgentScope, ModelInvocation, PermissionMode,
+    PermissionProfile, ReasoningLevel, ShellPolicy, TurnStatus,
+};
 use futures_util::StreamExt;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 /// Timestamp provider kept behind a function so tests can pin reports.
@@ -79,18 +87,23 @@ pub async fn run_scenario(scenario: &Scenario) -> ScenarioMetrics {
     let tool_runtime = ScenarioToolRuntime::new(&scenario.tools);
     let recorded_calls = tool_runtime.record_calls();
 
-    let agent = Agent::with_tools(&model, scenario.system_prompt.clone(), &tool_runtime)
+    let mut agent = Agent::with_tools(&model, scenario.system_prompt.clone(), &tool_runtime)
         .with_max_tool_rounds(scenario.max_tool_rounds);
+    let mut run_context = AgentRunContext {
+        context_token_limit: scenario.context_token_limit,
+        ..AgentRunContext::default()
+    };
+    if !scenario.after_turn_script.is_empty() {
+        let mut middleware = AgentMiddlewareChain::new();
+        middleware.register(Arc::new(ScriptedAfterTurn::new(
+            scenario.after_turn_script.clone(),
+        )));
+        agent = agent.with_middleware(middleware);
+        run_context.middleware = Some(eval_middleware_context());
+    }
 
     let mut stream = match agent
-        .run_turn_with_agent_context(
-            &scenario.thread,
-            scenario.prompt.clone(),
-            AgentRunContext {
-                context_token_limit: scenario.context_token_limit,
-                ..AgentRunContext::default()
-            },
-        )
+        .run_turn_with_agent_context(&scenario.thread, scenario.prompt.clone(), run_context)
         .await
     {
         Ok(stream) => stream,
@@ -277,6 +290,74 @@ fn snapshot_requests(
     (tokens, snapshots)
 }
 
+/// Deterministic `after_turn` middleware driven by the scenario script.
+struct ScriptedAfterTurn {
+    actions: Mutex<VecDeque<AfterTurnAction>>,
+}
+
+impl ScriptedAfterTurn {
+    fn new(actions: Vec<AfterTurnAction>) -> Self {
+        Self {
+            actions: Mutex::new(actions.into()),
+        }
+    }
+}
+
+impl AgentMiddleware for ScriptedAfterTurn {
+    fn id(&self) -> &str {
+        "eval-after-turn"
+    }
+
+    fn after_turn(&self, _input: AfterTurnInput) -> Option<MiddlewareFuture<AfterTurnOutput>> {
+        let action = {
+            let mut actions = self
+                .actions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if actions.len() > 1 {
+                actions.pop_front().expect("non-empty")
+            } else {
+                actions
+                    .front()
+                    .cloned()
+                    .unwrap_or(AfterTurnAction::Complete)
+            }
+        };
+        let output = match action {
+            AfterTurnAction::Complete => AfterTurnOutput::Complete,
+            AfterTurnAction::Continue(context) => AfterTurnOutput::Continue {
+                context: vec![ContextBlock::new(context)],
+            },
+            AfterTurnAction::Fail(reason) => AfterTurnOutput::Fail { reason },
+        };
+        Some(Box::pin(async move { Ok(output) }))
+    }
+}
+
+fn eval_middleware_context() -> MiddlewareExecutionContext {
+    MiddlewareExecutionContext {
+        invocation_id: None,
+        session: "eval".to_string(),
+        workspace_root: std::path::PathBuf::from("/eval"),
+        turn_index: 0,
+        operation_id: None,
+        turn_id: None,
+        model: ModelInvocation {
+            provider_id: "eval".to_string(),
+            provider_name: "Eval".to_string(),
+            model_id: "scripted".to_string(),
+            model_name: "Scripted".to_string(),
+            reasoning: ReasoningLevel::Off,
+        },
+        permissions: PermissionProfile {
+            mode: PermissionMode::WorkspaceWrite,
+            shell: ShellPolicy::Prompt,
+        },
+        agent_scope: MiddlewareAgentScope::Main,
+        cancellation: CancellationToken::new(),
+    }
+}
+
 fn estimate_text_tokens(text: &str) -> usize {
     text.chars().count().div_ceil(4)
 }
@@ -453,6 +534,28 @@ fn evaluate_expectations(
             failures.push(format!(
                 "model request {} does not contain {:?}",
                 assertion.model_call_index, assertion.contains
+            ));
+        }
+    }
+
+    for assertion in &expectations.model_request_roles {
+        let Some(request) = requests.get(assertion.model_call_index) else {
+            failures.push(format!(
+                "model request assertion out of range: call {} requested but only {} requests recorded",
+                assertion.model_call_index,
+                requests.len()
+            ));
+            continue;
+        };
+        let actual_roles: Vec<_> = request
+            .messages
+            .iter()
+            .map(|message| message.role)
+            .collect();
+        if actual_roles != assertion.roles {
+            failures.push(format!(
+                "model request {} roles mismatch: expected {:?}, got {:?}",
+                assertion.model_call_index, assertion.roles, actual_roles
             ));
         }
     }

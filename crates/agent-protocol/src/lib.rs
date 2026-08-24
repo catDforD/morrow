@@ -1755,6 +1755,7 @@ pub enum MiddlewareStage {
     BeforeTool,
     PermissionRequest,
     AfterTool,
+    AfterTurn,
     PreCompact,
     PostCompact,
 }

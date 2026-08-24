@@ -98,6 +98,7 @@ fn config_validates_exact_matchers_timeouts_and_unknown_fields() {
         "schema_version = 1\n[[hooks]]\nid = \"bad\"\nevent = \"before_prompt\"\ncommand = [\"true\"]\ntool_names = []\n",
         "schema_version = 1\n[[hooks]]\nid = \"bad\"\nevent = \"before_tool\"\ncommand = [\"true\"]\ntool_names = [\"shell_command\", \"shell_command\"]\n",
         "schema_version = 1\n[[hooks]]\nid = \"bad\"\nevent = \"before_prompt\"\ncommand = [\"true\"]\nunknown = true\n",
+        "schema_version = 1\n[[hooks]]\nid = \"bad\"\nevent = \"after_turn\"\ncommand = [\"true\"]\ntool_names = [\"shell_command\"]\n",
     ] {
         write_config(&manager.user_config_path(), body);
         assert!(manager.settings().is_err(), "config should fail: {body}");
@@ -462,6 +463,144 @@ fn matcher_uses_exact_tool_names_and_agent_scopes() {
     let mut delegated = main;
     delegated.agent_scope = MiddlewareAgentScope::DelegatedSubagent;
     assert!(!hook.matches(&delegated, Some("shell_command")));
+}
+
+#[tokio::test]
+async fn after_turn_hook_runs_on_agent_chain_and_receives_turn_summary() {
+    let home = unique_dir("after-turn-home");
+    let workspace = unique_dir("after-turn-workspace");
+    let manager = HookManager::new(&home, &workspace);
+    let input_path = workspace.join("after-turn-input.json");
+    let shell = format!(
+        "tee {:?} >/dev/null; printf '%s' '{{\"decision\":\"continue\",\"additional_context\":[\"cargo test failed\"]}}'",
+        input_path.to_string_lossy(),
+    );
+    write_config(
+        &manager.user_config_path(),
+        &format!(
+            "schema_version = 1\n[[hooks]]\nid = \"verify\"\nevent = \"after_turn\"\ncommand = [\"/bin/sh\", \"-c\", {:?}]\n",
+            shell
+        ),
+    );
+
+    let snapshot = manager.load_snapshot().expect("snapshot");
+    let run = snapshot
+        .registry()
+        .agent()
+        .run_after_turn(AfterTurnInput {
+            context: context(&workspace),
+            final_text: "done".to_string(),
+            tool_call_count: 2,
+            turn_message_count: 5,
+            tool_names: vec!["shell_command".to_string()],
+        })
+        .await;
+
+    assert!(run.continue_requested);
+    assert!(run.fail_reasons.is_empty());
+    assert_eq!(run.context.len(), 1);
+    assert_eq!(run.context[0].content, "cargo test failed");
+    assert_eq!(
+        run.context[0].stage,
+        agent_protocol::MiddlewareStage::AfterTurn
+    );
+    assert_eq!(run.events.len(), 2);
+
+    let input: Value =
+        serde_json::from_slice(&fs::read(input_path).expect("input")).expect("input JSON");
+    assert_eq!(input["event"], "after_turn");
+    assert_eq!(input["payload"]["final_text"], "done");
+    assert_eq!(input["payload"]["tool_call_count"], 2);
+    assert_eq!(input["payload"]["turn_message_count"], 5);
+    assert_eq!(input["payload"]["tool_names"], json!(["shell_command"]));
+
+    // after_turn 挂 agent 链而不是 runtime 链：before_prompt 不应触发任何 hook。
+    let runtime_run = snapshot
+        .registry()
+        .runtime()
+        .run_before_prompt(BeforePromptInput {
+            context: context(&workspace),
+            prompt: "hello".to_string(),
+        })
+        .await;
+    assert!(runtime_run.events.is_empty());
+}
+
+#[tokio::test]
+async fn after_turn_decisions_are_mapped_and_validated() {
+    let workspace = unique_dir("after-turn-decisions");
+    let payload = || {
+        json!({
+            "final_text": "done",
+            "tool_call_count": 0,
+            "turn_message_count": 1,
+            "tool_names": [],
+        })
+    };
+
+    let fail = command_hook(
+        HookEvent::AfterTurn,
+        "printf '%s' '{\"decision\":\"fail\",\"reason\":\"tests red\"}'",
+    );
+    let result = fail
+        .invoke(context(&workspace), payload())
+        .await
+        .expect("fail decision");
+    assert!(matches!(
+        crate::protocol::after_turn_output(result),
+        AfterTurnOutput::Fail { reason } if reason == "tests red"
+    ));
+
+    let complete = command_hook(
+        HookEvent::AfterTurn,
+        "printf '%s' '{\"decision\":\"complete\"}'",
+    );
+    let result = complete
+        .invoke(context(&workspace), payload())
+        .await
+        .expect("complete decision");
+    assert!(matches!(
+        crate::protocol::after_turn_output(result),
+        AfterTurnOutput::Complete
+    ));
+
+    let deny = command_hook(
+        HookEvent::AfterTurn,
+        "printf '%s' '{\"decision\":\"deny\"}'",
+    );
+    let error = deny
+        .invoke(context(&workspace), payload())
+        .await
+        .expect_err("deny is not valid after turn");
+    assert!(error.to_string().contains("invalid for after_turn"));
+}
+
+#[tokio::test]
+async fn hook_that_never_reads_stdin_still_returns_its_output() {
+    let workspace = unique_dir("epipe");
+    let hook = command_hook(
+        HookEvent::AfterTurn,
+        "printf '%s' '{\"decision\":\"complete\"}'",
+    );
+    // printf 不读 stdin 并立即退出，重复触发以覆盖 stdin 写入与进程退出的竞争。
+    for _ in 0..20 {
+        let result = hook
+            .invoke(
+                context(&workspace),
+                json!({
+                    "final_text": "done",
+                    "tool_call_count": 0,
+                    "turn_message_count": 1,
+                    "tool_names": [],
+                }),
+            )
+            .await
+            .expect("hook output must survive the stdin EPIPE race");
+        assert!(matches!(
+            crate::protocol::after_turn_output(result),
+            AfterTurnOutput::Complete
+        ));
+    }
 }
 
 #[tokio::test]

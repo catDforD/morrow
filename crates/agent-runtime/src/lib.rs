@@ -752,6 +752,7 @@ fn middleware_stage_name(stage: agent_protocol::MiddlewareStage) -> &'static str
         agent_protocol::MiddlewareStage::BeforeTool => "before_tool",
         agent_protocol::MiddlewareStage::PermissionRequest => "permission_request",
         agent_protocol::MiddlewareStage::AfterTool => "after_tool",
+        agent_protocol::MiddlewareStage::AfterTurn => "after_turn",
         agent_protocol::MiddlewareStage::PreCompact => "pre_compact",
         agent_protocol::MiddlewareStage::PostCompact => "post_compact",
     }

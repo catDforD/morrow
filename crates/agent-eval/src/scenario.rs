@@ -140,6 +140,28 @@ pub enum ApprovalPolicy {
     Deny,
 }
 
+/// One scripted `after_turn` middleware verdict, consumed per invocation; the
+/// last one repeats, mirroring `ToolBehavior::Sequence`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AfterTurnAction {
+    /// Accept the model's completion.
+    Complete,
+    /// Reject completion and feed this verification output back to the model.
+    Continue(String),
+    /// Fail the turn with this reason.
+    Fail(String),
+}
+
+impl AfterTurnAction {
+    pub fn continue_with(context: impl Into<String>) -> Self {
+        Self::Continue(context.into())
+    }
+
+    pub fn fail(reason: impl Into<String>) -> Self {
+        Self::Fail(reason.into())
+    }
+}
+
 /// Assert that a substring appears somewhere in the messages of a recorded
 /// model request. This is how we prove tool output really reached the next
 /// model call instead of being dropped or reordered.
@@ -155,6 +177,25 @@ impl RequestAssertion {
         Self {
             model_call_index,
             contains: contains.into(),
+        }
+    }
+}
+
+/// Assert the exact ordered role sequence of a recorded model request's
+/// messages. This pins the model-visible conversation chain, including
+/// middleware-injected system messages that never land in the `TurnRecord`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestRolesAssertion {
+    /// Zero-based model call index.
+    pub model_call_index: usize,
+    pub roles: Vec<Role>,
+}
+
+impl RequestRolesAssertion {
+    pub fn new(model_call_index: usize, roles: Vec<Role>) -> Self {
+        Self {
+            model_call_index,
+            roles,
         }
     }
 }
@@ -187,6 +228,8 @@ pub struct Expectations {
     pub message_roles: Option<Vec<Role>>,
     /// Substring assertions against recorded model request messages.
     pub model_request_contains: Vec<RequestAssertion>,
+    /// Exact role sequence assertions against recorded model request messages.
+    pub model_request_roles: Vec<RequestRolesAssertion>,
     /// Asserts that these recorded model requests carried no tool definitions.
     pub model_requests_without_tools: Vec<usize>,
     /// Exact number of approval requests surfaced to the harness.
@@ -259,6 +302,12 @@ impl Expectations {
         self
     }
 
+    pub fn request_message_roles(mut self, model_call_index: usize, roles: Vec<Role>) -> Self {
+        self.model_request_roles
+            .push(RequestRolesAssertion::new(model_call_index, roles));
+        self
+    }
+
     /// Assert that the recorded model request at `model_call_index` carried no
     /// tool definitions. This pins the mid-turn wrap-up call of the context
     /// guard: it must be a plain completion with `tools = []`.
@@ -317,6 +366,8 @@ pub struct Scenario {
     pub max_tool_rounds: usize,
     /// turn 内上下文护栏上限；`None` 关闭护栏（默认）。
     pub context_token_limit: Option<usize>,
+    /// 脚本化的 after_turn middleware 裁决序列；空表示不挂 after_turn middleware。
+    pub after_turn_script: Vec<AfterTurnAction>,
     pub approval_policy: ApprovalPolicy,
     pub expectations: Expectations,
     pub budget: Budget,
@@ -338,6 +389,7 @@ impl Scenario {
             script: Vec::new(),
             max_tool_rounds: 99,
             context_token_limit: None,
+            after_turn_script: Vec::new(),
             approval_policy: ApprovalPolicy::Deny,
             expectations: Expectations::completed(),
             budget: Budget::default(),
@@ -371,6 +423,11 @@ impl Scenario {
 
     pub fn with_context_token_limit(mut self, limit: usize) -> Self {
         self.context_token_limit = Some(limit);
+        self
+    }
+
+    pub fn with_after_turn_script(mut self, script: Vec<AfterTurnAction>) -> Self {
+        self.after_turn_script = script;
         self
     }
 

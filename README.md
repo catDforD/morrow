@@ -22,7 +22,7 @@ Morrow reads and edits files, applies patches, runs shell commands behind explic
 - **Bring your own model** — any OpenAI-compatible endpoint, configured per provider and per session.
 - **Real tools** — file reads/edits, patches, search, directory listing, and shell commands.
 - **Permission profiles** — read-only, workspace-write, and full-access modes, with shell controlled separately.
-- **Policy hooks** — trusted command hooks at `before_prompt`, `before_tool`, `permission_request`, `after_tool`, and compaction boundaries; project hooks require an explicit `morrow hooks trust`.
+- **Policy hooks** — trusted command hooks at `before_prompt`, `before_tool`, `permission_request`, `after_tool`, `after_turn`, and compaction boundaries; project hooks require an explicit `morrow hooks trust`.
 - **MCP support** — stdio and Streamable HTTP MCP servers.
 - **Session-scoped subagents** — persistent `explore`, `plan`, `worker`, and `reviewer` instances running in the background.
 - **Long-session friendly** — named, resumable sessions with automatic context compaction.
@@ -106,6 +106,15 @@ MCP tools that the server does not mark with `readOnlyHint` require per-call app
 ### Policy hooks
 
 Command hooks run at the lifecycle boundaries above. User-level hooks live in `~/.morrow/hooks.toml`; project hooks live in `<workspace>/.morrow/hooks.toml` and are **disabled until you run `morrow hooks trust`** for that exact hook configuration (fingerprint-pinned, `morrow hooks revoke` to remove). Hooks execute with your user permissions, so review them like shell commands. Manage them with `morrow hooks list | trust | revoke`.
+
+An `after_turn` hook runs when the model declares the turn complete, before the turn is accepted. It receives the final text and a turn summary, and answers `{"decision": "complete" | "continue" | "fail"}`: `continue` feeds `additional_context` back into the conversation for one more model call (at most 3 times per turn, then the turn completes with a warning), `fail` fails the turn with the given reason. For example, a verification gate that reruns the test suite:
+
+```toml
+[[hooks]]
+id = "verify-tests"
+event = "after_turn"
+command = ["/bin/sh", "-c", "cargo test --workspace >/dev/null 2>&1 && printf '%s' '{\"decision\":\"complete\"}' || printf '%s' '{\"decision\":\"continue\",\"additional_context\":[\"cargo test is still red; fix the failures before finishing\"]}'"]
+```
 
 ### Subagents
 

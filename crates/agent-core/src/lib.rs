@@ -4,10 +4,11 @@ pub mod middleware_runner;
 pub mod tokens;
 
 pub use middleware::{
-    AfterToolInput, AgentMiddleware, AgentMiddlewareChain, BeforeToolInput, ContextBlock,
-    FailureMode, GateDecision, GateOutput, GateRun, MiddlewareContextBlock, MiddlewareError,
-    MiddlewareExecutionContext, MiddlewareFuture, ObservationOutput, ObservationRun,
-    PermissionDecision, PermissionOutput, PermissionRequestInput, PermissionRun,
+    AfterToolInput, AfterTurnInput, AfterTurnOutput, AfterTurnRun, AgentMiddleware,
+    AgentMiddlewareChain, BeforeToolInput, ContextBlock, FailureMode, GateDecision, GateOutput,
+    GateRun, MiddlewareContextBlock, MiddlewareError, MiddlewareExecutionContext, MiddlewareFuture,
+    ObservationOutput, ObservationRun, PermissionDecision, PermissionOutput,
+    PermissionRequestInput, PermissionRun,
 };
 
 use agent_protocol::{
@@ -28,6 +29,8 @@ use thiserror::Error;
 
 const DEFAULT_MAX_TOOL_ROUNDS: usize = 99;
 const MAX_CONCURRENT_TOOL_CALLS: usize = 4;
+/// after_turn middleware 打回继续的次数上限；超限强制完成，避免验收钩子把 turn 卡成死循环。
+const MAX_AFTER_TURN_CONTINUES: usize = 3;
 /// turn 内护栏触发后注入的收尾指令：要求模型停止使用工具并总结进展。
 const CONTEXT_LIMIT_WRAP_UP_PROMPT: &str = "The conversation has reached its context token limit for this turn and cannot grow further. Do not call any more tools. Using only the information already gathered, summarize your progress so far, the partial results you have, and any remaining blockers or unfinished work, then stop.";
 const CONTEXT_LIMIT_FAILURE: &str = "context limit exceeded mid-turn";
@@ -407,6 +410,8 @@ impl<'a> Agent<'a> {
             active_serial_tool: false,
             processing_tool_calls: false,
             pending_approval: None,
+            pending_after_turn: None,
+            after_turn_continues: 0,
             turn: Turn::running(user_message.clone()),
             turn_messages: vec![user_message.clone()],
             assistant_reasoning: String::new(),
@@ -421,6 +426,7 @@ impl<'a> Agent<'a> {
 
 type ModelStartFuture = ModelFuture;
 type ToolCallFuture = BoxFuture<'static, ToolCallOutcome>;
+type AfterTurnFuture = BoxFuture<'static, AfterTurnRun>;
 
 struct ToolCallOutcome {
     index: usize,
@@ -471,6 +477,8 @@ pub struct AgentTurnStream<'a> {
     active_serial_tool: bool,
     processing_tool_calls: bool,
     pending_approval: Option<PendingApproval>,
+    pending_after_turn: Option<AfterTurnFuture>,
+    after_turn_continues: usize,
     turn: Turn,
     turn_messages: Vec<Message>,
     assistant_reasoning: String,
@@ -521,6 +529,7 @@ impl AgentTurnStream<'_> {
         self.pending_tool_calls.clear();
         self.pending_tool_results.clear();
         self.pending_approval = None;
+        self.pending_after_turn = None;
         self.processing_tool_calls = false;
         self.pending.clear();
         self.fail_turn(error);
@@ -596,6 +605,75 @@ impl AgentTurnStream<'_> {
         self.turn.fail(error.clone());
         self.pending.push_back(AgentEvent::Error(error));
         self.finished = true;
+    }
+
+    /// 模型流 Completed 后先过 after_turn middleware 链，再决定完成、打回还是判负。
+    /// 无 middleware 上下文时保持原路径直接完成。
+    fn start_after_turn_middleware(&mut self) {
+        let Some(context) = self.middleware_context.clone() else {
+            self.complete_turn();
+            return;
+        };
+        let middleware = self.middleware.clone();
+        let input = AfterTurnInput {
+            context,
+            final_text: self.assistant_text.clone(),
+            tool_call_count: self
+                .turn
+                .steps
+                .iter()
+                .filter(|step| step.tool_call_id.is_some())
+                .count(),
+            turn_message_count: self.turn_messages.len(),
+            tool_names: self
+                .turn
+                .steps
+                .iter()
+                .filter_map(|step| step.tool_name.clone())
+                .collect(),
+        };
+        self.pending_after_turn =
+            Some(async move { middleware.run_after_turn(input).await }.boxed());
+    }
+
+    fn handle_after_turn_run(&mut self, run: AfterTurnRun) {
+        self.pending.extend(run.events);
+        if run.cancelled {
+            return;
+        }
+        if !run.fail_reasons.is_empty() {
+            self.fail_turn(format!(
+                "after-turn middleware rejected completion: {}",
+                run.fail_reasons.join("; ")
+            ));
+            return;
+        }
+        if !run.continue_requested {
+            self.complete_turn();
+            return;
+        }
+        if self.after_turn_continues >= MAX_AFTER_TURN_CONTINUES {
+            self.pending.push_back(AgentEvent::Warning(format!(
+                "after-turn middleware continuation limit ({MAX_AFTER_TURN_CONTINUES}) reached; completing the turn"
+            )));
+            self.complete_turn();
+            return;
+        }
+        self.after_turn_continues += 1;
+        // 与 complete_turn 前半相同：提交当前 assistant message，但 turn 继续运行。
+        if let Some(step) = self.turn.steps.last_mut() {
+            step.complete();
+        }
+        let assistant_message = Message::assistant(std::mem::take(&mut self.assistant_text))
+            .with_reasoning_content(std::mem::take(&mut self.assistant_reasoning));
+        self.conversation.push(assistant_message.clone());
+        self.turn_messages.push(assistant_message.clone());
+        self.pending.push_back(AgentEvent::ModelMessageCommitted {
+            model_call_id: format!("model-call-{}", self.model_call_index),
+            message: assistant_message,
+        });
+        append_middleware_context_message(&mut self.conversation, &run.context);
+        self.start_next_model_call();
     }
 
     fn handle_tool_calls(&mut self, tool_calls: Vec<ToolCall>) {
@@ -1199,6 +1277,20 @@ impl Stream for AgentTurnStream<'_> {
                 return Poll::Pending;
             }
 
+            if let Some(future) = this.pending_after_turn.as_mut() {
+                match future.as_mut().poll(cx) {
+                    Poll::Ready(run) => {
+                        this.pending_after_turn = None;
+                        this.handle_after_turn_run(run);
+                        if let Some(event) = this.pending.pop_front() {
+                            return Poll::Ready(Some(event));
+                        }
+                        continue;
+                    }
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+
             if let Some(future) = this.model_start.as_mut() {
                 match future.as_mut().poll(cx) {
                     Poll::Ready(Ok(model_stream)) => {
@@ -1235,8 +1327,11 @@ impl Stream for AgentTurnStream<'_> {
                     }
                     Poll::Ready(Some(Ok(ModelEvent::Completed))) => {
                         this.model_stream = None;
-                        this.complete_turn();
-                        return Poll::Ready(this.pending.pop_front());
+                        this.start_after_turn_middleware();
+                        if let Some(event) = this.pending.pop_front() {
+                            return Poll::Ready(Some(event));
+                        }
+                        continue;
                     }
                     Poll::Ready(Some(Err(err))) => {
                         this.model_stream = None;
@@ -1277,6 +1372,7 @@ fn append_middleware_context_message(
             agent_protocol::MiddlewareStage::BeforeTool => "before_tool",
             agent_protocol::MiddlewareStage::PermissionRequest => "permission_request",
             agent_protocol::MiddlewareStage::AfterTool => "after_tool",
+            agent_protocol::MiddlewareStage::AfterTurn => "after_turn",
             agent_protocol::MiddlewareStage::PreCompact => "pre_compact",
             agent_protocol::MiddlewareStage::PostCompact => "post_compact",
         });
@@ -3263,5 +3359,270 @@ mod tests {
         // 水位未超限时后续调用仍带工具定义，也不注入收尾指令。
         assert!(requests[1].contains(r#""name":"big_read""#));
         assert!(!requests[1].contains("context token limit"));
+    }
+
+    struct ScriptedAfterTurn {
+        id: &'static str,
+        outputs: Mutex<Vec<AfterTurnOutput>>,
+        final_texts: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ScriptedAfterTurn {
+        fn new(id: &'static str, outputs: Vec<AfterTurnOutput>) -> Self {
+            Self {
+                id,
+                outputs: Mutex::new(outputs),
+                final_texts: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl AgentMiddleware for ScriptedAfterTurn {
+        fn id(&self) -> &str {
+            self.id
+        }
+
+        fn after_turn(&self, input: AfterTurnInput) -> Option<MiddlewareFuture<AfterTurnOutput>> {
+            self.final_texts
+                .lock()
+                .expect("final_texts lock poisoned")
+                .push(input.final_text);
+            // 脚本用尽后重复最后一条，便于"持续打回"场景。
+            let output = {
+                let mut outputs = self.outputs.lock().expect("outputs lock poisoned");
+                if outputs.len() > 1 {
+                    outputs.remove(0)
+                } else {
+                    outputs[0].clone()
+                }
+            };
+            Some(Box::pin(async move { Ok(output) }))
+        }
+    }
+
+    fn after_turn_context() -> MiddlewareExecutionContext {
+        MiddlewareExecutionContext {
+            invocation_id: None,
+            session: "test".to_string(),
+            workspace_root: PathBuf::from("/workspace"),
+            turn_index: 0,
+            operation_id: None,
+            turn_id: None,
+            model: agent_protocol::ModelInvocation {
+                provider_id: "test".to_string(),
+                provider_name: "Test".to_string(),
+                model_id: "model".to_string(),
+                model_name: "Model".to_string(),
+                reasoning: agent_protocol::ReasoningLevel::Off,
+            },
+            permissions: agent_protocol::PermissionProfile {
+                mode: PermissionMode::WorkspaceWrite,
+                shell: agent_protocol::ShellPolicy::Prompt,
+            },
+            agent_scope: agent_protocol::MiddlewareAgentScope::Main,
+            cancellation: CancellationToken::new(),
+        }
+    }
+
+    fn after_turn_run_context() -> AgentRunContext {
+        AgentRunContext {
+            middleware: Some(after_turn_context()),
+            ..AgentRunContext::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn after_turn_continue_commits_assistant_and_reruns_model() {
+        let model = ScriptedModel::new(vec![
+            ScriptedResponse::Events(vec![
+                Ok(ModelEvent::TextDelta("first answer".to_string())),
+                Ok(ModelEvent::Completed),
+            ]),
+            ScriptedResponse::Events(vec![
+                Ok(ModelEvent::TextDelta("fixed answer".to_string())),
+                Ok(ModelEvent::Completed),
+            ]),
+        ]);
+        let requests = model.recorded_requests();
+        let mut chain = AgentMiddlewareChain::new();
+        chain.register(Arc::new(ScriptedAfterTurn::new(
+            "verifier",
+            vec![
+                AfterTurnOutput::Continue {
+                    context: vec![ContextBlock::new("cargo test failed: auth_flow")],
+                },
+                AfterTurnOutput::Complete,
+            ],
+        )));
+        let agent = Agent::new(&model, "system").with_middleware(chain);
+        let mut thread = Thread::new();
+
+        let stream = agent
+            .run_turn_with_agent_context(&thread, "fix it", after_turn_run_context())
+            .await
+            .expect("run turn");
+        let (events, turn) = collect_all_events(stream, &mut thread).await;
+
+        assert_eq!(turn.status, TurnStatus::Completed);
+        assert_eq!(
+            turn.assistant_message,
+            Some(Message::assistant("fixed answer"))
+        );
+        assert!(matches!(events.last(), Some(AgentEvent::TurnCompleted)));
+        // 两次 after_turn 调用各产生一对 Started/Finished。
+        let finished = events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::MiddlewareFinished(_)))
+            .count();
+        assert_eq!(finished, 2);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::MiddlewareFinished(invocation)
+                if invocation.stage == agent_protocol::MiddlewareStage::AfterTurn
+        )));
+        // 被打回的 assistant message 先进入消息链，再轮到新的 assistant 回复。
+        assert_eq!(
+            thread.messages,
+            vec![
+                Message::user("fix it"),
+                Message::assistant("first answer"),
+                Message::assistant("fixed answer"),
+            ]
+        );
+
+        let requests = requests.lock().expect("requests lock poisoned");
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].contains("first answer"));
+        assert!(requests[1].contains("cargo test failed: auth_flow"));
+    }
+
+    #[tokio::test]
+    async fn after_turn_fail_fails_turn_with_attributed_reason() {
+        let model = ScriptedModel::new(vec![ScriptedResponse::Events(vec![
+            Ok(ModelEvent::TextDelta("done".to_string())),
+            Ok(ModelEvent::Completed),
+        ])]);
+        let mut chain = AgentMiddlewareChain::new();
+        chain.register(Arc::new(ScriptedAfterTurn::new(
+            "verifier",
+            vec![AfterTurnOutput::Fail {
+                reason: "tests still red".to_string(),
+            }],
+        )));
+        let agent = Agent::new(&model, "system").with_middleware(chain);
+        let mut thread = Thread::new();
+
+        let stream = agent
+            .run_turn_with_agent_context(&thread, "fix it", after_turn_run_context())
+            .await
+            .expect("run turn");
+        let (events, turn) = collect_all_events(stream, &mut thread).await;
+
+        assert_eq!(turn.status, TurnStatus::Failed);
+        assert_eq!(
+            turn.error.as_deref(),
+            Some("after-turn middleware rejected completion: verifier: tests still red")
+        );
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::Error(error)) if error.contains("verifier: tests still red")
+        ));
+        assert!(thread.messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn after_turn_continue_limit_completes_turn_with_warning() {
+        let responses = (1..=4)
+            .map(|index| {
+                ScriptedResponse::Events(vec![
+                    Ok(ModelEvent::TextDelta(format!("answer {index}"))),
+                    Ok(ModelEvent::Completed),
+                ])
+            })
+            .collect();
+        let model = ScriptedModel::new(responses);
+        let requests = model.recorded_requests();
+        let mut chain = AgentMiddlewareChain::new();
+        chain.register(Arc::new(ScriptedAfterTurn::new(
+            "verifier",
+            vec![AfterTurnOutput::Continue {
+                context: vec![ContextBlock::new("keep going")],
+            }],
+        )));
+        let agent = Agent::new(&model, "system").with_middleware(chain);
+        let mut thread = Thread::new();
+
+        let stream = agent
+            .run_turn_with_agent_context(&thread, "fix it", after_turn_run_context())
+            .await
+            .expect("run turn");
+        let (events, turn) = collect_all_events(stream, &mut thread).await;
+
+        assert_eq!(turn.status, TurnStatus::Completed);
+        assert_eq!(turn.assistant_message, Some(Message::assistant("answer 4")));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Warning(warning) if warning.contains("continuation limit")
+        )));
+        assert!(matches!(events.last(), Some(AgentEvent::TurnCompleted)));
+        let requests = requests.lock().expect("requests lock poisoned");
+        assert_eq!(requests.len(), 1 + MAX_AFTER_TURN_CONTINUES);
+    }
+
+    #[tokio::test]
+    async fn after_turn_without_middleware_context_completes_immediately() {
+        let model = ScriptedModel::new(vec![ScriptedResponse::Events(vec![
+            Ok(ModelEvent::TextDelta("done".to_string())),
+            Ok(ModelEvent::Completed),
+        ])]);
+        let mut chain = AgentMiddlewareChain::new();
+        let verifier = Arc::new(ScriptedAfterTurn::new(
+            "verifier",
+            vec![AfterTurnOutput::Fail {
+                reason: "must not run".to_string(),
+            }],
+        ));
+        let final_texts = verifier.final_texts.clone();
+        chain.register(verifier);
+        let agent = Agent::new(&model, "system").with_middleware(chain);
+        let mut thread = Thread::new();
+
+        // 无 middleware 执行上下文时保持原路径：after_turn 不运行，直接完成。
+        let stream = agent.run_turn(&thread, "fix it").await.expect("run turn");
+        let (_events, turn) = collect_events(stream, &mut thread).await;
+
+        assert_eq!(turn.status, TurnStatus::Completed);
+        assert!(final_texts.lock().expect("final_texts").is_empty());
+    }
+
+    #[tokio::test]
+    async fn after_turn_also_gates_wrap_up_completion() {
+        let (model, tools, mut thread) = big_output_turn_setup(ScriptedResponse::Events(vec![
+            Ok(ModelEvent::TextDelta("partial summary".to_string())),
+            Ok(ModelEvent::Completed),
+        ]));
+        let mut chain = AgentMiddlewareChain::new();
+        let verifier = Arc::new(ScriptedAfterTurn::new(
+            "verifier",
+            vec![AfterTurnOutput::Complete],
+        ));
+        let final_texts = verifier.final_texts.clone();
+        chain.register(verifier);
+        let agent = Agent::with_tools(&model, "system", &tools).with_middleware(chain);
+
+        let mut run_context = after_turn_run_context();
+        run_context.context_token_limit = Some(200);
+        let stream = agent
+            .run_turn_with_agent_context(&thread, "read the big blob", run_context)
+            .await
+            .expect("run turn");
+        let (_events, turn) = collect_events(stream, &mut thread).await;
+
+        assert_eq!(turn.status, TurnStatus::Completed);
+        // 收尾模式的完成同样过 after_turn，且看到的是收尾文本。
+        assert_eq!(
+            *final_texts.lock().expect("final_texts"),
+            vec!["partial summary".to_string()]
+        );
     }
 }

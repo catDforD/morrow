@@ -23,7 +23,7 @@ Morrow 以流式方式输出模型结果，按项目持久化会话，可以读�
 - **持久化会话** —— 按项目划分的命名会话，支持列表、重命名、导出和续接。
 - **真实工具** —— 文件读写、补丁、搜索、目录列举与 shell 命令。
 - **权限档案** —— 只读、工作区写入、完全访问；shell 单独控制。
-- **策略 Hook** —— 在 `before_prompt`、`before_tool`、`permission_request`、`after_tool` 与压缩前后运行受信命令 Hook；项目 Hook 需要显式 `morrow hooks trust` 后才生效。
+- **策略 Hook** —— 在 `before_prompt`、`before_tool`、`permission_request`、`after_tool`、`after_turn` 与压缩前后运行受信命令 Hook；项目 Hook 需要显式 `morrow hooks trust` 后才生效。
 - **MCP 支持** —— 通过 TOML 或仪表盘配置 stdio 与 Streamable HTTP MCP 服务器。
 - **会话级 Subagent** —— 在后台运行持久化的 `explore`、`plan`、`worker`、`reviewer` 实例，并可在 Web/Desktop 中查看、继续、取消或删除。
 - **长会话友好** —— 自动上下文压缩。
@@ -149,6 +149,15 @@ MCP 工具视为显式配置的受信工具，启用前请检查服务器命令�
 ### 策略 Hook
 
 命令 Hook 在上述生命周期边界执行。用户级配置位于 `~/.morrow/hooks.toml`，项目级配置位于 `<workspace>/.morrow/hooks.toml`。项目 Hook 默认禁用：只有对该精确配置执行 `morrow hooks trust`（按 SHA-256 指纹信任）后才生效，`morrow hooks revoke` 可撤销。Hook 以当前用户权限执行，请像审查 shell 命令一样审查后再信任。可用 `morrow hooks list | trust | revoke` 管理。
+
+`after_turn` Hook 在模型自称完成、turn 被接受之前执行。它收到最终文本与 turn 摘要（`final_text`、`tool_call_count`、`turn_message_count`、`tool_names`），返回 `{"decision": "complete" | "continue" | "fail"}`：`continue` 把 `additional_context` 注入对话并再跑一轮模型（每 turn 最多 3 次，超限强制完成并发出警告），`fail` 以给定理由判负该 turn。例如一个 turn 结束前跑测试的验收门：
+
+```toml
+[[hooks]]
+id = "verify-tests"
+event = "after_turn"
+command = ["/bin/sh", "-c", "cargo test --workspace >/dev/null 2>&1 && printf '%s' '{\"decision\":\"complete\"}' || printf '%s' '{\"decision\":\"continue\",\"additional_context\":[\"cargo test 仍为红色；先修复再结束\"]}'"]
+```
 
 ### Subagent
 

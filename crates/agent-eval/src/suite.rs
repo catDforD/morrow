@@ -9,8 +9,8 @@
 
 use crate::model::tool_call;
 use crate::scenario::{
-    ApprovalPolicy, Budget, Expectations, ModelScript, ModelStep, Scenario, ScenarioTool,
-    ToolBehavior, ToolResponse,
+    AfterTurnAction, ApprovalPolicy, Budget, Expectations, ModelScript, ModelStep, Scenario,
+    ScenarioTool, ToolBehavior, ToolResponse,
 };
 use agent_core::ToolExecutionMode;
 use agent_protocol::Role;
@@ -32,6 +32,8 @@ pub fn builtin_suite() -> Vec<Scenario> {
         duplicate_tool_call_id_rejected(),
         empty_tool_call_list_rejected(),
         reasoning_content_preserved(),
+        after_turn_continue_reruns_model(),
+        after_turn_fail_fails_turn(),
     ]
 }
 
@@ -445,6 +447,63 @@ fn reasoning_content_preserved() -> Scenario {
             .model_calls(1),
     )
     .with_budget(Budget::new(1, 0, 400))
+}
+
+fn after_turn_continue_reruns_model() -> Scenario {
+    Scenario::new(
+        "after_turn_continue_reruns_model",
+        "An after_turn middleware can reject the model's first completion and feed verification output back for one more model call.",
+        "implement the fix",
+    )
+    .with_script(ModelScript::new(vec![
+        ModelStep::text("done, tests should pass"),
+        ModelStep::completed(),
+    ]))
+    .with_script(ModelScript::new(vec![
+        ModelStep::text("fixed the failing test"),
+        ModelStep::completed(),
+    ]))
+    .with_after_turn_script(vec![
+        AfterTurnAction::continue_with("cargo test failed: auth_flow"),
+        AfterTurnAction::Complete,
+    ])
+    .with_expectations(
+        Expectations::completed()
+            .equals("fixed the failing test")
+            .model_calls(2)
+            .tool_calls_started(0)
+            // turn 记录链：被打回的 assistant 已提交，随后是新的 assistant 回复。
+            .message_roles(vec![Role::User, Role::Assistant, Role::Assistant])
+            // 第二次模型请求的可见链：system prompt -> user -> assistant -> 注入的验证反馈 system。
+            .request_message_roles(
+                1,
+                vec![Role::System, Role::User, Role::Assistant, Role::System],
+            )
+            .request_contains(1, "cargo test failed: auth_flow")
+            .request_contains(1, "done, tests should pass"),
+    )
+    .with_budget(Budget::new(2, 0, 1_200))
+}
+
+fn after_turn_fail_fails_turn() -> Scenario {
+    Scenario::new(
+        "after_turn_fail_fails_turn",
+        "An after_turn middleware verdict of fail fails the turn with the middleware id attached.",
+        "ship it",
+    )
+    .with_script(ModelScript::new(vec![
+        ModelStep::text("ready to ship"),
+        ModelStep::completed(),
+    ]))
+    .with_after_turn_script(vec![AfterTurnAction::fail("verification gate failed")])
+    .with_expectations(
+        Expectations::failed()
+            .error_contains("eval-after-turn")
+            .error_contains("verification gate failed")
+            .model_calls(1)
+            .tool_calls_started(0),
+    )
+    .with_budget(Budget::new(1, 0, 800))
 }
 
 #[cfg(test)]
