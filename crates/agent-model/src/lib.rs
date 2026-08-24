@@ -14,12 +14,22 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use thiserror::Error;
 
+/// Default upper bound on chat completion attempts (the initial request plus
+/// retries) when the caller does not configure one.
+pub const DEFAULT_MAX_RETRIES: u32 = 3;
+
+const RETRY_BASE_BACKOFF: Duration = Duration::from_millis(500);
+const RETRY_MAX_BACKOFF: Duration = Duration::from_secs(8);
+
 #[derive(Clone)]
 pub struct OpenAiCompatConfig {
     pub base_url: String,
     pub model: String,
     pub api_key: String,
     pub timeout: Duration,
+    /// Maximum number of attempts per chat completion request, including the
+    /// first one; `0` or `1` disables retries.
+    pub max_retries: u32,
 }
 
 impl std::fmt::Debug for OpenAiCompatConfig {
@@ -30,6 +40,7 @@ impl std::fmt::Debug for OpenAiCompatConfig {
             .field("model", &self.model)
             .field("api_key", &"<redacted>")
             .field("timeout", &self.timeout)
+            .field("max_retries", &self.max_retries)
             .finish()
     }
 }
@@ -75,6 +86,12 @@ pub enum ModelError {
     HttpStatus { status: u16, body: String },
     #[error("failed to send model request: {0}")]
     Request(#[source] reqwest::Error),
+    #[error("{source} (after {attempts} attempts)")]
+    RetryExhausted {
+        attempts: u32,
+        #[source]
+        source: Box<ModelError>,
+    },
     #[error("failed to read model stream: {0}")]
     Stream(String),
     #[error("model stream was not valid UTF-8: {0}")]
@@ -193,6 +210,11 @@ impl OpenAiCompatClient {
         self
     }
 
+    /// Establishes a streaming chat completion, retrying transient failures
+    /// (connect/timeout errors and HTTP 429/500/502/503/504) with exponential
+    /// backoff. Failures after the stream has been established are *not*
+    /// retried: deltas may already have been emitted, so retrying would risk
+    /// duplicating content.
     pub async fn stream_chat(
         &self,
         conversation: &Conversation,
@@ -214,11 +236,40 @@ impl OpenAiCompatClient {
             thinking,
             reasoning_effort,
         };
+        let max_attempts = self.config.max_retries.max(1);
+        let mut attempt = 0_u32;
+        let response = loop {
+            attempt += 1;
+            match self.send_chat_completion(&request).await {
+                Ok(response) => break response,
+                Err(error) if attempt < max_attempts && is_retryable_request_error(&error) => {
+                    tokio::time::sleep(retry_backoff(attempt)).await;
+                }
+                Err(error) => {
+                    return Err(if attempt > 1 {
+                        ModelError::RetryExhausted {
+                            attempts: attempt,
+                            source: Box::new(error),
+                        }
+                    } else {
+                        error
+                    });
+                }
+            }
+        };
+
+        Ok(ChatCompletionStream::new(response.bytes_stream().boxed()))
+    }
+
+    async fn send_chat_completion(
+        &self,
+        request: &ChatCompletionRequest<'_>,
+    ) -> Result<reqwest::Response, ModelError> {
         let response = self
             .http
             .post(self.chat_completions_url())
             .bearer_auth(&self.config.api_key)
-            .json(&request)
+            .json(request)
             .send()
             .await
             .map_err(|error| ModelError::Request(error.without_url()))?;
@@ -234,7 +285,7 @@ impl OpenAiCompatClient {
             });
         }
 
-        Ok(ChatCompletionStream::new(response.bytes_stream().boxed()))
+        Ok(response)
     }
 
     pub async fn list_models(&self) -> Result<Vec<String>, ModelError> {
@@ -280,6 +331,28 @@ impl OpenAiCompatClient {
     fn models_url(&self) -> String {
         format!("{}/models", self.config.base_url.trim_end_matches('/'))
     }
+}
+
+/// Transient establish-phase failures worth retrying: connection/timeout
+/// errors, rate limiting, and server-side statuses. Other 4xx responses
+/// (auth, bad request) would fail identically on retry, so they are not
+/// retried. Classification still works after `reqwest::Error::without_url()`.
+fn is_retryable_request_error(error: &ModelError) -> bool {
+    match error {
+        ModelError::Request(source) => source.is_connect() || source.is_timeout(),
+        ModelError::HttpStatus { status, .. } => matches!(*status, 429 | 500 | 502 | 503 | 504),
+        _ => false,
+    }
+}
+
+/// Exponential backoff after the given 1-based failed attempt:
+/// 500ms, 1s, 2s, ..., capped at 8s.
+fn retry_backoff(failed_attempt: u32) -> Duration {
+    let factor = 2_u32.saturating_pow(failed_attempt.saturating_sub(1).min(10));
+    RETRY_BASE_BACKOFF
+        .checked_mul(factor)
+        .unwrap_or(RETRY_MAX_BACKOFF)
+        .min(RETRY_MAX_BACKOFF)
 }
 
 fn request_messages(
@@ -596,6 +669,7 @@ mod tests {
     use agent_protocol::{Message, ToolCall, ToolDefinition};
     use futures_util::{StreamExt, stream};
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -668,6 +742,34 @@ mod tests {
         format!("http://{addr}/v1")
     }
 
+    /// Serves one scripted `(status, body)` response per request, in order.
+    /// Returns the base URL and a counter of received requests.
+    async fn spawn_scripted_server(
+        script: Vec<(&'static str, &'static str)>,
+    ) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind server");
+        let addr = listener.local_addr().expect("server addr");
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counted_requests = Arc::clone(&requests);
+        tokio::spawn(async move {
+            for (status, body) in script {
+                let (mut socket, _) = listener.accept().await.expect("accept request");
+                let mut request = vec![0_u8; 8192];
+                let _ = socket.read(&mut request).await.expect("read request");
+                counted_requests.fetch_add(1, Ordering::SeqCst);
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write response");
+            }
+        });
+        (format!("http://{addr}/v1"), requests)
+    }
+
     fn conversation() -> Conversation {
         let mut conversation = Conversation::new();
         conversation.push(Message::user("hello"));
@@ -681,6 +783,7 @@ mod tests {
             model: "test-model".to_string(),
             api_key: "model-secret".to_string(),
             timeout: Duration::from_secs(5),
+            max_retries: DEFAULT_MAX_RETRIES,
         };
         let client = OpenAiCompatClient::new_without_proxy(config.clone()).expect("client");
 
@@ -703,6 +806,7 @@ mod tests {
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
             timeout: Duration::from_secs(1),
+            max_retries: 1,
         })
         .expect("client");
 
@@ -722,6 +826,7 @@ mod tests {
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
             timeout: Duration::from_secs(5),
+            max_retries: DEFAULT_MAX_RETRIES,
         })
         .expect("client")
     }
@@ -786,6 +891,7 @@ mod tests {
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
             timeout: Duration::from_millis(250),
+            max_retries: DEFAULT_MAX_RETRIES,
         })
         .expect("client");
 
@@ -826,6 +932,7 @@ mod tests {
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
             timeout: Duration::from_millis(100),
+            max_retries: DEFAULT_MAX_RETRIES,
         })
         .expect("client");
 
@@ -905,6 +1012,7 @@ mod tests {
             model: "test-model".to_string(),
             api_key: "bad-key".to_string(),
             timeout: Duration::from_secs(5),
+            max_retries: DEFAULT_MAX_RETRIES,
         })
         .expect("client");
 
@@ -1012,6 +1120,7 @@ mod tests {
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
             timeout: Duration::from_secs(5),
+            max_retries: DEFAULT_MAX_RETRIES,
         })
         .expect("client");
         let tools = vec![ToolDefinition::function(
@@ -1050,6 +1159,7 @@ mod tests {
                 model: "deepseek-v4-pro".to_string(),
                 api_key: "test-key".to_string(),
                 timeout: Duration::from_secs(5),
+                max_retries: DEFAULT_MAX_RETRIES,
             })
             .expect("client")
             .with_request_options(OpenAiCompatRequestOptions {
@@ -1087,6 +1197,7 @@ mod tests {
             model: "generic-model".to_string(),
             api_key: "test-key".to_string(),
             timeout: Duration::from_secs(5),
+            max_retries: DEFAULT_MAX_RETRIES,
         })
         .expect("client");
         let mut conversation = Conversation::new();
@@ -1216,5 +1327,160 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         assert!(matches!(events[0], Err(ModelError::EmptyResponse)));
+    }
+
+    const RETRY_OK_BODY: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"recovered\"},\"finish_reason\":null}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+
+    #[tokio::test]
+    async fn retries_transient_statuses_until_stream_establishes() {
+        let (base_url, requests) = spawn_scripted_server(vec![
+            ("500 Internal Server Error", "boom"),
+            ("500 Internal Server Error", "boom"),
+            ("200 OK", RETRY_OK_BODY),
+        ])
+        .await;
+        let client = OpenAiCompatClient::new_without_proxy(OpenAiCompatConfig {
+            base_url,
+            model: "test-model".to_string(),
+            api_key: "test-key".to_string(),
+            timeout: Duration::from_secs(5),
+            max_retries: DEFAULT_MAX_RETRIES,
+        })
+        .expect("client");
+
+        let stream = client
+            .stream_chat(&conversation(), &[])
+            .await
+            .expect("stream chat");
+        let events = collect_events(stream).await;
+
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+        assert!(matches!(
+            events.as_slice(),
+            [Ok(ModelEvent::TextDelta(text)), Ok(ModelEvent::Completed)] if text == "recovered"
+        ));
+    }
+
+    #[tokio::test]
+    async fn non_retryable_status_fails_immediately_without_retrying() {
+        let (base_url, requests) = spawn_scripted_server(vec![("400 Bad Request", "nope")]).await;
+        let client = OpenAiCompatClient::new_without_proxy(OpenAiCompatConfig {
+            base_url,
+            model: "test-model".to_string(),
+            api_key: "test-key".to_string(),
+            timeout: Duration::from_secs(5),
+            max_retries: DEFAULT_MAX_RETRIES,
+        })
+        .expect("client");
+
+        let err = match client.stream_chat(&conversation(), &[]).await {
+            Ok(_) => panic!("stream_chat must fail"),
+            Err(err) => err,
+        };
+
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert!(matches!(err, ModelError::HttpStatus { status: 400, .. }));
+    }
+
+    #[tokio::test]
+    async fn persistent_retryable_status_fails_after_max_attempts() {
+        let (base_url, requests) = spawn_scripted_server(vec![
+            ("429 Too Many Requests", "slow down"),
+            ("429 Too Many Requests", "slow down"),
+            ("429 Too Many Requests", "slow down"),
+            ("429 Too Many Requests", "slow down"),
+        ])
+        .await;
+        let client = OpenAiCompatClient::new_without_proxy(OpenAiCompatConfig {
+            base_url,
+            model: "test-model".to_string(),
+            api_key: "test-key".to_string(),
+            timeout: Duration::from_secs(5),
+            max_retries: DEFAULT_MAX_RETRIES,
+        })
+        .expect("client");
+
+        let err = match client.stream_chat(&conversation(), &[]).await {
+            Ok(_) => panic!("stream_chat must fail"),
+            Err(err) => err,
+        };
+
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+        let message = err.to_string();
+        assert!(message.contains("429"), "unexpected error: {message}");
+        assert!(
+            message.contains("after 3 attempts"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_max_retries_disables_retrying() {
+        let (base_url, requests) = spawn_scripted_server(vec![
+            ("500 Internal Server Error", "boom"),
+            ("200 OK", RETRY_OK_BODY),
+        ])
+        .await;
+        let client = OpenAiCompatClient::new_without_proxy(OpenAiCompatConfig {
+            base_url,
+            model: "test-model".to_string(),
+            api_key: "test-key".to_string(),
+            timeout: Duration::from_secs(5),
+            max_retries: 0,
+        })
+        .expect("client");
+
+        let err = match client.stream_chat(&conversation(), &[]).await {
+            Ok(_) => panic!("stream_chat must fail"),
+            Err(err) => err,
+        };
+
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert!(matches!(err, ModelError::HttpStatus { status: 500, .. }));
+    }
+
+    #[tokio::test]
+    async fn connect_errors_are_retried_and_report_attempts() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind unused address");
+        let addr = listener.local_addr().expect("unused address");
+        drop(listener);
+        let client = OpenAiCompatClient::new_without_proxy(OpenAiCompatConfig {
+            base_url: format!("http://{addr}/v1"),
+            model: "test-model".to_string(),
+            api_key: "test-key".to_string(),
+            timeout: Duration::from_secs(1),
+            max_retries: 2,
+        })
+        .expect("client");
+
+        let err = match client.stream_chat(&conversation(), &[]).await {
+            Ok(_) => panic!("closed address must fail"),
+            Err(err) => err,
+        };
+
+        let message = err.to_string();
+        assert!(
+            message.contains("failed to send model request"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("after 2 attempts"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn retry_backoff_doubles_and_caps_at_max() {
+        assert_eq!(retry_backoff(1), Duration::from_millis(500));
+        assert_eq!(retry_backoff(2), Duration::from_secs(1));
+        assert_eq!(retry_backoff(3), Duration::from_secs(2));
+        assert_eq!(retry_backoff(4), Duration::from_secs(4));
+        assert_eq!(retry_backoff(5), Duration::from_secs(8));
+        assert_eq!(retry_backoff(20), Duration::from_secs(8));
     }
 }

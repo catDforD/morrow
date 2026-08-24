@@ -34,6 +34,8 @@ pub struct ModelConfig {
     pub model: String,
     pub api_key_env: String,
     pub timeout_secs: u64,
+    /// 单次模型请求的最大尝试次数（含首次）；`None` 使用默认值 3，`Some(0)` 禁用重试。
+    pub max_retries: Option<u32>,
     pub context_window_tokens: usize,
     pub reserved_output_tokens: usize,
 }
@@ -46,6 +48,7 @@ impl std::fmt::Debug for ModelConfig {
             .field("model", &self.model)
             .field("api_key_env", &self.api_key_env)
             .field("timeout_secs", &self.timeout_secs)
+            .field("max_retries", &self.max_retries)
             .field("context_window_tokens", &self.context_window_tokens)
             .field("reserved_output_tokens", &self.reserved_output_tokens)
             .finish()
@@ -268,6 +271,7 @@ struct RawModelConfig {
     #[serde(rename = "OPENAI_API_KEY")]
     openai_api_key: Option<String>,
     timeout_secs: Option<u64>,
+    max_retries: Option<u32>,
     context_window_tokens: Option<usize>,
     reserved_output_tokens: Option<usize>,
 }
@@ -551,6 +555,7 @@ fn parse_model_config(model: RawModelConfig) -> Result<(ModelConfig, Option<Stri
                 .api_key_env
                 .unwrap_or_else(|| DEFAULT_API_KEY_ENV.to_string()),
             timeout_secs: model.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS),
+            max_retries: model.max_retries,
             context_window_tokens,
             reserved_output_tokens,
         },
@@ -1047,6 +1052,7 @@ system_prompt = "Desktop workspace"
 
         assert_eq!(loaded.config.model.base_url, DEFAULT_BASE_URL);
         assert_eq!(loaded.config.model.timeout_secs, DEFAULT_TIMEOUT_SECS);
+        assert_eq!(loaded.config.model.max_retries, None);
         assert_eq!(loaded.config.model.context_window_tokens, 65_536);
         assert_eq!(
             loaded.config.model.reserved_output_tokens,
@@ -1068,6 +1074,28 @@ system_prompt = "Desktop workspace"
             PermissionProfile::for_mode(PermissionMode::ReadOnly)
         );
         assert!(loaded.config.mcp_servers.is_empty());
+    }
+
+    #[test]
+    fn loads_model_max_retries() {
+        let root = unique_dir("model-max-retries");
+        let config = root.join("morrow.toml");
+        fs::write(
+            &config,
+            r#"
+[model]
+model = "test-model"
+api_key_env = "MORROW_MAX_RETRIES_KEY"
+context_window_tokens = 65536
+max_retries = 0
+"#,
+        )
+        .expect("write config");
+        set_env("MORROW_MAX_RETRIES_KEY", "secret");
+
+        let loaded = load_config_from_locations(Some(&config), &root, None).expect("load config");
+
+        assert_eq!(loaded.config.model.max_retries, Some(0));
     }
 
     #[test]

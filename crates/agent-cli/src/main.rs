@@ -2,7 +2,7 @@ use agent_config::{
     ContextConfig, McpServerConfig, ModelContextLimits, load_config, load_server_config,
 };
 use agent_hooks::{HookManager, HookSettings};
-use agent_model::{ModelError, OpenAiCompatClient, OpenAiCompatConfig};
+use agent_model::{DEFAULT_MAX_RETRIES, ModelError, OpenAiCompatClient, OpenAiCompatConfig};
 #[cfg(test)]
 use agent_protocol::Session;
 use agent_protocol::{
@@ -274,6 +274,11 @@ async fn run() -> Result<(), CliError> {
         model: loaded.config.model.model,
         api_key: loaded.api_key,
         timeout: Duration::from_secs(loaded.config.model.timeout_secs),
+        max_retries: loaded
+            .config
+            .model
+            .max_retries
+            .unwrap_or(DEFAULT_MAX_RETRIES),
     })?;
     let session_scope_root = workspace_root.clone();
     let session_store = SessionStore::for_workspace(&session_scope_root, &session_name)?;
@@ -1477,6 +1482,7 @@ mod tests {
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
             timeout: Duration::from_secs(5),
+            max_retries: 1,
         })
         .expect("client")
     }

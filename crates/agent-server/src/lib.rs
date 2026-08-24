@@ -13,7 +13,7 @@ pub use subagent_settings::{
 
 use agent_config::{ContextConfig, LoadedServerConfig, McpServerConfig};
 use agent_hooks::{HookManager, HookSettings};
-use agent_model::{ModelError, OpenAiCompatClient, OpenAiCompatConfig};
+use agent_model::{DEFAULT_MAX_RETRIES, ModelError, OpenAiCompatClient, OpenAiCompatConfig};
 use agent_protocol::{
     AgentEvent, AgentEventOrigin, ApprovalDecision, ApprovalOrigin, ApprovalRequest,
     ModelSelection, PermissionMode, PermissionProfile, ReasoningProfile, RemoteMcpServerSpec,
@@ -118,6 +118,7 @@ pub fn server_options_from_loaded_config(
                 model: model_name.clone(),
                 api_key: model.api_key,
                 timeout: Duration::from_secs(model.config.timeout_secs),
+                max_retries: model.config.max_retries.unwrap_or(DEFAULT_MAX_RETRIES),
             })?;
             Ok(FallbackModel {
                 provider_name: "默认配置".to_string(),
@@ -826,6 +827,7 @@ fn resolved_model_from_remote(spec: RemoteModelSpec) -> Result<ResolvedModel, St
         model: spec.model,
         api_key: spec.api_key,
         timeout: Duration::from_secs(spec.timeout_secs),
+        max_retries: DEFAULT_MAX_RETRIES,
     })
     .map_err(|error| error.to_string())?
     .with_request_options(agent_model::OpenAiCompatRequestOptions {
@@ -3830,6 +3832,7 @@ mod tests {
             model: "test-model".to_string(),
             api_key: "secret-test-key".to_string(),
             timeout: Duration::from_secs(1),
+            max_retries: 1,
         })
         .expect("client");
         ServerOptions {

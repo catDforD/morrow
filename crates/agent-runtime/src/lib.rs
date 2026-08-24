@@ -2756,6 +2756,7 @@ mod tests {
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
             timeout: Duration::from_secs(5),
+            max_retries: 1,
         })
         .expect("client")
     }

@@ -1,6 +1,9 @@
 use crate::secrets::{SecretString, replace_file};
 use agent_config::ModelContextLimits;
-use agent_model::{ModelError, OpenAiCompatClient, OpenAiCompatConfig, OpenAiCompatRequestOptions};
+use agent_model::{
+    DEFAULT_MAX_RETRIES, ModelError, OpenAiCompatClient, OpenAiCompatConfig,
+    OpenAiCompatRequestOptions,
+};
 use agent_protocol::{
     ModelInvocation, ModelSelection, ReasoningLevel, ReasoningProfile, RemoteFallbackModelSpec,
     RemoteModelConnectionSpec, RemoteModelSpec, RemoteTurnModel,
@@ -620,6 +623,7 @@ pub async fn discover_models(
         model: "discovery".to_string(),
         api_key: spec.api_key,
         timeout: Duration::from_secs(spec.timeout_secs),
+        max_retries: DEFAULT_MAX_RETRIES,
     })?;
     validate_timeout(spec.timeout_secs)?;
     let models = client
@@ -711,6 +715,7 @@ fn build_clients(
                 model: model.id.clone(),
                 api_key: provider.api_key.expose().to_string(),
                 timeout: Duration::from_secs(provider.timeout_secs),
+                max_retries: DEFAULT_MAX_RETRIES,
             })?;
             clients.insert((provider.id.clone(), model.id.clone()), client);
         }
