@@ -1,15 +1,15 @@
 use crate::process::run_hook_command;
 use crate::protocol::{
-    HookCommandResponse, HookCommandResult, command_context, compaction_cause, decision_allowed,
-    gate_decision, permission_decision, tool_result_json,
+    HookCommandResponse, HookCommandResult, after_turn_output, command_context, compaction_cause,
+    decision_allowed, gate_decision, permission_decision, tool_result_json,
 };
 use crate::types::{
     HOOK_CONFIG_SCHEMA_VERSION, HookDefinition, HookEvent, MAX_OPERATION_CONTEXT_BYTES,
 };
 use agent_core::{
-    AfterToolInput, AgentMiddleware, BeforeToolInput, ContextBlock, GateOutput, MiddlewareError,
-    MiddlewareExecutionContext, MiddlewareFuture, ObservationOutput, PermissionOutput,
-    PermissionRequestInput,
+    AfterToolInput, AfterTurnInput, AfterTurnOutput, AgentMiddleware, BeforeToolInput,
+    ContextBlock, GateOutput, MiddlewareError, MiddlewareExecutionContext, MiddlewareFuture,
+    ObservationOutput, PermissionOutput, PermissionRequestInput,
 };
 use agent_protocol::MiddlewareSource;
 use agent_runtime::{
@@ -33,7 +33,7 @@ pub(crate) fn register_hook(
         source,
         context_budget,
     });
-    if event.is_tool_event() {
+    if event.is_agent_event() {
         registry.register_agent_with_failure_mode(hook, failure_mode);
     } else {
         registry.register_runtime_with_failure_mode(hook, failure_mode);
@@ -226,6 +226,30 @@ impl AgentMiddleware for CommandHook {
                 Ok(ObservationOutput {
                     additional_context: result.additional_context,
                 })
+            }
+            .boxed(),
+        )
+    }
+
+    fn after_turn(&self, input: AfterTurnInput) -> Option<MiddlewareFuture<AfterTurnOutput>> {
+        if self.definition.event != HookEvent::AfterTurn || !self.matches(&input.context, None) {
+            return None;
+        }
+        let this = self.clone();
+        Some(
+            async move {
+                let result = this
+                    .invoke(
+                        input.context,
+                        json!({
+                            "final_text": input.final_text,
+                            "tool_call_count": input.tool_call_count,
+                            "turn_message_count": input.turn_message_count,
+                            "tool_names": input.tool_names,
+                        }),
+                    )
+                    .await?;
+                Ok(after_turn_output(result))
             }
             .boxed(),
         )

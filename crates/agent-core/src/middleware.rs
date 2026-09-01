@@ -1,8 +1,9 @@
 use crate::middleware_runner::{
-    MiddlewareCompletion, MiddlewareMetadata, append_context, attributed_reason,
+    MiddlewareCompletion, MiddlewareMetadata, attributed_reason, collect_context,
     run_middleware_chain,
 };
 use crate::{CancellationToken, ToolResult};
+pub use agent_protocol::MiddlewareContextBlock;
 use agent_protocol::{
     ApprovalRequest, MiddlewareAgentScope, MiddlewareOutcome, MiddlewareSource, MiddlewareStage,
     ModelInvocation, PermissionProfile, ToolCall,
@@ -46,14 +47,6 @@ impl ContextBlock {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MiddlewareContextBlock {
-    pub middleware_id: String,
-    pub source: MiddlewareSource,
-    pub stage: MiddlewareStage,
-    pub content: String,
-}
-
 #[derive(Debug, Clone)]
 pub struct MiddlewareExecutionContext {
     pub invocation_id: Option<String>,
@@ -86,6 +79,20 @@ pub struct AfterToolInput {
     pub context: MiddlewareExecutionContext,
     pub tool_call: ToolCall,
     pub result: ToolResult,
+}
+
+/// after_turn 切割面的输入：模型自称完成时的精简摘要，避免把整段历史塞给 middleware。
+#[derive(Debug, Clone)]
+pub struct AfterTurnInput {
+    pub context: MiddlewareExecutionContext,
+    /// 模型本轮的最终文本。
+    pub final_text: String,
+    /// 本 turn 内已执行的工具调用数。
+    pub tool_call_count: usize,
+    /// 本 turn 已提交的消息条数。
+    pub turn_message_count: usize,
+    /// 本 turn 调用过的工具名（按调用顺序）。
+    pub tool_names: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,6 +128,14 @@ impl Default for PermissionOutput {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ObservationOutput {
     pub additional_context: Vec<ContextBlock>,
+}
+
+/// after_turn 的裁决：接受完成、打回继续（附验证反馈上下文），或直接判负。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AfterTurnOutput {
+    Complete,
+    Continue { context: Vec<ContextBlock> },
+    Fail { reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,6 +180,10 @@ pub trait AgentMiddleware: Send + Sync {
     }
 
     fn after_tool(&self, _input: AfterToolInput) -> Option<MiddlewareFuture<ObservationOutput>> {
+        None
+    }
+
+    fn after_turn(&self, _input: AfterTurnInput) -> Option<MiddlewareFuture<AfterTurnOutput>> {
         None
     }
 }
@@ -246,6 +265,17 @@ pub struct ObservationRun {
     pub cancelled: bool,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct AfterTurnRun {
+    pub context: Vec<MiddlewareContextBlock>,
+    pub events: Vec<agent_protocol::AgentEvent>,
+    /// 判负原因（已带 middleware id 前缀）；非空表示 turn 不得完成。
+    pub fail_reasons: Vec<String>,
+    /// 任一 middleware 要求打回继续。
+    pub continue_requested: bool,
+    pub cancelled: bool,
+}
+
 impl AgentMiddlewareChain {
     pub fn new() -> Self {
         Self::default()
@@ -291,13 +321,14 @@ impl AgentMiddlewareChain {
                             MiddlewareOutcome::Deny
                         }
                     };
-                    append_context(
-                        &mut run.context,
+                    let blocks = collect_context(
                         metadata,
                         MiddlewareStage::BeforeTool,
                         output.additional_context,
                     );
+                    run.context.extend(blocks.iter().cloned());
                     MiddlewareCompletion::new(outcome, gate_reason(&output.decision))
+                        .with_context(blocks)
                 }
                 Err(error) => {
                     let reason = error.to_string();
@@ -344,13 +375,13 @@ impl AgentMiddlewareChain {
                             (MiddlewareOutcome::Deny, Some(reason.clone()))
                         }
                     };
-                    append_context(
-                        &mut run.context,
+                    let blocks = collect_context(
                         metadata,
                         MiddlewareStage::PermissionRequest,
                         output.additional_context,
                     );
-                    MiddlewareCompletion::new(outcome, reason)
+                    run.context.extend(blocks.iter().cloned());
+                    MiddlewareCompletion::new(outcome, reason).with_context(blocks)
                 }
                 Err(error) => {
                     let reason = error.to_string();
@@ -383,18 +414,64 @@ impl AgentMiddlewareChain {
             },
             |_entry, metadata, result, run: &mut ObservationRun| match result {
                 Ok(output) => {
-                    append_context(
-                        &mut run.context,
+                    let blocks = collect_context(
                         metadata,
                         MiddlewareStage::AfterTool,
                         output.additional_context,
                     );
+                    run.context.extend(blocks.iter().cloned());
                     MiddlewareCompletion::new(MiddlewareOutcome::Continue, None)
+                        .with_context(blocks)
                 }
                 Err(error) => {
                     let reason = error.to_string();
                     if metadata.failure_mode == FailureMode::Closed {
                         run.fatal_errors.push(attributed_reason(metadata, &reason));
+                    }
+                    MiddlewareCompletion::new(metadata.failure_outcome(), Some(reason))
+                }
+            },
+        )
+        .await;
+        let mut run = chain.aggregate;
+        run.events = chain.events;
+        run.cancelled = chain.cancelled;
+        run
+    }
+
+    pub async fn run_after_turn(&self, input: AfterTurnInput) -> AfterTurnRun {
+        let chain = run_middleware_chain(
+            &self.entries,
+            &input.context,
+            MiddlewareStage::AfterTurn,
+            &MIDDLEWARE_INVOCATION_COUNTER,
+            RegisteredAgentMiddleware::metadata,
+            |entry, context| {
+                let mut input = input.clone();
+                input.context = context;
+                entry.middleware.after_turn(input)
+            },
+            |_entry, metadata, result, run: &mut AfterTurnRun| match result {
+                Ok(output) => match output {
+                    AfterTurnOutput::Complete => {
+                        MiddlewareCompletion::new(MiddlewareOutcome::Continue, None)
+                    }
+                    AfterTurnOutput::Continue { context } => {
+                        run.continue_requested = true;
+                        let blocks = collect_context(metadata, MiddlewareStage::AfterTurn, context);
+                        run.context.extend(blocks.iter().cloned());
+                        MiddlewareCompletion::new(MiddlewareOutcome::Continue, None)
+                            .with_context(blocks)
+                    }
+                    AfterTurnOutput::Fail { reason } => {
+                        run.fail_reasons.push(attributed_reason(metadata, &reason));
+                        MiddlewareCompletion::new(MiddlewareOutcome::Deny, Some(reason))
+                    }
+                },
+                Err(error) => {
+                    let reason = error.to_string();
+                    if metadata.failure_mode == FailureMode::Closed {
+                        run.fail_reasons.push(attributed_reason(metadata, &reason));
                     }
                     MiddlewareCompletion::new(metadata.failure_outcome(), Some(reason))
                 }
@@ -622,5 +699,122 @@ mod tests {
 
         assert!(!open_run.denied());
         assert!(closed_run.denied());
+    }
+
+    struct ScriptedAfterTurn {
+        id: &'static str,
+        outputs: Mutex<Vec<Result<AfterTurnOutput, MiddlewareError>>>,
+    }
+
+    impl AgentMiddleware for ScriptedAfterTurn {
+        fn id(&self) -> &str {
+            self.id
+        }
+
+        fn after_turn(&self, input: AfterTurnInput) -> Option<MiddlewareFuture<AfterTurnOutput>> {
+            assert_eq!(input.final_text, "done");
+            assert_eq!(input.tool_call_count, 1);
+            assert_eq!(input.turn_message_count, 3);
+            assert_eq!(input.tool_names, vec!["shell_command".to_string()]);
+            let output = self.outputs.lock().expect("outputs").remove(0);
+            Some(async move { output }.boxed())
+        }
+    }
+
+    fn after_turn_input() -> AfterTurnInput {
+        AfterTurnInput {
+            context: context(),
+            final_text: "done".to_string(),
+            tool_call_count: 1,
+            turn_message_count: 3,
+            tool_names: vec!["shell_command".to_string()],
+        }
+    }
+
+    #[tokio::test]
+    async fn after_turn_continue_collects_context_and_fail_is_attributed() {
+        let mut chain = AgentMiddlewareChain::new();
+        chain.register(Arc::new(ScriptedAfterTurn {
+            id: "verifier",
+            outputs: Mutex::new(vec![Ok(AfterTurnOutput::Continue {
+                context: vec![ContextBlock::new("cargo test failed")],
+            })]),
+        }));
+        chain.register(Arc::new(ScriptedAfterTurn {
+            id: "lint",
+            outputs: Mutex::new(vec![Ok(AfterTurnOutput::Fail {
+                reason: "lint errors remain".to_string(),
+            })]),
+        }));
+
+        let run = chain.run_after_turn(after_turn_input()).await;
+
+        assert!(run.continue_requested);
+        assert_eq!(
+            run.fail_reasons,
+            vec!["lint: lint errors remain".to_string()]
+        );
+        assert_eq!(
+            run.context
+                .iter()
+                .map(|block| (
+                    block.middleware_id.as_str(),
+                    block.stage,
+                    block.content.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            vec![("verifier", MiddlewareStage::AfterTurn, "cargo test failed")]
+        );
+        assert_eq!(run.events.len(), 4);
+        assert!(matches!(
+            &run.events[3],
+            agent_protocol::AgentEvent::MiddlewareFinished(invocation)
+                if invocation.outcome == MiddlewareOutcome::Deny
+        ));
+    }
+
+    #[tokio::test]
+    async fn after_turn_error_fails_closed_or_open_by_failure_mode() {
+        let mut closed = AgentMiddlewareChain::new();
+        closed.register(Arc::new(ScriptedAfterTurn {
+            id: "broken",
+            outputs: Mutex::new(vec![Err(MiddlewareError::new("hook crashed"))]),
+        }));
+        let mut open = AgentMiddlewareChain::new();
+        open.register_with_failure_mode(
+            Arc::new(ScriptedAfterTurn {
+                id: "broken",
+                outputs: Mutex::new(vec![Err(MiddlewareError::new("hook crashed"))]),
+            }),
+            FailureMode::Open,
+        );
+
+        let closed_run = closed.run_after_turn(after_turn_input()).await;
+        let open_run = open.run_after_turn(after_turn_input()).await;
+
+        assert_eq!(
+            closed_run.fail_reasons,
+            vec!["broken: hook crashed".to_string()]
+        );
+        assert!(open_run.fail_reasons.is_empty());
+        assert!(!open_run.continue_requested);
+    }
+
+    #[tokio::test]
+    async fn after_turn_without_implementations_completes_without_events() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut chain = AgentMiddlewareChain::new();
+        chain.register(middleware(
+            "tool-only",
+            calls,
+            Ok(GateOutput::default()),
+            Ok(PermissionOutput::default()),
+        ));
+
+        let run = chain.run_after_turn(after_turn_input()).await;
+
+        assert!(!run.continue_requested);
+        assert!(run.fail_reasons.is_empty());
+        assert!(run.events.is_empty());
     }
 }

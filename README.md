@@ -22,7 +22,7 @@ Morrow reads and edits files, applies patches, runs shell commands behind explic
 - **Bring your own model** — any OpenAI-compatible endpoint, configured per provider and per session.
 - **Real tools** — file reads/edits, patches, search, directory listing, and shell commands.
 - **Permission profiles** — read-only, workspace-write, and full-access modes, with shell controlled separately.
-- **Policy hooks** — trusted command hooks at `before_prompt`, `before_tool`, `permission_request`, `after_tool`, and compaction boundaries; project hooks require an explicit `morrow hooks trust`.
+- **Policy hooks** — trusted command hooks at `before_prompt`, `before_tool`, `permission_request`, `after_tool`, `after_turn`, and compaction boundaries; project hooks require an explicit `morrow hooks trust`.
 - **MCP support** — stdio and Streamable HTTP MCP servers.
 - **Session-scoped subagents** — persistent `explore`, `plan`, `worker`, and `reviewer` instances running in the background.
 - **Long-session friendly** — named, resumable sessions with automatic context compaction.
@@ -67,7 +67,7 @@ morrow                               # interactive REPL
 morrow server                        # web dashboard on 127.0.0.1:3000
 ```
 
-The dashboard is local-first and unauthenticated — keep it bound to localhost. It picks permissions per turn in the browser; `[permissions]` in `morrow.toml` applies to the CLI only.
+The dashboard is local-first — keep it bound to localhost. On startup it prints a one-time bootstrap URL that signs the browser in with an `HttpOnly` cookie; other local processes get `401`. Pass `--no-auth` to disable this for debugging, and `--permission-ceiling` (or `[server] permission_ceiling` in `morrow.toml`) to cap the permission mode the browser may pick per turn. `[permissions]` applies to the CLI only.
 
 ## Configuration
 
@@ -88,7 +88,7 @@ An inline `OPENAI_API_KEY` wins when present; otherwise Morrow reads the `api_ke
 
 ### Project instructions
 
-Morrow reads `AGENTS.md` from the workspace root and appends it to the system prompt for the main agent and all subagents. It cannot grant tool access beyond the active permission profile, and it is sent to your model provider — don't put secrets in it.
+Morrow reads `AGENTS.md` from the workspace root and appends it to the system prompt for the main agent and all subagents. The file is re-read on every turn (mtime-cached), so edits take effect on the next turn without restarting. Each turn's system prompt also ends with an `<environment>` block (workspace root, OS/arch, current date, and the current git branch when available). `AGENTS.md` cannot grant tool access beyond the active permission profile, and it is sent to your model provider — don't put secrets in it.
 
 ### MCP tools
 
@@ -101,11 +101,22 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
 enabled = true
 ```
 
-MCP tools are treated as trusted — review server commands and endpoints before enabling them.
+MCP tools that the server does not mark with `readOnlyHint` require per-call approval by default; set `require_approval = false` on a server to opt out. Review server commands and endpoints before enabling them or disabling approval.
+
+Use `[tools] allow` / `deny` in `morrow.toml` to restrict which tools the main agent sees at all. Entries match built-in tool names exactly, a whole MCP server (`mcp__filesystem`), or a prefix wildcard (`mcp__filesystem__*`); `deny` wins over `allow`, and an empty `allow` list allows everything. Skipped MCP tools are reported as startup diagnostics.
 
 ### Policy hooks
 
 Command hooks run at the lifecycle boundaries above. User-level hooks live in `~/.morrow/hooks.toml`; project hooks live in `<workspace>/.morrow/hooks.toml` and are **disabled until you run `morrow hooks trust`** for that exact hook configuration (fingerprint-pinned, `morrow hooks revoke` to remove). Hooks execute with your user permissions, so review them like shell commands. Manage them with `morrow hooks list | trust | revoke`.
+
+An `after_turn` hook runs when the model declares the turn complete, before the turn is accepted. It receives the final text and a turn summary, and answers `{"decision": "complete" | "continue" | "fail"}`: `continue` feeds `additional_context` back into the conversation for one more model call (at most 3 times per turn, then the turn completes with a warning), `fail` fails the turn with the given reason. For example, a verification gate that reruns the test suite:
+
+```toml
+[[hooks]]
+id = "verify-tests"
+event = "after_turn"
+command = ["/bin/sh", "-c", "cargo test --workspace >/dev/null 2>&1 && printf '%s' '{\"decision\":\"complete\"}' || printf '%s' '{\"decision\":\"continue\",\"additional_context\":[\"cargo test is still red; fix the failures before finishing\"]}'"]
+```
 
 ### Subagents
 
@@ -118,7 +129,7 @@ Web/Desktop sessions can spawn persistent background subagents (`spawn_subagent`
 | `worker` | File reads/writes, patches, shell | Workspace-write; shell always prompts |
 | `reviewer` | Read, list, search, shell | No file writes; every shell command prompts |
 
-Effective access is the intersection of the parent's permission profile, the role ceiling, and the role's tool allowlist; subagents never receive MCP or delegation tools. Each session keeps at most 8 instances and runs at most 4 concurrently. The synchronous, read-only `delegate_task` tool remains available everywhere (including the CLI) for quick one-off delegation. Per-role model, prompt, timeout, and identity settings live under **Settings → Subagents**.
+Effective access is the intersection of the parent's permission profile, the role ceiling, the role's tool allowlist, and the `[tools] allow/deny` filter; subagents never receive MCP or delegation tools. Subagent runs are unattended, so in-workspace writes are auto-approved for them regardless of `workspace_write_require_approval`. Each session keeps at most 8 instances and runs at most 4 concurrently. The synchronous, read-only `delegate_task` tool remains available everywhere (including the CLI) for quick one-off delegation. Per-role model, prompt, timeout, and identity settings live under **Settings → Subagents**.
 
 ### Web custom commands
 
@@ -129,7 +140,7 @@ Effective access is the intersection of the parent's permission profile, the rol
 | `permissions.mode` | Behavior |
 | --- | --- |
 | `read_only` | Write tools denied |
-| `workspace_write` | File changes need approval and stay in the workspace |
+| `workspace_write` | File changes stay in the workspace and run without approval (see `workspace_write_require_approval` below to restore per-change prompts) |
 | `danger_full_access` | File I/O may leave the workspace |
 
 | `permissions.shell` | Behavior |
@@ -146,6 +157,13 @@ morrow --allow-shell "run the test suite and explain failures"
 ```
 
 Shell policy is an approval boundary, not an OS sandbox — an approved command runs with your user permissions. Use an external sandbox when stronger isolation is required.
+
+In `workspace_write` mode, writes that resolve inside the workspace are auto-approved — only shell commands, out-of-workspace writes (rejected outright), and non-read-only MCP tools still gate on approval. To restore the old per-change confirmation:
+
+```toml
+[permissions]
+workspace_write_require_approval = true
+```
 
 ## Sessions
 

@@ -777,7 +777,7 @@ function validateApprovalRequest(value: unknown): void {
   if (
     typeof approval.id !== 'string' ||
     typeof approval.reason !== 'string' ||
-    !['shell_command', 'file_changes'].includes(String(action.kind))
+    !['shell_command', 'file_changes', 'mcp_tool'].includes(String(action.kind))
   ) {
     throw new SessionProtocolError('invalid approval request')
   }

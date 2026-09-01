@@ -87,8 +87,13 @@ async fn collect_child(
     input: Vec<u8>,
 ) -> Result<ChildOutput, MiddlewareError> {
     let write = async move {
-        stdin.write_all(&input).await?;
-        stdin.shutdown().await
+        match stdin.write_all(&input).await {
+            Ok(()) => stdin.shutdown().await,
+            // hook 不读 stdin 且提前退出（如直接 printf 返回结果）时，写入端会收到
+            // EPIPE；输入本来就是尽力投递，这不是 hook 失败。
+            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+            Err(error) => Err(error),
+        }
     };
     let (write, status, stdout, stderr) = tokio::join!(
         write,

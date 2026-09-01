@@ -1,6 +1,7 @@
 use crate::types::HookEvent;
 use agent_core::{
-    ContextBlock, GateDecision, MiddlewareExecutionContext, PermissionDecision, ToolResult,
+    AfterTurnOutput, ContextBlock, GateDecision, MiddlewareExecutionContext, PermissionDecision,
+    ToolResult,
 };
 use agent_runtime::CompactionCause;
 use serde::Deserialize;
@@ -12,6 +13,8 @@ pub(crate) enum HookDecision {
     Continue,
     Approve,
     Deny,
+    Complete,
+    Fail,
 }
 
 #[derive(Debug, Deserialize)]
@@ -58,7 +61,12 @@ pub(crate) fn gate_decision(decision: HookDecision, reason: Option<String>) -> G
         HookDecision::Deny => GateDecision::Deny {
             reason: reason.unwrap_or_else(|| "denied by command hook".to_string()),
         },
-        HookDecision::Continue | HookDecision::Approve => GateDecision::Continue,
+        // Complete/Fail 只对 after_turn 合法；decision_allowed 已在响应校验阶段拦截，
+        // 这里防御性地按"无意见"处理。
+        HookDecision::Continue
+        | HookDecision::Approve
+        | HookDecision::Complete
+        | HookDecision::Fail => GateDecision::Continue,
     }
 }
 
@@ -67,11 +75,14 @@ pub(crate) fn permission_decision(
     reason: Option<String>,
 ) -> PermissionDecision {
     match decision {
-        HookDecision::Continue => PermissionDecision::Continue,
         HookDecision::Approve => PermissionDecision::Approve { reason },
         HookDecision::Deny => PermissionDecision::Deny {
             reason: reason.unwrap_or_else(|| "denied by command hook".to_string()),
         },
+        // 同上：Complete/Fail 不会到达这里，防御性按 Continue 处理。
+        HookDecision::Continue | HookDecision::Complete | HookDecision::Fail => {
+            PermissionDecision::Continue
+        }
     }
 }
 
@@ -115,5 +126,24 @@ pub(crate) fn decision_allowed(event: HookEvent, decision: HookDecision) -> bool
                 | HookEvent::PermissionRequest
                 | HookEvent::PreCompact
         ),
+        HookDecision::Complete | HookDecision::Fail => event == HookEvent::AfterTurn,
+    }
+}
+
+/// after_turn hook 的裁决映射：`complete` 接受完成，`continue` 打回并注入验证反馈，
+/// `fail` 判负。`decision_allowed` 已在响应校验阶段拦截其他 decision，这里不会遇到。
+pub(crate) fn after_turn_output(result: HookCommandResult) -> AfterTurnOutput {
+    match result.decision {
+        HookDecision::Continue => AfterTurnOutput::Continue {
+            context: result.additional_context,
+        },
+        HookDecision::Fail => AfterTurnOutput::Fail {
+            reason: result
+                .reason
+                .unwrap_or_else(|| "failed by command hook".to_string()),
+        },
+        HookDecision::Complete | HookDecision::Approve | HookDecision::Deny => {
+            AfterTurnOutput::Complete
+        }
     }
 }

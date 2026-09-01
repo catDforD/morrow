@@ -51,6 +51,7 @@ pub fn project_session(
                 user_message,
                 model,
                 permissions,
+                ..
             } => {
                 let turn_id =
                     envelope
@@ -107,6 +108,8 @@ pub fn project_session(
             SessionFact::MiddlewareFinished { invocation } => {
                 middleware_audit.push(invocation.clone());
             }
+            // PromptRejected 只作审计留在 fact log，不进入投影的 Turn 状态机或模型上下文。
+            SessionFact::PromptRejected { .. } => {}
             fact => {
                 let turn_id =
                     envelope
@@ -287,6 +290,7 @@ fn apply_turn_fact(turn: &mut ProjectedTurn, envelope: &SessionFactEnvelope, fac
         SessionFact::TurnStarted { .. }
         | SessionFact::ContextCompacted { .. }
         | SessionFact::MiddlewareFinished { .. }
+        | SessionFact::PromptRejected { .. }
         | SessionFact::LegacyContextCheckpoint { .. } => {}
     }
 }
@@ -474,6 +478,7 @@ mod tests {
                     user_message: Message::user("hello"),
                     model: model(),
                     permissions: PermissionProfile::default(),
+                    system_prompt: String::new(),
                 },
             },
             SessionFactEnvelope {
@@ -511,6 +516,7 @@ mod tests {
                     user_message: Message::user("unfinished"),
                     model: model(),
                     permissions: PermissionProfile::default(),
+                    system_prompt: String::new(),
                 },
             },
             SessionFactEnvelope {
@@ -531,6 +537,7 @@ mod tests {
                     user_message: Message::user("failed"),
                     model: model(),
                     permissions: PermissionProfile::default(),
+                    system_prompt: String::new(),
                 },
             },
             SessionFactEnvelope {
@@ -551,6 +558,7 @@ mod tests {
                     user_message: Message::user("cancelled"),
                     model: model(),
                     permissions: PermissionProfile::default(),
+                    system_prompt: String::new(),
                 },
             },
             SessionFactEnvelope {
@@ -596,6 +604,7 @@ mod tests {
                     user_message: Message::user(prompt),
                     model: model(),
                     permissions: PermissionProfile::default(),
+                    system_prompt: String::new(),
                 },
             });
             let revision = facts.len() as u64 + 1;
@@ -674,6 +683,7 @@ mod tests {
             started_at_ms: 1,
             duration_ms: 2,
             reason: Some("blocked".to_string()),
+            injected_context: Vec::new(),
         };
         let facts = vec![SessionFactEnvelope {
             revision: 1,
@@ -689,5 +699,66 @@ mod tests {
 
         assert!(projection.turns.is_empty());
         assert_eq!(projection.middleware_audit, vec![invocation]);
+    }
+
+    #[test]
+    fn prompt_rejected_is_audit_only_and_never_enters_context() {
+        let header = SessionLogHeader {
+            schema_version: agent_protocol::SESSION_DOCUMENT_SCHEMA_VERSION,
+            session_id: "session-rejected".to_string(),
+            created_at_ms: 1,
+        };
+        let facts = vec![
+            SessionFactEnvelope {
+                revision: 1,
+                timestamp_ms: 1,
+                operation_id: None,
+                turn_id: None,
+                fact: SessionFact::PromptRejected {
+                    prompt: "blocked secret".to_string(),
+                    reasons: vec!["policy: secret detected".to_string()],
+                },
+            },
+            SessionFactEnvelope {
+                revision: 2,
+                timestamp_ms: 2,
+                operation_id: Some("op-1".to_string()),
+                turn_id: Some("turn-1".to_string()),
+                fact: SessionFact::TurnStarted {
+                    user_message: Message::user("hello"),
+                    model: model(),
+                    permissions: PermissionProfile::default(),
+                    system_prompt: "system".to_string(),
+                },
+            },
+            SessionFactEnvelope {
+                revision: 3,
+                timestamp_ms: 3,
+                operation_id: Some("op-1".to_string()),
+                turn_id: Some("turn-1".to_string()),
+                fact: SessionFact::ModelMessageCommitted {
+                    model_call_id: "model-0".to_string(),
+                    message: Message::assistant("hi"),
+                },
+            },
+            SessionFactEnvelope {
+                revision: 4,
+                timestamp_ms: 4,
+                operation_id: Some("op-1".to_string()),
+                turn_id: Some("turn-1".to_string()),
+                fact: SessionFact::TurnCompleted,
+            },
+        ];
+
+        let projection = project_session(&header, &facts).expect("project");
+
+        assert_eq!(projection.revision, 4);
+        assert_eq!(projection.turns.len(), 1);
+        assert_eq!(projection.turns[0].status, SessionTurnStatus::Completed);
+        assert_eq!(
+            projection.context.messages,
+            vec![Message::user("hello"), Message::assistant("hi")]
+        );
+        assert!(projection.middleware_audit.is_empty());
     }
 }

@@ -3,16 +3,46 @@ base_url = "https://opencode.ai/zen/go/v1"
 model = "deepseek-v4-flash"
 OPENAI_API_KEY = "replace-with-your-api-key"
 timeout_secs = 120
+# Maximum chat completion attempts on transient failures (connect/timeout
+# errors, HTTP 429/500/502/503/504), including the first attempt.
+# 0 or 1 disables retries.
+# max_retries = 3
 context_window_tokens = 256000
 reserved_output_tokens = 8192
 
 [permissions]
 mode = "read_only"
 shell = "deny"
+# In workspace_write mode, file changes inside the workspace are auto-approved
+# (only shell commands and non-read-only MCP tools still prompt). Set to true
+# to restore the old behavior of confirming every file change.
+# workspace_write_require_approval = false
+
+# Tool-level allow/deny for the main agent and persistent subagents.
+# Entries match built-in tool names exactly (e.g. "shell_command"), a whole MCP
+# server ("mcp__filesystem"), or a prefix wildcard ("mcp__filesystem__*").
+# deny wins over allow; an empty allow list (the default) allows everything.
+# [tools]
+# allow = ["read_file", "list_files", "search_text", "web_fetch", "mcp__docs__*"]
+# deny = ["shell_command"]
+
+# Web dashboard (`morrow server`) settings.
+# [server]
+# Cap on the permission mode browser clients may pick per turn.
+# One of "read_only", "workspace_write", "danger_full_access".
+# Defaults to "danger_full_access" (no cap); "workspace_write" is a good
+# choice when the dashboard is reachable by other users or machines.
+# permission_ceiling = "workspace_write"
 
 [context]
 auto_compact = true
 auto_compact_threshold = 0.835
+# Absolute context water-level ceiling in estimated tokens (default: 300000).
+# Auto-compaction triggers at min(context_window * threshold, max_context_tokens),
+# so even million-token windows settle around this ceiling; the same budget backs
+# the mid-turn guard, which forces a tool-less wrap-up call when a turn's tool
+# loop would grow the conversation past it. Disabled together with auto_compact.
+# max_context_tokens = 300000
 retain_recent_turns = 2
 summary_target_tokens = 12000
 compact_max_retries = 2
@@ -26,6 +56,9 @@ compact_max_retries = 2
 # enabled = true
 # startup_timeout_sec = 10
 # tool_timeout_sec = 60
+# Non-read-only tools require approval per call unless you opt out (default: true).
+# Tools marked readOnlyHint by the server always run without approval.
+# require_approval = true
 
 # MCP Streamable HTTP server example. OAuth is not supported yet.
 # [mcp_servers.remote]
@@ -36,3 +69,4 @@ compact_max_retries = 2
 # enabled = true
 # startup_timeout_sec = 10
 # tool_timeout_sec = 60
+# require_approval = true

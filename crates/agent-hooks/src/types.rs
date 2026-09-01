@@ -22,6 +22,7 @@ pub enum HookEvent {
     BeforeTool,
     PermissionRequest,
     AfterTool,
+    AfterTurn,
     PreCompact,
     PostCompact,
 }
@@ -33,6 +34,7 @@ impl HookEvent {
             Self::BeforeTool => "before_tool",
             Self::PermissionRequest => "permission_request",
             Self::AfterTool => "after_tool",
+            Self::AfterTurn => "after_turn",
             Self::PreCompact => "pre_compact",
             Self::PostCompact => "post_compact",
         }
@@ -43,6 +45,11 @@ impl HookEvent {
             self,
             Self::BeforeTool | Self::PermissionRequest | Self::AfterTool
         )
+    }
+
+    /// 挂在 agent 中间件链（turn 生命周期）上的事件；其余挂在 runtime 链上。
+    pub(crate) fn is_agent_event(self) -> bool {
+        self.is_tool_event() || self == Self::AfterTurn
     }
 }
 

@@ -1,5 +1,5 @@
 use agent_core::middleware_runner::{
-    MiddlewareCompletion, MiddlewareMetadata, append_context, attributed_reason,
+    MiddlewareCompletion, MiddlewareMetadata, attributed_reason, collect_context,
     run_middleware_chain,
 };
 use agent_core::{
@@ -152,13 +152,14 @@ impl RuntimeMiddlewareChain {
             },
             |_entry, metadata, result, run: &mut ObservationRun| match result {
                 Ok(output) => {
-                    append_context(
-                        &mut run.context,
+                    let blocks = collect_context(
                         metadata,
                         MiddlewareStage::PostCompact,
                         output.additional_context,
                     );
+                    run.context.extend(blocks.iter().cloned());
                     MiddlewareCompletion::new(MiddlewareOutcome::Continue, None)
+                        .with_context(blocks)
                 }
                 Err(error) => {
                     let reason = error.to_string();
@@ -201,8 +202,9 @@ impl RuntimeMiddlewareChain {
                             (MiddlewareOutcome::Deny, Some(reason.clone()))
                         }
                     };
-                    append_context(&mut run.context, metadata, stage, output.additional_context);
-                    MiddlewareCompletion::new(outcome, reason)
+                    let blocks = collect_context(metadata, stage, output.additional_context);
+                    run.context.extend(blocks.iter().cloned());
+                    MiddlewareCompletion::new(outcome, reason).with_context(blocks)
                 }
                 Err(error) => {
                     let reason = error.to_string();

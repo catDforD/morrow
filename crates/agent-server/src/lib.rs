@@ -11,9 +11,9 @@ pub use subagent_settings::{
     load_subagent_identities,
 };
 
-use agent_config::{ContextConfig, LoadedServerConfig, McpServerConfig};
+use agent_config::{ContextConfig, LoadedServerConfig, McpServerConfig, ToolsConfig};
 use agent_hooks::{HookManager, HookSettings};
-use agent_model::{ModelError, OpenAiCompatClient, OpenAiCompatConfig};
+use agent_model::{DEFAULT_MAX_RETRIES, ModelError, OpenAiCompatClient, OpenAiCompatConfig};
 use agent_protocol::{
     AgentEvent, AgentEventOrigin, ApprovalDecision, ApprovalOrigin, ApprovalRequest,
     ModelSelection, PermissionMode, PermissionProfile, ReasoningProfile, RemoteMcpServerSpec,
@@ -26,8 +26,8 @@ use agent_runtime::{
     AgentEventEnvelope, CancellationToken, McpInspection, McpToolCache, Model, RunAgentTurnContext,
     SessionHandle, SessionListingDiagnostic, SessionListingEntry, SessionStore,
     SessionSubscription, SubagentController, SubagentInstanceDocument, SubagentObserver,
-    SubagentRoleRuntime, SubagentSupervisor, TurnEventHandler, inspect_mcp_servers,
-    load_workspace_instructions, subagent_store_for_session,
+    SubagentRoleRuntime, SubagentSupervisor, TurnEventHandler, WorkspaceInstructionsCache,
+    inspect_mcp_servers, subagent_store_for_session,
 };
 use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -56,6 +56,7 @@ use models::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::fmt::Write as _;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -81,7 +82,11 @@ pub struct ServerOptions {
     pub command_store_path: PathBuf,
     pub subagent_store_path: PathBuf,
     pub hook_home_dir: PathBuf,
+    /// 配置层 base prompt（不含 AGENTS.md）；AGENTS.md 段落每个 turn 经
+    /// `workspace_instructions` 缓存重读后再拼接。
     pub system_prompt: String,
+    /// 每轮重读 AGENTS.md 的进程级缓存（mtime 未变时零文件读取）。
+    pub workspace_instructions: Arc<WorkspaceInstructionsCache>,
     pub context_config: ContextConfig,
     pub workspace_root: PathBuf,
     pub workspace_location: WorkspaceLocation,
@@ -89,7 +94,12 @@ pub struct ServerOptions {
     pub config_diagnostics: Vec<String>,
     /// Default for legacy clients that do not select a permission mode per turn.
     pub permissions: PermissionProfile,
+    /// workspace_write 模式下 workspace 内文件变更是否自动放行（配置回退开关的取反值）。
+    pub auto_approve_workspace_writes: bool,
+    /// Cap on the permission mode web clients may request per turn.
+    pub permission_ceiling: PermissionMode,
     pub mcp_servers: Vec<McpServerConfig>,
+    pub tools: ToolsConfig,
     pub default_session_name: String,
 }
 
@@ -101,10 +111,10 @@ pub fn server_options_from_loaded_config(
     loaded: LoadedServerConfig,
     default_session_name: String,
 ) -> Result<ServerOptions, ModelError> {
-    let workspace_instructions =
-        load_workspace_instructions(&workspace_root, &loaded.config.agent.system_prompt);
+    // 冷启动预热：收集 AGENTS.md 诊断并填充缓存；之后每个 turn 经缓存重读。
+    let workspace_instructions = Arc::new(WorkspaceInstructionsCache::new(&workspace_root));
     let mut config_diagnostics = loaded.diagnostics;
-    config_diagnostics.extend(workspace_instructions.diagnostics);
+    config_diagnostics.extend(workspace_instructions.prewarm());
     let fallback_model = loaded
         .model
         .map(|model| {
@@ -115,6 +125,7 @@ pub fn server_options_from_loaded_config(
                 model: model_name.clone(),
                 api_key: model.api_key,
                 timeout: Duration::from_secs(model.config.timeout_secs),
+                max_retries: model.config.max_retries.unwrap_or(DEFAULT_MAX_RETRIES),
             })?;
             Ok(FallbackModel {
                 provider_name: "默认配置".to_string(),
@@ -139,14 +150,18 @@ pub fn server_options_from_loaded_config(
         command_store_path: home.join(".morrow").join("commands"),
         subagent_store_path: home.join(".morrow").join("subagents.json"),
         hook_home_dir: home.to_path_buf(),
-        system_prompt: workspace_instructions.effective_system_prompt,
+        system_prompt: loaded.config.agent.system_prompt,
+        workspace_instructions,
         context_config: loaded.config.context,
         workspace_root,
         workspace_location,
         config_path: loaded.path,
         config_diagnostics,
         permissions: PermissionProfile::for_mode(DEFAULT_WEB_PERMISSION_MODE),
+        auto_approve_workspace_writes: !loaded.config.workspace_write_require_approval,
+        permission_ceiling: loaded.config.server.permission_ceiling,
         mcp_servers: loaded.config.mcp_servers,
+        tools: loaded.config.tools,
         default_session_name,
     })
 }
@@ -158,17 +173,30 @@ fn reasoning_profile(model: &str) -> ReasoningProfile {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub enum ServerAccessPolicy {
-    #[default]
-    Browser,
+    /// Web dashboard access. `Some(token)` requires the bootstrap/cookie flow;
+    /// `None` disables authentication (only via explicit `--no-auth`).
+    Browser {
+        token: Option<String>,
+    },
     Desktop {
         token: Arc<str>,
     },
     Embedded,
 }
 
+impl Default for ServerAccessPolicy {
+    fn default() -> Self {
+        Self::Browser { token: None }
+    }
+}
+
 impl ServerAccessPolicy {
+    pub fn browser(token: Option<String>) -> Self {
+        Self::Browser { token }
+    }
+
     pub fn desktop(token: impl Into<String>) -> Self {
         Self::Desktop {
             token: Arc::from(token.into()),
@@ -179,7 +207,10 @@ impl ServerAccessPolicy {
 impl std::fmt::Debug for ServerAccessPolicy {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Browser => formatter.write_str("Browser"),
+            Self::Browser { token } => formatter
+                .debug_struct("Browser")
+                .field("token", &token.as_ref().map(|_| "<redacted>"))
+                .finish(),
             Self::Desktop { .. } => formatter
                 .debug_struct("Desktop")
                 .field("token", &"<redacted>")
@@ -187,6 +218,17 @@ impl std::fmt::Debug for ServerAccessPolicy {
             Self::Embedded => formatter.write_str("Embedded"),
         }
     }
+}
+
+/// Generate a cryptographically random browser session token.
+pub fn generate_browser_token() -> Result<String, ServerError> {
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes).map_err(|error| ServerError::Random(error.to_string()))?;
+    let mut token = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(&mut token, "{byte:02x}").expect("writing to a string cannot fail");
+    }
+    Ok(token)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -562,8 +604,11 @@ impl EmbeddedServer {
             .cloned()
             .or_else(|| models.values().next().cloned())
             .ok_or_else(|| "remote subagent runtime contains no models".to_string())?;
-        let permissions =
-            requested_permissions(self.service.inner.options.permissions, permission_mode);
+        let permissions = requested_permissions(
+            self.service.inner.options.permissions,
+            permission_mode,
+            self.service.inner.options.permission_ceiling,
+        );
         let middleware = self
             .service
             .inner
@@ -792,6 +837,7 @@ fn resolved_model_from_remote(spec: RemoteModelSpec) -> Result<ResolvedModel, St
         model: spec.model,
         api_key: spec.api_key,
         timeout: Duration::from_secs(spec.timeout_secs),
+        max_retries: DEFAULT_MAX_RETRIES,
     })
     .map_err(|error| error.to_string())?
     .with_request_options(agent_model::OpenAiCompatRequestOptions {
@@ -887,9 +933,14 @@ pub enum ServerError {
     Task(#[source] tokio::task::JoinError),
     #[error("server has {0} running turn(s)")]
     RunningTurns(usize),
+    #[error("failed to generate a browser session token: {0}")]
+    Random(String),
 }
 
-pub async fn serve(mut options: ServerOptions) -> Result<(), ServerError> {
+pub async fn serve(
+    mut options: ServerOptions,
+    access_policy: ServerAccessPolicy,
+) -> Result<(), ServerError> {
     let addr = SocketAddr::new(options.host, options.port);
     let listener = TcpListener::bind(addr)
         .await
@@ -899,13 +950,9 @@ pub async fn serve(mut options: ServerOptions) -> Result<(), ServerError> {
         .map_err(|source| ServerError::Bind { addr, source })?;
     options.host = bound_addr.ip();
     options.port = bound_addr.port();
-    axum::serve(listener, router(options)?)
+    axum::serve(listener, build_router(options, access_policy)?.0)
         .await
         .map_err(ServerError::Serve)
-}
-
-pub fn router(options: ServerOptions) -> Result<Router, ModelRegistryError> {
-    build_router(options, ServerAccessPolicy::Browser).map(|(router, _)| router)
 }
 
 pub async fn spawn_local(
@@ -1097,44 +1144,49 @@ async fn access_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    if matches!(state.inner.access_policy, ServerAccessPolicy::Embedded) {
-        return next.run(request).await;
-    }
-    let response = match &state.inner.access_policy {
-        ServerAccessPolicy::Browser => next.run(request).await,
-        ServerAccessPolicy::Embedded => next.run(request).await,
-        ServerAccessPolicy::Desktop { token } => {
-            let expected_host =
-                format!("{}:{}", state.inner.options.host, state.inner.options.port);
-            let host_matches = request
-                .headers()
-                .get(header::HOST)
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(|host| host == expected_host);
-            if !host_matches {
-                StatusCode::UNAUTHORIZED.into_response()
-            } else if is_bootstrap_request(&request, token) {
-                let mut response = StatusCode::SEE_OTHER.into_response();
-                response
-                    .headers_mut()
-                    .insert(header::LOCATION, HeaderValue::from_static("/"));
-                let cookie =
-                    format!("morrow_desktop_session={token}; HttpOnly; SameSite=Strict; Path=/");
-                if let Ok(value) = HeaderValue::from_str(&cookie) {
-                    response.headers_mut().insert(header::SET_COOKIE, value);
-                }
-                response
-            } else if !has_desktop_cookie(&request, token)
-                || !origin_is_allowed(&request, &expected_host)
-            {
-                StatusCode::UNAUTHORIZED.into_response()
-            } else {
-                next.run(request).await
-            }
+    let token: &str = match &state.inner.access_policy {
+        ServerAccessPolicy::Browser { token: Some(token) } => token.as_str(),
+        ServerAccessPolicy::Desktop { token } => token.as_ref(),
+        ServerAccessPolicy::Browser { token: None } | ServerAccessPolicy::Embedded => {
+            return with_security_headers(next.run(request).await);
         }
+    };
+    let expected_host = format!("{}:{}", state.inner.options.host, state.inner.options.port);
+    let response = match token_guard(&request, token, &expected_host) {
+        Some(rejection) => rejection,
+        None => next.run(request).await,
     };
 
     with_security_headers(response)
+}
+
+/// Shared Host/bootstrap/cookie/Origin guard for token-protected access policies.
+/// Returns `Some(response)` when the request is handled (bootstrap redirect or
+/// rejection) and `None` when it may proceed.
+fn token_guard(request: &Request<Body>, token: &str, expected_host: &str) -> Option<Response> {
+    let host_matches = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|host| host == expected_host);
+    if !host_matches {
+        return Some(StatusCode::UNAUTHORIZED.into_response());
+    }
+    if is_bootstrap_request(request, token) {
+        let mut response = StatusCode::SEE_OTHER.into_response();
+        response
+            .headers_mut()
+            .insert(header::LOCATION, HeaderValue::from_static("/"));
+        let cookie = format!("morrow_session={token}; HttpOnly; SameSite=Strict; Path=/");
+        if let Ok(value) = HeaderValue::from_str(&cookie) {
+            response.headers_mut().insert(header::SET_COOKIE, value);
+        }
+        return Some(response);
+    }
+    if !has_session_cookie(request, token) || !origin_is_allowed(request, expected_host) {
+        return Some(StatusCode::UNAUTHORIZED.into_response());
+    }
+    None
 }
 
 fn is_bootstrap_request(request: &Request<Body>, token: &str) -> bool {
@@ -1145,14 +1197,14 @@ fn is_bootstrap_request(request: &Request<Body>, token: &str) -> bool {
             .query()
             .and_then(|query| {
                 query.split('&').find_map(|pair| {
-                    pair.strip_prefix("desktop_bootstrap=")
+                    pair.strip_prefix("bootstrap=")
                         .filter(|value| !value.contains('='))
                 })
             })
             .is_some_and(|provided| constant_time_eq(provided.as_bytes(), token.as_bytes()))
 }
 
-fn has_desktop_cookie(request: &Request<Body>, token: &str) -> bool {
+fn has_session_cookie(request: &Request<Body>, token: &str) -> bool {
     request
         .headers()
         .get(header::COOKIE)
@@ -1161,7 +1213,7 @@ fn has_desktop_cookie(request: &Request<Body>, token: &str) -> bool {
             cookies.split(';').any(|cookie| {
                 cookie
                     .trim()
-                    .strip_prefix("morrow_desktop_session=")
+                    .strip_prefix("morrow_session=")
                     .is_some_and(|provided| constant_time_eq(provided.as_bytes(), token.as_bytes()))
             })
         })
@@ -2477,7 +2529,11 @@ async fn start_turn_inner(
     }
 
     let cancellation = CancellationToken::new();
-    let permissions = requested_permissions(state.inner.options.permissions, permission_mode);
+    let permissions = requested_permissions(
+        state.inner.options.permissions,
+        permission_mode,
+        state.inner.options.permission_ceiling,
+    );
     if running_snapshot(&state, &session_name).await.is_some() {
         return Err("session already has a running turn".to_string());
     }
@@ -2558,9 +2614,12 @@ async fn start_turn_inner(
                 context_config: state.inner.options.context_config,
                 model_limits: resolved_model.limits,
                 workspace_root: &state.inner.options.workspace_root,
+                workspace_instructions: Some(state.inner.options.workspace_instructions.as_ref()),
                 permissions,
                 mcp_servers: hook_mcp_servers,
                 mcp_cache: mcp_cache.as_ref(),
+                tools: Some(&state.inner.options.tools),
+                auto_approve_workspace_writes: state.inner.options.auto_approve_workspace_writes,
                 session_name: &session_name,
                 turn_index,
             },
@@ -2571,6 +2630,9 @@ async fn start_turn_inner(
         &prompt,
         &mut hook_handler,
         &cancellation,
+        // 该 turn 随后一定以 `Some(supervisor)` 运行，TurnStarted 需记录含持久
+        // subagent guidance 的完整 system prompt。
+        true,
     )
     .await
     .map_err(|error| error.to_string())?
@@ -2588,6 +2650,7 @@ async fn start_turn_inner(
         }
         let operation_id = prepared.operation_id;
         let turn_id = prepared.turn_id;
+        let system_prompt = prepared.system_prompt;
         let result = (operation_id.clone(), turn_id.clone());
         let state_for_task = state.clone();
         let session_for_task = session_name.clone();
@@ -2602,6 +2665,7 @@ async fn start_turn_inner(
                 operation_id,
                 turn_id: turn_for_task,
                 prompt,
+                system_prompt,
                 permissions,
                 resolved_model,
                 mcp_servers,
@@ -2644,6 +2708,8 @@ struct TurnTaskContext {
     operation_id: String,
     turn_id: String,
     prompt: String,
+    /// prepare 阶段写入 `TurnStarted` fact 的 turn base prompt，运行阶段复用。
+    system_prompt: String,
     permissions: PermissionProfile,
     resolved_model: ResolvedModel,
     mcp_servers: Option<Vec<McpServerConfig>>,
@@ -2726,6 +2792,7 @@ async fn run_turn_task_inner(context: TurnTaskContext) -> Result<(), agent_runti
         operation_id,
         turn_id,
         prompt,
+        system_prompt,
         permissions,
         resolved_model,
         mcp_servers,
@@ -2768,9 +2835,12 @@ async fn run_turn_task_inner(context: TurnTaskContext) -> Result<(), agent_runti
                     context_config: options.context_config,
                     model_limits: resolved_model.limits,
                     workspace_root: &options.workspace_root,
+                    workspace_instructions: Some(options.workspace_instructions.as_ref()),
                     permissions,
                     mcp_servers: &mcp_servers,
                     mcp_cache: mcp_cache.as_ref(),
+                    tools: Some(&options.tools),
+                    auto_approve_workspace_writes: options.auto_approve_workspace_writes,
                     session_name: &session_name,
                     turn_index,
                 },
@@ -2783,6 +2853,7 @@ async fn run_turn_task_inner(context: TurnTaskContext) -> Result<(), agent_runti
                     operation_id,
                     turn_id: turn_id.clone(),
                     prompt: &prompt,
+                    system_prompt,
                 },
                 initial_context,
                 event_index,
@@ -3218,6 +3289,7 @@ async fn ensure_session_resources(
             identities,
             observer,
             runtime.writer_lease.clone(),
+            state.inner.options.tools.clone(),
         )
         .map_err(|error| error.to_string())?;
         runtime.supervisor = Some(Arc::new(supervisor));
@@ -3487,10 +3559,17 @@ fn session_entry_for_name(
 fn requested_permissions(
     default: PermissionProfile,
     requested_mode: Option<PermissionMode>,
+    ceiling: PermissionMode,
 ) -> PermissionProfile {
-    requested_mode
-        .map(PermissionProfile::for_mode)
-        .unwrap_or(default)
+    match requested_mode {
+        // Derive the profile from the clamped mode so a reduced mode cannot
+        // keep the escalated shell policy of the requested one.
+        Some(mode) => PermissionProfile::for_mode(mode.clamp(ceiling)),
+        None => PermissionProfile {
+            mode: default.mode.clamp(ceiling),
+            ..default
+        },
+    }
 }
 
 async fn prepare_subagent_supervisor(
@@ -3545,6 +3624,15 @@ async fn prepare_subagent_supervisor_with_runtime(
         middleware,
     } = preparation;
     let resources = ensure_session_resources(state, session_name).await?;
+    // 持久 subagent 的 base 在每次 turn 准备时经缓存重拼（spawn 时快照），
+    // 实例生命周期内沿用 spawn 时的 prompt，不再重读 AGENTS.md。
+    let subagent_base_prompt: Arc<str> = Arc::from(
+        state
+            .inner
+            .options
+            .workspace_instructions
+            .apply(&state.inner.options.system_prompt),
+    );
     let mut roles = BTreeMap::new();
     for role in SubagentRole::ALL {
         let role_config = overrides.get(&role).cloned().unwrap_or_default();
@@ -3573,7 +3661,7 @@ async fn prepare_subagent_supervisor_with_runtime(
                 invocation: resolved.invocation,
                 limits: resolved.limits,
                 role_config,
-                base_system_prompt: Arc::from(state.inner.options.system_prompt.clone()),
+                base_system_prompt: subagent_base_prompt.clone(),
                 parent_permissions,
                 middleware: middleware.clone(),
             },
@@ -3727,7 +3815,7 @@ fn broadcast_error(tx: &broadcast::Sender<ServerMessage>, message: impl ToString
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_config::{AgentConfig, ModelContextLimits, ServerAppConfig};
+    use agent_config::{AgentConfig, ModelContextLimits, ServerAppConfig, ServerConfig};
     use agent_model::{OpenAiCompatClient, OpenAiCompatConfig};
     use agent_protocol::{
         ModelInvocation, PermissionMode, ReasoningLevel, ReasoningProfile, ShellPolicy,
@@ -3740,6 +3828,10 @@ mod tests {
     use tower::ServiceExt;
 
     static ENV_LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
+
+    fn router(options: ServerOptions) -> Result<Router, ModelRegistryError> {
+        build_router(options, ServerAccessPolicy::browser(None)).map(|(router, _)| router)
+    }
 
     struct HomeGuard {
         previous: Option<std::ffi::OsString>,
@@ -3775,6 +3867,7 @@ mod tests {
             model: "test-model".to_string(),
             api_key: "secret-test-key".to_string(),
             timeout: Duration::from_secs(1),
+            max_retries: 1,
         })
         .expect("client");
         ServerOptions {
@@ -3797,19 +3890,24 @@ mod tests {
             subagent_store_path: root.join("subagents.json"),
             hook_home_dir: root.clone(),
             system_prompt: "system".to_string(),
+            workspace_instructions: Arc::new(WorkspaceInstructionsCache::new(&root)),
             context_config: ContextConfig {
                 auto_compact: false,
                 auto_compact_threshold: 0.835,
                 retain_recent_turns: 2,
                 summary_target_tokens: 256,
                 compact_max_retries: 2,
+                max_context_tokens: Some(300_000),
             },
             workspace_root: root.clone(),
             workspace_location: WorkspaceLocation::Local { path: root.clone() },
             config_path: Some(root.join("morrow.toml")),
             config_diagnostics: Vec::new(),
             permissions: PermissionProfile::for_mode(DEFAULT_WEB_PERMISSION_MODE),
+            auto_approve_workspace_writes: true,
+            permission_ceiling: PermissionMode::DangerFullAccess,
             mcp_servers: Vec::new(),
+            tools: ToolsConfig::default(),
             default_session_name: "default".to_string(),
         }
     }
@@ -3845,7 +3943,7 @@ mod tests {
                 subagent_registry,
                 sessions: Mutex::new(HashMap::new()),
                 mcp_cache: RwLock::new(Arc::new(McpToolCache::new())),
-                access_policy: ServerAccessPolicy::Browser,
+                access_policy: ServerAccessPolicy::Browser { token: None },
                 shutting_down: AtomicBool::new(false),
             }),
         }
@@ -3880,9 +3978,13 @@ mod tests {
                     retain_recent_turns: 2,
                     summary_target_tokens: 256,
                     compact_max_retries: 2,
+                    max_context_tokens: Some(300_000),
                 },
                 permissions: PermissionProfile::for_mode(DEFAULT_WEB_PERMISSION_MODE),
+                workspace_write_require_approval: false,
                 mcp_servers: Vec::new(),
+                server: ServerConfig::default(),
+                tools: ToolsConfig::default(),
             },
             path: None,
             model: None,
@@ -3898,10 +4000,12 @@ mod tests {
             "default".to_string(),
         )
         .expect("server options");
-        assert!(options.system_prompt.starts_with("base system prompt"));
+        // options.system_prompt 只保留配置层 base；AGENTS.md 由缓存每轮拼装。
+        assert_eq!(options.system_prompt, "base system prompt");
         assert!(
             options
-                .system_prompt
+                .workspace_instructions
+                .apply(&options.system_prompt)
                 .contains("Use the workspace release checklist.")
         );
         assert_eq!(options.config_diagnostics, ["existing diagnostic"]);
@@ -4105,7 +4209,7 @@ mod tests {
             state.clone(),
             "default".to_string(),
             StartTurnRequest {
-                prompt: "do not persist this prompt".to_string(),
+                prompt: "blocked prompt content".to_string(),
                 prompt_resolved: true,
                 permission_mode: None,
                 model_selection: None,
@@ -4139,7 +4243,26 @@ mod tests {
                 .expect("export session"),
         )
         .expect("export UTF-8");
-        assert!(!exported.contains("do not persist this prompt"));
+        // 被拒 prompt 以 prompt_rejected fact 落盘（只作审计，不创建 turn）。
+        let rejected = exported
+            .lines()
+            .skip(1)
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|line| line["fact"]["type"] == "prompt_rejected")
+            .expect("prompt_rejected fact");
+        assert_eq!(
+            rejected["fact"]["data"]["prompt"],
+            serde_json::json!("blocked prompt content")
+        );
+        assert!(
+            rejected["fact"]["data"]["reasons"]
+                .as_array()
+                .expect("reasons array")
+                .iter()
+                .any(|reason| reason
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("blocked by policy")))
+        );
     }
 
     #[test]
@@ -4422,7 +4545,7 @@ mod tests {
                 Request::builder()
                     .uri("/api/status")
                     .header(header::HOST, "localhost:43123")
-                    .header(header::COOKIE, "morrow_desktop_session=desktop-test-token")
+                    .header(header::COOKIE, "morrow_session=desktop-test-token")
                     .body(Body::empty())
                     .expect("request"),
             )
@@ -4434,7 +4557,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/?desktop_bootstrap=desktop-test-token")
+                    .uri("/?bootstrap=desktop-test-token")
                     .header(header::HOST, host)
                     .body(Body::empty())
                     .expect("request"),
@@ -4457,7 +4580,7 @@ mod tests {
                 Request::builder()
                     .uri("/api/status")
                     .header(header::HOST, host)
-                    .header(header::COOKIE, "morrow_desktop_session=desktop-test-token")
+                    .header(header::COOKIE, "morrow_session=desktop-test-token")
                     .body(Body::empty())
                     .expect("request"),
             )
@@ -4472,9 +4595,101 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn browser_access_remains_available_without_a_desktop_token() {
-        let response = router(test_options())
-            .expect("browser router")
+    async fn browser_access_with_token_requires_bootstrap_and_origin() {
+        let mut options = test_options();
+        options.port = 43125;
+        let (router, _) = build_router(
+            options,
+            ServerAccessPolicy::browser(Some("browser-test-token".to_string())),
+        )
+        .expect("browser router");
+        let host = "127.0.0.1:43125";
+
+        let unauthorized = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/status")
+                    .header(header::HOST, host)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let wrong_token = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/?bootstrap=wrong-token")
+                    .header(header::HOST, host)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(wrong_token.status(), StatusCode::UNAUTHORIZED);
+
+        let bootstrap = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/?bootstrap=browser-test-token")
+                    .header(header::HOST, host)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(bootstrap.status(), StatusCode::SEE_OTHER);
+        let cookie = bootstrap
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("session cookie")
+            .to_str()
+            .expect("cookie text")
+            .to_string();
+        assert!(cookie.contains("morrow_session=browser-test-token"));
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("SameSite=Strict"));
+
+        let authorized = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/status")
+                    .header(header::HOST, host)
+                    .header(header::COOKIE, "morrow_session=browser-test-token")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(authorized.status(), StatusCode::OK);
+
+        let cross_origin = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/commands/resolve")
+                    .header(header::HOST, host)
+                    .header(header::ORIGIN, "https://example.com")
+                    .header(header::COOKIE, "morrow_session=browser-test-token")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"input":"hello"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(cross_origin.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn browser_access_without_token_passes_through_for_no_auth() {
+        let (router, _) = build_router(test_options(), ServerAccessPolicy::browser(None))
+            .expect("browser router");
+        let response = router
             .oneshot(
                 Request::builder()
                     .uri("/api/status")
@@ -4498,7 +4713,7 @@ mod tests {
             .uri("/api/commands/resolve")
             .header(header::HOST, "127.0.0.1:43124")
             .header(header::ORIGIN, "https://example.com")
-            .header(header::COOKIE, "morrow_desktop_session=token")
+            .header(header::COOKIE, "morrow_session=token")
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(r#"{"input":"hello"}"#))
             .expect("request");
@@ -4510,7 +4725,7 @@ mod tests {
             .uri("/api/sessions/default/ws")
             .header(header::HOST, "127.0.0.1:43124")
             .header(header::ORIGIN, "https://example.com")
-            .header(header::COOKIE, "morrow_desktop_session=token")
+            .header(header::COOKIE, "morrow_session=token")
             .body(Body::empty())
             .expect("request");
         let response = router.oneshot(websocket).await.expect("response");
@@ -4519,7 +4734,7 @@ mod tests {
 
     #[tokio::test]
     async fn spawned_local_server_reports_address_and_shuts_down() {
-        let mut server = spawn_local(test_options(), ServerAccessPolicy::Browser)
+        let mut server = spawn_local(test_options(), ServerAccessPolicy::browser(None))
             .await
             .expect("spawn server");
 
@@ -4534,7 +4749,7 @@ mod tests {
 
     #[tokio::test]
     async fn require_idle_rejection_keeps_the_server_available() {
-        let mut server = spawn_local(test_options(), ServerAccessPolicy::Browser)
+        let mut server = spawn_local(test_options(), ServerAccessPolicy::browser(None))
             .await
             .expect("spawn server");
         let worker = tokio::spawn(std::future::pending::<()>());
@@ -5100,21 +5315,54 @@ mod tests {
     }
 
     #[test]
-    fn requested_permissions_allow_all_web_modes() {
+    fn requested_permissions_clamp_requested_mode_to_the_ceiling() {
         let read_only = PermissionProfile {
             mode: PermissionMode::ReadOnly,
             shell: ShellPolicy::Deny,
         };
 
         assert_eq!(
-            requested_permissions(read_only, Some(PermissionMode::WorkspaceWrite)),
+            requested_permissions(
+                read_only,
+                Some(PermissionMode::WorkspaceWrite),
+                PermissionMode::DangerFullAccess
+            ),
             PermissionProfile::for_mode(PermissionMode::WorkspaceWrite)
         );
         assert_eq!(
-            requested_permissions(read_only, Some(PermissionMode::DangerFullAccess)),
+            requested_permissions(
+                read_only,
+                Some(PermissionMode::DangerFullAccess),
+                PermissionMode::DangerFullAccess
+            ),
             PermissionProfile::for_mode(PermissionMode::DangerFullAccess)
         );
-        assert_eq!(requested_permissions(read_only, None), read_only);
+        assert_eq!(
+            requested_permissions(
+                read_only,
+                Some(PermissionMode::DangerFullAccess),
+                PermissionMode::WorkspaceWrite
+            ),
+            PermissionProfile::for_mode(PermissionMode::WorkspaceWrite)
+        );
+        assert_eq!(
+            requested_permissions(
+                read_only,
+                Some(PermissionMode::WorkspaceWrite),
+                PermissionMode::ReadOnly
+            ),
+            PermissionProfile::for_mode(PermissionMode::ReadOnly)
+        );
+        assert_eq!(
+            requested_permissions(read_only, None, PermissionMode::DangerFullAccess),
+            read_only
+        );
+        // The ceiling also caps the server-side default profile.
+        let workspace_write = PermissionProfile::for_mode(PermissionMode::WorkspaceWrite);
+        assert_eq!(
+            requested_permissions(workspace_write, None, PermissionMode::ReadOnly).mode,
+            PermissionMode::ReadOnly
+        );
         assert_eq!(DEFAULT_WEB_PERMISSION_MODE, PermissionMode::WorkspaceWrite);
     }
 

@@ -23,7 +23,7 @@ Morrow 以流式方式输出模型结果，按项目持久化会话，可以读�
 - **持久化会话** —— 按项目划分的命名会话，支持列表、重命名、导出和续接。
 - **真实工具** —— 文件读写、补丁、搜索、目录列举与 shell 命令。
 - **权限档案** —— 只读、工作区写入、完全访问；shell 单独控制。
-- **策略 Hook** —— 在 `before_prompt`、`before_tool`、`permission_request`、`after_tool` 与压缩前后运行受信命令 Hook；项目 Hook 需要显式 `morrow hooks trust` 后才生效。
+- **策略 Hook** —— 在 `before_prompt`、`before_tool`、`permission_request`、`after_tool`、`after_turn` 与压缩前后运行受信命令 Hook；项目 Hook 需要显式 `morrow hooks trust` 后才生效。
 - **MCP 支持** —— 通过 TOML 或仪表盘配置 stdio 与 Streamable HTTP MCP 服务器。
 - **会话级 Subagent** —— 在后台运行持久化的 `explore`、`plan`、`worker`、`reviewer` 实例，并可在 Web/Desktop 中查看、继续、取消或删除。
 - **长会话友好** —— 自动上下文压缩。
@@ -123,11 +123,11 @@ Web 端的模型、MCP 服务器、自定义命令与 Subagent 设置分别在 *
 
 ### 项目指令
 
-工作区启动时，Morrow 会读取已解析工作区根目录下的 `AGENTS.md`，并将其追加到 `[agent].system_prompt`。同一份快照会应用于主 Agent、临时委派 Agent 和持久 Subagent。运行时角色限制与权限校验仍然优先，`AGENTS.md` 不能授予额外的工具访问权限。
+工作区启动时，Morrow 会读取已解析工作区根目录下的 `AGENTS.md`，并将其追加到 `[agent].system_prompt`。之后每个 turn 都会检查文件修改时间并重读（mtime 未变时零额外读取），运行中的修改在下一个 turn 生效，主 Agent、临时委派 Agent 和持久 Subagent 均以各自 turn/spawn 时的拼装结果为准。运行时角色限制与权限校验仍然优先，`AGENTS.md` 不能授予额外的工具访问权限。
 
 只加载根目录的 `AGENTS.md`。文件必须是普通 UTF-8 文件且不超过 32 KiB；不会跟随符号链接，也不会查找嵌套文件或备用文件名。文件缺失或为空时直接忽略；读取失败会在启动终端及 **设置 → 关于** 中显示告警，同时继续使用基础 system prompt。
 
-文件修改会在下次启动 CLI/server，或重新打开桌面/WSL 工作区时生效。其内容会作为 system prompt 的一部分发送给所配置的模型，因此不要在 `AGENTS.md` 中保存密钥等敏感信息。
+每个 turn 的 system prompt 尾部还会追加 `<environment>` 块（workspace 根目录、操作系统/架构、当前日期，以及可用时的当前 git 分支）。`AGENTS.md` 内容会作为 system prompt 的一部分发送给所配置的模型，因此不要在其中保存密钥等敏感信息。
 
 ### MCP 工具
 
@@ -150,6 +150,15 @@ MCP 工具视为显式配置的受信工具，启用前请检查服务器命令�
 
 命令 Hook 在上述生命周期边界执行。用户级配置位于 `~/.morrow/hooks.toml`，项目级配置位于 `<workspace>/.morrow/hooks.toml`。项目 Hook 默认禁用：只有对该精确配置执行 `morrow hooks trust`（按 SHA-256 指纹信任）后才生效，`morrow hooks revoke` 可撤销。Hook 以当前用户权限执行，请像审查 shell 命令一样审查后再信任。可用 `morrow hooks list | trust | revoke` 管理。
 
+`after_turn` Hook 在模型自称完成、turn 被接受之前执行。它收到最终文本与 turn 摘要（`final_text`、`tool_call_count`、`turn_message_count`、`tool_names`），返回 `{"decision": "complete" | "continue" | "fail"}`：`continue` 把 `additional_context` 注入对话并再跑一轮模型（每 turn 最多 3 次，超限强制完成并发出警告），`fail` 以给定理由判负该 turn。例如一个 turn 结束前跑测试的验收门：
+
+```toml
+[[hooks]]
+id = "verify-tests"
+event = "after_turn"
+command = ["/bin/sh", "-c", "cargo test --workspace >/dev/null 2>&1 && printf '%s' '{\"decision\":\"complete\"}' || printf '%s' '{\"decision\":\"continue\",\"additional_context\":[\"cargo test 仍为红色；先修复再结束\"]}'"]
+```
+
 ### Subagent
 
 Web/Desktop 会话通过 `spawn_subagent`、`send_subagent`、`inspect_subagent`、`wait_subagents` 和 `cancel_subagent` 管理可后台运行的持久 Subagent。父 turn 结束后子任务仍可继续。用户可以在 Subagents 检查器中查看完整消息与事件日志、使用保留的上下文继续空闲或中断实例、取消活跃任务，或删除终态实例。
@@ -161,7 +170,7 @@ Web/Desktop 会话通过 `spawn_subagent`、`send_subagent`、`inspect_subagent`
 | `worker` | 文件读写、补丁、shell | 工作区写入；shell 始终审批 |
 | `reviewer` | 读取、列目录、搜索、shell | 不提供文件写工具；每条 shell 都审批 |
 
-有效权限取父权限、角色上限和显式工具 allowlist 的交集；权限不足的工具不会出现在模型请求中。Subagent 不会获得 MCP 或继续委派的工具。每个角色可覆盖模型/推理级别、追加最多 4,000 字符的提示词、设置 30–1,800 秒超时和 1–99 个工具轮次。设置变更只影响新实例；实例创建时会快照身份名称、有效提示词、模型与权限上限。
+有效权限取父权限、角色上限、显式工具 allowlist 与 `[tools] allow/deny` 过滤的交集；权限不足的工具不会出现在模型请求中。Subagent 不会获得 MCP 或继续委派的工具。Subagent run 无人值守执行，因此其工作区内写入始终自动放行，不受 `workspace_write_require_approval` 影响。每个角色可覆盖模型/推理级别、追加最多 4,000 字符的提示词、设置 30–1,800 秒超时和 1–99 个工具轮次。设置变更只影响新实例；实例创建时会快照身份名称、有效提示词、模型与权限上限。
 
 每个会话最多保留 8 个持久实例，同时最多执行 4 个 Subagent run。父智能体的文件写入与 shell、`worker` run、获批的 `reviewer` shell 共用一个 workspace writer lease；读取仍可并行。父子审批请求进入同一个 FIFO 队列并显示来源。文件修改获批后会在真正写入前重新验证预览，工作区已变化时旧审批会被拒绝。
 
@@ -178,7 +187,7 @@ Web/Desktop 会话通过 `spawn_subagent`、`send_subagent`、`inspect_subagent`
 | `permissions.mode` | 行为 |
 | --- | --- |
 | `read_only` | 拒绝写入类工具 |
-| `workspace_write` | 文件修改需批准，且限制在工作区内 |
+| `workspace_write` | 文件修改限制在工作区内并自动放行（可用下文 `workspace_write_require_approval` 恢复逐次审批） |
 | `danger_full_access` | 可访问工作区外路径 |
 
 | `permissions.shell` | 行为 |
@@ -188,6 +197,13 @@ Web/Desktop 会话通过 `spawn_subagent`、`send_subagent`、`inspect_subagent`
 | `allow` | shell 直接执行 |
 
 Shell 策略是 Agent 层的审批边界，不是 OS 级只读沙箱。获批命令会继承 Morrow 进程用户的操作系统权限，命令本身仍可能修改文件；批准前应检查命令，需要更强隔离时请配合外部沙箱。
+
+`workspace_write` 模式下，解析到工作区内的写入自动放行——只有 shell 命令、越界写入（直接拒绝）和非只读 MCP 工具仍需审批。如需恢复旧的逐次确认行为：
+
+```toml
+[permissions]
+workspace_write_require_approval = true
+```
 
 默认配置为 `read_only` + `shell = "deny"`。单次运行可覆盖：
 

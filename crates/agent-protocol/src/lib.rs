@@ -768,7 +768,7 @@ impl Thread {
 }
 
 pub const THREAD_DOCUMENT_SCHEMA_VERSION: u32 = 2;
-pub const SESSION_DOCUMENT_SCHEMA_VERSION: u32 = 6;
+pub const SESSION_DOCUMENT_SCHEMA_VERSION: u32 = 7;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ThreadDocument {
@@ -871,6 +871,26 @@ pub enum PermissionMode {
     ReadOnly,
     WorkspaceWrite,
     DangerFullAccess,
+}
+
+impl PermissionMode {
+    /// Severity rank: read_only < workspace_write < danger_full_access.
+    pub fn severity(self) -> u8 {
+        match self {
+            Self::ReadOnly => 0,
+            Self::WorkspaceWrite => 1,
+            Self::DangerFullAccess => 2,
+        }
+    }
+
+    /// The more restrictive of `self` and `ceiling`.
+    pub fn clamp(self, ceiling: Self) -> Self {
+        if self.severity() <= ceiling.severity() {
+            self
+        } else {
+            ceiling
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -980,6 +1000,11 @@ pub enum ApprovalAction {
         files: Vec<FileChangeSummary>,
         diff: String,
     },
+    McpTool {
+        server: String,
+        tool: String,
+        arguments: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
@@ -1058,10 +1083,43 @@ impl ApprovalRequest {
         }
     }
 
+    pub fn mcp_tool(
+        id: impl Into<String>,
+        server: impl Into<String>,
+        tool: impl Into<String>,
+        arguments: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            action: ApprovalAction::McpTool {
+                server: server.into(),
+                tool: tool.into(),
+                arguments: truncate_mcp_arguments(&arguments.into()),
+            },
+            reason: reason.into(),
+            origin: ApprovalOrigin::Unknown,
+        }
+    }
+
     pub fn with_origin(mut self, origin: ApprovalOrigin) -> Self {
         self.origin = origin;
         self
     }
+}
+
+/// MCP 工具审批请求展示的序列化参数上限，避免超大参数淹没审批界面。
+pub const MCP_ARGUMENTS_MAX_BYTES: usize = 2048;
+
+fn truncate_mcp_arguments(arguments: &str) -> String {
+    if arguments.len() <= MCP_ARGUMENTS_MAX_BYTES {
+        return arguments.to_string();
+    }
+    let mut end = MCP_ARGUMENTS_MAX_BYTES;
+    while !arguments.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…(truncated)", &arguments[..end])
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -1403,6 +1461,10 @@ pub enum SessionFact {
         user_message: Message,
         model: ModelInvocation,
         permissions: PermissionProfile,
+        /// 当次模型实际看到的完整 system prompt（含 AGENTS.md 与 subagent guidance）。
+        /// v6 及更早的日志行没有此字段，反序列化为空串。
+        #[serde(default)]
+        system_prompt: String,
     },
     NoticeRecorded {
         message: String,
@@ -1446,6 +1508,12 @@ pub enum SessionFact {
     },
     MiddlewareFinished {
         invocation: MiddlewareInvocationFinished,
+    },
+    /// before_prompt middleware 拒绝的 prompt。只作审计，不进入投影的模型上下文或
+    /// Turn 状态机。
+    PromptRejected {
+        prompt: String,
+        reasons: Vec<String>,
     },
     LegacyContextCheckpoint {
         source_schema: u32,
@@ -1687,6 +1755,7 @@ pub enum MiddlewareStage {
     BeforeTool,
     PermissionRequest,
     AfterTool,
+    AfterTurn,
     PreCompact,
     PostCompact,
 }
@@ -1719,6 +1788,16 @@ pub enum MiddlewareOutcome {
     SkippedUntrusted,
 }
 
+/// 一次 middleware 调用注入到模型请求的上下文块。定义在 protocol 层，使
+/// `MiddlewareInvocationFinished` 与 Session fact log 能直接持久化它。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct MiddlewareContextBlock {
+    pub middleware_id: String,
+    pub source: MiddlewareSource,
+    pub stage: MiddlewareStage,
+    pub content: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct MiddlewareInvocationStarted {
     pub invocation_id: String,
@@ -1739,6 +1818,9 @@ pub struct MiddlewareInvocationFinished {
     pub duration_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// 该次调用实际注入模型请求的上下文块；无注入或 v6 及更早的日志行为空。
+    #[serde(default)]
+    pub injected_context: Vec<MiddlewareContextBlock>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -1798,6 +1880,27 @@ pub enum AgentEvent {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn permission_mode_clamp_picks_the_more_restrictive_mode() {
+        assert_eq!(
+            PermissionMode::DangerFullAccess.clamp(PermissionMode::WorkspaceWrite),
+            PermissionMode::WorkspaceWrite
+        );
+        assert_eq!(
+            PermissionMode::ReadOnly.clamp(PermissionMode::DangerFullAccess),
+            PermissionMode::ReadOnly
+        );
+        assert_eq!(
+            PermissionMode::WorkspaceWrite.clamp(PermissionMode::WorkspaceWrite),
+            PermissionMode::WorkspaceWrite
+        );
+        assert!(
+            PermissionMode::ReadOnly.severity() < PermissionMode::WorkspaceWrite.severity()
+                && PermissionMode::WorkspaceWrite.severity()
+                    < PermissionMode::DangerFullAccess.severity()
+        );
+    }
 
     #[test]
     fn remote_runtime_debug_output_redacts_managed_secrets() {
@@ -2007,7 +2110,7 @@ mod tests {
         let document = SessionDocument::new(session.clone());
         let value = serde_json::to_value(&document).expect("serialize session document");
 
-        assert_eq!(value["schema_version"], json!(6));
+        assert_eq!(value["schema_version"], json!(7));
         assert_eq!(
             value["session"]["context"],
             json!({"summary": "Known facts", "summarized_turns": 1})
@@ -2175,6 +2278,52 @@ mod tests {
                 }
             ])
         );
+    }
+
+    #[test]
+    fn mcp_tool_approval_roundtrips_and_truncates_arguments() {
+        let request = ApprovalRequest::mcp_tool(
+            "approval-call_1",
+            "docs",
+            "search",
+            r#"{"query":"morrow"}"#,
+            "MCP tool requires approval",
+        );
+
+        let value = serde_json::to_value(&request).expect("serialize mcp approval");
+        assert_eq!(
+            value,
+            json!({
+                "id": "approval-call_1",
+                "action": {
+                    "kind": "mcp_tool",
+                    "server": "docs",
+                    "tool": "search",
+                    "arguments": "{\"query\":\"morrow\"}"
+                },
+                "reason": "MCP tool requires approval"
+            })
+        );
+        let parsed: ApprovalRequest =
+            serde_json::from_value(value).expect("deserialize mcp approval");
+        assert_eq!(parsed, request);
+
+        let long = "x".repeat(MCP_ARGUMENTS_MAX_BYTES + 100);
+        let truncated = ApprovalRequest::mcp_tool("approval-call_2", "docs", "search", long, "r");
+        let ApprovalAction::McpTool { arguments, .. } = &truncated.action else {
+            panic!("expected mcp tool action");
+        };
+        assert!(arguments.ends_with("…(truncated)"));
+        assert!(arguments.len() <= MCP_ARGUMENTS_MAX_BYTES + "…(truncated)".len());
+
+        // 多字节字符跨越截断边界时回退到字符边界，不产生非法 UTF-8。
+        let boundary = format!("{}界", "a".repeat(MCP_ARGUMENTS_MAX_BYTES - 1));
+        let truncated =
+            ApprovalRequest::mcp_tool("approval-call_3", "docs", "search", boundary, "r");
+        let ApprovalAction::McpTool { arguments, .. } = &truncated.action else {
+            panic!("expected mcp tool action");
+        };
+        assert!(arguments.starts_with(&"a".repeat(MCP_ARGUMENTS_MAX_BYTES - 1)));
     }
 
     #[test]
@@ -2529,5 +2678,111 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn v6_fact_lines_without_model_visible_fields_still_parse() {
+        // v6 的 TurnStarted 没有 system_prompt，MiddlewareFinished 没有 injected_context。
+        let turn_started: SessionFactEnvelope = serde_json::from_value(json!({
+            "revision": 1,
+            "timestamp_ms": 1,
+            "operation_id": "operation-1",
+            "turn_id": "turn-1",
+            "fact": {
+                "type": "turn_started",
+                "data": {
+                    "user_message": {"role": "user", "content": "hello"},
+                    "model": {
+                        "provider_id": "test",
+                        "provider_name": "Test",
+                        "model_id": "model",
+                        "model_name": "Model",
+                        "reasoning": "off"
+                    },
+                    "permissions": {"mode": "read_only", "shell": "deny"}
+                }
+            }
+        }))
+        .expect("parse v6 turn_started");
+        assert!(matches!(
+            turn_started.fact,
+            SessionFact::TurnStarted {
+                ref system_prompt,
+                ..
+            } if system_prompt.is_empty()
+        ));
+
+        let middleware_finished: SessionFactEnvelope = serde_json::from_value(json!({
+            "revision": 2,
+            "timestamp_ms": 2,
+            "fact": {
+                "type": "middleware_finished",
+                "data": {
+                    "invocation": {
+                        "invocation_id": "middleware-1",
+                        "middleware_id": "policy",
+                        "source": "internal",
+                        "stage": "before_prompt",
+                        "outcome": "continue",
+                        "started_at_ms": 1,
+                        "duration_ms": 2
+                    }
+                }
+            }
+        }))
+        .expect("parse v6 middleware_finished");
+        assert!(matches!(
+            middleware_finished.fact,
+            SessionFact::MiddlewareFinished {
+                ref invocation,
+            } if invocation.injected_context.is_empty()
+        ));
+    }
+
+    #[test]
+    fn model_visible_fact_fields_roundtrip() {
+        let invocation = MiddlewareInvocationFinished {
+            invocation_id: "middleware-1".to_string(),
+            middleware_id: "policy".to_string(),
+            source: MiddlewareSource::ProjectCommand,
+            stage: MiddlewareStage::BeforePrompt,
+            outcome: MiddlewareOutcome::Continue,
+            started_at_ms: 1,
+            duration_ms: 2,
+            reason: None,
+            injected_context: vec![MiddlewareContextBlock {
+                middleware_id: "policy".to_string(),
+                source: MiddlewareSource::ProjectCommand,
+                stage: MiddlewareStage::BeforePrompt,
+                content: "injected".to_string(),
+            }],
+        };
+        let facts = vec![
+            SessionFact::TurnStarted {
+                user_message: Message::user("hello"),
+                model: ModelInvocation {
+                    provider_id: "test".to_string(),
+                    provider_name: "Test".to_string(),
+                    model_id: "model".to_string(),
+                    model_name: "Model".to_string(),
+                    reasoning: ReasoningLevel::Off,
+                },
+                permissions: PermissionProfile::default(),
+                system_prompt: "base\n\nguidance".to_string(),
+            },
+            SessionFact::MiddlewareFinished {
+                invocation: invocation.clone(),
+            },
+            SessionFact::PromptRejected {
+                prompt: "secret prompt".to_string(),
+                reasons: vec!["policy: secret detected".to_string()],
+            },
+        ];
+
+        for fact in facts {
+            let bytes = serde_json::to_vec(&fact).expect("serialize fact");
+            let parsed: SessionFact = serde_json::from_slice(&bytes).expect("parse fact");
+            assert_eq!(parsed, fact);
+        }
     }
 }

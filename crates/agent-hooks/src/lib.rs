@@ -17,7 +17,7 @@ pub use types::{
 #[cfg(test)]
 use adapter::CommandHook;
 #[cfg(test)]
-use agent_core::{ContextBlock, MiddlewareExecutionContext};
+use agent_core::{AfterTurnInput, AfterTurnOutput, ContextBlock, MiddlewareExecutionContext};
 #[cfg(test)]
 use agent_protocol::{MiddlewareAgentScope, MiddlewareSource};
 #[cfg(test)]

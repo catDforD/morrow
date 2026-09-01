@@ -18,6 +18,7 @@ tauri-build = { version = "2", features = [] }
 agent-config = { workspace = true }
 agent-protocol = { workspace = true }
 agent-remote = { workspace = true }
+agent-runtime = { workspace = true }
 agent-server = { workspace = true }
 dirs = { workspace = true }
 getrandom = "0.3"

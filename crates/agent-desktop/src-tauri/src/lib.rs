@@ -3,11 +3,11 @@ mod state;
 mod wsl;
 
 use agent_config::{
-    ContextConfig, McpServerConfig, McpTransport, load_server_config_for_workspace,
+    ContextConfig, McpServerConfig, McpTransport, ToolsConfig, load_server_config_for_workspace,
 };
 use agent_protocol::{
-    PermissionProfile, RemoteEnvelope, RemoteEvent, RemoteMcpTransport, RemoteMessage,
-    RemoteRequest, RemoteResponse, RemoteWorkspaceConfiguration, WorkspaceLocation,
+    PermissionMode, PermissionProfile, RemoteEnvelope, RemoteEvent, RemoteMcpTransport,
+    RemoteMessage, RemoteRequest, RemoteResponse, RemoteWorkspaceConfiguration, WorkspaceLocation,
 };
 use agent_server::{
     EmbeddedServer, FallbackModel, RunningServer, ServerAccessPolicy, ServerOptions,
@@ -23,7 +23,7 @@ use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex as StdMutex, RwLock};
+use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::Duration;
 use tauri::ipc::Channel;
 #[cfg(target_os = "macos")]
@@ -1215,6 +1215,7 @@ fn prepare_remote_settings(
             enabled: server.enabled,
             startup_timeout_sec: server.startup_timeout_sec,
             tool_timeout_sec: server.tool_timeout_sec,
+            require_approval: None,
         })
         .collect();
     let options = ServerOptions {
@@ -1227,19 +1228,26 @@ fn prepare_remote_settings(
         subagent_store_path: morrow_home.join("subagents.json"),
         hook_home_dir: runtime_home_for_hooks(&morrow_home),
         system_prompt: String::new(),
+        workspace_instructions: Arc::new(agent_runtime::WorkspaceInstructionsCache::new(
+            &workspace_scope,
+        )),
         context_config: ContextConfig {
             auto_compact: true,
             auto_compact_threshold: 0.835,
             retain_recent_turns: 6,
             summary_target_tokens: 12_000,
             compact_max_retries: 2,
+            max_context_tokens: Some(300_000),
         },
         workspace_root: workspace_scope,
         workspace_location: location.clone(),
         config_path: None,
         config_diagnostics: Vec::new(),
         permissions: PermissionProfile::for_mode(agent_server::DEFAULT_WEB_PERMISSION_MODE),
+        auto_approve_workspace_writes: true,
+        permission_ceiling: PermissionMode::DangerFullAccess,
         mcp_servers: fallback_mcp_servers,
+        tools: ToolsConfig::default(),
         default_session_name: "default".to_string(),
     };
     EmbeddedServer::new(options)
@@ -1258,7 +1266,7 @@ async fn launch_server(
     bootstrap_token: &str,
 ) -> Result<StartedServer, DesktopError> {
     let access_policy = if cfg!(debug_assertions) {
-        ServerAccessPolicy::Browser
+        ServerAccessPolicy::browser(None)
     } else {
         ServerAccessPolicy::desktop(bootstrap_token)
     };
@@ -1267,7 +1275,7 @@ async fn launch_server(
         parse_url(VITE_DEV_URL)?
     } else {
         parse_url(&format!(
-            "{}/?desktop_bootstrap={bootstrap_token}",
+            "{}/?bootstrap={bootstrap_token}",
             server.base_url()
         ))?
     };

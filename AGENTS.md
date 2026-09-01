@@ -9,12 +9,12 @@
 - `crates/agent-eval`：确定性回归评估：脚本化模型与工具驱动真实 turn 循环，断言行为并执行效率预算棘轮。
 - `crates/agent-model`：OpenAI-compatible 模型客户端和 SSE 解析。
 - `crates/agent-protocol`：共享协议类型，例如 `Message`、`Thread`、`Turn`、Session fact 和事件。
-- `crates/agent-runtime`：一次 turn 的应用编排、上下文压缩、SessionStore 与 v6 fact log 持久化、MCP 装配和 Subagent 监督。
+- `crates/agent-runtime`：一次 turn 的应用编排、上下文压缩、SessionStore 与 v7 fact log 持久化、MCP 装配和 Subagent 监督。
 - `crates/agent-config`：`morrow.toml` 配置加载与校验。
 - `crates/agent-tools`：内置文件与 shell 工具、ToolRegistry、MCP 适配和 `web_fetch`。
 - `crates/agent-sandbox`：workspace 路径约束与权限判定。
 - `crates/agent-server`：HTTP/WebSocket、内嵌 Web 仪表盘、远程审批与取消、Subagent/MCP/命令设置。
-- `crates/agent-hooks`：命令 Hook 与中间件适配器（before_prompt、before_tool、permission_request、after_tool、pre/post compact），含项目 Hook 指纹信任。
+- `crates/agent-hooks`：命令 Hook 与中间件适配器（before_prompt、before_tool、permission_request、after_tool、after_turn、pre/post compact），含项目 Hook 指纹信任。
 - `crates/agent-remote`：Desktop/WSL 远程运行时协议与命令/事件转发。
 - `crates/agent-desktop`：Tauri 2 桌面外壳、嵌入式 server 生命周期与 WSL 连接。
 
@@ -54,4 +54,4 @@ cargo run -p agent-eval -- run
 
 ## 安全与配置提示
 
-不要提交本地密钥。`morrow.toml` 已被忽略，可能包含本地测试用 API key；优先使用 `OPENAI_API_KEY` 等环境变量。持久化 session 保存在 `~/.morrow/sessions/`，持久化 Subagent 保存在 `~/.morrow/subagent-sessions/`，其中可能包含用户输入和模型回复，应视为本地私有数据。项目 Hook（`<workspace>/.morrow/hooks.toml`）在显式 `morrow hooks trust` 前默认禁用；Hook 命令以用户身份执行，审查后再信任。
+不要提交本地密钥。`morrow.toml` 已被忽略，可能包含本地测试用 API key；优先使用 `OPENAI_API_KEY` 等环境变量。持久化 session 保存在 `~/.morrow/sessions/`，持久化 Subagent 保存在 `~/.morrow/subagent-sessions/`，其中可能包含用户输入和模型回复，应视为本地私有数据。项目 Hook（`<workspace>/.morrow/hooks.toml`）在显式 `morrow hooks trust` 前默认禁用；Hook 命令以用户身份执行，审查后再信任。MCP 工具默认纳入审批管线：server 标注 `readOnlyHint` 的只读工具直接执行，其余工具每次调用都需批准，除非在 `[mcp_servers.*]` 里显式 `require_approval = false`。

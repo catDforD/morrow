@@ -9,8 +9,8 @@
 
 use crate::model::tool_call;
 use crate::scenario::{
-    ApprovalPolicy, Budget, Expectations, ModelScript, ModelStep, Scenario, ScenarioTool,
-    ToolBehavior, ToolResponse,
+    AfterTurnAction, ApprovalPolicy, Budget, Expectations, ModelScript, ModelStep, Scenario,
+    ScenarioTool, ToolBehavior, ToolResponse,
 };
 use agent_core::ToolExecutionMode;
 use agent_protocol::Role;
@@ -26,11 +26,14 @@ pub fn builtin_suite() -> Vec<Scenario> {
         approval_denied_flows_to_model(),
         approval_granted_executes_tool(),
         runaway_tools_hit_round_limit(),
+        context_limit_wraps_up_turn(),
         model_error_fails_turn(),
         truncated_stream_fails_turn(),
         duplicate_tool_call_id_rejected(),
         empty_tool_call_list_rejected(),
         reasoning_content_preserved(),
+        after_turn_continue_reruns_model(),
+        after_turn_fail_fails_turn(),
     ]
 }
 
@@ -310,6 +313,48 @@ fn runaway_tools_hit_round_limit() -> Scenario {
     .with_budget(Budget::new(3, 2, 1_500))
 }
 
+fn context_limit_wraps_up_turn() -> Scenario {
+    Scenario::new(
+        "context_limit_wraps_up_turn",
+        "A huge tool result trips the mid-turn context guard; the turn wraps up with one final tool-less model call instead of growing unbounded.",
+        "read the big file and summarize it",
+    )
+    .with_tool(ScenarioTool::new(
+        "read_big",
+        "Reads a very large file",
+        ToolExecutionMode::Concurrent,
+        ToolBehavior::ok("x".repeat(8_000)),
+    ))
+    .with_script(ModelScript::new(vec![ModelStep::tool_calls(vec![
+        tool_call("read-1", "read_big", r#"{"path":"big.txt"}"#),
+    ])]))
+    .with_script(ModelScript::new(vec![
+        ModelStep::text("partial summary of what was read"),
+        ModelStep::completed(),
+    ]))
+    .with_context_token_limit(200)
+    .with_expectations(
+        Expectations::completed()
+            .equals("partial summary of what was read")
+            .tool_sequence(vec!["read_big"])
+            .model_calls(2)
+            .tool_calls_started(1)
+            .tool_calls_failed(0)
+            // 消息链保持合法：收尾 system 指令只进 conversation，不落 TurnRecord。
+            .message_roles(vec![
+                Role::User,
+                Role::Assistant,
+                Role::Tool,
+                Role::Assistant,
+            ])
+            // 收尾调用的请求带护栏注入的收尾指令，且不带任何工具定义。
+            .request_contains(1, "context token limit")
+            .request_contains(1, "x".repeat(64).as_str())
+            .request_without_tools(1),
+    )
+    .with_budget(Budget::new(2, 1, 4_000))
+}
+
 fn model_error_fails_turn() -> Scenario {
     Scenario::new(
         "model_error_fails_turn",
@@ -402,6 +447,63 @@ fn reasoning_content_preserved() -> Scenario {
             .model_calls(1),
     )
     .with_budget(Budget::new(1, 0, 400))
+}
+
+fn after_turn_continue_reruns_model() -> Scenario {
+    Scenario::new(
+        "after_turn_continue_reruns_model",
+        "An after_turn middleware can reject the model's first completion and feed verification output back for one more model call.",
+        "implement the fix",
+    )
+    .with_script(ModelScript::new(vec![
+        ModelStep::text("done, tests should pass"),
+        ModelStep::completed(),
+    ]))
+    .with_script(ModelScript::new(vec![
+        ModelStep::text("fixed the failing test"),
+        ModelStep::completed(),
+    ]))
+    .with_after_turn_script(vec![
+        AfterTurnAction::continue_with("cargo test failed: auth_flow"),
+        AfterTurnAction::Complete,
+    ])
+    .with_expectations(
+        Expectations::completed()
+            .equals("fixed the failing test")
+            .model_calls(2)
+            .tool_calls_started(0)
+            // turn 记录链：被打回的 assistant 已提交，随后是新的 assistant 回复。
+            .message_roles(vec![Role::User, Role::Assistant, Role::Assistant])
+            // 第二次模型请求的可见链：system prompt -> user -> assistant -> 注入的验证反馈 system。
+            .request_message_roles(
+                1,
+                vec![Role::System, Role::User, Role::Assistant, Role::System],
+            )
+            .request_contains(1, "cargo test failed: auth_flow")
+            .request_contains(1, "done, tests should pass"),
+    )
+    .with_budget(Budget::new(2, 0, 1_200))
+}
+
+fn after_turn_fail_fails_turn() -> Scenario {
+    Scenario::new(
+        "after_turn_fail_fails_turn",
+        "An after_turn middleware verdict of fail fails the turn with the middleware id attached.",
+        "ship it",
+    )
+    .with_script(ModelScript::new(vec![
+        ModelStep::text("ready to ship"),
+        ModelStep::completed(),
+    ]))
+    .with_after_turn_script(vec![AfterTurnAction::fail("verification gate failed")])
+    .with_expectations(
+        Expectations::failed()
+            .error_contains("eval-after-turn")
+            .error_contains("verification gate failed")
+            .model_calls(1)
+            .tool_calls_started(0),
+    )
+    .with_budget(Budget::new(1, 0, 800))
 }
 
 #[cfg(test)]

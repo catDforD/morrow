@@ -16,6 +16,7 @@ const DEFAULT_AUTO_COMPACT_THRESHOLD: f32 = 0.835;
 const DEFAULT_RETAIN_RECENT_TURNS: usize = 6;
 const DEFAULT_SUMMARY_TARGET_TOKENS: usize = 12_000;
 const DEFAULT_COMPACT_MAX_RETRIES: usize = 2;
+const DEFAULT_MAX_CONTEXT_TOKENS: usize = 300_000;
 const DEFAULT_MCP_STARTUP_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_MCP_TOOL_TIMEOUT_SECS: u64 = 60;
 
@@ -25,7 +26,50 @@ pub struct AppConfig {
     pub agent: AgentConfig,
     pub context: ContextConfig,
     pub permissions: PermissionProfile,
+    /// workspace_write 模式下 workspace 内文件变更是否仍需逐次审批；
+    /// 默认 false（自动放行），设为 true 恢复旧的逐次确认行为。
+    pub workspace_write_require_approval: bool,
     pub mcp_servers: Vec<McpServerConfig>,
+    pub tools: ToolsConfig,
+}
+
+/// 工具级 allow/deny：`deny` 优先于 `allow`，空 `allow` 表示全部允许。
+/// 条目支持内置工具名精确匹配、`mcp__server`（整个 server）与 `mcp__server__*` 前缀通配。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolsConfig {
+    pub allow: Vec<String>,
+    pub deny: Vec<String>,
+}
+
+impl ToolsConfig {
+    pub fn allows(&self, tool_name: &str) -> bool {
+        if self
+            .deny
+            .iter()
+            .any(|pattern| tool_name_matches_pattern(pattern, tool_name))
+        {
+            return false;
+        }
+        self.allow.is_empty()
+            || self
+                .allow
+                .iter()
+                .any(|pattern| tool_name_matches_pattern(pattern, tool_name))
+    }
+}
+
+fn tool_name_matches_pattern(pattern: &str, tool_name: &str) -> bool {
+    let pattern = pattern.trim();
+    if pattern.is_empty() {
+        return false;
+    }
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        return tool_name.starts_with(prefix);
+    }
+    tool_name == pattern
+        || tool_name
+            .strip_prefix(pattern)
+            .is_some_and(|rest| rest.starts_with("__"))
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -34,6 +78,8 @@ pub struct ModelConfig {
     pub model: String,
     pub api_key_env: String,
     pub timeout_secs: u64,
+    /// 单次模型请求的最大尝试次数（含首次）；`None` 使用默认值 3，`Some(0)` 禁用重试。
+    pub max_retries: Option<u32>,
     pub context_window_tokens: usize,
     pub reserved_output_tokens: usize,
 }
@@ -46,6 +92,7 @@ impl std::fmt::Debug for ModelConfig {
             .field("model", &self.model)
             .field("api_key_env", &self.api_key_env)
             .field("timeout_secs", &self.timeout_secs)
+            .field("max_retries", &self.max_retries)
             .field("context_window_tokens", &self.context_window_tokens)
             .field("reserved_output_tokens", &self.reserved_output_tokens)
             .finish()
@@ -79,6 +126,9 @@ pub struct ContextConfig {
     pub retain_recent_turns: usize,
     pub summary_target_tokens: usize,
     pub compact_max_retries: usize,
+    /// 上下文水位的绝对上限：压缩触发点与 turn 内护栏都不会超过它。
+    /// `None` 只保留模型窗口百分比阈值（TOML 配置始终解析为 `Some(_)`）。
+    pub max_context_tokens: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -100,6 +150,8 @@ pub struct McpServerConfig {
     pub enabled: bool,
     pub startup_timeout_sec: u64,
     pub tool_timeout_sec: u64,
+    /// 非只读工具调用是否需要审批；`None` 等价于 `Some(true)`。
+    pub require_approval: Option<bool>,
 }
 
 impl std::fmt::Debug for McpServerConfig {
@@ -127,6 +179,7 @@ impl std::fmt::Debug for McpServerConfig {
             .field("enabled", &self.enabled)
             .field("startup_timeout_sec", &self.startup_timeout_sec)
             .field("tool_timeout_sec", &self.tool_timeout_sec)
+            .field("require_approval", &self.require_approval)
             .finish()
     }
 }
@@ -143,7 +196,25 @@ pub struct ServerAppConfig {
     pub agent: AgentConfig,
     pub context: ContextConfig,
     pub permissions: PermissionProfile,
+    /// 见 AppConfig::workspace_write_require_approval。
+    pub workspace_write_require_approval: bool,
     pub mcp_servers: Vec<McpServerConfig>,
+    pub server: ServerConfig,
+    pub tools: ToolsConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerConfig {
+    /// Cap on the permission mode web clients may request per turn.
+    pub permission_ceiling: PermissionMode,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            permission_ceiling: PermissionMode::DangerFullAccess,
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -236,6 +307,8 @@ struct RawAppConfig {
     agent: Option<RawAgentConfig>,
     context: Option<RawContextConfig>,
     permissions: Option<RawPermissionsConfig>,
+    server: Option<RawServerConfig>,
+    tools: Option<RawToolsConfig>,
     #[serde(default)]
     mcp_servers: BTreeMap<String, RawMcpServerConfig>,
 }
@@ -249,6 +322,7 @@ struct RawModelConfig {
     #[serde(rename = "OPENAI_API_KEY")]
     openai_api_key: Option<String>,
     timeout_secs: Option<u64>,
+    max_retries: Option<u32>,
     context_window_tokens: Option<usize>,
     reserved_output_tokens: Option<usize>,
 }
@@ -267,6 +341,7 @@ struct RawContextConfig {
     retain_recent_turns: Option<usize>,
     summary_target_tokens: Option<usize>,
     compact_max_retries: Option<usize>,
+    max_context_tokens: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -274,6 +349,20 @@ struct RawContextConfig {
 struct RawPermissionsConfig {
     mode: Option<PermissionMode>,
     shell: Option<ShellPolicy>,
+    workspace_write_require_approval: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawServerConfig {
+    permission_ceiling: Option<PermissionMode>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawToolsConfig {
+    allow: Option<Vec<String>>,
+    deny: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -288,6 +377,7 @@ struct RawMcpServerConfig {
     enabled: Option<bool>,
     startup_timeout_sec: Option<u64>,
     tool_timeout_sec: Option<u64>,
+    require_approval: Option<bool>,
     url: Option<String>,
     bearer_token_env_var: Option<String>,
     #[serde(default)]
@@ -340,9 +430,11 @@ fn load_server_config_from_locations(
         agent,
         context,
         permissions,
+        server,
+        tools,
         mcp_servers,
     } = raw;
-    let config = parse_server_app_config(agent, context, permissions, mcp_servers)?;
+    let config = parse_server_app_config(agent, context, permissions, server, tools, mcp_servers)?;
     let mut diagnostics = Vec::new();
     let model = model.and_then(|model| match parse_model_config(model) {
         Ok((config, inline_api_key)) => {
@@ -473,17 +565,22 @@ impl TryFrom<RawAppConfig> for AppConfig {
             agent,
             context,
             permissions,
+            server,
+            tools,
             mcp_servers,
         } = value;
         let (model, _) = parse_model_config(model.unwrap_or_default())?;
-        let server = parse_server_app_config(agent, context, permissions, mcp_servers)?;
+        let server =
+            parse_server_app_config(agent, context, permissions, server, tools, mcp_servers)?;
 
         Ok(Self {
             model,
             agent: server.agent,
             context: server.context,
             permissions: server.permissions,
+            workspace_write_require_approval: server.workspace_write_require_approval,
             mcp_servers: server.mcp_servers,
+            tools: server.tools,
         })
     }
 }
@@ -523,6 +620,7 @@ fn parse_model_config(model: RawModelConfig) -> Result<(ModelConfig, Option<Stri
                 .api_key_env
                 .unwrap_or_else(|| DEFAULT_API_KEY_ENV.to_string()),
             timeout_secs: model.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS),
+            max_retries: model.max_retries,
             context_window_tokens,
             reserved_output_tokens,
         },
@@ -534,6 +632,8 @@ fn parse_server_app_config(
     agent: Option<RawAgentConfig>,
     context: Option<RawContextConfig>,
     permissions: Option<RawPermissionsConfig>,
+    server: Option<RawServerConfig>,
+    tools: Option<RawToolsConfig>,
     mcp_servers: BTreeMap<String, RawMcpServerConfig>,
 ) -> Result<ServerAppConfig, ConfigError> {
     let agent = agent.unwrap_or_default();
@@ -544,6 +644,8 @@ fn parse_server_app_config(
     if let Some(shell) = permissions.shell {
         permissions_profile.shell = shell;
     }
+    let server = server.unwrap_or_default();
+    let tools = tools.unwrap_or_default();
 
     Ok(ServerAppConfig {
         agent: AgentConfig {
@@ -553,7 +655,19 @@ fn parse_server_app_config(
         },
         context,
         permissions: permissions_profile,
+        workspace_write_require_approval: permissions
+            .workspace_write_require_approval
+            .unwrap_or(false),
         mcp_servers: parse_mcp_servers(mcp_servers)?,
+        server: ServerConfig {
+            permission_ceiling: server
+                .permission_ceiling
+                .unwrap_or(PermissionMode::DangerFullAccess),
+        },
+        tools: ToolsConfig {
+            allow: tools.allow.unwrap_or_default(),
+            deny: tools.deny.unwrap_or_default(),
+        },
     })
 }
 
@@ -589,6 +703,13 @@ impl TryFrom<RawContextConfig> for ContextConfig {
                 .compact_max_retries
                 .unwrap_or(DEFAULT_COMPACT_MAX_RETRIES),
         )?;
+        let max_context_tokens = match value.max_context_tokens {
+            Some(value) => Some(positive_config_value(
+                "[context].max_context_tokens",
+                value,
+            )?),
+            None => Some(DEFAULT_MAX_CONTEXT_TOKENS),
+        };
 
         Ok(Self {
             auto_compact: value.auto_compact.unwrap_or(DEFAULT_AUTO_COMPACT),
@@ -596,6 +717,7 @@ impl TryFrom<RawContextConfig> for ContextConfig {
             retain_recent_turns,
             summary_target_tokens,
             compact_max_retries,
+            max_context_tokens,
         })
     }
 }
@@ -692,6 +814,7 @@ fn parse_mcp_servers(
                     enabled,
                     startup_timeout_sec,
                     tool_timeout_sec,
+                    require_approval: raw.require_approval,
                 });
             }
             McpTransport::Http => {
@@ -736,6 +859,7 @@ fn parse_mcp_servers(
                     enabled,
                     startup_timeout_sec,
                     tool_timeout_sec,
+                    require_approval: raw.require_approval,
                 });
             }
         }
@@ -836,6 +960,7 @@ auto_compact_threshold = 0.75
 retain_recent_turns = 2
 summary_target_tokens = 256
 compact_max_retries = 3
+max_context_tokens = 150000
 "#
             ),
         )
@@ -1010,6 +1135,7 @@ system_prompt = "Desktop workspace"
 
         assert_eq!(loaded.config.model.base_url, DEFAULT_BASE_URL);
         assert_eq!(loaded.config.model.timeout_secs, DEFAULT_TIMEOUT_SECS);
+        assert_eq!(loaded.config.model.max_retries, None);
         assert_eq!(loaded.config.model.context_window_tokens, 65_536);
         assert_eq!(
             loaded.config.model.reserved_output_tokens,
@@ -1024,6 +1150,7 @@ system_prompt = "Desktop workspace"
                 retain_recent_turns: DEFAULT_RETAIN_RECENT_TURNS,
                 summary_target_tokens: DEFAULT_SUMMARY_TARGET_TOKENS,
                 compact_max_retries: DEFAULT_COMPACT_MAX_RETRIES,
+                max_context_tokens: Some(DEFAULT_MAX_CONTEXT_TOKENS),
             }
         );
         assert_eq!(
@@ -1031,6 +1158,28 @@ system_prompt = "Desktop workspace"
             PermissionProfile::for_mode(PermissionMode::ReadOnly)
         );
         assert!(loaded.config.mcp_servers.is_empty());
+    }
+
+    #[test]
+    fn loads_model_max_retries() {
+        let root = unique_dir("model-max-retries");
+        let config = root.join("morrow.toml");
+        fs::write(
+            &config,
+            r#"
+[model]
+model = "test-model"
+api_key_env = "MORROW_MAX_RETRIES_KEY"
+context_window_tokens = 65536
+max_retries = 0
+"#,
+        )
+        .expect("write config");
+        set_env("MORROW_MAX_RETRIES_KEY", "secret");
+
+        let loaded = load_config_from_locations(Some(&config), &root, None).expect("load config");
+
+        assert_eq!(loaded.config.model.max_retries, Some(0));
     }
 
     #[test]
@@ -1052,6 +1201,7 @@ env = { FOO = "bar" }
 cwd = "."
 startup_timeout_sec = 11
 tool_timeout_sec = 22
+require_approval = false
 "#,
         )
         .expect("write config");
@@ -1075,6 +1225,7 @@ tool_timeout_sec = 22
         assert!(server.enabled);
         assert_eq!(server.startup_timeout_sec, 11);
         assert_eq!(server.tool_timeout_sec, 22);
+        assert_eq!(server.require_approval, Some(false));
     }
 
     #[test]
@@ -1103,6 +1254,7 @@ enabled = false
         assert!(!server.enabled);
         assert_eq!(server.startup_timeout_sec, DEFAULT_MCP_STARTUP_TIMEOUT_SECS);
         assert_eq!(server.tool_timeout_sec, DEFAULT_MCP_TOOL_TIMEOUT_SECS);
+        assert_eq!(server.require_approval, None);
     }
 
     #[test]
@@ -1286,6 +1438,66 @@ oauth_client_id = "client"
                 shell: ShellPolicy::Deny,
             }
         );
+        assert!(!loaded.config.workspace_write_require_approval);
+    }
+
+    #[test]
+    fn loads_workspace_write_require_approval() {
+        let root = unique_dir("workspace-write-require-approval");
+        let config = root.join("morrow.toml");
+        fs::write(
+            &config,
+            r#"
+[permissions]
+mode = "workspace_write"
+workspace_write_require_approval = true
+"#,
+        )
+        .expect("write config");
+
+        let loaded = load_server_config_from_locations(Some(&config), &root, None)
+            .expect("load server config");
+
+        assert!(loaded.config.workspace_write_require_approval);
+    }
+
+    #[test]
+    fn loads_server_permission_ceiling() {
+        let root = unique_dir("server-ceiling");
+        let config = root.join("morrow.toml");
+        fs::write(
+            &config,
+            r#"
+[server]
+permission_ceiling = "workspace_write"
+"#,
+        )
+        .expect("write config");
+
+        let loaded = load_server_config_from_locations(Some(&config), &root, None)
+            .expect("load server config");
+
+        assert_eq!(
+            loaded.config.server.permission_ceiling,
+            PermissionMode::WorkspaceWrite
+        );
+    }
+
+    #[test]
+    fn server_permission_ceiling_defaults_to_no_cap() {
+        let root = unique_dir("server-ceiling-default");
+        let config = root.join("morrow.toml");
+        fs::write(&config, "").expect("write config");
+
+        let loaded = load_server_config_from_locations(Some(&config), &root, None)
+            .expect("load server config");
+
+        assert_eq!(
+            loaded.config.server,
+            ServerConfig {
+                permission_ceiling: PermissionMode::DangerFullAccess,
+            }
+        );
     }
 
     #[test]
@@ -1305,6 +1517,7 @@ oauth_client_id = "client"
                 retain_recent_turns: 2,
                 summary_target_tokens: 256,
                 compact_max_retries: 3,
+                max_context_tokens: Some(150_000),
             }
         );
         assert_eq!(loaded.config.model.context_window_tokens, 131_072);
@@ -1385,6 +1598,35 @@ auto_compact_threshold = 1.5
     }
 
     #[test]
+    fn rejects_zero_max_context_tokens() {
+        let root = unique_dir("context-max-tokens");
+        let config = root.join("morrow.toml");
+        fs::write(
+            &config,
+            r#"
+[model]
+model = "test-model"
+api_key_env = "MORROW_CONTEXT_MAX_TOKENS_KEY"
+context_window_tokens = 65536
+
+[context]
+max_context_tokens = 0
+"#,
+        )
+        .expect("write config");
+        set_env("MORROW_CONTEXT_MAX_TOKENS_KEY", "secret");
+
+        let err = load_config_from_locations(Some(&config), &root, None).expect_err("must fail");
+
+        assert!(matches!(
+            err,
+            ConfigError::InvalidPositiveValue {
+                field: "[context].max_context_tokens"
+            }
+        ));
+    }
+
+    #[test]
     fn rejects_legacy_max_context_chars() {
         let root = unique_dir("legacy-context");
         let config = root.join("morrow.toml");
@@ -1437,5 +1679,141 @@ http_headers = { Authorization = "Bearer mcp-secret" }
         assert!(!debug.contains("url-secret"));
         assert!(debug.contains("<redacted>"));
         assert!(debug.contains("Authorization"));
+    }
+
+    #[test]
+    fn loads_tools_allow_deny_config() {
+        let root = unique_dir("tools-allow-deny");
+        let config = root.join("morrow.toml");
+        fs::write(
+            &config,
+            r#"
+[model]
+model = "test-model"
+api_key_env = "MORROW_TOOLS_CONFIG_KEY"
+context_window_tokens = 65536
+
+[tools]
+allow = ["read_file", "mcp__docs__*"]
+deny = ["shell_command"]
+"#,
+        )
+        .expect("write config");
+        set_env("MORROW_TOOLS_CONFIG_KEY", "secret");
+
+        let loaded = load_config_from_locations(Some(&config), &root, None).expect("load config");
+
+        assert_eq!(
+            loaded.config.tools,
+            ToolsConfig {
+                allow: vec!["read_file".to_string(), "mcp__docs__*".to_string()],
+                deny: vec!["shell_command".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn tools_config_defaults_to_allowing_everything() {
+        let root = unique_dir("tools-default");
+        let config = root.join("morrow.toml");
+        fs::write(
+            &config,
+            r#"
+[model]
+model = "test-model"
+api_key_env = "MORROW_TOOLS_DEFAULT_KEY"
+context_window_tokens = 65536
+"#,
+        )
+        .expect("write config");
+        set_env("MORROW_TOOLS_DEFAULT_KEY", "secret");
+
+        let loaded = load_config_from_locations(Some(&config), &root, None).expect("load config");
+
+        assert_eq!(loaded.config.tools, ToolsConfig::default());
+        assert!(loaded.config.tools.allows("shell_command"));
+        assert!(loaded.config.tools.allows("mcp__docs__read"));
+    }
+
+    #[test]
+    fn tools_config_rejects_unknown_fields() {
+        let root = unique_dir("tools-unknown-field");
+        let config = root.join("morrow.toml");
+        fs::write(
+            &config,
+            r#"
+[model]
+model = "test-model"
+api_key_env = "MORROW_TOOLS_UNKNOWN_KEY"
+context_window_tokens = 65536
+
+[tools]
+allowed = ["read_file"]
+"#,
+        )
+        .expect("write config");
+        set_env("MORROW_TOOLS_UNKNOWN_KEY", "secret");
+
+        let err = load_config_from_locations(Some(&config), &root, None).expect_err("must fail");
+
+        assert!(matches!(err, ConfigError::Parse { .. }));
+    }
+
+    #[test]
+    fn tools_config_matching_matrix() {
+        let config = ToolsConfig::default();
+        assert!(config.allows("read_file"));
+        assert!(config.allows("mcp__docs__read"));
+
+        // 内置工具名精确匹配。
+        let config = ToolsConfig {
+            allow: vec!["read_file".to_string()],
+            deny: Vec::new(),
+        };
+        assert!(config.allows("read_file"));
+        assert!(!config.allows("read_file_extra"));
+        assert!(!config.allows("write_file"));
+
+        // mcp__server 匹配整个 server，要求 "__" 边界。
+        let config = ToolsConfig {
+            allow: vec!["mcp__docs".to_string()],
+            deny: Vec::new(),
+        };
+        assert!(config.allows("mcp__docs"));
+        assert!(config.allows("mcp__docs__read"));
+        assert!(!config.allows("mcp__docs2__read"));
+        assert!(!config.allows("mcp__fs__read"));
+
+        // 前缀通配。
+        let config = ToolsConfig {
+            allow: vec!["mcp__docs__*".to_string()],
+            deny: Vec::new(),
+        };
+        assert!(config.allows("mcp__docs__read"));
+        assert!(!config.allows("mcp__fs__read"));
+        assert!(!config.allows("read_file"));
+
+        // deny 优先于 allow。
+        let config = ToolsConfig {
+            allow: vec!["mcp__docs".to_string()],
+            deny: vec!["mcp__docs__write".to_string()],
+        };
+        assert!(config.allows("mcp__docs__read"));
+        assert!(!config.allows("mcp__docs__write"));
+
+        // 空 allow + deny 内置工具。
+        let config = ToolsConfig {
+            allow: Vec::new(),
+            deny: vec!["shell_command".to_string()],
+        };
+        assert!(!config.allows("shell_command"));
+        assert!(config.allows("read_file"));
+
+        // 空条目与空白条目不匹配任何工具。
+        let config = ToolsConfig {
+            allow: vec![String::new()],
+            deny: vec!["  ".to_string()],
+        };
+        assert!(!config.allows("read_file"));
     }
 }

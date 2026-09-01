@@ -85,7 +85,7 @@ agent-eval 是验证层：依赖 core/protocol，用脚本化模型与工具固�
 | `agent-model` | OpenAI-compatible 请求、SSE 解析，实现 `Model` | Session 写入、工具调度和 UI 事件处理 |
 | `agent-tools` | 内置工具、工具注册、MCP 工具适配，实现 `ToolRuntime` | 决定一整个 turn 的状态流转 |
 | `agent-sandbox` | workspace 路径约束和权限决策 | 直接执行模型或管理 Session |
-| `agent-runtime` | 编排已注入的模型端口与工具系统、上下文压缩、turn 事件封装、SessionStore 与 v6 fact log 持久化、Subagent 监督 | 解析 CLI 参数、实现模型 HTTP 协议或渲染 Web UI |
+| `agent-runtime` | 编排已注入的模型端口与工具系统、上下文压缩、turn 事件封装、SessionStore 与 v7 fact log 持久化、Subagent 监督 | 解析 CLI 参数、实现模型 HTTP 协议或渲染 Web UI |
 | `agent-config` | 加载并校验 `morrow.toml` 和环境变量 | 执行 agent turn |
 | `agent-cli` | CLI 参数、REPL、终端输出、交互式审批、`session` / `hooks` 子命令和服务装配 | 复制核心状态机或实现会话持久化 |
 | `agent-server` | HTTP/WebSocket API、浏览器事件、远程审批和取消入口 | 实现模型协议或工具业务 |
@@ -204,7 +204,7 @@ TurnRecord + AgentEvent
     │ 10. runtime 校验并转换 turn 事实
     ▼
 agent-runtime / SessionStore
-    │ 11. 追加 v6 Session fact log 并 sync
+    │ 11. 追加 v7 Session fact log 并 sync
     ▼
 CLI 输出、WebSocket 广播或 WSL 转发
 ```
@@ -219,19 +219,19 @@ CLI 输出、WebSocket 广播或 WSL 转发
 6. 模型请求工具时，core 先记录 assistant tool-call message，再调度工具。
 7. 工具结果被转换成 `tool` role message，随后进入下一次模型调用。
 8. 最终文本形成 assistant message，并生成完成的 `TurnRecord`。
-9. runtime 按副作用顺序把 `TurnStarted`、模型/工具事实与终态事实追加进 v6 fact log；只有已完成的 turn 消息才进入后续模型上下文。
+9. runtime 按副作用顺序把 `TurnStarted`、模型/工具事实与终态事实追加进 v7 fact log；只有已完成的 turn 消息才进入后续模型上下文。
 
-事件展示和 Session 持久化是两个概念。`AgentEvent` 用于实时观察执行过程，v6 Session fact 才是会话历史的持久化事实。
+事件展示和 Session 持久化是两个概念。`AgentEvent` 用于实时观察执行过程，v7 Session fact 才是会话历史的持久化事实。
 
 事件接收方失败也不会回滚已经发生的领域事实：若投递在 turn 中途失败，runtime 会取消执行并提交一个 `Failed` record；若 turn 已经完成，则仍提交 `Completed` record，并通过 `RunAgentTurnOutcome.error` 把投递错误返回给入口层。这样 stdout/JSONL/WebSocket 的观察故障不会造成“副作用已经发生但 Session 没有审计记录”。
 
 ## 7. Session 与 Turn 不变量
 
-当前运行时的唯一持久化事实源是 append-only v6 fact log（见第 12 节和 `docs/session-consistency-protocol.md`）。`agent-protocol::Session` 是聚合投影类型，用于旧 v1–v4 数据迁移和导出兼容；下面的不变量对聚合投影与 fact 投影同时成立。
+当前运行时的唯一持久化事实源是 append-only v7 fact log（见第 12 节和 `docs/session-consistency-protocol.md`）。`agent-protocol::Session` 是聚合投影类型，用于旧 v1–v4 数据迁移和导出兼容；下面的不变量对聚合投影与 fact 投影同时成立。
 
 ### 7.1 Session 聚合投影的三个部分
 
-聚合 Session 文档（当前 schema v6）保持下面的 JSON 结构：
+聚合 Session 文档（当前 schema v7）保持下面的 JSON 结构：
 
 ```text
 Session
@@ -368,7 +368,7 @@ CLI 没有独立的 turn cancellation 协议；进程级中断仍属于入口层
 
 ## 12. Session 持久化与事件协议
 
-`agent-runtime::SessionStore` 把 Session 保存为 append-only JSONL fact log。当前 canonical header 是 schema v6（`SESSION_DOCUMENT_SCHEMA_VERSION = 6`），并接受 v5 header（就地升级 header，不重写 facts）。旧的 v1/v2 Thread 文档和 v3/v4 Session 聚合文档只作为迁移输入；迁移产生 `LegacyContextCheckpoint` / `ContextCompacted` 等 fact 后即安装 v6 log，旧源原子移动为 `.legacy-vN.bak`。聚合 `SessionDocument`（schema v6）仅用于迁移与导出兼容，不作为运行时模型上下文的事实源。一致性细节见 [`docs/session-consistency-protocol.md`](docs/session-consistency-protocol.md)。
+`agent-runtime::SessionStore` 把 Session 保存为 append-only JSONL fact log。当前 canonical header 是 schema v7（`SESSION_DOCUMENT_SCHEMA_VERSION = 7`），并接受 v5/v6 header（就地升级 header，不重写 facts）。旧的 v1/v2 Thread 文档和 v3/v4 Session 聚合文档只作为迁移输入；迁移产生 `LegacyContextCheckpoint` / `ContextCompacted` 等 fact 后即安装 v7 log，旧源原子移动为 `.legacy-vN.bak`。聚合 `SessionDocument`（schema v7）仅用于迁移与导出兼容，不作为运行时模型上下文的事实源。一致性细节见 [`docs/session-consistency-protocol.md`](docs/session-consistency-protocol.md)。
 
 每次 turn 的 runtime 上下文必须携带解析后的 `ModelInvocation`，并在 Turn 创建时写入记录；Web、CLI、Desktop、WSL 与远端入口不得在持久化后各自补写模型信息。这样实时展示和历史恢复都以同一份模型元数据为准。
 
@@ -418,7 +418,7 @@ Subagent 身份遵守同样的单一来源规则：父 turn 启动时把 `Subage
 - `agent-tools`：验证参数、路径、权限、副作用前审批和结构化结果。
 - `agent-runtime`：验证压缩、事件 envelope、fact 追加顺序、恢复与迁移时机。
 - `agent-server`：验证同 Session 的运行限制、审批 request id、取消和 WebSocket 消息。
-- `agent-protocol`：锁定 Session v6 fact/文档、Session stream v3、事件和消息的 JSON 契约。
+- `agent-protocol`：锁定 Session v7 fact/文档、Session stream v3、事件和消息的 JSON 契约。
 - `agent-eval`：以脚本化模型和脚本化工具端到端运行真实 turn 循环，锁定工具结果回灌、错误传播、审批、轮次上限、消息链和效率预算；CI 通过 `cargo run -p agent-eval -- run` 执行。
 
 端口架构的直接收益是：core 测试不需要启动 HTTP server、真实 MCP 进程或写入用户 Session，就可以覆盖绝大多数 agent 循环行为。

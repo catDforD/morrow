@@ -538,6 +538,12 @@ export type ApprovalAction =
       files: FileChangeSummary[]
       diff: string
     }
+  | {
+      kind: 'mcp_tool'
+      server: string
+      tool: string
+      arguments: string
+    }
 
 export interface ApprovalRequest {
   id: string

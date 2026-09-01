@@ -1,8 +1,9 @@
 use agent_config::{
-    ContextConfig, McpServerConfig, ModelContextLimits, load_config, load_server_config,
+    ContextConfig, McpServerConfig, ModelContextLimits, ToolsConfig, load_config,
+    load_server_config,
 };
 use agent_hooks::{HookManager, HookSettings};
-use agent_model::{ModelError, OpenAiCompatClient, OpenAiCompatConfig};
+use agent_model::{DEFAULT_MAX_RETRIES, ModelError, OpenAiCompatClient, OpenAiCompatConfig};
 #[cfg(test)]
 use agent_protocol::Session;
 use agent_protocol::{
@@ -12,7 +13,7 @@ use agent_protocol::{
 };
 use agent_runtime::{
     AgentEventEnvelope, CompactionOutcome, McpToolCache, RunAgentTurnOutcome, SessionHandle,
-    SessionStore, SubagentSessionStore, TurnEventHandler, load_workspace_instructions,
+    SessionStore, SubagentSessionStore, TurnEventHandler, WorkspaceInstructionsCache,
 };
 use clap::{Parser, Subcommand};
 use futures_util::future::{BoxFuture, FutureExt};
@@ -81,6 +82,17 @@ enum CliCommand {
         host: IpAddr,
         #[arg(long, default_value_t = 3000)]
         port: u16,
+        #[arg(
+            long,
+            help = "Disable browser session authentication (local debugging only)"
+        )]
+        no_auth: bool,
+        #[arg(
+            long,
+            value_parser = parse_permission_mode,
+            help = "Cap the permission mode web clients may request per turn"
+        )]
+        permission_ceiling: Option<PermissionMode>,
     },
     Session {
         #[command(subcommand)]
@@ -210,10 +222,16 @@ async fn run() -> Result<(), CliError> {
     let prompt = args.prompt.join(" ");
     validate_jsonl_prompt(&args, &prompt)?;
 
-    if let Some(CliCommand::Server { host, port }) = args.command.as_ref() {
+    if let Some(CliCommand::Server {
+        host,
+        port,
+        no_auth,
+        permission_ceiling,
+    }) = args.command.as_ref()
+    {
         let loaded = load_server_config(args.config.as_deref())?;
         let home = dirs::home_dir().ok_or(CliError::HomeDirNotFound)?;
-        let options = agent_server::server_options_from_loaded_config(
+        let mut options = agent_server::server_options_from_loaded_config(
             *host,
             *port,
             workspace_root,
@@ -221,9 +239,22 @@ async fn run() -> Result<(), CliError> {
             loaded,
             session_name,
         )?;
+        if let Some(ceiling) = permission_ceiling {
+            options.permission_ceiling = *ceiling;
+        }
         print_startup_diagnostics(&options.config_diagnostics);
         eprintln!("morrow server listening on http://{host}:{port}");
-        agent_server::serve(options).await?;
+        let access_policy = if *no_auth {
+            eprintln!(
+                "WARNING: server authentication is disabled (--no-auth); any local process can drive this agent"
+            );
+            agent_server::ServerAccessPolicy::browser(None)
+        } else {
+            let token = agent_server::generate_browser_token()?;
+            eprintln!("open this URL to sign in: http://{host}:{port}/?bootstrap={token}");
+            agent_server::ServerAccessPolicy::browser(Some(token))
+        };
+        agent_server::serve(options, access_policy).await?;
         return Ok(());
     }
 
@@ -231,19 +262,26 @@ async fn run() -> Result<(), CliError> {
     let home = dirs::home_dir().ok_or(CliError::HomeDirNotFound)?;
     let subagent_store_path = home.join(".morrow").join("subagents.json");
     let loaded = load_config(args.config.as_deref())?;
-    let workspace_instructions =
-        load_workspace_instructions(&workspace_root, &loaded.config.agent.system_prompt);
-    print_startup_diagnostics(&workspace_instructions.diagnostics);
-    let system_prompt = workspace_instructions.effective_system_prompt;
+    // 冷启动预热：打印 AGENTS.md 诊断并填充缓存；之后每个 turn 经缓存重读，
+    // 运行中的修改在下一个 turn 生效。turn context 只携带配置层 base prompt。
+    let workspace_instructions = WorkspaceInstructionsCache::new(&workspace_root);
+    print_startup_diagnostics(&workspace_instructions.prewarm());
+    let system_prompt = loaded.config.agent.system_prompt.clone();
     let model_limits = loaded.config.model.context_limits();
     let model_invocation = config_model_invocation(&loaded.config.model.model);
     let permissions =
         effective_permissions(loaded.config.permissions, args.permission, args.allow_shell);
+    let auto_approve_workspace_writes = !loaded.config.workspace_write_require_approval;
     let client = OpenAiCompatClient::new(OpenAiCompatConfig {
         base_url: loaded.config.model.base_url,
         model: loaded.config.model.model,
         api_key: loaded.api_key,
         timeout: Duration::from_secs(loaded.config.model.timeout_secs),
+        max_retries: loaded
+            .config
+            .model
+            .max_retries
+            .unwrap_or(DEFAULT_MAX_RETRIES),
     })?;
     let session_scope_root = workspace_root.clone();
     let session_store = SessionStore::for_workspace(&session_scope_root, &session_name)?;
@@ -262,6 +300,7 @@ async fn run() -> Result<(), CliError> {
                 client: &client,
                 model: &model_invocation,
                 system_prompt: &system_prompt,
+                workspace_instructions: &workspace_instructions,
                 context_config: loaded.config.context,
                 model_limits,
                 session_handle: &session_handle,
@@ -271,6 +310,8 @@ async fn run() -> Result<(), CliError> {
                 config_path: &loaded.path,
                 mcp_servers: &loaded.config.mcp_servers,
                 mcp_cache: &mcp_cache,
+                tools: &loaded.config.tools,
+                auto_approve_workspace_writes,
                 subagent_store_path: &subagent_store_path,
             },
             &mut permissions,
@@ -288,12 +329,15 @@ async fn run() -> Result<(), CliError> {
             model: &model_invocation,
             subagent_identities: &subagent_identities,
             system_prompt: &system_prompt,
+            workspace_instructions: Some(&workspace_instructions),
             context_config: loaded.config.context,
             model_limits,
             workspace_root: &workspace_root,
             permissions,
             mcp_servers: &loaded.config.mcp_servers,
             mcp_cache: &mcp_cache,
+            tools: &loaded.config.tools,
+            auto_approve_workspace_writes,
             interactive_approvals: io::stdin().is_terminal(),
             output: if args.jsonl {
                 OutputMode::Jsonl {
@@ -327,6 +371,7 @@ struct ReplContext<'a> {
     client: &'a OpenAiCompatClient,
     model: &'a ModelInvocation,
     system_prompt: &'a str,
+    workspace_instructions: &'a WorkspaceInstructionsCache,
     context_config: ContextConfig,
     model_limits: ModelContextLimits,
     session_handle: &'a SessionHandle,
@@ -336,6 +381,8 @@ struct ReplContext<'a> {
     config_path: &'a Path,
     mcp_servers: &'a [McpServerConfig],
     mcp_cache: &'a McpToolCache,
+    tools: &'a ToolsConfig,
+    auto_approve_workspace_writes: bool,
     subagent_store_path: &'a Path,
 }
 
@@ -345,12 +392,15 @@ struct RunAgentTurnContext<'a> {
     model: &'a ModelInvocation,
     subagent_identities: &'a [SubagentIdentity],
     system_prompt: &'a str,
+    workspace_instructions: Option<&'a WorkspaceInstructionsCache>,
     context_config: ContextConfig,
     model_limits: ModelContextLimits,
     workspace_root: &'a Path,
     permissions: PermissionProfile,
     mcp_servers: &'a [McpServerConfig],
     mcp_cache: &'a McpToolCache,
+    tools: &'a ToolsConfig,
+    auto_approve_workspace_writes: bool,
     interactive_approvals: bool,
     output: OutputMode<'a>,
 }
@@ -413,12 +463,15 @@ async fn run_repl(
                 model: context.model,
                 subagent_identities: &subagent_identities,
                 system_prompt: context.system_prompt,
+                workspace_instructions: Some(context.workspace_instructions),
                 context_config: context.context_config,
                 model_limits: context.model_limits,
                 workspace_root: context.workspace_root,
                 permissions: *permissions,
                 mcp_servers: context.mcp_servers,
                 mcp_cache: context.mcp_cache,
+                tools: context.tools,
+                auto_approve_workspace_writes: context.auto_approve_workspace_writes,
                 interactive_approvals: io::stdin().is_terminal(),
                 output: OutputMode::Human,
             },
@@ -601,9 +654,12 @@ async fn run_persisted_agent_turn(
                 context_config: context.context_config,
                 model_limits: context.model_limits,
                 workspace_root: context.workspace_root,
+                workspace_instructions: context.workspace_instructions,
                 permissions: context.permissions,
                 mcp_servers: context.mcp_servers,
                 mcp_cache: context.mcp_cache,
+                tools: Some(context.tools),
+                auto_approve_workspace_writes: context.auto_approve_workspace_writes,
                 session_name,
                 turn_index,
             },
@@ -645,9 +701,12 @@ async fn run_agent_turn(
             context_config: context.context_config,
             model_limits: context.model_limits,
             workspace_root: context.workspace_root,
+            workspace_instructions: context.workspace_instructions,
             permissions: context.permissions,
             mcp_servers: context.mcp_servers,
             mcp_cache: context.mcp_cache,
+            tools: Some(context.tools),
+            auto_approve_workspace_writes: context.auto_approve_workspace_writes,
             session_name,
             turn_index,
         },
@@ -1221,6 +1280,21 @@ fn format_approval_request(request: &ApprovalRequest, permissions: PermissionPro
             let _ = writeln!(output, "permissions: {}", permission_summary(permissions));
             let _ = writeln!(output, "warning: approving this action will modify files.");
         }
+        ApprovalAction::McpTool {
+            server,
+            tool,
+            arguments,
+        } => {
+            let _ = writeln!(output, "action: mcp tool");
+            let _ = writeln!(output, "server: {server}");
+            let _ = writeln!(output, "tool: {tool}");
+            let _ = writeln!(output, "arguments: {arguments}");
+            let _ = writeln!(output, "permissions: {}", permission_summary(permissions));
+            let _ = writeln!(
+                output,
+                "warning: approving this action lets the MCP server perform side effects."
+            );
+        }
     }
     output
 }
@@ -1432,6 +1506,7 @@ mod tests {
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
             timeout: Duration::from_secs(5),
+            max_retries: 1,
         })
         .expect("client")
     }
@@ -1495,6 +1570,7 @@ mod tests {
             retain_recent_turns,
             summary_target_tokens: 256,
             compact_max_retries: 2,
+            max_context_tokens: Some(300_000),
         }
     }
 
@@ -1656,6 +1732,39 @@ compact test
         assert!(matches!(
             resolve_session_name(&conflicting),
             Err(CliError::ConflictingSessionArgs)
+        ));
+    }
+
+    #[test]
+    fn parses_server_flags() {
+        let default_args = Args::try_parse_from(["morrow", "server"]).expect("parse server");
+        assert!(matches!(
+            default_args.command,
+            Some(CliCommand::Server {
+                no_auth: false,
+                permission_ceiling: None,
+                ..
+            })
+        ));
+
+        let args = Args::try_parse_from([
+            "morrow",
+            "server",
+            "--port",
+            "3100",
+            "--no-auth",
+            "--permission-ceiling",
+            "workspace-write",
+        ])
+        .expect("parse server flags");
+        assert!(matches!(
+            args.command,
+            Some(CliCommand::Server {
+                port: 3100,
+                no_auth: true,
+                permission_ceiling: Some(PermissionMode::WorkspaceWrite),
+                ..
+            })
         ));
     }
 
@@ -1875,6 +1984,28 @@ compact test
     }
 
     #[test]
+    fn formats_mcp_tool_approval_request() {
+        let request = ApprovalRequest::mcp_tool(
+            "approval-call_1",
+            "docs",
+            "write_page",
+            r#"{"path":"/index","content":"hello"}"#,
+            "MCP tool 'write_page' on server 'docs' requires approval",
+        );
+
+        let text = format_approval_request(
+            &request,
+            PermissionProfile::for_mode(PermissionMode::WorkspaceWrite),
+        );
+
+        assert!(text.contains("action: mcp tool"));
+        assert!(text.contains("server: docs"));
+        assert!(text.contains("tool: write_page"));
+        assert!(text.contains(r#"arguments: {"path":"/index","content":"hello"}"#));
+        assert!(text.contains("permissions: mode=workspace_write, shell=prompt"));
+    }
+
+    #[test]
     fn formats_execution_summary_for_file_shell_subagent_and_error_results() {
         let records = vec![
             ExecutionRecord {
@@ -1978,12 +2109,15 @@ compact test
                 model: test_model_invocation(),
                 subagent_identities: &[],
                 system_prompt: "system",
+                workspace_instructions: None,
                 context_config: context_config(2),
                 model_limits: model_limits(10_000),
                 workspace_root: &root,
                 permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
                 mcp_servers: &[],
                 mcp_cache: &mcp_cache,
+                tools: &ToolsConfig::default(),
+                auto_approve_workspace_writes: true,
                 interactive_approvals: false,
                 output: OutputMode::Human,
             },
@@ -2030,12 +2164,15 @@ compact test
                 model: test_model_invocation(),
                 subagent_identities: &[],
                 system_prompt: "system",
+                workspace_instructions: None,
                 context_config: context_config(2),
                 model_limits: model_limits(10_000),
                 workspace_root: &root,
                 permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
                 mcp_servers: &[],
                 mcp_cache: &mcp_cache,
+                tools: &ToolsConfig::default(),
+                auto_approve_workspace_writes: true,
                 interactive_approvals: false,
                 output: OutputMode::Jsonl {
                     session_name: "default",
@@ -2140,6 +2277,7 @@ compact test
             enabled: true,
             startup_timeout_sec: 1,
             tool_timeout_sec: 1,
+            require_approval: None,
         }];
 
         let outcome = run_agent_turn(
@@ -2148,12 +2286,15 @@ compact test
                 model: test_model_invocation(),
                 subagent_identities: &[],
                 system_prompt: "system",
+                workspace_instructions: None,
                 context_config: context_config(2),
                 model_limits: model_limits(10_000),
                 workspace_root: &root,
                 permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
                 mcp_servers: &mcp_servers,
                 mcp_cache: &mcp_cache,
+                tools: &ToolsConfig::default(),
+                auto_approve_workspace_writes: true,
                 interactive_approvals: false,
                 output: OutputMode::Jsonl {
                     session_name: "default",
@@ -2209,12 +2350,15 @@ compact test
                 model: test_model_invocation(),
                 subagent_identities: &[],
                 system_prompt: "system",
+                workspace_instructions: None,
                 context_config: context_config(2),
                 model_limits: model_limits(10_000),
                 workspace_root: &root,
                 permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
                 mcp_servers: &[],
                 mcp_cache: &mcp_cache,
+                tools: &ToolsConfig::default(),
+                auto_approve_workspace_writes: true,
                 interactive_approvals: false,
                 output: OutputMode::Jsonl {
                     session_name: "default",
@@ -2260,12 +2404,15 @@ compact test
                 model: test_model_invocation(),
                 subagent_identities: &[],
                 system_prompt: "system",
+                workspace_instructions: None,
                 context_config: context_config(2),
                 model_limits: model_limits(1),
                 workspace_root: &root,
                 permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
                 mcp_servers: &[],
                 mcp_cache: &mcp_cache,
+                tools: &ToolsConfig::default(),
+                auto_approve_workspace_writes: true,
                 interactive_approvals: false,
                 output: OutputMode::Human,
             },

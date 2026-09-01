@@ -5,7 +5,11 @@ pub mod session_store;
 pub mod subagent_store;
 pub mod subagent_supervisor;
 
-use agent_config::{ContextConfig, McpServerConfig, ModelContextLimits};
+use agent_config::{ContextConfig, McpServerConfig, ModelContextLimits, ToolsConfig};
+use agent_core::tokens::{
+    apply_request_padding, estimate_message_tokens, estimate_role_text_tokens,
+    estimate_tool_definitions_tokens,
+};
 use agent_core::{
     Agent, AgentError, AgentRunContext, ModelEvent, ModelFailure, ModelRequest,
     ToolExecutionContext,
@@ -56,10 +60,6 @@ pub const EVENT_SCHEMA_VERSION: u32 = 8;
 const AGENTS_MD_FILE_NAME: &str = "AGENTS.md";
 const MAX_AGENTS_MD_BYTES: u64 = 32 * 1024;
 const PROJECT_INSTRUCTIONS_PREFIX: &str = "Project instructions from AGENTS.md. Follow them for work in this workspace unless they conflict with runtime safety or role constraints:\n<project_instructions>";
-const MESSAGE_BASE_TOKENS: usize = 6;
-const TOOL_CALL_BASE_TOKENS: usize = 12;
-const REQUEST_PADDING_NUMERATOR: usize = 4;
-const REQUEST_PADDING_DENOMINATOR: usize = 3;
 const REQUIRED_SUMMARY_SECTIONS: [&str; 7] = [
     "User Goals and Constraints",
     "Important Decisions",
@@ -156,13 +156,21 @@ pub struct RunAgentTurnContext<'a> {
     pub client: &'a dyn Model,
     pub model: &'a ModelInvocation,
     pub subagent_identities: &'a [SubagentIdentity],
+    /// 配置层 base prompt（不含 AGENTS.md）；AGENTS.md 段落每轮经
+    /// `workspace_instructions` 缓存重读后再拼接。
     pub system_prompt: &'a str,
     pub context_config: ContextConfig,
     pub model_limits: ModelContextLimits,
     pub workspace_root: &'a Path,
+    /// 每轮重读 AGENTS.md 的进程级缓存；`None` 时 `system_prompt` 原样使用。
+    pub workspace_instructions: Option<&'a WorkspaceInstructionsCache>,
     pub permissions: PermissionProfile,
     pub mcp_servers: &'a [McpServerConfig],
     pub mcp_cache: &'a McpToolCache,
+    /// `[tools] allow/deny` 过滤；`None` 等价于全量允许。
+    pub tools: Option<&'a ToolsConfig>,
+    /// workspace_write 模式下 workspace 内文件变更是否自动放行（false = 逐次审批旧行为）。
+    pub auto_approve_workspace_writes: bool,
     pub session_name: &'a str,
     pub turn_index: usize,
 }
@@ -238,6 +246,9 @@ struct AgentTurnExecution<'a> {
     cancellation: CancellationToken,
     controller: Option<Arc<dyn SubagentController>>,
     middleware: MiddlewareRunConfig<'a>,
+    /// prepared session 路径在写 `TurnStarted` fact 时已拼好的 turn base
+    /// （含 AGENTS.md 与 `<environment>` 块），透传以保证 fact 与模型请求一致。
+    prepared_system_prompt: Option<String>,
 }
 
 fn middleware_execution_context(
@@ -330,83 +341,177 @@ pub fn load_workspace_instructions(
     base_system_prompt: &str,
 ) -> WorkspaceInstructionsLoad {
     let path = workspace_root.join(AGENTS_MD_FILE_NAME);
-    let metadata = match fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return unchanged_workspace_instructions(base_system_prompt);
+    match read_agents_md(&path) {
+        AgentsMdRead::Absent => unchanged_workspace_instructions(base_system_prompt),
+        AgentsMdRead::Rejected(diagnostic) => {
+            workspace_instruction_diagnostic(base_system_prompt, diagnostic)
         }
-        Err(error) => {
-            return workspace_instruction_diagnostic(
+        AgentsMdRead::Content(content) => WorkspaceInstructionsLoad {
+            effective_system_prompt: join_workspace_instructions(
                 base_system_prompt,
-                format!("failed to inspect {}: {error}", path.display()),
-            );
+                &project_instructions_section(&content),
+            ),
+            diagnostics: Vec::new(),
+        },
+    }
+}
+
+enum AgentsMdRead {
+    /// 文件缺失或内容为空。
+    Absent,
+    /// 修剪后的有效内容。
+    Content(String),
+    /// 读取被拒绝，附带诊断信息。
+    Rejected(String),
+}
+
+fn read_agents_md(path: &Path) -> AgentsMdRead {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return AgentsMdRead::Absent,
+        Err(error) => {
+            return AgentsMdRead::Rejected(format!(
+                "failed to inspect {}: {error}",
+                path.display()
+            ));
         }
     };
 
     if !metadata.file_type().is_file() {
-        return workspace_instruction_diagnostic(
-            base_system_prompt,
-            format!(
-                "ignored {}: AGENTS.md must be a regular file and symbolic links are not supported",
-                path.display()
-            ),
-        );
+        return AgentsMdRead::Rejected(format!(
+            "ignored {}: AGENTS.md must be a regular file and symbolic links are not supported",
+            path.display()
+        ));
     }
 
     if metadata.len() > MAX_AGENTS_MD_BYTES {
-        return oversized_workspace_instruction_diagnostic(
-            base_system_prompt,
-            &path,
-            metadata.len(),
-        );
+        return AgentsMdRead::Rejected(oversized_agents_md_diagnostic(path, metadata.len()));
     }
 
-    let bytes = match fs::read(&path) {
+    let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) => {
-            return workspace_instruction_diagnostic(
-                base_system_prompt,
-                format!("failed to read {}: {error}", path.display()),
-            );
+            return AgentsMdRead::Rejected(format!("failed to read {}: {error}", path.display()));
         }
     };
     if bytes.len() as u64 > MAX_AGENTS_MD_BYTES {
-        return oversized_workspace_instruction_diagnostic(
-            base_system_prompt,
-            &path,
-            bytes.len() as u64,
-        );
+        return AgentsMdRead::Rejected(oversized_agents_md_diagnostic(path, bytes.len() as u64));
     }
 
     let content = match String::from_utf8(bytes) {
         Ok(content) => content,
         Err(error) => {
-            return workspace_instruction_diagnostic(
-                base_system_prompt,
-                format!(
-                    "ignored {}: AGENTS.md is not valid UTF-8: {error}",
-                    path.display()
-                ),
-            );
+            return AgentsMdRead::Rejected(format!(
+                "ignored {}: AGENTS.md is not valid UTF-8: {error}",
+                path.display()
+            ));
         }
     };
     let content = content.trim_start_matches('\u{feff}').trim();
     if content.is_empty() {
-        return unchanged_workspace_instructions(base_system_prompt);
+        return AgentsMdRead::Absent;
+    }
+    AgentsMdRead::Content(content.to_string())
+}
+
+fn oversized_agents_md_diagnostic(path: &Path, bytes: u64) -> String {
+    format!(
+        "ignored {}: AGENTS.md is {bytes} bytes and exceeds the {MAX_AGENTS_MD_BYTES}-byte limit",
+        path.display()
+    )
+}
+
+fn project_instructions_section(content: &str) -> String {
+    format!("{PROJECT_INSTRUCTIONS_PREFIX}\n{content}\n</project_instructions>")
+}
+
+/// base + AGENTS.md 段落拼接；section 为空时原样返回 base。
+fn join_workspace_instructions(base_system_prompt: &str, section: &str) -> String {
+    if section.is_empty() {
+        return base_system_prompt.to_string();
+    }
+    let base_system_prompt = base_system_prompt.trim_end();
+    if base_system_prompt.is_empty() {
+        section.to_string()
+    } else {
+        format!("{base_system_prompt}\n\n{section}")
+    }
+}
+
+/// AGENTS.md 的每轮重读缓存：记录 path、mtime 与组装好的
+/// `<project_instructions>` 段落。mtime 未变时命中缓存、零文件读取；
+/// 文件变更后下一个 turn 自动生效。生命周期由调用方持有（CLI/server 进程级），
+/// turn 通过 `RunAgentTurnContext::workspace_instructions` 引用。
+#[derive(Debug)]
+pub struct WorkspaceInstructionsCache {
+    path: PathBuf,
+    state: std::sync::Mutex<WorkspaceInstructionsCacheState>,
+}
+
+#[derive(Debug, Default)]
+struct WorkspaceInstructionsCacheState {
+    loaded: bool,
+    mtime: Option<SystemTime>,
+    section: String,
+}
+
+impl WorkspaceInstructionsCache {
+    pub fn new(workspace_root: &Path) -> Self {
+        Self {
+            path: workspace_root.join(AGENTS_MD_FILE_NAME),
+            state: std::sync::Mutex::new(WorkspaceInstructionsCacheState::default()),
+        }
     }
 
-    let project_instructions =
-        format!("{PROJECT_INSTRUCTIONS_PREFIX}\n{content}\n</project_instructions>");
-    let base_system_prompt = base_system_prompt.trim_end();
-    let effective_system_prompt = if base_system_prompt.is_empty() {
-        project_instructions
-    } else {
-        format!("{base_system_prompt}\n\n{project_instructions}")
-    };
+    /// 冷启动预热：立即读取并返回诊断信息（与 `load_workspace_instructions` 同源规则）。
+    pub fn prewarm(&self) -> Vec<String> {
+        self.refresh().1
+    }
 
-    WorkspaceInstructionsLoad {
-        effective_system_prompt,
-        diagnostics: Vec::new(),
+    /// 当前 `<project_instructions>` 段落；AGENTS.md 缺失、为空或被忽略时为空串。
+    pub fn section(&self) -> String {
+        let mtime = self.current_mtime();
+        {
+            let state = self.lock_state();
+            if state.loaded && state.mtime == mtime {
+                return state.section.clone();
+            }
+        }
+        self.refresh().0
+    }
+
+    /// base + 每轮新鲜的 AGENTS.md 段落。
+    pub fn apply(&self, base_system_prompt: &str) -> String {
+        join_workspace_instructions(base_system_prompt, &self.section())
+    }
+
+    fn refresh(&self) -> (String, Vec<String>) {
+        // 先取 mtime 再读内容：读的过程中文件被改写会让缓存的 mtime 偏旧，
+        // 下一 turn 触发重读，而不是把旧内容钉在新 mtime 上。
+        let mtime = self.current_mtime();
+        let (section, diagnostics) = match read_agents_md(&self.path) {
+            AgentsMdRead::Absent => (String::new(), Vec::new()),
+            AgentsMdRead::Content(content) => (project_instructions_section(&content), Vec::new()),
+            AgentsMdRead::Rejected(diagnostic) => (String::new(), vec![diagnostic]),
+        };
+        *self.lock_state() = WorkspaceInstructionsCacheState {
+            loaded: true,
+            mtime,
+            section: section.clone(),
+        };
+        (section, diagnostics)
+    }
+
+    fn current_mtime(&self) -> Option<SystemTime> {
+        fs::symlink_metadata(&self.path)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+    }
+
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, WorkspaceInstructionsCacheState> {
+        self.state
+            .lock()
+            .expect("workspace instructions cache lock poisoned")
     }
 }
 
@@ -425,20 +530,6 @@ fn workspace_instruction_diagnostic(
         effective_system_prompt: base_system_prompt.to_string(),
         diagnostics: vec![diagnostic],
     }
-}
-
-fn oversized_workspace_instruction_diagnostic(
-    base_system_prompt: &str,
-    path: &Path,
-    bytes: u64,
-) -> WorkspaceInstructionsLoad {
-    workspace_instruction_diagnostic(
-        base_system_prompt,
-        format!(
-            "ignored {}: AGENTS.md is {bytes} bytes and exceeds the {MAX_AGENTS_MD_BYTES}-byte limit",
-            path.display()
-        ),
-    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -622,6 +713,9 @@ impl RuntimeSubagentExecutor {
                     },
                     middleware: Some(middleware_context),
                     initial_context: before.context,
+                    // delegate executor 每个任务起新 Thread 且只读、有超时，
+                    // 不启用 turn 内上下文护栏。
+                    context_token_limit: None,
                 },
             )
             .await
@@ -749,6 +843,7 @@ fn middleware_stage_name(stage: agent_protocol::MiddlewareStage) -> &'static str
         agent_protocol::MiddlewareStage::BeforeTool => "before_tool",
         agent_protocol::MiddlewareStage::PermissionRequest => "permission_request",
         agent_protocol::MiddlewareStage::AfterTool => "after_tool",
+        agent_protocol::MiddlewareStage::AfterTurn => "after_turn",
         agent_protocol::MiddlewareStage::PreCompact => "pre_compact",
         agent_protocol::MiddlewareStage::PostCompact => "post_compact",
     }
@@ -981,6 +1076,117 @@ impl<'a> SessionFactRun<'a> {
     }
 }
 
+/// 模型当次实际看到的完整 system prompt：turn base（配置层 base + 每轮重读的
+/// AGENTS.md + `<environment>` 块，见 `assembled_turn_system_prompt`）+ subagent guidance。
+/// `prepare_session_turn_with_middleware_context` 把它写入 `TurnStarted` fact，
+/// `run_agent_turn_inner` 用它发起模型请求，两边共用此函数与同一份 turn base，
+/// 保证日志与模型所见一致。
+fn effective_turn_system_prompt(
+    system_prompt: &str,
+    subagent_delegation: bool,
+    persistent_controller: bool,
+) -> String {
+    if !subagent_delegation {
+        return system_prompt.to_string();
+    }
+    let guidance = if persistent_controller {
+        format!("{PARENT_SUBAGENT_GUIDANCE}\n\n{PERSISTENT_SUBAGENT_GUIDANCE}")
+    } else {
+        PARENT_SUBAGENT_GUIDANCE.to_string()
+    };
+    format!("{system_prompt}\n\n{guidance}")
+}
+
+const ENVIRONMENT_GIT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// 每轮 fresh 的 turn base prompt：`context.system_prompt`（配置层 base）加上
+/// 经缓存重读的 AGENTS.md 段落（无缓存时跳过）与 `<environment>` 块。
+/// subagent guidance 由 `effective_turn_system_prompt` 在此之后追加，顺序稳定。
+async fn assembled_turn_system_prompt(context: RunAgentTurnContext<'_>) -> String {
+    let mut prompt = match context.workspace_instructions {
+        Some(cache) => cache.apply(context.system_prompt),
+        None => context.system_prompt.to_string(),
+    };
+    append_prompt_block(
+        &mut prompt,
+        &environment_context_block(context.workspace_root).await,
+    );
+    prompt
+}
+
+fn append_prompt_block(prompt: &mut String, block: &str) {
+    if block.is_empty() {
+        return;
+    }
+    let trimmed_len = prompt.trim_end().len();
+    prompt.truncate(trimmed_len);
+    if !prompt.is_empty() {
+        prompt.push_str("\n\n");
+    }
+    prompt.push_str(block);
+}
+
+async fn environment_context_block(workspace_root: &Path) -> String {
+    let mut lines = vec![
+        format!("workspace_root: {}", workspace_root.display()),
+        format!("os: {}", std::env::consts::OS),
+        format!("arch: {}", std::env::consts::ARCH),
+        format!("date: {}", utc_today()),
+    ];
+    if let Some(branch) = current_git_branch(workspace_root).await {
+        lines.push(format!("git_branch: {branch}"));
+    }
+    format!("<environment>\n{}\n</environment>", lines.join("\n"))
+}
+
+/// 当前 git 分支；非 git repo、git 缺失、命令失败或超时时静默返回 None。
+async fn current_git_branch(workspace_root: &Path) -> Option<String> {
+    let output = tokio::time::timeout(
+        ENVIRONMENT_GIT_TIMEOUT,
+        tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(workspace_root)
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!branch.is_empty()).then_some(branch)
+}
+
+fn utc_today() -> String {
+    utc_date_string(SystemTime::now())
+}
+
+/// SystemTime → UTC 日历日期（YYYY-MM-DD），civil-from-days 算法。
+fn utc_date_string(time: SystemTime) -> String {
+    let days = time
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() / 86_400)
+        .unwrap_or(0) as i64;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = (z - era * 146_097) as u32;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era as i64 + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = if month_prime < 10 {
+        month_prime + 3
+    } else {
+        month_prime - 9
+    };
+    let year = if month <= 2 { year + 1 } else { year };
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
 pub async fn run_agent_turn(
     context: RunAgentTurnContext<'_>,
     session: &mut Session,
@@ -1055,6 +1261,7 @@ pub async fn run_agent_turn_with_middleware_context(
             cancellation,
             controller: None,
             middleware: context.run_config(before.context, event_index),
+            prepared_system_prompt: None,
         },
         None,
     )
@@ -1112,12 +1319,14 @@ pub async fn run_agent_turn_with_session_handle_and_middleware_context(
     cancellation: CancellationToken,
     controller: Option<Arc<dyn SubagentController>>,
 ) -> Result<RunAgentTurnOutcome, RuntimeError> {
+    let persistent_controller = controller.is_some();
     let prepared = prepare_session_turn_with_middleware_context(
         context,
         handle,
         prompt,
         handler,
         &cancellation,
+        persistent_controller,
     )
     .await?;
     let Some(prepared) = prepared else {
@@ -1140,6 +1349,9 @@ pub async fn run_agent_turn_with_session_handle_and_middleware_context(
 pub struct PreparedMiddlewareSessionTurn {
     pub operation_id: String,
     pub turn_id: String,
+    /// 写入 `TurnStarted` fact 时拼好的 turn base prompt（含 AGENTS.md 与
+    /// `<environment>` 块，不含 subagent guidance），运行阶段直接复用。
+    pub system_prompt: String,
     pub initial_context: Vec<MiddlewareContextBlock>,
     pub event_index: usize,
 }
@@ -1151,6 +1363,7 @@ impl PreparedMiddlewareSessionTurn {
                 operation_id: self.operation_id,
                 turn_id: self.turn_id,
                 prompt,
+                system_prompt: self.system_prompt,
             },
             initial_context: self.initial_context,
             event_index: self.event_index,
@@ -1179,6 +1392,7 @@ pub async fn prepare_session_turn_with_middleware(
         prompt,
         handler,
         cancellation,
+        false,
     )
     .await
 }
@@ -1189,6 +1403,7 @@ pub async fn prepare_session_turn_with_middleware_context(
     prompt: &str,
     handler: &mut impl TurnEventHandler,
     cancellation: &CancellationToken,
+    persistent_controller: bool,
 ) -> Result<Option<PreparedMiddlewareSessionTurn>, RuntimeError> {
     let execution_context = context.execution_context(cancellation, None, None);
     let before = context
@@ -1209,6 +1424,16 @@ pub async fn prepare_session_turn_with_middleware_context(
     }
     if before_denied {
         handle
+            .commit_fact(
+                None,
+                None,
+                SessionFact::PromptRejected {
+                    prompt: prompt.to_string(),
+                    reasons: denied_reasons.clone(),
+                },
+            )
+            .await?;
+        handle
             .notice(format!(
                 "prompt blocked by middleware: {}",
                 denied_reasons.join("; ")
@@ -1216,16 +1441,24 @@ pub async fn prepare_session_turn_with_middleware_context(
             .await;
         return Ok(None);
     }
+    let turn_base = assembled_turn_system_prompt(context.turn).await;
+    let system_prompt = effective_turn_system_prompt(
+        &turn_base,
+        context.turn.client.shared_clone().is_some(),
+        persistent_controller,
+    );
     let (operation_id, turn_id) = handle
         .begin_operation(
             Message::user(prompt),
             context.turn.model.clone(),
             context.turn.permissions,
+            system_prompt,
         )
         .await?;
     Ok(Some(PreparedMiddlewareSessionTurn {
         operation_id,
         turn_id,
+        system_prompt: turn_base,
         initial_context: before.context,
         event_index,
     }))
@@ -1235,6 +1468,8 @@ pub struct PreparedSessionTurn<'a> {
     pub operation_id: String,
     pub turn_id: String,
     pub prompt: &'a str,
+    /// 见 `PreparedMiddlewareSessionTurn::system_prompt`。
+    pub system_prompt: String,
 }
 
 pub async fn run_agent_turn_with_prepared_session_handle(
@@ -1304,6 +1539,7 @@ pub async fn run_agent_turn_with_prepared_session_handle_and_middleware_context(
                 operation_id,
                 turn_id,
                 prompt,
+                system_prompt,
             },
         initial_context,
         event_index,
@@ -1323,6 +1559,7 @@ pub async fn run_agent_turn_with_prepared_session_handle_and_middleware_context(
             cancellation: cancellation.clone(),
             controller,
             middleware: context.run_config(initial_context, event_index),
+            prepared_system_prompt: Some(system_prompt),
         },
         Some(&mut fact_run),
     )
@@ -1388,6 +1625,7 @@ pub async fn run_agent_turn_with_cancellation(
                 MiddlewareAgentScope::Main,
             )
             .run_config(Vec::new(), 0),
+            prepared_system_prompt: None,
         },
     )
     .await
@@ -1416,6 +1654,7 @@ pub async fn run_agent_turn_with_subagent_controller(
                 MiddlewareAgentScope::Main,
             )
             .run_config(Vec::new(), 0),
+            prepared_system_prompt: None,
         },
     )
     .await
@@ -1454,6 +1693,7 @@ async fn run_agent_turn_inner(
         cancellation,
         controller,
         middleware,
+        prepared_system_prompt,
     } = execution;
     let cancellation = &cancellation;
     let MiddlewareRunConfig {
@@ -1462,22 +1702,38 @@ async fn run_agent_turn_inner(
         mut initial_context,
         event_index: initial_event_index,
     } = middleware;
+    // turn base：prepared 路径沿用写 fact 时的拼装结果；否则现场按
+    // 配置层 base + 每轮重读的 AGENTS.md + <environment> 块拼装。
+    let turn_base = match prepared_system_prompt {
+        Some(prepared) => prepared,
+        None => assembled_turn_system_prompt(context).await,
+    };
     let writer_lease = controller
         .as_ref()
         .and_then(|controller| controller.writer_lease());
     let artifact_root = SessionStore::for_workspace(context.workspace_root, context.session_name)
         .ok()
         .and_then(|store| store.artifact_root().ok());
+    let allow_all_tools;
+    let tool_filter = match context.tools {
+        Some(tools) => tools,
+        None => {
+            allow_all_tools = ToolsConfig::default();
+            &allow_all_tools
+        }
+    };
     let build = tokio::select! {
         biased;
         _ = cancellation.cancelled() => None,
-        result = ToolRegistry::with_mcp_cache_and_writer_lease_and_artifact_root_async(
+        result = ToolRegistry::with_mcp_cache_and_writer_lease_and_artifact_root_and_tool_filter_async(
             context.workspace_root,
             context.permissions,
             context.mcp_servers,
             context.mcp_cache,
             writer_lease,
             artifact_root.clone(),
+            tool_filter,
+            context.auto_approve_workspace_writes,
         ) => Some(result),
     };
     let Some(build) = build else {
@@ -1487,12 +1743,15 @@ async fn run_agent_turn_inner(
     let mut tools = build.registry;
     let diagnostics = build.diagnostics;
     let mut persistent_controller_registered = false;
-    let effective_system_prompt = if let Some(model) = context.client.shared_clone() {
+    let shared_model = context.client.shared_clone();
+    if let Some(model) = shared_model.as_ref() {
         tools.register_subagent(
             Arc::new(
                 RuntimeSubagentExecutor::new(
-                    model,
-                    Arc::<str>::from(context.system_prompt),
+                    model.clone(),
+                    // 临时委派 subagent 沿用 spawn 时（本 turn 拼装）的快照，
+                    // 生命周期内不再重读 AGENTS.md。
+                    Arc::<str>::from(turn_base.as_str()),
                     Arc::new(context.workspace_root.to_path_buf()),
                 )
                 .with_middleware_context(
@@ -1509,15 +1768,12 @@ async fn run_agent_turn_inner(
             tools.register_subagent_controller(controller)?;
             persistent_controller_registered = true;
         }
-        let guidance = if persistent_controller_registered {
-            format!("{PARENT_SUBAGENT_GUIDANCE}\n\n{PERSISTENT_SUBAGENT_GUIDANCE}")
-        } else {
-            PARENT_SUBAGENT_GUIDANCE.to_string()
-        };
-        format!("{}\n\n{guidance}", context.system_prompt)
-    } else {
-        context.system_prompt.to_string()
-    };
+    }
+    let effective_system_prompt = effective_turn_system_prompt(
+        &turn_base,
+        shared_model.is_some(),
+        persistent_controller_registered,
+    );
     let tool_definitions = tools.definitions();
 
     let operation_id = fact_run.as_deref().map(|run| run.operation_id.clone());
@@ -1698,6 +1954,10 @@ async fn run_agent_turn_inner(
                     },
                     middleware: Some(middleware_context),
                     initial_context,
+                    context_token_limit: mid_turn_context_token_limit(
+                        context.context_config,
+                        context.model_limits,
+                    ),
                 },
             )
             .await?;
@@ -2051,7 +2311,23 @@ fn auto_compact_trigger_tokens(
     let input_window = model_limits
         .context_window_tokens
         .saturating_sub(model_limits.reserved_output_tokens);
-    ((input_window as f64) * f64::from(context_config.auto_compact_threshold)).floor() as usize
+    let window_trigger =
+        ((input_window as f64) * f64::from(context_config.auto_compact_threshold)).floor() as usize;
+    // 绝对上限封顶：即使模型窗口很大，水位也主动收敛到 max_context_tokens 以内。
+    match context_config.max_context_tokens {
+        Some(max) => window_trigger.min(max),
+        None => window_trigger,
+    }
+}
+
+/// turn 内护栏上限：跟随自动压缩预算；关闭 auto_compact 时不启用护栏。
+fn mid_turn_context_token_limit(
+    context_config: ContextConfig,
+    model_limits: ModelContextLimits,
+) -> Option<usize> {
+    context_config
+        .auto_compact
+        .then(|| auto_compact_trigger_tokens(model_limits, context_config))
 }
 
 pub async fn compact_session(
@@ -2603,73 +2879,17 @@ fn estimate_context_tokens(
     prompt: &str,
     tools: &[ToolDefinition],
 ) -> usize {
-    let tool_tokens = serde_json::to_string(tools)
-        .map(|definitions| estimate_text_tokens(&definitions))
-        .unwrap_or_default();
-    let raw_total = message_text_tokens(agent_protocol::Role::System, system_prompt)
-        + message_text_tokens(agent_protocol::Role::User, prompt)
+    let tool_tokens = estimate_tool_definitions_tokens(tools);
+    let raw_total = estimate_role_text_tokens(agent_protocol::Role::System, system_prompt)
+        + estimate_role_text_tokens(agent_protocol::Role::User, prompt)
         + tool_tokens
         + session
             .active_thread
             .messages
             .iter()
-            .map(message_context_tokens)
+            .map(estimate_message_tokens)
             .sum::<usize>();
-    raw_total
-        .saturating_mul(REQUEST_PADDING_NUMERATOR)
-        .div_ceil(REQUEST_PADDING_DENOMINATOR)
-}
-
-fn message_context_tokens(message: &Message) -> usize {
-    let mut total = MESSAGE_BASE_TOKENS + estimate_text_tokens(message_role_label(message));
-    if let Some(content) = message.content.as_ref() {
-        total += estimate_text_tokens(content);
-    }
-    if let Some(reasoning_content) = message.reasoning_content.as_ref() {
-        total += estimate_text_tokens(reasoning_content);
-    }
-    if let Some(tool_call_id) = message.tool_call_id.as_ref() {
-        total += estimate_text_tokens(tool_call_id);
-    }
-    if let Some(tool_calls) = message.tool_calls.as_ref() {
-        total += TOOL_CALL_BASE_TOKENS
-            + serde_json::to_string(tool_calls)
-                .map(|value| estimate_text_tokens(&value))
-                .unwrap_or_default();
-    }
-    total
-}
-
-fn message_text_tokens(role: agent_protocol::Role, content: &str) -> usize {
-    let mut total = MESSAGE_BASE_TOKENS + estimate_text_tokens(role_label(role));
-    total += estimate_text_tokens(content);
-    total
-}
-
-fn estimate_text_tokens(text: &str) -> usize {
-    if text.is_empty() {
-        return 0;
-    }
-
-    let mut ascii_chars = 0usize;
-    let mut non_ascii_tokens = 0usize;
-    for ch in text.chars() {
-        if ch.is_ascii() {
-            ascii_chars += 1;
-        } else {
-            non_ascii_tokens += 1;
-        }
-    }
-    ascii_chars.div_ceil(4) + non_ascii_tokens
-}
-
-fn role_label(role: agent_protocol::Role) -> &'static str {
-    match role {
-        agent_protocol::Role::System => "system",
-        agent_protocol::Role::User => "user",
-        agent_protocol::Role::Assistant => "assistant",
-        agent_protocol::Role::Tool => "tool",
-    }
+    apply_request_padding(raw_total)
 }
 
 fn message_role_label(message: &Message) -> &'static str {
@@ -2756,6 +2976,7 @@ mod tests {
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
             timeout: Duration::from_secs(5),
+            max_retries: 1,
         })
         .expect("client")
     }
@@ -2813,7 +3034,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_instructions_append_agents_md_and_snapshot_the_content() {
+    fn workspace_instructions_append_agents_md_to_the_base_prompt() {
         let root = unique_dir("agents-valid");
         let path = root.join(AGENTS_MD_FILE_NAME);
         fs::write(&path, "\nUse the repository test commands.\n").expect("write AGENTS.md");
@@ -2827,10 +3048,191 @@ mod tests {
             )
         );
 
+        fs::remove_dir_all(root).expect("remove root");
+    }
+
+    fn bump_mtime(path: &Path) {
+        // 显式推进 mtime，避免依赖文件系统的时间粒度。
+        fs::File::open(path)
+            .expect("open AGENTS.md")
+            .set_modified(SystemTime::now() + Duration::from_secs(5))
+            .expect("bump mtime");
+    }
+
+    #[test]
+    fn workspace_instructions_cache_reloads_agents_md_after_mtime_change() {
+        let root = unique_dir("agents-reload");
+        let path = root.join(AGENTS_MD_FILE_NAME);
+        fs::write(&path, "Use the repository test commands.").expect("write AGENTS.md");
+
+        let cache = WorkspaceInstructionsCache::new(&root);
+        assert!(cache.prewarm().is_empty());
+        assert_eq!(
+            cache.apply("base system prompt\n"),
+            format!(
+                "base system prompt\n\n{PROJECT_INSTRUCTIONS_PREFIX}\nUse the repository test commands.\n</project_instructions>"
+            )
+        );
+
+        // mtime 变化后下一轮读取生效（turn 语义由 per-turn 调用方保证）。
         fs::write(&path, "Use the updated commands.").expect("update AGENTS.md");
-        assert!(!loaded.effective_system_prompt.contains("updated"));
-        let reloaded = load_workspace_instructions(&root, "base system prompt");
-        assert!(reloaded.effective_system_prompt.contains("updated"));
+        bump_mtime(&path);
+        let reloaded = cache.apply("base system prompt");
+        assert!(reloaded.contains("updated"));
+        assert!(!reloaded.contains("repository test commands"));
+
+        // 文件删除后段落消失。
+        fs::remove_file(&path).expect("remove AGENTS.md");
+        assert_eq!(cache.apply("base system prompt"), "base system prompt");
+
+        fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[test]
+    fn workspace_instructions_cache_hits_without_rereading_when_mtime_is_unchanged() {
+        let root = unique_dir("agents-cache-hit");
+        let path = root.join(AGENTS_MD_FILE_NAME);
+        fs::write(&path, "cached instructions").expect("write AGENTS.md");
+
+        let cache = WorkspaceInstructionsCache::new(&root);
+        assert!(cache.section().contains("cached instructions"));
+
+        // 改写内容但把 mtime 拨回原值：缓存命中时必须返回旧段落，证明没有重读。
+        let mtime = fs::symlink_metadata(&path)
+            .expect("metadata")
+            .modified()
+            .expect("mtime");
+        fs::write(&path, "rewritten instructions").expect("rewrite AGENTS.md");
+        fs::File::open(&path)
+            .expect("open AGENTS.md")
+            .set_modified(mtime)
+            .expect("restore mtime");
+        assert!(cache.section().contains("cached instructions"));
+
+        fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[test]
+    fn utc_date_string_formats_civil_dates() {
+        assert_eq!(utc_date_string(UNIX_EPOCH), "1970-01-01");
+        assert_eq!(
+            utc_date_string(UNIX_EPOCH + Duration::from_secs(1_735_689_600)),
+            "2025-01-01"
+        );
+        assert_eq!(
+            utc_date_string(UNIX_EPOCH + Duration::from_secs(1_709_251_200)),
+            "2024-03-01"
+        );
+        // 2000 是 400 整除的闰年。
+        assert_eq!(
+            utc_date_string(UNIX_EPOCH + Duration::from_secs(951_782_400)),
+            "2000-02-29"
+        );
+        // 2100 不是闰年。
+        assert_eq!(
+            utc_date_string(UNIX_EPOCH + Duration::from_secs(4_102_444_800)),
+            "2100-01-01"
+        );
+    }
+
+    #[tokio::test]
+    async fn environment_context_block_lists_workspace_platform_and_date_without_git() {
+        let root = unique_dir("environment-block");
+        let block = environment_context_block(&root).await;
+
+        assert!(block.starts_with("<environment>\n"));
+        assert!(block.ends_with("\n</environment>"));
+        assert!(block.contains(&format!("workspace_root: {}", root.display())));
+        assert!(block.contains(&format!("os: {}", std::env::consts::OS)));
+        assert!(block.contains(&format!("arch: {}", std::env::consts::ARCH)));
+        // YYYY-MM-DD
+        let date = block
+            .lines()
+            .find_map(|line| line.strip_prefix("date: "))
+            .expect("date line");
+        assert_eq!(date.len(), 10);
+        assert_eq!(date.as_bytes()[4], b'-');
+        assert_eq!(date.as_bytes()[7], b'-');
+        assert!(date.chars().all(|c| c.is_ascii_digit() || c == '-'));
+        // 临时目录不是 git repo：静默省略分支行。
+        assert!(!block.contains("git_branch"));
+
+        fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[tokio::test]
+    async fn environment_context_block_includes_git_branch_in_a_repository() {
+        let root = unique_dir("environment-git");
+        let init = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["init", "-b", "main"])
+            .output()
+            .expect("run git init");
+        if !init.status.success() {
+            // 测试环境没有 git 时跳过分支断言。
+            fs::remove_dir_all(root).expect("remove root");
+            return;
+        }
+        let commit = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args([
+                "-c",
+                "user.name=morrow-test",
+                "-c",
+                "user.email=morrow-test@example.com",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "init",
+            ])
+            .output()
+            .expect("run git commit");
+        assert!(commit.status.success());
+
+        assert_eq!(current_git_branch(&root).await.as_deref(), Some("main"));
+        let block = environment_context_block(&root).await;
+        assert!(block.contains("git_branch: main"));
+
+        fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[tokio::test]
+    async fn assembled_turn_system_prompt_orders_base_instructions_environment_then_guidance() {
+        let root = unique_dir("assembled-order");
+        fs::write(root.join(AGENTS_MD_FILE_NAME), "project rule").expect("write AGENTS.md");
+        let cache = WorkspaceInstructionsCache::new(&root);
+        let client = client("http://127.0.0.1:1/v1".to_string());
+        let mcp_cache = McpToolCache::new();
+        let context = RunAgentTurnContext {
+            client: &client,
+            model: test_model_invocation(),
+            subagent_identities: &[],
+            system_prompt: "config base",
+            context_config: context_config(2),
+            model_limits: model_limits(10_000),
+            workspace_root: &root,
+            workspace_instructions: Some(&cache),
+            permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
+            mcp_servers: &[],
+            mcp_cache: &mcp_cache,
+            tools: None,
+            auto_approve_workspace_writes: true,
+            session_name: "default",
+            turn_index: 0,
+        };
+
+        let turn_base = assembled_turn_system_prompt(context).await;
+        let full = effective_turn_system_prompt(&turn_base, true, false);
+
+        let base_at = full.find("config base").expect("base");
+        let instructions_at = full.find("<project_instructions>").expect("instructions");
+        let environment_at = full.find("<environment>").expect("environment");
+        let guidance_at = full.find(PARENT_SUBAGENT_GUIDANCE).expect("guidance");
+        assert!(base_at < instructions_at);
+        assert!(instructions_at < environment_at);
+        assert!(environment_at < guidance_at);
 
         fs::remove_dir_all(root).expect("remove root");
     }
@@ -2906,6 +3308,7 @@ mod tests {
             retain_recent_turns,
             summary_target_tokens: 256,
             compact_max_retries: 2,
+            max_context_tokens: Some(300_000),
         }
     }
 
@@ -3361,6 +3764,38 @@ compact test
     }
 
     #[test]
+    fn auto_compact_trigger_is_capped_by_max_context_tokens() {
+        let mut config = context_config(6);
+        // 窗口阈值：(1_000_000 - 1) * 0.835 = 834_999，远超绝对上限。
+        let limits = model_limits(1_000_000);
+
+        config.max_context_tokens = Some(300_000);
+        assert_eq!(auto_compact_trigger_tokens(limits, config), 300_000);
+
+        // 窗口阈值低于上限时不受上限影响。
+        config.max_context_tokens = Some(900_000);
+        assert_eq!(auto_compact_trigger_tokens(limits, config), 834_999);
+
+        // None 只保留窗口百分比阈值。
+        config.max_context_tokens = None;
+        assert_eq!(auto_compact_trigger_tokens(limits, config), 834_999);
+    }
+
+    #[test]
+    fn mid_turn_guard_follows_auto_compact_switch() {
+        let mut config = context_config(6);
+        let limits = model_limits(131_072);
+
+        assert_eq!(
+            mid_turn_context_token_limit(config, limits),
+            Some(auto_compact_trigger_tokens(limits, config))
+        );
+
+        config.auto_compact = false;
+        assert_eq!(mid_turn_context_token_limit(config, limits), None);
+    }
+
+    #[test]
     fn summary_prompt_omits_reasoning_content() {
         let user = Message::user("question");
         let assistant =
@@ -3506,9 +3941,12 @@ compact test
                 context_config: context_config(2),
                 model_limits: model_limits(10_000),
                 workspace_root: &root,
+                workspace_instructions: None,
                 permissions: PermissionProfile::for_mode(agent_protocol::PermissionMode::ReadOnly),
                 mcp_servers: &[],
                 mcp_cache: &mcp_cache,
+                tools: None,
+                auto_approve_workspace_writes: true,
                 session_name: "default",
                 turn_index: 0,
             },
@@ -3558,7 +3996,7 @@ compact test
     }
 
     #[tokio::test]
-    async fn denied_before_prompt_is_audited_without_persisting_prompt() {
+    async fn denied_before_prompt_is_logged_and_still_broadcast() {
         let root = unique_dir("middleware-deny-workspace");
         let sessions = unique_dir("middleware-deny-sessions");
         let legacy = unique_dir("middleware-deny-legacy");
@@ -3569,6 +4007,7 @@ compact test
             PermissionProfile::for_mode(PermissionMode::ReadOnly),
         )
         .expect("handle");
+        let mut subscription = handle.subscribe().await.expect("subscribe");
         let client = client("http://127.0.0.1:1/v1".to_string());
         let cache = McpToolCache::new();
         let mut handler = RecordingHandler::default();
@@ -3590,9 +4029,12 @@ compact test
                     context_config: context_config(2),
                     model_limits: model_limits(10_000),
                     workspace_root: &root,
+                    workspace_instructions: None,
                     permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
                     mcp_servers: &[],
                     mcp_cache: &cache,
+                    tools: None,
+                    auto_approve_workspace_writes: true,
                     session_name: "default",
                     turn_index: 0,
                 },
@@ -3600,7 +4042,7 @@ compact test
                 MiddlewareAgentScope::Main,
             ),
             &handle,
-            "do not persist this secret",
+            "persist this rejected secret",
             &mut handler,
             CancellationToken::new(),
             None,
@@ -3617,9 +4059,33 @@ compact test
             projection.middleware_audit[0].outcome,
             agent_protocol::MiddlewareOutcome::Deny
         );
+        // 拒绝仍通过原有 notice 广播通知订阅者。
+        let notice = loop {
+            let envelope = subscription.recv().await.expect("subscription event");
+            if let agent_protocol::SessionUpdate::Notice { message } = envelope.update {
+                break message;
+            }
+        };
+        assert!(notice.contains("prompt blocked by middleware"));
+        // 被拒 prompt 以 PromptRejected fact 落盘，只作审计，不进入投影。
         let exported =
             String::from_utf8(handle.export_document_bytes().await.expect("export")).expect("utf8");
-        assert!(!exported.contains("do not persist this secret"));
+        assert!(exported.contains("persist this rejected secret"));
+        let facts = exported_facts(&exported);
+        let rejected = facts
+            .iter()
+            .find(|line| line["fact"]["type"] == "prompt_rejected")
+            .expect("prompt_rejected fact");
+        assert_eq!(
+            rejected["fact"]["data"]["prompt"],
+            json!("persist this rejected secret")
+        );
+        assert_eq!(
+            rejected["fact"]["data"]["reasons"],
+            json!(["prompt-policy: secret detected"])
+        );
+        assert!(projection.turns.is_empty());
+        assert!(projection.context.messages.is_empty());
     }
 
     #[tokio::test]
@@ -3646,9 +4112,12 @@ compact test
                     context_config: context_config(2),
                     model_limits: model_limits(10_000),
                     workspace_root: &root,
+                    workspace_instructions: None,
                     permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
                     mcp_servers: &[],
                     mcp_cache: &cache,
+                    tools: None,
+                    auto_approve_workspace_writes: true,
                     session_name: "default",
                     turn_index: 0,
                 },
@@ -3675,6 +4144,234 @@ compact test
                 .iter()
                 .all(|message| message.content.as_deref() != Some("ephemeral policy"))
         );
+    }
+
+    fn exported_facts(exported: &str) -> Vec<serde_json::Value> {
+        exported
+            .lines()
+            .skip(1)
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn turn_started_fact_records_the_effective_system_prompt() {
+        let root = unique_dir("system-prompt-workspace");
+        let sessions = unique_dir("system-prompt-sessions");
+        let legacy = unique_dir("system-prompt-legacy");
+        let (base_url, requests) = spawn_recording_sse_server(vec![sse_text_body("ok")]).await;
+        let client = client(base_url);
+        let cache = McpToolCache::new();
+        let store = SessionStore::new(&sessions, &legacy, &root, "default").expect("store");
+        let handle = SessionHandle::open(
+            store,
+            "default",
+            PermissionProfile::for_mode(PermissionMode::ReadOnly),
+        )
+        .expect("handle");
+        let mut handler = RecordingHandler::default();
+        let middleware = MiddlewareRegistry::new();
+
+        let outcome = run_agent_turn_with_session_handle_and_middleware_context(
+            MiddlewareAgentTurnContext::new(
+                RunAgentTurnContext {
+                    client: &client,
+                    model: test_model_invocation(),
+                    subagent_identities: &[],
+                    system_prompt: "base prompt",
+                    context_config: context_config(2),
+                    model_limits: model_limits(10_000),
+                    workspace_root: &root,
+                    workspace_instructions: None,
+                    permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
+                    mcp_servers: &[],
+                    mcp_cache: &cache,
+                    tools: None,
+                    auto_approve_workspace_writes: true,
+                    session_name: "default",
+                    turn_index: 0,
+                },
+                &middleware,
+                MiddlewareAgentScope::Main,
+            ),
+            &handle,
+            "hello",
+            &mut handler,
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("run");
+
+        assert_eq!(outcome.error, None);
+        let exported =
+            String::from_utf8(handle.export_document_bytes().await.expect("export")).expect("utf8");
+        let facts = exported_facts(&exported);
+        let turn_started = facts
+            .iter()
+            .find(|line| line["fact"]["type"] == "turn_started")
+            .expect("turn_started fact");
+        let logged_prompt = turn_started["fact"]["data"]["system_prompt"]
+            .as_str()
+            .expect("system prompt string");
+        // 模型可见 prompt = base + <environment> 块 + 委派 guidance（无持久 subagent controller）。
+        assert!(
+            logged_prompt.starts_with(&format!(
+                "base prompt\n\n<environment>\nworkspace_root: {}\n",
+                root.display()
+            )),
+            "unexpected prompt: {logged_prompt}"
+        );
+        assert!(logged_prompt.contains("\nos: "));
+        assert!(logged_prompt.contains("\narch: "));
+        assert!(logged_prompt.contains("\ndate: "));
+        assert!(logged_prompt.ends_with(&format!("</environment>\n\n{PARENT_SUBAGENT_GUIDANCE}")));
+        // 与模型请求实际携带的 system 消息逐字节一致。
+        let request = requests.lock().expect("requests")[0].clone();
+        let body = request.split("\r\n\r\n").nth(1).expect("request body");
+        let body: serde_json::Value = serde_json::from_str(body).expect("parse request body");
+        assert_eq!(body["messages"][0]["role"], json!("system"));
+        assert_eq!(body["messages"][0]["content"], json!(logged_prompt));
+    }
+
+    #[tokio::test]
+    async fn agents_md_edits_take_effect_on_the_next_turn() {
+        let root = unique_dir("agents-per-turn");
+        let agents_md = root.join(AGENTS_MD_FILE_NAME);
+        fs::write(&agents_md, "first version of the rules").expect("write AGENTS.md");
+        let (base_url, requests) =
+            spawn_recording_sse_server(vec![sse_text_body("one"), sse_text_body("two")]).await;
+        let client = client(base_url);
+        let mcp_cache = McpToolCache::new();
+        let instructions = WorkspaceInstructionsCache::new(&root);
+        assert!(instructions.prewarm().is_empty());
+        let mut session = Session::new();
+        let mut handler = RecordingHandler::default();
+        let context = RunAgentTurnContext {
+            client: &client,
+            model: test_model_invocation(),
+            subagent_identities: &[],
+            system_prompt: "base prompt",
+            context_config: context_config(2),
+            model_limits: model_limits(10_000),
+            workspace_root: &root,
+            workspace_instructions: Some(&instructions),
+            permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
+            mcp_servers: &[],
+            mcp_cache: &mcp_cache,
+            tools: None,
+            auto_approve_workspace_writes: true,
+            session_name: "default",
+            turn_index: 0,
+        };
+
+        run_agent_turn(context, &mut session, "first", &mut handler)
+            .await
+            .expect("first turn");
+
+        fs::write(&agents_md, "second version of the rules").expect("rewrite AGENTS.md");
+        bump_mtime(&agents_md);
+        run_agent_turn(context, &mut session, "second", &mut handler)
+            .await
+            .expect("second turn");
+
+        let requests = requests.lock().expect("requests lock poisoned");
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains("first version of the rules"));
+        assert!(!requests[0].contains("second version of the rules"));
+        assert!(requests[1].contains("second version of the rules"));
+        assert!(!requests[1].contains("first version of the rules"));
+        // 两个 turn 都携带 <environment> 块。
+        assert!(requests[0].contains("<environment>"));
+        assert!(requests[1].contains("<environment>"));
+
+        fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[tokio::test]
+    async fn middleware_injected_context_is_logged_with_the_invocation() {
+        let root = unique_dir("middleware-log-workspace");
+        let sessions = unique_dir("middleware-log-sessions");
+        let legacy = unique_dir("middleware-log-legacy");
+        let (base_url, requests) = spawn_recording_sse_server(vec![sse_text_body("ok")]).await;
+        let client = client(base_url);
+        let cache = McpToolCache::new();
+        let store = SessionStore::new(&sessions, &legacy, &root, "default").expect("store");
+        let handle = SessionHandle::open(
+            store,
+            "default",
+            PermissionProfile::for_mode(PermissionMode::ReadOnly),
+        )
+        .expect("handle");
+        let mut handler = RecordingHandler::default();
+        let mut middleware = MiddlewareRegistry::new();
+        middleware.register_runtime(Arc::new(PromptMiddleware {
+            decision: GateDecision::Continue,
+            context: vec![agent_core::ContextBlock::new("ephemeral policy")],
+        }));
+
+        let outcome = run_agent_turn_with_session_handle_and_middleware_context(
+            MiddlewareAgentTurnContext::new(
+                RunAgentTurnContext {
+                    client: &client,
+                    model: test_model_invocation(),
+                    subagent_identities: &[],
+                    system_prompt: "system",
+                    context_config: context_config(2),
+                    model_limits: model_limits(10_000),
+                    workspace_root: &root,
+                    workspace_instructions: None,
+                    permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
+                    mcp_servers: &[],
+                    mcp_cache: &cache,
+                    tools: None,
+                    auto_approve_workspace_writes: true,
+                    session_name: "default",
+                    turn_index: 0,
+                },
+                &middleware,
+                MiddlewareAgentScope::Main,
+            ),
+            &handle,
+            "hello",
+            &mut handler,
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("run");
+
+        assert_eq!(outcome.error, None);
+        assert!(
+            requests.lock().expect("requests")[0].contains("ephemeral policy"),
+            "middleware context must reach the model request"
+        );
+        let projection = handle.projection().await;
+        let before_prompt = projection
+            .middleware_audit
+            .iter()
+            .find(|invocation| invocation.stage == agent_protocol::MiddlewareStage::BeforePrompt)
+            .expect("before_prompt audit");
+        assert_eq!(before_prompt.injected_context.len(), 1);
+        assert_eq!(
+            before_prompt.injected_context[0].content,
+            "ephemeral policy"
+        );
+        assert_eq!(
+            before_prompt.injected_context[0].middleware_id,
+            "prompt-policy"
+        );
+        // 注入内容只留在审计 fact 中，不进入模型上下文投影。
+        assert!(
+            projection
+                .context
+                .messages
+                .iter()
+                .all(|message| message.content.as_deref() != Some("ephemeral policy"))
+        );
+        let exported =
+            String::from_utf8(handle.export_document_bytes().await.expect("export")).expect("utf8");
+        assert!(exported.contains("ephemeral policy"));
     }
 
     #[tokio::test]
@@ -3720,11 +4417,14 @@ compact test
                 context_config: context_config(2),
                 model_limits: model_limits(100_000),
                 workspace_root: &root,
+                workspace_instructions: None,
                 permissions: PermissionProfile::for_mode(
                     agent_protocol::PermissionMode::DangerFullAccess,
                 ),
                 mcp_servers: &[],
                 mcp_cache: &mcp_cache,
+                tools: None,
+                auto_approve_workspace_writes: true,
                 session_name: "default",
                 turn_index: 0,
             },
@@ -3827,9 +4527,12 @@ compact test
                 context_config: context_config(2),
                 model_limits: model_limits(10_000),
                 workspace_root: &root,
+                workspace_instructions: None,
                 permissions: PermissionProfile::for_mode(agent_protocol::PermissionMode::ReadOnly),
                 mcp_servers: &[],
                 mcp_cache: &mcp_cache,
+                tools: None,
+                auto_approve_workspace_writes: true,
                 session_name: "default",
                 turn_index: 0,
             },
@@ -3881,9 +4584,12 @@ compact test
                 context_config: context_config(2),
                 model_limits: model_limits(10_000),
                 workspace_root: &root,
+                workspace_instructions: None,
                 permissions: PermissionProfile::for_mode(agent_protocol::PermissionMode::ReadOnly),
                 mcp_servers: &[],
                 mcp_cache: &mcp_cache,
+                tools: None,
+                auto_approve_workspace_writes: true,
                 session_name: "default",
                 turn_index: 0,
             },
@@ -3940,9 +4646,12 @@ compact test
                 context_config: context_config(2),
                 model_limits: model_limits(1_000_000),
                 workspace_root: &root,
+                workspace_instructions: None,
                 permissions: PermissionProfile::for_mode(agent_protocol::PermissionMode::ReadOnly),
                 mcp_servers: &[],
                 mcp_cache: &mcp_cache,
+                tools: None,
+                auto_approve_workspace_writes: true,
                 session_name: "default",
                 turn_index: 0,
             },
@@ -4013,6 +4722,7 @@ done
             enabled: true,
             startup_timeout_sec: 5,
             tool_timeout_sec: 5,
+            require_approval: None,
         };
 
         let inspection = inspect_mcp_servers(&root, &[server]).await;
@@ -4060,6 +4770,7 @@ done
             enabled: true,
             startup_timeout_sec: 5,
             tool_timeout_sec: 5,
+            require_approval: None,
         }];
 
         let outcome = run_agent_turn(
@@ -4071,9 +4782,12 @@ done
                 context_config: context_config(2),
                 model_limits: model_limits(10_000),
                 workspace_root: &root,
+                workspace_instructions: None,
                 permissions: PermissionProfile::for_mode(agent_protocol::PermissionMode::ReadOnly),
                 mcp_servers: &mcp_servers,
                 mcp_cache: &mcp_cache,
+                tools: None,
+                auto_approve_workspace_writes: true,
                 session_name: "default",
                 turn_index: 0,
             },
@@ -4111,6 +4825,7 @@ done
             enabled: true,
             startup_timeout_sec: 1,
             tool_timeout_sec: 1,
+            require_approval: None,
         }];
 
         let outcome = run_agent_turn(
@@ -4122,9 +4837,12 @@ done
                 context_config: context_config(2),
                 model_limits: model_limits(10_000),
                 workspace_root: &root,
+                workspace_instructions: None,
                 permissions: PermissionProfile::for_mode(agent_protocol::PermissionMode::ReadOnly),
                 mcp_servers: &mcp_servers,
                 mcp_cache: &mcp_cache,
+                tools: None,
+                auto_approve_workspace_writes: true,
                 session_name: "default",
                 turn_index: 0,
             },
@@ -4192,6 +4910,7 @@ done
             enabled: true,
             startup_timeout_sec: 5,
             tool_timeout_sec: 5,
+            require_approval: None,
         }];
 
         for (turn_index, prompt, handler) in [
@@ -4207,11 +4926,14 @@ done
                     context_config: context_config(2),
                     model_limits: model_limits(10_000),
                     workspace_root: &root,
+                    workspace_instructions: None,
                     permissions: PermissionProfile::for_mode(
                         agent_protocol::PermissionMode::ReadOnly,
                     ),
                     mcp_servers: &mcp_servers,
                     mcp_cache: &mcp_cache,
+                    tools: None,
+                    auto_approve_workspace_writes: true,
                     session_name: "default",
                     turn_index,
                 },
@@ -4261,11 +4983,15 @@ done
                 context_config: context_config(2),
                 model_limits: model_limits(10_000),
                 workspace_root: &root,
+                workspace_instructions: None,
                 permissions: PermissionProfile::for_mode(
                     agent_protocol::PermissionMode::WorkspaceWrite,
                 ),
                 mcp_servers: &[],
                 mcp_cache: &mcp_cache,
+                tools: None,
+                // 该用例验证审批拒绝链路，显式回退到逐次审批旧行为。
+                auto_approve_workspace_writes: false,
                 session_name: "default",
                 turn_index: 0,
             },
@@ -4312,11 +5038,15 @@ done
                 subagent_identities: &[],
                 system_prompt: "system",
                 context_config: context_config(2),
-                model_limits: model_limits(2_000),
+                // 工具定义计入上下文估算；窗口要同时触发压缩并容纳回退压缩后的保留内容。
+                model_limits: model_limits(4_000),
                 workspace_root: &root,
+                workspace_instructions: None,
                 permissions: PermissionProfile::for_mode(agent_protocol::PermissionMode::ReadOnly),
                 mcp_servers: &[],
                 mcp_cache: &mcp_cache,
+                tools: None,
+                auto_approve_workspace_writes: true,
                 session_name: "default",
                 turn_index: session.turns.len(),
             },
