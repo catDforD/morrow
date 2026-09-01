@@ -63,7 +63,7 @@ pub use instructions::*;
 mod middleware_glue;
 pub use middleware_glue::*;
 mod subagent_support;
-pub use subagent_support::*;
+pub(crate) use subagent_support::*;
 mod system_prompt;
 pub use system_prompt::*;
 mod turn;

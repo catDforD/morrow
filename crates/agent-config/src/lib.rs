@@ -9,7 +9,7 @@ use thiserror::Error;
 mod loader;
 pub use loader::*;
 mod raw;
-pub use raw::*;
+pub(crate) use raw::*;
 mod schema;
 pub use schema::*;
 #[cfg(test)]

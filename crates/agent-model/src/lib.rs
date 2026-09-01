@@ -19,6 +19,6 @@ pub use client::*;
 mod sse;
 pub use sse::*;
 mod types;
-pub use types::*;
+pub(crate) use types::*;
 #[cfg(test)]
 mod tests;

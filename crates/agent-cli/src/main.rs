@@ -34,20 +34,20 @@ async fn main() {
 }
 
 mod approval_ui;
-pub use approval_ui::*;
+pub(crate) use approval_ui::*;
 mod cli;
-pub use cli::*;
+pub(crate) use cli::*;
 mod commands_hooks;
-pub use commands_hooks::*;
+pub(crate) use commands_hooks::*;
 mod commands_init;
-pub use commands_init::*;
+pub(crate) use commands_init::*;
 mod commands_session;
-pub use commands_session::*;
+pub(crate) use commands_session::*;
 mod output;
-pub use output::*;
+pub(crate) use output::*;
 mod repl;
-pub use repl::*;
+pub(crate) use repl::*;
 mod run;
-pub use run::*;
+pub(crate) use run::*;
 #[cfg(test)]
 mod tests;
