@@ -30,19 +30,6 @@ const api = vi.hoisted(() => {
 })
 
 vi.mock('./api', () => api)
-vi.mock('./desktop', () => ({
-  getDesktopPlatform: () => null,
-  getDesktopShellState: vi.fn(),
-  runDesktopAction: vi.fn(),
-}))
-vi.mock('./DesktopShell', () => ({
-  default: ({ children }: { children: React.ReactNode }) => <>{children}</>,
-}))
-vi.mock('./WorkspaceManager', () => ({
-  ProjectsDialog: () => null,
-  RemoteConnectionDialog: () => null,
-  WorkspaceMenu: () => null,
-}))
 
 import App from './App'
 import type {
@@ -111,10 +98,9 @@ describe('App Session creation flow', () => {
         case '/api/status':
           return {
             workspace_root: '/workspace/morrow',
-            workspace_location: { kind: 'local', path: '/workspace/morrow' },
             config_path: null,
             permissions: { mode: 'workspace_write', shell: 'prompt' },
-            version: '0.1.0',
+            version: '0.4.0',
             model_ready: true,
             model_store_path: '/models.json',
             mcp_store_path: '/mcp.json',
