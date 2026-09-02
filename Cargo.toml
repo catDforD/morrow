@@ -5,10 +5,8 @@ members = [
     "crates/agent-core",
     "crates/agent-eval",
     "crates/agent-hooks",
-    "crates/agent-desktop/src-tauri",
     "crates/agent-model",
     "crates/agent-protocol",
-    "crates/agent-remote",
     "crates/agent-runtime",
     "crates/agent-server",
     "crates/agent-sandbox",
@@ -17,7 +15,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
 
 [workspace.dependencies]
@@ -27,7 +25,6 @@ agent-eval = { path = "crates/agent-eval" }
 agent-hooks = { path = "crates/agent-hooks" }
 agent-model = { path = "crates/agent-model" }
 agent-protocol = { path = "crates/agent-protocol" }
-agent-remote = { path = "crates/agent-remote" }
 agent-runtime = { path = "crates/agent-runtime" }
 agent-server = { path = "crates/agent-server" }
 agent-sandbox = { path = "crates/agent-sandbox" }
