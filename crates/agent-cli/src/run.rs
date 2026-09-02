@@ -101,18 +101,23 @@ pub(crate) async fn run() -> Result<(), CliError> {
             options.permission_ceiling = *ceiling;
         }
         print_startup_diagnostics(&options.config_diagnostics);
-        eprintln!("morrow server listening on http://{host}:{port}");
-        let access_policy = if *no_auth {
+        let bootstrap_token = if *no_auth {
             eprintln!(
                 "WARNING: server authentication is disabled (--no-auth); any local process can drive this agent"
             );
-            agent_server::ServerAccessPolicy::browser(None)
+            None
         } else {
             let token = agent_server::generate_browser_token()?;
-            eprintln!("open this URL to sign in: http://{host}:{port}/?bootstrap={token}");
-            agent_server::ServerAccessPolicy::browser(Some(token))
+            Some(token)
         };
-        agent_server::serve(options, access_policy).await?;
+        let access_policy = agent_server::ServerAccessPolicy::browser(bootstrap_token.clone());
+        agent_server::serve_with_ready(options, access_policy, move |addr| {
+            eprintln!("morrow server listening on http://{addr}");
+            if let Some(token) = bootstrap_token {
+                eprintln!("open this URL to sign in: http://{addr}/?bootstrap={token}");
+            }
+        })
+        .await?;
         return Ok(());
     }
 

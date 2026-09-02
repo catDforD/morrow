@@ -20,7 +20,7 @@ use agent_protocol::{
     SessionTurnStatus, ShellPolicy, SubagentExecutionSummary, SubagentIdentity, Thread, ToolCall,
     ToolDefinition, TurnRecord, TurnStatus, TurnStepKind,
 };
-use agent_tools::{SubagentExecutor, ToolRegistry, ToolRegistryError};
+use agent_tools::{BuiltInToolAllowlist, SubagentExecutor, ToolRegistry, ToolRegistryError};
 use futures_util::StreamExt;
 use futures_util::future::{BoxFuture, FutureExt};
 use serde::{Deserialize, Serialize};

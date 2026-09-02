@@ -8,7 +8,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::Duration;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, oneshot};
 use tower::ServiceExt;
 
 static ENV_LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
@@ -870,6 +870,105 @@ async fn browser_access_with_token_requires_bootstrap_and_origin() {
 }
 
 #[tokio::test]
+async fn browser_access_accepts_ipv6_and_default_http_port_authorities() {
+    let mut options = test_options();
+    options.host = "::1".parse().expect("IPv6 host");
+    options.port = 43126;
+    let (router, _) = build_router(
+        options,
+        ServerAccessPolicy::browser(Some("ipv6-test-token".to_string())),
+    )
+    .expect("browser router");
+
+    let bootstrap = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/?bootstrap=ipv6-test-token")
+                .header(header::HOST, "[::1]:43126")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(bootstrap.status(), StatusCode::SEE_OTHER);
+
+    let authorized = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/commands/resolve")
+                .header(header::HOST, "[::1]:43126")
+                .header(header::ORIGIN, "http://[::1]:43126")
+                .header(header::COOKIE, "morrow_session=ipv6-test-token")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"input":"hello"}"#))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_ne!(authorized.status(), StatusCode::UNAUTHORIZED);
+
+    let mut options = test_options();
+    options.port = 80;
+    let (router, _) = build_router(
+        options,
+        ServerAccessPolicy::browser(Some("default-port-token".to_string())),
+    )
+    .expect("browser router");
+    let bootstrap = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/?bootstrap=default-port-token")
+                .header(header::HOST, "127.0.0.1")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(bootstrap.status(), StatusCode::SEE_OTHER);
+    let authorized = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/status")
+                .header(header::HOST, "127.0.0.1")
+                .header(header::ORIGIN, "http://127.0.0.1")
+                .header(header::COOKIE, "morrow_session=default-port-token")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_ne!(authorized.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn serve_reports_the_bound_address_before_starting() {
+    let (sender, receiver) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        serve_with_ready(
+            test_options(),
+            ServerAccessPolicy::browser(None),
+            move |address| {
+                sender.send(address).expect("bound address receiver");
+            },
+        )
+        .await
+    });
+
+    let address = tokio::time::timeout(Duration::from_secs(1), receiver)
+        .await
+        .expect("bound address callback")
+        .expect("bound address");
+    assert_ne!(address.port(), 0);
+    task.abort();
+    let _ = task.await;
+}
+
+#[tokio::test]
 async fn browser_access_without_token_passes_through_for_no_auth() {
     let (router, _) =
         build_router(test_options(), ServerAccessPolicy::browser(None)).expect("browser router");
@@ -1546,6 +1645,21 @@ fn requested_permissions_clamp_requested_mode_to_the_ceiling() {
     assert_eq!(
         requested_permissions(workspace_write, None, PermissionMode::ReadOnly).mode,
         PermissionMode::ReadOnly
+    );
+    let escalated_default = PermissionProfile {
+        mode: PermissionMode::DangerFullAccess,
+        shell: ShellPolicy::Allow,
+    };
+    assert_eq!(
+        requested_permissions(escalated_default, None, PermissionMode::WorkspaceWrite),
+        PermissionProfile {
+            mode: PermissionMode::WorkspaceWrite,
+            shell: ShellPolicy::Prompt,
+        }
+    );
+    assert_eq!(
+        requested_permissions(escalated_default, None, PermissionMode::DangerFullAccess),
+        escalated_default
     );
     assert_eq!(DEFAULT_WEB_PERMISSION_MODE, PermissionMode::WorkspaceWrite);
 }

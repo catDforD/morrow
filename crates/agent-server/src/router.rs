@@ -1,4 +1,5 @@
 use super::*;
+use axum::http::uri::{Authority, Uri};
 
 pub const DEFAULT_WEB_PERMISSION_MODE: PermissionMode = PermissionMode::WorkspaceWrite;
 #[derive(Clone)]
@@ -204,8 +205,11 @@ async fn access_middleware(
             return with_security_headers(next.run(request).await);
         }
     };
-    let expected_host = format!("{}:{}", state.inner.options.host, state.inner.options.port);
-    let response = match token_guard(&request, token, &expected_host) {
+    let expected_authority = ExpectedAuthority {
+        host: state.inner.options.host,
+        port: state.inner.options.port,
+    };
+    let response = match token_guard(&request, token, expected_authority) {
         Some(rejection) => rejection,
         None => next.run(request).await,
     };
@@ -216,12 +220,56 @@ async fn access_middleware(
 /// Shared Host/bootstrap/cookie/Origin guard for token-protected access policies.
 /// Returns `Some(response)` when the request is handled (bootstrap redirect or
 /// rejection) and `None` when it may proceed.
-fn token_guard(request: &Request<Body>, token: &str, expected_host: &str) -> Option<Response> {
+#[derive(Clone, Copy)]
+struct ExpectedAuthority {
+    host: IpAddr,
+    port: u16,
+}
+
+impl ExpectedAuthority {
+    fn matches(&self, authority: &Authority) -> bool {
+        if authority.as_str().contains('@') {
+            return false;
+        }
+        let host = authority.host();
+        let host = host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(host);
+        host.parse::<IpAddr>().ok() == Some(self.host)
+            && authority.port_u16().unwrap_or(80) == self.port
+    }
+
+    fn matches_host_header(&self, value: &str) -> bool {
+        value
+            .parse::<Authority>()
+            .ok()
+            .is_some_and(|authority| self.matches(&authority))
+    }
+
+    fn matches_origin(&self, value: &str) -> bool {
+        let Ok(origin) = value.parse::<Uri>() else {
+            return false;
+        };
+        origin.scheme_str() == Some("http")
+            && matches!(origin.path(), "" | "/")
+            && origin.query().is_none()
+            && origin
+                .authority()
+                .is_some_and(|authority| self.matches(authority))
+    }
+}
+
+fn token_guard(
+    request: &Request<Body>,
+    token: &str,
+    expected: ExpectedAuthority,
+) -> Option<Response> {
     let host_matches = request
         .headers()
         .get(header::HOST)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|host| host == expected_host);
+        .is_some_and(|host| expected.matches_host_header(host));
     if !host_matches {
         return Some(StatusCode::UNAUTHORIZED.into_response());
     }
@@ -236,7 +284,7 @@ fn token_guard(request: &Request<Body>, token: &str, expected_host: &str) -> Opt
         }
         return Some(response);
     }
-    if !has_session_cookie(request, token) || !origin_is_allowed(request, expected_host) {
+    if !has_session_cookie(request, token) || !origin_is_allowed(request, expected) {
         return Some(StatusCode::UNAUTHORIZED.into_response());
     }
     None
@@ -272,18 +320,17 @@ fn has_session_cookie(request: &Request<Body>, token: &str) -> bool {
         })
 }
 
-fn origin_is_allowed(request: &Request<Body>, expected_host: &str) -> bool {
+fn origin_is_allowed(request: &Request<Body>, expected: ExpectedAuthority) -> bool {
     let requires_origin = request.uri().path().ends_with("/ws")
         || !matches!(*request.method(), Method::GET | Method::HEAD);
     if !requires_origin {
         return true;
     }
-    let expected_origin = format!("http://{expected_host}");
     request
         .headers()
         .get(header::ORIGIN)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|origin| origin == expected_origin)
+        .is_some_and(|origin| expected.matches_origin(origin))
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {

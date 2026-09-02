@@ -18,7 +18,7 @@ use agent_protocol::{
     AgentEvent, AgentEventOrigin, ApprovalDecision, ApprovalOrigin, ApprovalRequest,
     ModelSelection, PermissionMode, PermissionProfile, ReasoningProfile, RemoteMcpServerSpec,
     RemoteModelConnectionSpec, RemoteModelSpec, RemoteSubagentMessageSpec, RemoteSubagentRoleSpec,
-    RemoteTurnModel, RemoteTurnSpec, Session, SessionProjection, SessionStreamFrame,
+    RemoteTurnModel, RemoteTurnSpec, Session, SessionProjection, SessionStreamFrame, ShellPolicy,
     SubagentIdentity, SubagentInstanceSnapshot, SubagentRole, SubagentRoleOverride,
     SubagentRunRecord, WorkspaceLocation,
 };
@@ -144,8 +144,16 @@ impl Drop for RunningServer {
 }
 
 pub async fn serve(
+    options: ServerOptions,
+    access_policy: ServerAccessPolicy,
+) -> Result<(), ServerError> {
+    serve_with_ready(options, access_policy, |_| {}).await
+}
+
+pub async fn serve_with_ready(
     mut options: ServerOptions,
     access_policy: ServerAccessPolicy,
+    on_ready: impl FnOnce(SocketAddr),
 ) -> Result<(), ServerError> {
     let addr = SocketAddr::new(options.host, options.port);
     let listener = TcpListener::bind(addr)
@@ -156,7 +164,9 @@ pub async fn serve(
         .map_err(|source| ServerError::Bind { addr, source })?;
     options.host = bound_addr.ip();
     options.port = bound_addr.port();
-    axum::serve(listener, build_router(options, access_policy)?.0)
+    let router = build_router(options, access_policy)?.0;
+    on_ready(bound_addr);
+    axum::serve(listener, router)
         .await
         .map_err(ServerError::Serve)
 }

@@ -774,10 +774,15 @@ pub(crate) fn requested_permissions(
         // Derive the profile from the clamped mode so a reduced mode cannot
         // keep the escalated shell policy of the requested one.
         Some(mode) => PermissionProfile::for_mode(mode.clamp(ceiling)),
-        None => PermissionProfile {
-            mode: default.mode.clamp(ceiling),
-            ..default
-        },
+        None => {
+            let mode = default.mode.clamp(ceiling);
+            let shell = match (default.shell, mode) {
+                (ShellPolicy::Allow, PermissionMode::DangerFullAccess) => ShellPolicy::Allow,
+                (ShellPolicy::Allow, _) => ShellPolicy::Prompt,
+                (shell, _) => shell,
+            };
+            PermissionProfile { mode, shell }
+        }
     }
 }
 

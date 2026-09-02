@@ -13,6 +13,7 @@ pub(crate) struct RuntimeSubagentExecutor {
     system_prompt: Arc<str>,
     workspace_root: Arc<PathBuf>,
     artifact_root: Option<Arc<PathBuf>>,
+    tools: ToolsConfig,
     middleware: Arc<MiddlewareRegistry>,
     invocation: ModelInvocation,
     session_name: Arc<str>,
@@ -33,6 +34,7 @@ impl RuntimeSubagentExecutor {
             system_prompt: system_prompt.into(),
             workspace_root: workspace_root.into(),
             artifact_root: None,
+            tools: ToolsConfig::default(),
             middleware: Arc::new(MiddlewareRegistry::default()),
             invocation: ModelInvocation {
                 provider_id: "unknown".to_string(),
@@ -51,6 +53,11 @@ impl RuntimeSubagentExecutor {
 
     pub(crate) fn with_artifact_root(mut self, artifact_root: Option<PathBuf>) -> Self {
         self.artifact_root = artifact_root.map(Arc::new);
+        self
+    }
+
+    pub(crate) fn with_tool_filter(mut self, tools: ToolsConfig) -> Self {
+        self.tools = tools;
         self
     }
 
@@ -116,9 +123,17 @@ impl RuntimeSubagentExecutor {
         task: String,
         cancellation: CancellationToken,
     ) -> SubagentExecutionSummary {
-        let tools = match ToolRegistry::research_with_artifact_root(
+        let allowed = BuiltInToolAllowlist::research().filtered(&self.tools);
+        let tools = match ToolRegistry::built_in_with_allowlist_and_writer_lease_and_artifact_root(
             self.workspace_root.as_ref(),
+            PermissionProfile {
+                mode: PermissionMode::ReadOnly,
+                shell: ShellPolicy::Deny,
+            },
+            allowed,
+            None,
             self.artifact_root.as_deref().cloned(),
+            true,
         ) {
             Ok(tools) => tools,
             Err(error) => {

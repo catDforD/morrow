@@ -484,9 +484,10 @@ pub async fn prepare_session_turn_with_middleware_context(
     let before_cancelled = before.cancelled;
     let before_denied = before.denied();
     let denied_reasons = before.denied_reasons.clone();
-    let event_index =
-        deliver_middleware_events(context.turn, handler, Some(handle), before.events, 0).await?;
+    let event_delivery =
+        deliver_middleware_events(context.turn, handler, Some(handle), before.events, 0).await;
     if before_cancelled {
+        event_delivery?;
         return Ok(None);
     }
     if before_denied {
@@ -506,8 +507,10 @@ pub async fn prepare_session_turn_with_middleware_context(
                 denied_reasons.join("; ")
             ))
             .await;
+        event_delivery?;
         return Ok(None);
     }
+    let event_index = event_delivery?;
     let turn_base = assembled_turn_system_prompt(context.turn).await;
     let system_prompt = effective_turn_system_prompt(
         &turn_base,
@@ -827,7 +830,8 @@ async fn run_agent_turn_inner(
                     Arc::<str>::from(context.session_name),
                     context.turn_index,
                 )
-                .with_artifact_root(artifact_root),
+                .with_artifact_root(artifact_root)
+                .with_tool_filter(tool_filter.clone()),
             ),
             context.subagent_identities,
         )?;

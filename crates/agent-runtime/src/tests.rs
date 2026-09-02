@@ -541,6 +541,16 @@ impl TurnEventHandler for FailOnAgentMessage {
     }
 }
 
+struct FailOnFirstEvent;
+
+impl TurnEventHandler for FailOnFirstEvent {
+    fn on_event(&mut self, _event: &AgentEventEnvelope) -> Result<(), RuntimeError> {
+        Err(RuntimeError::event_handler(
+            "simulated middleware delivery failure",
+        ))
+    }
+}
+
 struct FailOnTextDelta;
 
 impl TurnEventHandler for FailOnTextDelta {
@@ -1164,6 +1174,73 @@ async fn denied_before_prompt_is_logged_and_still_broadcast() {
 }
 
 #[tokio::test]
+async fn denied_before_prompt_is_logged_when_event_delivery_fails() {
+    let root = unique_dir("middleware-deny-handler-failure-workspace");
+    let sessions = unique_dir("middleware-deny-handler-failure-sessions");
+    let legacy = unique_dir("middleware-deny-handler-failure-legacy");
+    let store = SessionStore::new(&sessions, &legacy, &root, "default").expect("store");
+    let handle = SessionHandle::open(
+        store,
+        "default",
+        PermissionProfile::for_mode(PermissionMode::ReadOnly),
+    )
+    .expect("handle");
+    let client = client("http://127.0.0.1:1/v1".to_string());
+    let cache = McpToolCache::new();
+    let mut handler = FailOnFirstEvent;
+    let mut middleware = MiddlewareRegistry::new();
+    middleware.register_runtime(Arc::new(PromptMiddleware {
+        decision: GateDecision::Deny {
+            reason: "secret detected".to_string(),
+        },
+        context: Vec::new(),
+    }));
+
+    let result = run_agent_turn_with_session_handle_and_middleware_context(
+        MiddlewareAgentTurnContext::new(
+            RunAgentTurnContext {
+                client: &client,
+                model: test_model_invocation(),
+                subagent_identities: &[],
+                system_prompt: "system",
+                context_config: context_config(2),
+                model_limits: model_limits(10_000),
+                workspace_root: &root,
+                workspace_instructions: None,
+                permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
+                mcp_servers: &[],
+                mcp_cache: &cache,
+                tools: None,
+                auto_approve_workspace_writes: true,
+                session_name: "default",
+                turn_index: 0,
+            },
+            &middleware,
+            MiddlewareAgentScope::Main,
+        ),
+        &handle,
+        "persist this rejected secret",
+        &mut handler,
+        CancellationToken::new(),
+        None,
+    )
+    .await;
+    assert!(result.is_err());
+
+    let exported =
+        String::from_utf8(handle.export_document_bytes().await.expect("export")).expect("utf8");
+    let facts = exported_facts(&exported);
+    let rejected = facts
+        .iter()
+        .find(|line| line["fact"]["type"] == "prompt_rejected")
+        .expect("prompt_rejected fact");
+    assert_eq!(
+        rejected["fact"]["data"]["prompt"],
+        json!("persist this rejected secret")
+    );
+}
+
+#[tokio::test]
 async fn before_prompt_context_is_sent_once_and_not_persisted() {
     let root = unique_dir("middleware-context");
     let (base_url, requests) = spawn_recording_sse_server(vec![sse_text_body("ok")]).await;
@@ -1580,6 +1657,67 @@ async fn delegate_task_runs_an_isolated_read_only_subagent() {
     assert!(!requests[1].contains("Use a subagent to inspect the note"));
     assert!(requests[2].contains("workspace evidence"));
     assert!(requests[3].contains("The file contains workspace evidence."));
+}
+
+#[tokio::test]
+async fn delegated_subagent_respects_parent_tool_filter() {
+    let root = unique_dir("subagent-tool-filter");
+    let (base_url, requests) = spawn_recording_sse_server(vec![
+        tool_call_body(
+            "delegate-filter-1",
+            "delegate_task",
+            json!({"task": "Inspect the workspace"}),
+        ),
+        sse_text_body("The child completed without the denied tool."),
+        sse_text_body("The parent completed."),
+    ])
+    .await;
+    let client = client(base_url);
+    let mut session = Session::new();
+    let mut handler = RecordingHandler::default();
+    let mcp_cache = McpToolCache::new();
+    let tools = ToolsConfig {
+        allow: Vec::new(),
+        deny: vec!["read_file".to_string()],
+    };
+    let subagent_identities = [SubagentIdentity {
+        id: "filtered-researcher".to_string(),
+        name: "Filtered Researcher".to_string(),
+    }];
+
+    run_agent_turn(
+        RunAgentTurnContext {
+            client: &client,
+            model: test_model_invocation(),
+            subagent_identities: &subagent_identities,
+            system_prompt: "system",
+            context_config: context_config(2),
+            model_limits: model_limits(100_000),
+            workspace_root: &root,
+            workspace_instructions: None,
+            permissions: PermissionProfile::for_mode(PermissionMode::ReadOnly),
+            mcp_servers: &[],
+            mcp_cache: &mcp_cache,
+            tools: Some(&tools),
+            auto_approve_workspace_writes: true,
+            session_name: "default",
+            turn_index: 0,
+        },
+        &mut session,
+        "Delegate a workspace inspection",
+        &mut handler,
+    )
+    .await
+    .expect("run delegated turn");
+
+    let requests = requests.lock().expect("requests lock poisoned");
+    assert_eq!(requests.len(), 3);
+    assert!(requests[0].contains("\"name\":\"delegate_task\""));
+    assert!(!requests[0].contains("\"name\":\"read_file\""));
+    assert!(!requests[1].contains("\"name\":\"read_file\""));
+    assert!(requests[1].contains("\"name\":\"list_files\""));
+    assert!(requests[1].contains("\"name\":\"search_text\""));
+    assert!(requests[1].contains("\"name\":\"web_fetch\""));
 }
 
 #[tokio::test]
