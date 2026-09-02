@@ -41,8 +41,6 @@ trait 由核心层拥有，具体适配器依赖并实现它，这就是依赖�
 │ 入口层                                                      │
 │ agent-cli                 agent-server                      │
 │ 参数、REPL、JSONL          HTTP、WebSocket、Web UI           │
-│ agent-desktop              agent-remote                      │
-│ Tauri 壳、WSL 生命周期      Desktop/WSL 转发                 │
 └──────────────────────────────┬──────────────────────────────┘
                                │
                                ▼
@@ -88,10 +86,8 @@ agent-eval 是验证层：依赖 core/protocol，用脚本化模型与工具固�
 | `agent-runtime` | 编排已注入的模型端口与工具系统、上下文压缩、turn 事件封装、SessionStore 与 v7 fact log 持久化、Subagent 监督 | 解析 CLI 参数、实现模型 HTTP 协议或渲染 Web UI |
 | `agent-config` | 加载并校验 `morrow.toml` 和环境变量 | 执行 agent turn |
 | `agent-cli` | CLI 参数、REPL、终端输出、交互式审批、`session` / `hooks` 子命令和服务装配 | 复制核心状态机或实现会话持久化 |
-| `agent-server` | HTTP/WebSocket API、浏览器事件、远程审批和取消入口 | 实现模型协议或工具业务 |
-| `agent-desktop` | Tauri 2 桌面壳、嵌入式 server 生命周期、WSL 连接 | 执行 agent turn 或实现模型协议 |
+| `agent-server` | HTTP/WebSocket API、浏览器事件、审批和取消入口 | 实现模型协议或工具业务 |
 | `agent-hooks` | 命令 Hook 与中间件适配器、项目 Hook 指纹信任 | 修改 turn 状态机或实现 HTTP |
-| `agent-remote` | Desktop/WSL remote 协议、命令与事件转发 | 持有会话业务状态或执行 turn |
 | `agent-eval` | 确定性回归场景、脚本化模型与工具、效率基线 | 参与生产运行时或依赖真实模型 |
 
 ## 4. 编译依赖方向
@@ -101,8 +97,6 @@ agent-eval 是验证层：依赖 core/protocol，用脚本化模型与工具固�
 ```text
 agent-cli    -> agent-hooks, agent-runtime, agent-server, agent-model, agent-config, agent-protocol
 agent-server -> agent-hooks, agent-runtime, agent-model, agent-config, agent-protocol
-agent-desktop-> agent-remote, agent-server, agent-config, agent-protocol
-agent-remote -> agent-server, agent-config, agent-protocol
 agent-runtime-> agent-core, agent-tools, agent-model, agent-config, agent-protocol
 agent-hooks  -> agent-core, agent-runtime, agent-protocol
 agent-eval   -> agent-core, agent-protocol
@@ -119,7 +113,7 @@ agent-protocol -> serde / serde_json
 
 1. `agent-core` 定义端口，但不依赖 `agent-model` 或 `agent-tools` 的具体类型。
 2. `agent-model` 和 `agent-tools` 依赖 `agent-core`，分别实现端口。
-3. `agent-cli`、`agent-server` 和 `agent-desktop` 是模型适配器的组合根；它们创建客户端，再以 `dyn Model` 注入 runtime。
+3. `agent-cli` 和 `agent-server` 是模型适配器的组合根；它们创建客户端，再以 `dyn Model` 注入 runtime。
 4. `agent-runtime` 负责用例编排和工具系统装配，但不知道具体模型供应商。
 5. `agent-protocol` 不反向依赖任何业务 crate。
 6. `agent-eval` 和 `agent-hooks` 可以依赖 `agent-core`，但 `agent-core` 不反向感知它们；`agent-eval` 绝不进入生产运行时。
@@ -178,7 +172,7 @@ pub trait ToolRuntime: Send + Sync {
 ## 6. 一次 turn 的完整时序
 
 ```text
-CLI / Server / Desktop
+CLI / Server
     │
     │ prompt + Session 投影 + 配置
     ▼
@@ -206,7 +200,7 @@ TurnRecord + AgentEvent
 agent-runtime / SessionStore
     │ 11. 追加 v7 Session fact log 并 sync
     ▼
-CLI 输出、WebSocket 广播或 WSL 转发
+CLI 输出或 WebSocket 广播
 ```
 
 更具体地说：
@@ -370,7 +364,7 @@ CLI 没有独立的 turn cancellation 协议；进程级中断仍属于入口层
 
 `agent-runtime::SessionStore` 把 Session 保存为 append-only JSONL fact log。当前 canonical header 是 schema v7（`SESSION_DOCUMENT_SCHEMA_VERSION = 7`），并接受 v5/v6 header（就地升级 header，不重写 facts）。旧的 v1/v2 Thread 文档和 v3/v4 Session 聚合文档只作为迁移输入；迁移产生 `LegacyContextCheckpoint` / `ContextCompacted` 等 fact 后即安装 v7 log，旧源原子移动为 `.legacy-vN.bak`。聚合 `SessionDocument`（schema v7）仅用于迁移与导出兼容，不作为运行时模型上下文的事实源。一致性细节见 [`docs/session-consistency-protocol.md`](docs/session-consistency-protocol.md)。
 
-每次 turn 的 runtime 上下文必须携带解析后的 `ModelInvocation`，并在 Turn 创建时写入记录；Web、CLI、Desktop、WSL 与远端入口不得在持久化后各自补写模型信息。这样实时展示和历史恢复都以同一份模型元数据为准。
+每次 turn 的 runtime 上下文必须携带解析后的 `ModelInvocation`，并在 Turn 创建时写入记录；Web 与 CLI 入口不得在持久化后各自补写模型信息。这样实时展示和历史恢复都以同一份模型元数据为准。
 
 实时事件使用当前 schema v8 的 `AgentEventEnvelope`（`agent-runtime::EVENT_SCHEMA_VERSION = 8`）包装，包含：
 
@@ -379,11 +373,11 @@ CLI 没有独立的 turn cancellation 协议；进程级中断仍属于入口层
 - turn index 和 event index。
 - 时间戳与具体 `AgentEvent`。
 
-Session 订阅流当前为 schema v3（`SESSION_STREAM_SCHEMA_VERSION = 3`），remote 协议当前为 v5（`REMOTE_PROTOCOL_VERSION = 5`）。CLI 的 JSONL 和 server 的 WebSocket 共用 `AgentEventEnvelope`。修改任何事件/订阅 JSON 形状或版本号时，都需要把它当作外部协议变更，而不是普通内部重构。
+Session 订阅流当前为 schema v3（`SESSION_STREAM_SCHEMA_VERSION = 3`）。CLI 的 JSONL 和 server 的浏览器 WebSocket 共用 `AgentEventEnvelope`。修改任何事件/订阅 JSON 形状或版本号时，都需要把它当作外部协议变更，而不是普通内部重构。
 
 父模型每次真实开始请求时都会发送 `model_call_started`。Web 以该事件创建模型步骤，工具和 Subagent 的开始事件只结束当前模型步骤，不再自行推断新的模型调用；因此同一批并发工具不会产生重复的模型行。
 
-Subagent 身份遵守同样的单一来源规则：父 turn 启动时把 `SubagentIdentity { id, name }` 名单快照写入 `RunAgentTurnContext`，`ToolRegistry` 再按 tool-call ID 缓存随机分配结果，保证开始事件、结束事件和持久化工具结果使用同一身份。完整的姓名与头像配置由 `agent-server` 保存在全局 `~/.morrow/subagents.json`；协议和 Session 只携带 ID/姓名，不携带 Base64 头像。Desktop/WSL 通过 remote protocol v5 只把身份池发送给远端 runtime，头像始终留在 Windows 展示端。
+Subagent 身份遵守同样的单一来源规则：父 turn 启动时把 `SubagentIdentity { id, name }` 名单快照写入 `RunAgentTurnContext`，`ToolRegistry` 再按 tool-call ID 缓存随机分配结果，保证开始事件、结束事件和持久化工具结果使用同一身份。完整的姓名与头像配置由 `agent-server` 保存在全局 `~/.morrow/subagents.json`；协议和 Session 只携带 ID/姓名，不携带 Base64 头像。
 
 当前 SessionStore 是本地文件存储。SessionHandle 使用标准库跨进程文件锁保证单写者；server 还会在进程内阻止同一 Session 同时启动两个 turn。多个独立进程通过文件锁排队获取写租约，但不要绕过 `SessionHandle` 直接改写 fact log。
 
@@ -401,7 +395,6 @@ Subagent 身份遵守同样的单一来源规则：父 turn 启动时把 `Subage
 | 修改参数、REPL 或终端输出 | `agent-cli` |
 | 修改 HTTP、WebSocket 或 Web UI | `agent-server` |
 | 新增命令 Hook 或中间件策略 | `agent-hooks` |
-| 修改 Desktop/WSL 握手与转发 | `agent-remote`、`agent-desktop` |
 | 新增回归场景、断言或效率预算 | `agent-eval` |
 
 判断位置时可以问两个问题：

@@ -13,10 +13,8 @@
 - `crates/agent-config`：`morrow.toml` 配置加载与校验。
 - `crates/agent-tools`：内置文件与 shell 工具、ToolRegistry、MCP 适配和 `web_fetch`。
 - `crates/agent-sandbox`：workspace 路径约束与权限判定。
-- `crates/agent-server`：HTTP/WebSocket、内嵌 Web 仪表盘、远程审批与取消、Subagent/MCP/命令设置。
+- `crates/agent-server`：HTTP/WebSocket 浏览器仪表盘、审批与取消、Subagent/MCP/命令设置。
 - `crates/agent-hooks`：命令 Hook 与中间件适配器（before_prompt、before_tool、permission_request、after_tool、after_turn、pre/post compact），含项目 Hook 指纹信任。
-- `crates/agent-remote`：Desktop/WSL 远程运行时协议与命令/事件转发。
-- `crates/agent-desktop`：Tauri 2 桌面外壳、嵌入式 server 生命周期与 WSL 连接。
 
 测试通常和代码放在同一 crate 的 `#[cfg(test)]` 模块中。GitHub/PR 相关配置放在 `.github/`。
 
