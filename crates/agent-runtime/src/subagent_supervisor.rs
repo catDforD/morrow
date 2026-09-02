@@ -1684,7 +1684,7 @@ fn failed_summary(
     }
 }
 
-fn truncate_chars(value: String, max_chars: usize) -> (String, bool) {
+pub(crate) fn truncate_chars(value: String, max_chars: usize) -> (String, bool) {
     if value.chars().count() <= max_chars {
         return (value, false);
     }
@@ -1817,7 +1817,7 @@ mod tests {
     }
 
     impl ConstantModel {
-        fn new(text: impl Into<String>) -> Self {
+        pub(crate) fn new(text: impl Into<String>) -> Self {
             Self {
                 text: text.into(),
                 requests: Arc::new(StdMutex::new(Vec::new())),
