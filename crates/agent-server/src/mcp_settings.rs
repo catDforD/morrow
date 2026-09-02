@@ -1,6 +1,5 @@
 use crate::secrets::{SecretString, replace_file};
 use agent_config::{McpServerConfig, McpTransport};
-use agent_protocol::{RemoteMcpServerSpec, RemoteMcpTransport};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
@@ -265,17 +264,6 @@ impl McpRegistry {
         })
     }
 
-    pub fn in_memory(fallback: Vec<McpServerConfig>) -> Result<Self, McpRegistryError> {
-        let store = PersistedMcpStore::default();
-        validate_store(&store, &fallback)?;
-        Ok(Self {
-            path: PathBuf::from("<memory>"),
-            persistent: false,
-            fallback,
-            state: RwLock::new(store),
-        })
-    }
-
     pub async fn settings(&self) -> McpSettingsResponse {
         let state = self.state.read().await;
         let mut servers = self
@@ -295,20 +283,6 @@ impl McpRegistry {
         let mut servers = self.fallback.clone();
         servers.extend(state.servers.iter().map(ManagedMcpServer::runtime_config));
         servers
-    }
-
-    pub async fn managed_servers(&self) -> Vec<McpServerConfig> {
-        self.state
-            .read()
-            .await
-            .servers
-            .iter()
-            .map(ManagedMcpServer::runtime_config)
-            .collect()
-    }
-
-    pub fn fallback_servers(&self) -> &[McpServerConfig] {
-        &self.fallback
     }
 
     pub async fn create(
@@ -498,45 +472,6 @@ fn commit_store(
     }
     *state = next;
     Ok(())
-}
-
-pub(crate) fn remote_spec_from_config(server: &McpServerConfig) -> RemoteMcpServerSpec {
-    RemoteMcpServerSpec {
-        name: server.name.clone(),
-        transport: match server.transport {
-            McpTransport::Stdio => RemoteMcpTransport::Stdio,
-            McpTransport::Http => RemoteMcpTransport::Http,
-        },
-        command: server.command.clone(),
-        args: server.args.clone(),
-        env: server.env.clone(),
-        cwd: server.cwd.as_ref().map(|path| path.display().to_string()),
-        url: server.url.clone(),
-        http_headers: server.http_headers.clone(),
-        enabled: server.enabled,
-        startup_timeout_sec: server.startup_timeout_sec,
-        tool_timeout_sec: server.tool_timeout_sec,
-    }
-}
-
-pub(crate) fn config_from_remote_spec(server: RemoteMcpServerSpec) -> McpServerConfig {
-    McpServerConfig {
-        name: server.name,
-        transport: match server.transport {
-            RemoteMcpTransport::Stdio => McpTransport::Stdio,
-            RemoteMcpTransport::Http => McpTransport::Http,
-        },
-        command: server.command,
-        args: server.args,
-        env: server.env,
-        cwd: server.cwd.map(PathBuf::from),
-        url: server.url,
-        http_headers: server.http_headers,
-        enabled: server.enabled,
-        startup_timeout_sec: server.startup_timeout_sec,
-        tool_timeout_sec: server.tool_timeout_sec,
-        require_approval: None,
-    }
 }
 
 fn ensure_name_available(

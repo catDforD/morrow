@@ -167,7 +167,6 @@ pub enum SubagentRegistryError {
 
 pub struct SubagentRegistry {
     path: PathBuf,
-    persistent: bool,
     store: RwLock<PersistedSubagentStore>,
 }
 
@@ -176,17 +175,8 @@ impl SubagentRegistry {
         let store = load_store(&path)?;
         Ok(Self {
             path,
-            persistent: true,
             store: RwLock::new(store),
         })
-    }
-
-    pub fn in_memory(path: PathBuf) -> Self {
-        Self {
-            path,
-            persistent: false,
-            store: RwLock::new(PersistedSubagentStore::default()),
-        }
     }
 
     pub fn path(&self) -> &Path {
@@ -223,7 +213,7 @@ impl SubagentRegistry {
         let mut next = guard.clone();
         next.roles.insert(role, overrides.clone());
         validate_store(&next)?;
-        commit_store(&self.path, self.persistent, &next)?;
+        commit_store(&self.path, &next)?;
         *guard = next;
         Ok(role_settings_response(role, overrides))
     }
@@ -235,7 +225,7 @@ impl SubagentRegistry {
         let mut next = guard.clone();
         next.roles = default_role_overrides();
         validate_store(&next)?;
-        commit_store(&self.path, self.persistent, &next)?;
+        commit_store(&self.path, &next)?;
         let roles = role_settings_responses(&next.roles);
         *guard = next;
         Ok(roles)
@@ -257,7 +247,7 @@ impl SubagentRegistry {
         profile.id = next_profile_id(&next.profiles);
         next.profiles.push(profile.clone());
         validate_store(&next)?;
-        commit_store(&self.path, self.persistent, &next)?;
+        commit_store(&self.path, &next)?;
         *guard = next;
         Ok(profile)
     }
@@ -280,7 +270,7 @@ impl SubagentRegistry {
         profile.id = id.to_string();
         next.profiles[index] = profile.clone();
         validate_store(&next)?;
-        commit_store(&self.path, self.persistent, &next)?;
+        commit_store(&self.path, &next)?;
         *guard = next;
         Ok(profile)
     }
@@ -295,7 +285,7 @@ impl SubagentRegistry {
             return Err(SubagentRegistryError::NotFound(id.to_string()));
         }
         validate_store(&next)?;
-        commit_store(&self.path, self.persistent, &next)?;
+        commit_store(&self.path, &next)?;
         *guard = next;
         Ok(())
     }
@@ -305,7 +295,7 @@ impl SubagentRegistry {
         let mut next = guard.clone();
         next.profiles = default_profiles();
         validate_store(&next)?;
-        commit_store(&self.path, self.persistent, &next)?;
+        commit_store(&self.path, &next)?;
         let response = settings_response(&self.path, next.profiles.clone(), &next.roles);
         *guard = next;
         Ok(response)
@@ -665,16 +655,8 @@ fn load_store(path: &Path) -> Result<PersistedSubagentStore, SubagentRegistryErr
     Ok(store)
 }
 
-fn commit_store(
-    path: &Path,
-    persistent: bool,
-    store: &PersistedSubagentStore,
-) -> Result<(), SubagentRegistryError> {
-    if persistent {
-        save_store(path, store)
-    } else {
-        validate_store(store)
-    }
+fn commit_store(path: &Path, store: &PersistedSubagentStore) -> Result<(), SubagentRegistryError> {
+    save_store(path, store)
 }
 
 fn save_store(path: &Path, store: &PersistedSubagentStore) -> Result<(), SubagentRegistryError> {
@@ -975,20 +957,6 @@ mod tests {
             .expect_err("long name must fail");
         assert!(matches!(invalid, SubagentRegistryError::Validation(_)));
         let _ = fs::remove_file(path);
-    }
-
-    #[tokio::test]
-    async fn in_memory_registry_never_writes_its_display_path() {
-        let path = unique_path("subagents-memory");
-        let registry = SubagentRegistry::in_memory(path.clone());
-        registry
-            .create(SubagentProfileWriteRequest {
-                name: "内存成员".to_string(),
-                avatar_data_url: None,
-            })
-            .await
-            .expect("create in memory");
-        assert!(!path.exists());
     }
 
     #[test]

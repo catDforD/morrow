@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 mod chat;
@@ -10,8 +9,6 @@ mod facts;
 pub use facts::*;
 mod projection;
 pub use projection::*;
-mod remote;
-pub use remote::*;
 mod session;
 pub use session::*;
 mod subagent;

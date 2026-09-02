@@ -4,7 +4,7 @@ mod models;
 mod secrets;
 mod subagent_settings;
 
-pub use models::{FallbackModel, discover_models as discover_remote_models};
+pub use models::FallbackModel;
 pub use subagent_settings::{
     SubagentProfileResponse, SubagentProfileWriteRequest, SubagentRegistryError,
     SubagentRoleSettingsResponse, SubagentRoleWriteRequest, SubagentSettingsResponse,
@@ -16,18 +16,15 @@ use agent_hooks::{HookManager, HookSettings};
 use agent_model::{DEFAULT_MAX_RETRIES, ModelError, OpenAiCompatClient, OpenAiCompatConfig};
 use agent_protocol::{
     AgentEvent, AgentEventOrigin, ApprovalDecision, ApprovalOrigin, ApprovalRequest,
-    ModelSelection, PermissionMode, PermissionProfile, ReasoningProfile, RemoteMcpServerSpec,
-    RemoteModelConnectionSpec, RemoteModelSpec, RemoteSubagentMessageSpec, RemoteSubagentRoleSpec,
-    RemoteTurnModel, RemoteTurnSpec, Session, SessionProjection, SessionStreamFrame, ShellPolicy,
-    SubagentIdentity, SubagentInstanceSnapshot, SubagentRole, SubagentRoleOverride,
-    SubagentRunRecord, WorkspaceLocation,
+    ModelSelection, PermissionMode, PermissionProfile, ReasoningProfile, Session,
+    SessionProjection, SessionStreamFrame, ShellPolicy, SubagentIdentity, SubagentInstanceSnapshot,
+    SubagentRole, SubagentRoleOverride, SubagentRunRecord,
 };
 use agent_runtime::{
     AgentEventEnvelope, CancellationToken, McpInspection, McpToolCache, Model, RunAgentTurnContext,
-    SessionHandle, SessionListingDiagnostic, SessionListingEntry, SessionStore,
-    SessionSubscription, SubagentController, SubagentInstanceDocument, SubagentObserver,
-    SubagentRoleRuntime, SubagentSupervisor, TurnEventHandler, WorkspaceInstructionsCache,
-    inspect_mcp_servers, subagent_store_for_session,
+    SessionHandle, SessionListingDiagnostic, SessionListingEntry, SessionStore, SubagentController,
+    SubagentInstanceDocument, SubagentObserver, SubagentRoleRuntime, SubagentSupervisor,
+    TurnEventHandler, WorkspaceInstructionsCache, inspect_mcp_servers, subagent_store_for_session,
 };
 use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -46,7 +43,7 @@ use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use mcp_settings::{
     McpRegistry, McpRegistryError, McpServerResponse, McpServerTestRequest, McpServerWriteRequest,
-    McpSettingsResponse, config_from_remote_spec, remote_spec_from_config,
+    McpSettingsResponse,
 };
 use models::{
     DiscoverModelsRequest, DiscoverModelsResponse, ModelProviderResponse, ModelRegistry,
@@ -55,7 +52,7 @@ use models::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -67,7 +64,6 @@ use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, RwLock, Semaphore, broadcast, oneshot};
 use tokio::task::{AbortHandle, JoinHandle};
-use tower::ServiceExt;
 
 #[derive(Debug, Clone, Copy)]
 pub enum ShutdownPolicy {
@@ -206,8 +202,6 @@ mod api_sessions;
 pub(crate) use api_sessions::*;
 mod api_settings;
 pub(crate) use api_settings::*;
-mod embedded;
-pub use embedded::*;
 mod error;
 pub use error::*;
 mod router;
