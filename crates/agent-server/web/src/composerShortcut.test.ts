@@ -10,6 +10,10 @@ describe('shouldSubmitPromptOnEnter', () => {
     expect(shouldSubmitPromptOnEnter('Enter', true, false)).toBe(false)
   })
 
+  it('keeps modified Enter for a newline', () => {
+    expect(shouldSubmitPromptOnEnter('Enter', false, false, true)).toBe(false)
+  })
+
   it('does not submit while an IME composition is active', () => {
     expect(shouldSubmitPromptOnEnter('Enter', false, true)).toBe(false)
   })

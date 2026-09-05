@@ -73,25 +73,12 @@ export default function HookSettingsPanel({
     >
       <header className="settings-page-header resource-settings-header">
         <div>
-          <p className="eyebrow">Settings</p>
           <h1 id="hook-settings-title">Hooks</h1>
-          <p>查看命令 Hook 的匹配范围、执行策略和当前项目配置的信任状态。</p>
         </div>
       </header>
 
-      <div className="settings-safety-note hook-security-note">
-        <ShieldAlert size={24} />
-        <div>
-          <strong>项目 Hook 可以执行仓库控制的命令</strong>
-          <p>
-            获得信任后，命令会在工作区中运行，并继承宿主进程的完整环境变量，包括 API key。修改或重排项目 Hook 配置会自动撤销信任。
-          </p>
-        </div>
-      </div>
-
       <HookSourceSection
         title="用户 Hooks"
-        description="来自用户配置，默认可信并在项目 Hooks 之前运行。"
         path={settings?.user_config_path ?? '—'}
         hooks={userHooks}
         emptyMessage="用户配置中没有 Hook。"
@@ -99,7 +86,6 @@ export default function HookSettingsPanel({
 
       <HookSourceSection
         title="项目 Hooks"
-        description="仅在当前配置指纹获得本机信任后运行。"
         path={settings?.project_config_path ?? '—'}
         hooks={projectHooks}
         emptyMessage="当前工作区没有项目 Hook。"
@@ -156,7 +142,6 @@ export default function HookSettingsPanel({
 
 function HookSourceSection({
   title,
-  description,
   path,
   hooks,
   emptyMessage,
@@ -165,7 +150,6 @@ function HookSourceSection({
   trusted,
 }: {
   title: string
-  description: string
   path: string
   hooks: HookDefinitionStatus[]
   emptyMessage: string
@@ -178,7 +162,6 @@ function HookSourceSection({
       <div className="settings-section-heading hook-section-heading">
         <div>
           <h2>{title}</h2>
-          <p>{description}</p>
         </div>
         {actions}
       </div>

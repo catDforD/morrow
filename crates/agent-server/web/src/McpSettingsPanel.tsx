@@ -229,9 +229,7 @@ export default function McpSettingsPanel() {
     <section className="settings-page resource-settings-page" aria-labelledby="mcp-settings-title">
       <header className="settings-page-header resource-settings-header">
         <div>
-          <p className="eyebrow">Settings</p>
           <h1 id="mcp-settings-title">MCP 服务器</h1>
-          <p>管理 Web Agent 使用的本地与远端 MCP 工具服务器。</p>
         </div>
         {!editing ? (
           <div className="resource-header-actions">
@@ -267,9 +265,7 @@ export default function McpSettingsPanel() {
             <div className="resource-form-card">
               <div className="resource-form-heading">
                 <div>
-                  <p className="eyebrow">JSON import</p>
                   <h2>导入 MCP 服务器</h2>
-                  <p>支持直接服务器对象或 mcpServers 包装，可一次导入多项。</p>
                 </div>
                 <span className="scope-badge">用户</span>
               </div>
@@ -282,7 +278,6 @@ export default function McpSettingsPanel() {
                   onChange={(event) => setJsonValue(event.target.value)}
                 />
               </label>
-              <p className="resource-form-note">导入是原子操作；任意名称冲突或配置错误都会取消整批写入。</p>
               <div className="resource-form-actions">
                 <button className="secondary-button" type="button" onClick={backToList}>取消</button>
                 <button className="approve-button" type="button" disabled={saving} onClick={() => void importJson()}>
@@ -310,7 +305,6 @@ export default function McpSettingsPanel() {
               <div className="resource-empty">
                 <Server size={28} />
                 <strong>{query ? '没有匹配的服务器' : '尚未配置 MCP 服务器'}</strong>
-                <span>可以通过表单新建，或粘贴标准 JSON 配置。</span>
               </div>
             ) : null}
             {filteredServers.map((server) => (
@@ -320,7 +314,7 @@ export default function McpSettingsPanel() {
                 </span>
                 <span className="resource-list-copy">
                   <span><strong>{server.name}</strong><small>{server.transport}</small>{server.read_only ? <small>morrow.toml</small> : <small>用户</small>}</span>
-                  <small>{server.read_only ? '运行时配置，只读' : server.enabled ? '下一次 turn 将加载此服务器' : '当前已停用'}</small>
+                  {server.read_only ? <small>只读</small> : null}
                 </span>
                 <span className={`resource-status ${server.enabled ? 'ready' : 'disabled'}`}>
                   {server.enabled ? <Check size={13} /> : null}{server.enabled ? '已启用' : '已停用'}
@@ -358,9 +352,7 @@ function McpEditor({
     <form className="resource-form-card" onSubmit={(event) => { event.preventDefault(); onSave() }}>
       <div className="resource-form-heading">
         <div>
-          <p className="eyebrow">MCP server</p>
           <h2>{draft.originalName ? `编辑 ${draft.originalName}` : '新建 MCP 服务器'}</h2>
-          <p>保存后从下一次 turn 开始生效。</p>
         </div>
         <span className="scope-badge">用户</span>
       </div>
@@ -415,14 +407,13 @@ function McpEditor({
 
       <label className="resource-toggle-row">
         <input type="checkbox" checked={draft.enabled} onChange={(event) => onChange({ ...draft, enabled: event.target.checked })} />
-        <span><strong>启用服务器</strong><small>停用后保留配置，但不会注入任何工具。</small></span>
+        <span><strong>启用服务器</strong></span>
       </label>
 
       <div className="resource-test-block">
         <button className="secondary-button" type="button" disabled={testing || saving} onClick={onTest}>
           <RefreshCw size={16} className={testing ? 'spinning' : undefined} /> {testing ? '测试中…' : '测试连接'}
         </button>
-        <p>测试会执行本地命令或访问远端服务，但不会保存当前草稿。</p>
         {inspection ? (
           <div className={`resource-test-result${inspection.diagnostics.length ? ' warning' : ''}`}>
             <strong>发现 {inspection.tools.length} 个工具</strong>
@@ -470,10 +461,11 @@ function ReadOnlyServer({ server }: { server: McpServerResponse }) {
   return (
     <div className="resource-form-card readonly-resource">
       <div className="resource-form-heading">
-        <div><p className="eyebrow">Runtime config</p><h2>{server.name}</h2><p>该服务器来自 morrow.toml，只读且敏感值不会发送到浏览器。</p></div>
+        <div><h2>{server.name}</h2></div>
         <span className={`resource-status ${server.enabled ? 'ready' : 'disabled'}`}>{server.enabled ? '已启用' : '已停用'}</span>
       </div>
       <dl className="settings-card settings-info-list">
+        <div className="settings-info-row"><dt>来源</dt><dd>morrow.toml（只读）</dd></div>
         <div className="settings-info-row"><dt>类型</dt><dd>{server.transport}</dd></div>
         {server.command ? <div className="settings-info-row"><dt>命令</dt><dd>{server.command}</dd></div> : null}
         {server.url ? <div className="settings-info-row"><dt>URL</dt><dd>{server.url}</dd></div> : null}

@@ -11,6 +11,7 @@ import {
   subagentTranscriptMessages,
 } from './App'
 import type { SessionProjection, SubagentTranscriptSnapshot } from './types'
+import { currentTask } from './SubagentInspector'
 
 let roots: Root[] = []
 
@@ -29,7 +30,7 @@ describe('PersistentSubagentPanel', () => {
     vi.restoreAllMocks()
   })
 
-  it('shows concise agent details without rendering the complete transcript', async () => {
+  it('shows the complete latest Markdown result and folds technical metadata', async () => {
     const transcript = buildTranscript()
     await render(
       <PersistentSubagentPanel
@@ -43,23 +44,25 @@ describe('PersistentSubagentPanel', () => {
     )
 
     expect(document.querySelector('.subagent-detail-card')).not.toBeNull()
-    expect(document.body.textContent).toContain('Agent details')
     expect(document.body.textContent).toContain('Reviewer')
-    expect(document.body.textContent).toContain('独立审查与审批后检查')
+    expect(document.querySelector('.subagent-detail-header')?.textContent).toContain('审查')
+    expect(document.querySelector('.subagent-detail-header')?.textContent).toContain('已完成')
     expect(document.body.textContent).toContain('review the workspace')
     expect(document.body.textContent).toContain('Review completed with three findings.')
-    expect(document.body.textContent).not.toContain('SHOULD_NOT_APPEAR')
+    expect(document.querySelector('.subagent-result')?.textContent).toContain('RESULT_END')
+    expect(document.querySelector('.subagent-result li strong')?.textContent).toBe('完整结果')
     expect(document.body.textContent).not.toContain('first question')
     expect(document.body.textContent).not.toContain('first answer')
     expect(document.querySelector('.subagent-message-transcript')).toBeNull()
     expect(document.querySelector('.subagent-event-log')).toBeNull()
     expect(document.body.textContent).not.toContain('Show event log')
-    expect(document.body.textContent).toContain('event log reached its 16 MiB limit')
-    expect(document.querySelector<HTMLDetailsElement>('.subagent-followup-disclosure')?.open)
+    expect(document.querySelector('.subagent-technical-details')?.textContent).toContain('事件日志已截断')
+    expect(document.querySelector<HTMLDetailsElement>('.subagent-technical-details')?.open)
       .toBe(false)
+    expect(document.querySelector<HTMLDetailsElement>('.subagent-more')?.open).toBe(false)
   })
 
-  it('does not expose manual creation controls and explains the empty state', async () => {
+  it('does not expose manual creation controls and shows the empty state', async () => {
     await render(
       <PersistentSubagentPanel
         instances={[]}
@@ -73,9 +76,8 @@ describe('PersistentSubagentPanel', () => {
 
     expect(document.querySelector('.subagent-spawn-form')).toBeNull()
     expect(document.querySelector('select')).toBeNull()
-    expect(document.querySelector('.subagent-instance-section')?.textContent).toContain('Current agents')
-    expect(document.querySelector('.subagent-empty-state')?.textContent).toContain('No agents yet')
-    expect(document.querySelector('.subagent-empty-state')?.textContent).toContain('主 Agent')
+    expect(document.querySelector('.subagent-instance-section')?.textContent).toContain('子智能体')
+    expect(document.querySelector('.subagent-empty-state')?.textContent).toContain('暂无子智能体')
   })
 
   it('wires inspect, continue and delete controls to existing instance actions', async () => {
@@ -100,14 +102,6 @@ describe('PersistentSubagentPanel', () => {
     })
     expect(onInspect).toHaveBeenCalledWith('subagent-1')
 
-    const followupDisclosure = document.querySelector<HTMLDetailsElement>(
-      '.subagent-followup-disclosure',
-    )
-    await act(async () => {
-      followupDisclosure?.querySelector('summary')?.click()
-    })
-    expect(followupDisclosure?.open).toBe(true)
-
     await setInput(
       document.querySelector<HTMLTextAreaElement>('.subagent-followup-form textarea'),
       'review the result',
@@ -118,10 +112,58 @@ describe('PersistentSubagentPanel', () => {
     expect(onSend).toHaveBeenCalledWith('subagent-1', 'review the result')
 
     await act(async () => {
-      findButton('Delete')?.click()
+      document.querySelector<HTMLDetailsElement>('.subagent-more')?.querySelector('summary')?.click()
+      findButton('删除子智能体')?.click()
     })
     expect(window.confirm).toHaveBeenCalledOnce()
     expect(onDelete).toHaveBeenCalledWith('subagent-1')
+  })
+
+  it('copies the complete Markdown result', async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined)
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } })
+    const transcript = buildTranscript()
+    await render(<PersistentSubagentPanel instances={[transcript.instance]} transcript={transcript} onSend={vi.fn()} onInspect={vi.fn()} onCancel={vi.fn()} onDelete={vi.fn()} />)
+    await act(async () => document.querySelector<HTMLButtonElement>('[aria-label="复制结果"]')?.click())
+    expect(writeText).toHaveBeenCalledWith(transcript.runs[0].summary?.result)
+    expect(document.querySelector('.subagent-copy')?.textContent).toContain('已复制')
+  })
+
+  it('returns to the list and ignores another agent’s late transcript', async () => {
+    const transcript = buildTranscript()
+    const other = { ...transcript.instance, id: 'subagent-2', identity: { id: 'builtin-02', name: 'Explorer' } }
+    const onInspect = vi.fn()
+    await render(<PersistentSubagentPanel instances={[transcript.instance, other]} transcript={transcript} onSend={vi.fn()} onInspect={onInspect} onCancel={vi.fn()} onDelete={vi.fn()} />)
+    await act(async () => document.querySelectorAll<HTMLButtonElement>('.subagent-instance-card')[1]?.click())
+    expect(onInspect).toHaveBeenCalledWith('subagent-2')
+    expect(document.querySelector('.subagent-detail-header')?.textContent).toContain('Explorer')
+    expect(document.querySelector('.subagent-result')?.textContent).not.toContain('RESULT_END')
+    expect(document.querySelector<HTMLButtonElement>('[aria-label="发送后续任务"]')?.disabled).toBe(true)
+    await act(async () => document.querySelector<HTMLButtonElement>('.subagent-back')?.click())
+    expect(document.querySelector('.subagent-detail-card')).toBeNull()
+    expect(document.querySelector('.persistent-subagent-panel')?.classList.contains('has-selection')).toBe(false)
+  })
+
+  it('keeps active task cancellation available and disables destructive and followup actions', async () => {
+    const transcript = buildTranscript()
+    const active = { ...transcript.instance, status: 'running' as const, latest_run_id: 'new-run' }
+    const onCancel = vi.fn()
+    await render(<PersistentSubagentPanel instances={[active]} transcript={transcript} onSend={vi.fn()} onInspect={vi.fn()} onCancel={onCancel} onDelete={vi.fn()} />)
+    expect(document.querySelector('.subagent-detail-header')?.textContent).toContain('执行中')
+    expect(document.querySelector('.subagent-result')?.textContent).not.toContain('RESULT_END')
+    expect(document.querySelector('.subagent-followup-form')).toBeNull()
+    expect(findButton('删除子智能体')?.disabled).toBe(true)
+    await act(async () => findButton('停止任务')?.click())
+    expect(onCancel).toHaveBeenCalledWith('subagent-1')
+  })
+
+  it('uses fresh instance results and does not reuse a completed summary for a newer run', () => {
+    const transcript = buildTranscript()
+    const summary = transcript.runs[0].summary!
+    const fresh = { ...transcript.instance, latest_run_id: 'new-run', latest_summary: { ...summary, run_id: 'new-run', result: 'new result' } }
+    expect(currentTask(fresh, transcript).summary?.result).toBe('new result')
+    expect(currentTask({ ...fresh, status: 'running' }, transcript).summary).toBeUndefined()
+    expect(currentTask({ ...fresh, latest_summary: summary }, transcript).summary).toBeUndefined()
   })
 })
 
@@ -148,7 +190,7 @@ describe('InspectorDrawer', () => {
 
     const tabs = [...document.querySelectorAll<HTMLButtonElement>('.drawer-tab')]
       .map((button) => button.textContent?.trim())
-    expect(tabs).toEqual(['Run', 'Agents'])
+    expect(tabs).toEqual(['执行', '子智能体'])
     expect(document.body.textContent).not.toContain('Recent')
     expect(document.body.textContent).not.toContain('Tools')
   })
@@ -165,7 +207,7 @@ describe('subagentTranscriptMessages', () => {
 })
 
 function buildTranscript(): SubagentTranscriptSnapshot {
-  const result = `Review completed with three findings. ${'Supporting detail. '.repeat(40)}SHOULD_NOT_APPEAR`
+  const result = `Review completed with three findings. ${'Supporting detail. '.repeat(40)}\n\n- **完整结果**\n\nRESULT_END`
   const session: SessionProjection = {
     session_id: 'session-subagent-1',
     revision: 4,

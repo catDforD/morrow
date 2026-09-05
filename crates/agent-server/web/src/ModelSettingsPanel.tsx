@@ -257,9 +257,7 @@ export default function ModelSettingsPanel({
     <section className="settings-page model-settings-page" aria-labelledby="model-settings-title">
       <header className="settings-page-header model-settings-header">
         <div>
-          <p className="eyebrow">Settings</p>
           <h1 id="model-settings-title">模型设置</h1>
-          <p>管理 Web 专用的 OpenAI-compatible 供应商，并选择聊天默认模型。</p>
         </div>
         <button
           className="secondary-button"
@@ -324,7 +322,6 @@ export default function ModelSettingsPanel({
             <div className="model-settings-empty">
               <Bot size={30} />
               <h2>添加第一个模型供应商</h2>
-              <p>可以使用 DeepSeek V4 模板，或配置任意 OpenAI-compatible API。</p>
               <button type="button" onClick={() => startProvider('deepseek')}>
                 <Sparkles size={16} />
                 使用 DeepSeek 模板
@@ -402,13 +399,12 @@ function ProviderEditor({
       <div className="readonly-provider">
         <div className="provider-editor-title">
           <div>
-            <p className="eyebrow">Runtime config</p>
             <h2>{draft.name}</h2>
           </div>
           <span className="enabled-badge"><Check size={14} /> 已启用</span>
         </div>
-        <p>该供应商来自当前 morrow.toml，只读且不会把 API Key 暴露给浏览器。</p>
         <dl className="settings-card settings-info-list">
+          <div className="settings-info-row"><dt>来源</dt><dd>morrow.toml（只读）</dd></div>
           <div className="settings-info-row"><dt>Base URL</dt><dd>{draft.base_url}</dd></div>
           <div className="settings-info-row"><dt>模型</dt><dd>{model?.name ?? '—'}</dd></div>
           <div className="settings-info-row"><dt>上下文</dt><dd>{model ? compactTokens(model.context_window_tokens) : '—'}</dd></div>
@@ -445,7 +441,6 @@ function ProviderEditor({
     >
       <div className="provider-editor-title">
         <div>
-          <p className="eyebrow">OpenAI-compatible</p>
           <h2>{draft.id ? draft.name || '编辑供应商' : '添加模型供应商'}</h2>
         </div>
         <label className="provider-enabled-toggle">
@@ -511,7 +506,6 @@ function ProviderEditor({
         <div className="provider-models-heading">
           <div>
             <strong>模型列表</strong>
-            <p>上下文参数用于 Morrow 自动压缩预算。</p>
           </div>
           <button type="button" onClick={addModel}>
             <Plus size={15} /> 添加模型

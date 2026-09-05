@@ -2,7 +2,6 @@ import { useMemo, useState } from 'react'
 import {
   ArrowLeft,
   CircleAlert,
-  FileText,
   Plus,
   Save,
   Search,
@@ -113,9 +112,7 @@ export default function CommandSettingsPanel({
     <section className="settings-page resource-settings-page" aria-labelledby="command-settings-title">
       <header className="settings-page-header resource-settings-header">
         <div>
-          <p className="eyebrow">Settings</p>
           <h1 id="command-settings-title">命令</h1>
-          <p>管理 Web 聊天可通过 /command-name 调用的 Markdown 提示词。</p>
         </div>
         {!draft ? (
           <button className="approve-button" type="button" onClick={createCommand}>
@@ -132,9 +129,7 @@ export default function CommandSettingsPanel({
           <form className="resource-form-card command-form" onSubmit={(event) => { event.preventDefault(); void saveCommand() }}>
             <div className="resource-form-heading">
               <div>
-                <p className="eyebrow">Markdown command</p>
                 <h2>{draft.originalName ? `编辑 /${draft.originalName}` : '新建命令'}</h2>
-                <p>提示词正文中的 $ARGUMENTS 会替换为调用时输入的全部参数。</p>
               </div>
               <span className="scope-badge">用户</span>
             </div>
@@ -152,13 +147,9 @@ export default function CommandSettingsPanel({
                 <input value={draft.description} placeholder="在命令建议中显示的简短描述" onChange={(event) => setDraft({ ...draft, description: event.target.value })} />
               </label>
               <label className="resource-field full">
-                <span>提示词</span>
+                <span title="$ARGUMENTS 会替换为调用参数；未使用时，参数附加到正文末尾。">提示词</span>
                 <textarea className="command-prompt-editor" value={draft.prompt} placeholder="填写调用该命令时发送给模型的提示词…" onChange={(event) => setDraft({ ...draft, prompt: event.target.value })} />
               </label>
-            </div>
-            <div className="command-template-help">
-              <FileText size={17} />
-              <span>保存为 <code>~/.morrow/commands/{draft.name || 'command'}.md</code>。模板没有 $ARGUMENTS 时，参数会自动附加到正文末尾。</span>
             </div>
             <div className="resource-form-actions split">
               {draft.originalName ? (
@@ -189,7 +180,6 @@ export default function CommandSettingsPanel({
               <div className="resource-empty">
                 <Terminal size={28} />
                 <strong>{query ? '没有匹配的命令' : '尚未创建命令'}</strong>
-                <span>创建 Markdown 提示词，然后在聊天框中输入 / 调用。</span>
               </div>
             ) : null}
             {commands.map((command) => (

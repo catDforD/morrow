@@ -6,6 +6,7 @@ import type { Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type {
   ClientMessage,
+  CommandDefinition,
   SessionStreamFrame,
 } from './types'
 import { eventFrame, sessionEntry, snapshotFrame, turnProjection, testModelSelection } from './sessionTestFixtures'
@@ -41,6 +42,7 @@ let root: Root | null = null
 let handlers: SessionConnectionHandlers | null = null
 let connection: TestConnection
 let failingUrls: Set<string>
+let commands: CommandDefinition[] = []
 
 describe('App Session creation flow', () => {
   beforeEach(() => {
@@ -68,6 +70,7 @@ describe('App Session creation flow', () => {
     handlers = null
     connection = new TestConnection()
     failingUrls = new Set()
+    commands = []
     api.sessionClient.listSessions.mockReset().mockResolvedValue({
       schema_version: 1,
       sessions: [],
@@ -133,7 +136,7 @@ describe('App Session creation flow', () => {
             store_path: '/models.json',
           }
         case '/api/commands':
-          return { commands: [], store_path: '/commands', diagnostics: [] }
+          return { commands, store_path: '/commands', diagnostics: [] }
         case '/api/hooks':
           return {
             schema_version: 1,
@@ -172,14 +175,14 @@ describe('App Session creation flow', () => {
   it('clicks New task, creates, applies Snapshot, then enables Send', async () => {
     await renderApp()
 
-    expect(document.body.textContent).toContain('Create a task to start')
+    expect(document.body.textContent).toContain('从一个想法开始')
     expect(document.querySelector('.composer textarea')).toBeNull()
 
     await act(async () => {
       document.querySelector<HTMLButtonElement>('.home-create-task')?.click()
     })
     await setInput(
-      document.querySelector<HTMLInputElement>('input[aria-label="New session name"]'),
+      document.querySelector<HTMLInputElement>('input[aria-label="新会话名称"]'),
       'task-one',
     )
     await act(async () => {
@@ -194,7 +197,7 @@ describe('App Session creation flow', () => {
     )
     expect(document.querySelector<HTMLTextAreaElement>('.composer textarea')?.disabled)
       .toBe(true)
-    expect(document.querySelector<HTMLButtonElement>('[aria-label="Send"]')?.disabled)
+    expect(document.querySelector<HTMLButtonElement>('[aria-label="发送"]')?.disabled)
       .toBe(true)
 
     await act(async () => {
@@ -204,7 +207,7 @@ describe('App Session creation flow', () => {
     const prompt = document.querySelector<HTMLTextAreaElement>('.composer textarea')
     expect(prompt?.disabled).toBe(false)
     await setInput(prompt, 'hello from the browser')
-    const send = document.querySelector<HTMLButtonElement>('[aria-label="Send"]')
+    const send = document.querySelector<HTMLButtonElement>('[aria-label="发送"]')
     expect(send?.disabled).toBe(false)
 
     await act(async () => send?.click())
@@ -214,6 +217,94 @@ describe('App Session creation flow', () => {
         data: expect.objectContaining({ prompt: 'hello from the browser' }),
       }),
     ])
+  })
+
+  it('keeps IME and Shift+Enter out of command selection and submission', async () => {
+    commands = [{ name: 'review', description: 'Review changes', argument_hint: '', prompt: 'Review changes' }]
+    await openReadySession()
+    const input = document.querySelector<HTMLTextAreaElement>('.composer textarea')!
+    await setInput(input, '/rev')
+    expect(document.querySelector('[role="listbox"]')).not.toBeNull()
+    await act(async () => {
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', isComposing: true, bubbles: true }))
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', shiftKey: true, bubbles: true }))
+    })
+    expect(input.value).toBe('/rev')
+    expect(connection.sent).toHaveLength(0)
+    await act(async () => {
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
+    })
+    expect(input.value).toBe('/review ')
+    expect(connection.sent).toHaveLength(0)
+  })
+
+  it('collapses the process on completion after the user expanded it while running', async () => {
+    await openReadySession()
+    const turn = {
+      ...turnProjection('running'),
+      steps: [{ id: 'model-1', kind: 'model_call' as const, status: 'running' as const, model_message: { role: 'assistant' as const, reasoning_content: '先确认界面结构。' } }],
+    }
+    await act(async () => handlers?.onMessage(eventFrame('task-one', 1, { type: 'turn_upserted', data: turn })))
+    const toggle = () => document.querySelector<HTMLButtonElement>('.execution-toggle')!
+    await act(async () => toggle().click())
+    await act(async () => toggle().click())
+    expect(toggle().getAttribute('aria-expanded')).toBe('true')
+    await act(async () => handlers?.onMessage(eventFrame('task-one', 2, {
+      type: 'turn_upserted',
+      data: { ...turn, status: 'completed', steps: [{ ...turn.steps[0], status: 'completed' }], messages: [{ role: 'assistant', content: '正式回答。' }] },
+    })))
+    expect(toggle().getAttribute('aria-expanded')).toBe('false')
+    expect(document.querySelector('.execution-thought')).toBeNull()
+    expect(document.querySelector('.message-row.assistant')?.textContent).toContain('正式回答。')
+    await act(async () => toggle().click())
+    expect(document.querySelector('.execution-thought')?.textContent).toBe('先确认界面结构。')
+  })
+
+  it('keeps a reading position while messages arrive and resumes following on demand', async () => {
+    await openReadySession()
+    await act(async () => handlers?.onMessage(eventFrame('task-one', 1, {
+      type: 'turn_upserted', data: turnProjection('completed'),
+    })))
+    const scroller = document.querySelector<HTMLDivElement>('.message-scroll')!
+    Object.defineProperties(scroller, {
+      scrollHeight: { configurable: true, value: 1800 },
+      clientHeight: { configurable: true, value: 500 },
+    })
+    await act(async () => {
+      scroller.scrollTop = 200
+      scroller.dispatchEvent(new Event('scroll', { bubbles: true }))
+      handlers?.onMessage(eventFrame('task-one', 2, {
+        type: 'turn_upserted',
+        data: { ...turnProjection('completed'), messages: [{ role: 'assistant', content: 'A longer answer' }] },
+      }))
+    })
+    expect(scroller.scrollTop).toBe(200)
+    const jump = document.querySelector<HTMLButtonElement>('[aria-label="回到底部"]')
+    expect(jump).not.toBeNull()
+    await act(async () => jump?.click())
+    expect(scroller.scrollTop).toBe(1300)
+    expect(document.querySelector('[aria-label="回到底部"]')).toBeNull()
+  })
+
+  it('keeps approval focus contained and submits only an explicit decision', async () => {
+    await openReadySession()
+    const input = document.querySelector<HTMLTextAreaElement>('.composer textarea')!
+    input.focus()
+    await act(async () => handlers?.onMessage(eventFrame('task-one', 1, {
+      type: 'approvals_replaced',
+      data: [{ id: 'approval-1', reason: 'Run tests', action: { kind: 'shell_command', command: 'cargo test', cwd: '/workspace', timeout_secs: 60 } }],
+    })))
+    const panel = document.querySelector<HTMLElement>('.approval-panel')!
+    expect(document.activeElement).toBe(panel)
+    expect(connection.sent).toHaveLength(0)
+    const approve = panel.querySelector<HTMLButtonElement>('.approve-button')!
+    approve.focus()
+    await act(async () => approve.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true })))
+    expect(document.activeElement).toBe(panel.querySelector('button'))
+    await act(async () => approve.click())
+    expect(connection.sent).toEqual([{ type: 'approval_decision', data: { request_id: 'approval-1', approved: true } }])
+    await act(async () => handlers?.onMessage(eventFrame('task-one', 2, { type: 'approvals_replaced', data: [] })))
+    expect(document.activeElement).toBe(input)
   })
 
   it('keeps task creation available when optional settings requests fail', async () => {
@@ -227,7 +318,7 @@ describe('App Session creation flow', () => {
       document.querySelector<HTMLButtonElement>('.home-create-task')?.click()
     })
     await setInput(
-      document.querySelector<HTMLInputElement>('input[aria-label="New session name"]'),
+      document.querySelector<HTMLInputElement>('input[aria-label="新会话名称"]'),
       'degraded-task',
     )
     await act(async () => {
@@ -240,7 +331,7 @@ describe('App Session creation flow', () => {
     const prompt = document.querySelector<HTMLTextAreaElement>('.composer textarea')
     expect(prompt?.disabled).toBe(false)
     await setInput(prompt, 'still inspectable')
-    expect(document.querySelector<HTMLButtonElement>('[aria-label="Send"]')?.disabled)
+    expect(document.querySelector<HTMLButtonElement>('[aria-label="发送"]')?.disabled)
       .toBe(true)
   })
 
@@ -251,7 +342,7 @@ describe('App Session creation flow', () => {
       document.querySelector<HTMLButtonElement>('.home-create-task')?.click()
     })
     await setInput(
-      document.querySelector<HTMLInputElement>('input[aria-label="New session name"]'),
+      document.querySelector<HTMLInputElement>('input[aria-label="新会话名称"]'),
       'task-one',
     )
     await act(async () => {
@@ -270,7 +361,7 @@ describe('App Session creation flow', () => {
     })
 
     expect(document.body.textContent).toContain(
-      'Connection interrupted. Reconnecting with a fresh snapshot',
+      '连接已中断，正在恢复会话',
     )
     expect(document.body.textContent).not.toContain('[object Event]')
   })
@@ -289,20 +380,20 @@ describe('App Session creation flow', () => {
     await renderApp()
 
     expect(document.body.textContent).toContain(
-      '1 damaged task log were skipped. Other tasks remain available.',
+      '已跳过 1 个损坏的会话记录，其余会话仍可使用。',
     )
     const dismiss = document.querySelector<HTMLButtonElement>(
-      'button[title="Dismiss message"]',
+      'button[title="关闭提示"]',
     )
     expect(dismiss).not.toBeNull()
     await act(async () => dismiss?.click())
-    expect(document.body.textContent).not.toContain('damaged task log')
+    expect(document.body.textContent).not.toContain('损坏的会话记录')
 
     await act(async () => {
       document.querySelector<HTMLButtonElement>('.home-create-task')?.click()
     })
     await setInput(
-      document.querySelector<HTMLInputElement>('input[aria-label="New session name"]'),
+      document.querySelector<HTMLInputElement>('input[aria-label="新会话名称"]'),
       'task-one',
     )
     await act(async () => {
@@ -328,7 +419,7 @@ describe('App Session creation flow', () => {
     expect(api.sessionClient.listSessions.mock.calls.length).toBe(
       callsBeforeRefresh + 1,
     )
-    expect(document.body.textContent).not.toContain('damaged task log')
+    expect(document.body.textContent).not.toContain('损坏的会话记录')
 
     // A changed diagnostics set has a new signature and re-shows the banner.
     api.sessionClient.listSessions.mockResolvedValue({
@@ -353,7 +444,7 @@ describe('App Session creation flow', () => {
       for (let index = 0; index < 6; index += 1) await Promise.resolve()
     })
     expect(document.body.textContent).toContain(
-      '2 damaged task logs were skipped. Other tasks remain available.',
+      '已跳过 2 个损坏的会话记录，其余会话仍可使用。',
     )
   })
 })
@@ -396,5 +487,15 @@ async function setInput(
       : HTMLInputElement.prototype
     Object.getOwnPropertyDescriptor(prototype, 'value')?.set?.call(input, value)
     input.dispatchEvent(new Event('input', { bubbles: true }))
+  })
+}
+
+async function openReadySession() {
+  history.replaceState({}, '', '/?session=task-one')
+  api.sessionClient.listSessions.mockResolvedValue({ schema_version: 1, sessions: [sessionEntry('task-one')], diagnostics: [] })
+  await renderApp()
+  await act(async () => {
+    handlers?.onMessage(snapshotFrame('task-one'))
+    for (let index = 0; index < 4; index += 1) await Promise.resolve()
   })
 }

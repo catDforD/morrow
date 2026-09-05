@@ -763,6 +763,9 @@ export interface RunStep {
   title: string
   detail?: string
   reasoning?: string
+  commentary?: string
+  toolCall?: ToolCall
+  output?: string
   summary?: ToolExecutionSummary
   agentId?: string
   agentName?: string
