@@ -10,11 +10,9 @@ import {
   useContext,
 } from 'react'
 import {
-  Activity,
-  Archive,
-  ArchiveRestore,
+  ArrowDown,
+  ArrowUp,
   Bot,
-  CalendarClock,
   Check,
   ChevronDown,
   ChevronRight,
@@ -25,26 +23,27 @@ import {
   Folder,
   GitBranch,
   Eye,
-  ListTree,
-  Moon,
   PanelLeft,
-  PanelLeftClose,
   PencilLine,
-  Plug,
   Plus,
   RefreshCw,
-  Search,
   Send,
   Settings,
   Shield,
   ShieldCheck,
   Square,
-  Sun,
   Terminal,
   X,
 } from 'lucide-react'
-import ReactMarkdown from 'react-markdown'
-import remarkGfm from 'remark-gfm'
+import AppSidebar from './AppSidebar'
+import ExecutionTrace from './ExecutionTrace'
+import RunInspector from './RunInspector'
+import SubagentInspector from './SubagentInspector'
+import type { SubagentInspectorProps } from './SubagentInspector'
+import TimelineNotices, { groupTimelineNotices } from './TimelineNotices'
+import { IconButton, MiniIconButton } from './IconButton'
+import MarkdownContent from './MarkdownContent'
+import { useDialogFocus } from './useDialogFocus'
 import { fetchJson } from './api'
 import {
   isMessageScrollNearBottom,
@@ -86,7 +85,6 @@ import type {
   SubagentTranscriptSnapshot,
   TimelineItem,
   TimelineMessageItem,
-  TimelineNoticeItem,
   RunStep,
   RunTrace,
   ToolExecutionSummary,
@@ -98,13 +96,12 @@ type ConnectionStatus = 'connecting' | 'connected' | 'disconnected'
 type AppView = 'workspace' | 'settings'
 type ResolvedTheme = Exclude<ThemePreference, 'system'>
 
-const markdownPlugins = [remarkGfm]
 const SubagentProfilesContext = createContext<SubagentProfileResponse[]>([])
 const PersistentSubagentsContext = createContext<SubagentInstanceSnapshot[]>([])
 
 const permissionOptions: Array<{
-  id: PermissionMode | 'plan'
-  mode: PermissionMode | null
+  id: PermissionMode
+  mode: PermissionMode
   label: string
   description: string
   disabled?: boolean
@@ -120,13 +117,6 @@ const permissionOptions: Array<{
     mode: 'workspace_write',
     label: '自动编辑',
     description: '可编辑工作区，敏感操作仍需确认。',
-  },
-  {
-    id: 'plan',
-    mode: null,
-    label: '计划模式',
-    description: '先制定实施计划，再开始修改。',
-    disabled: true,
   },
   {
     id: 'danger_full_access',
@@ -145,7 +135,7 @@ export default function App() {
   const [settingsSection, setSettingsSection] = useState<SettingsSection>(
     initialLocationRef.current.section,
   )
-  const [runCollapsed, setRunCollapsed] = useState<Record<string, boolean>>({})
+  const [runCollapsed, setRunCollapsed] = useState<Record<string, { status: RunTrace['status']; collapsed: boolean }>>({})
   const [visibleError, setVisibleError] = useState<string | null>(null)
   const [visibleNotice, setVisibleNotice] = useState<string | null>(null)
   const [dismissedDiagnosticsKey, setDismissedDiagnosticsKey] = useState<
@@ -266,10 +256,10 @@ export default function App() {
   const timeline = useMemo(
     () =>
       timelineFromSnapshot(sessionSnapshot).map((item) =>
-        item.kind === 'run' && item.id in runCollapsed
+        item.kind === 'run' && runCollapsed[item.id]?.status === item.trace.status
           ? {
               ...item,
-              trace: { ...item.trace, collapsed: runCollapsed[item.id] },
+              trace: { ...item.trace, collapsed: runCollapsed[item.id].collapsed },
             }
           : item,
       ),
@@ -362,7 +352,7 @@ export default function App() {
   }, [isSearchOpen])
 
   useEffect(() => {
-    if (!isInspectorOpen && !isSidebarOpen) return
+    if (pendingApproval || (!isInspectorOpen && !isSidebarOpen)) return
 
     const handleKeyDown = (event: globalThis.KeyboardEvent) => {
       if (event.key === 'Escape') {
@@ -376,7 +366,7 @@ export default function App() {
 
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [isInspectorOpen, isSidebarOpen])
+  }, [isInspectorOpen, isSidebarOpen, pendingApproval])
 
   useEffect(() => {
     const media = window.matchMedia('(prefers-color-scheme: dark)')
@@ -604,7 +594,8 @@ export default function App() {
       shouldSubmitPromptOnEnter(
         event.key,
         event.ctrlKey,
-        event.nativeEvent.isComposing,
+        event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229,
+        event.shiftKey || event.altKey || event.metaKey,
       )
     ) {
       event.preventDefault()
@@ -787,6 +778,7 @@ export default function App() {
     <SubagentProfilesContext.Provider value={subagentSettings?.profiles ?? []}>
       <PersistentSubagentsContext.Provider value={subagents}>
       <>
+      <div style={{ height: '100%' }} inert={Boolean(pendingApproval)}>
       {appView === 'settings' ? (
           <SettingsView
             section={settingsSection}
@@ -823,12 +815,12 @@ export default function App() {
           />
         ) : (
           <div
-            className={`app-frame${isSidebarOpen ? ' sidebar-open' : ''}${isWorkspaceSidebarCollapsed ? ' sidebar-collapsed' : ''}`}
+            className={`app-frame${isSidebarOpen ? ' sidebar-open' : ''}${isWorkspaceSidebarCollapsed ? ' sidebar-collapsed' : ''}${isInspectorOpen ? ' inspector-open' : ''}`}
           >
             <button
               className="mobile-sidebar-backdrop"
               type="button"
-              aria-label="Close task navigation"
+              aria-label="关闭会话导航"
               aria-hidden={!isSidebarOpen}
               tabIndex={isSidebarOpen ? 0 : -1}
               onClick={() => setIsSidebarOpen(false)}
@@ -928,15 +920,20 @@ export default function App() {
                   if (!item || item.kind !== 'run') return
                   setRunCollapsed((current) => ({
                     ...current,
-                    [id]: !item.trace.collapsed,
+                    [id]: { status: item.trace.status, collapsed: !item.trace.collapsed },
                   }))
                 }}
                 messageScrollRef={messageScrollRef}
                 onMessageScroll={handleMessageScroll}
+                onScrollToBottom={() => {
+                  followMessagesRef.current = true
+                  if (messageScrollRef.current) scrollMessageListToBottom(messageScrollRef.current)
+                }}
               />
             </main>
             <InspectorDrawer
               open={isInspectorOpen}
+              timeline={timeline}
               panel={inspectorPanel}
               selectedEntry={selectedEntry}
               runningTurn={runningTurn}
@@ -954,6 +951,7 @@ export default function App() {
             />
           </div>
         )}
+      </div>
       <ApprovalDialog
         request={pendingApproval}
         disabled={!sessionCommandsEnabled}
@@ -963,288 +961,6 @@ export default function App() {
       </>
       </PersistentSubagentsContext.Provider>
     </SubagentProfilesContext.Provider>
-  )
-}
-
-function AppSidebar({
-  sessions,
-  archivedSessions,
-  sessionCount,
-  runningTurn,
-  selected,
-  sessionAction,
-  isCreatingSession,
-  newSessionName,
-  createSessionError,
-  isSearchOpen,
-  sessionFilter,
-  theme,
-  searchInputRef,
-  isHidden,
-  onSelectSession,
-  onStartCreateSession,
-  onCancelCreateSession,
-  onNewSessionNameChange,
-  onCreateSession,
-  onToggleSearch,
-  onSessionFilterChange,
-  onArchiveSession,
-  onRestoreSession,
-  onRefresh,
-  onClose,
-  onOpenSettings,
-  onThemeToggle,
-}: {
-  sessions: SessionEntryResponse[]
-  archivedSessions: SessionEntryResponse[]
-  sessionCount: number
-  runningTurn: RunningTurnSnapshot | null
-  selected: string | null
-  sessionAction: string | null
-  isCreatingSession: boolean
-  newSessionName: string
-  createSessionError: string | null
-  isSearchOpen: boolean
-  sessionFilter: string
-  theme: 'light' | 'dark'
-  searchInputRef: React.RefObject<HTMLInputElement | null>
-  isHidden: boolean
-  onSelectSession: (name: string) => void
-  onStartCreateSession: () => void
-  onCancelCreateSession: () => void
-  onNewSessionNameChange: (value: string) => void
-  onCreateSession: () => void
-  onToggleSearch: () => void
-  onSessionFilterChange: (value: string) => void
-  onArchiveSession: (name: string) => void
-  onRestoreSession: (name: string) => void
-  onRefresh: () => void
-  onClose: () => void
-  onOpenSettings: () => void
-  onThemeToggle: () => void
-}) {
-  const [isArchiveOpen, setIsArchiveOpen] = useState(false)
-  const selectedSessionRef = useRef<HTMLDivElement | null>(null)
-  const showArchivedSessions = isArchiveOpen || sessionFilter.trim().length > 0
-
-  useEffect(() => {
-    selectedSessionRef.current?.scrollIntoView({ block: 'nearest' })
-  }, [selected, sessions])
-
-  return (
-    <aside
-      id="task-navigation"
-      className="app-sidebar workspace-sidebar"
-      aria-label="Task navigation"
-      aria-hidden={isHidden}
-      inert={isHidden}
-    >
-      <div className="sidebar-brand workspace-brand">
-        <span className="workspace-brand-mark" aria-hidden="true">
-          M
-        </span>
-        <strong className="workspace-brand-name">Morrow</strong>
-        <MiniIconButton title="Collapse task navigation" onClick={onClose}>
-          <PanelLeftClose size={17} />
-        </MiniIconButton>
-      </div>
-
-      <nav className="sidebar-actions" aria-label="Primary">
-        <SidebarAction
-          icon={<Plus size={18} />}
-          label="New task"
-          onClick={onStartCreateSession}
-        />
-        <SidebarAction
-          icon={<Search size={18} />}
-          label="Search"
-          onClick={onToggleSearch}
-        />
-        <SidebarAction
-          icon={<CalendarClock size={18} />}
-          label="Scheduled"
-          badge="Soon"
-          disabled
-        />
-        <SidebarAction
-          icon={<Plug size={18} />}
-          label="Plugins"
-          badge="Soon"
-          disabled
-        />
-      </nav>
-
-      <section className="session-browser" aria-label="Tasks">
-        <div className="session-browser-head">
-          <div>
-            <p className="eyebrow">Tasks</p>
-            <span>{sessionCount}</span>
-          </div>
-          <MiniIconButton title="New task" onClick={onStartCreateSession}>
-            <Plus size={16} />
-          </MiniIconButton>
-        </div>
-
-        {isSearchOpen ? (
-          <label className="session-search">
-            <Search size={16} />
-            <input
-              ref={searchInputRef}
-              value={sessionFilter}
-              placeholder="Search tasks"
-              onChange={(event) => onSessionFilterChange(event.target.value)}
-            />
-          </label>
-        ) : null}
-
-        <div className="sidebar-session-list main-scroll">
-          {isCreatingSession ? (
-            <CreateSessionRow
-              value={newSessionName}
-              error={createSessionError}
-              onChange={onNewSessionNameChange}
-              onCancel={onCancelCreateSession}
-              onSubmit={onCreateSession}
-            />
-          ) : null}
-          {sessions.length === 0 ? (
-            <p className="muted-line">
-              {sessionFilter.trim() ? 'No matching active tasks.' : 'No active tasks.'}
-            </p>
-          ) : (
-            sessions.map((session) => (
-              <div
-                key={session.name}
-                className={`sidebar-session-row${session.name === selected ? ' active' : ''}`}
-                ref={session.name === selected ? selectedSessionRef : undefined}
-              >
-                <button
-                  type="button"
-                  className="sidebar-session"
-                  onClick={() => onSelectSession(session.name)}
-                >
-                  <span className="session-name">{session.name}</span>
-                  <span>
-                    {session.turns} turns
-                    {session.has_summary ? ' / summary' : ''}
-                  </span>
-                </button>
-                <button
-                  type="button"
-                  className="session-row-action archive-action"
-                  title={
-                    session.path
-                      ? `归档任务 ${session.name}`
-                      : '空任务无需归档'
-                  }
-                  aria-label={`归档任务 ${session.name}`}
-                  disabled={
-                    !session.path ||
-                    Boolean(sessionAction) ||
-                    (session.name === selected && Boolean(runningTurn))
-                  }
-                  onClick={() => onArchiveSession(session.name)}
-                >
-                  <Archive size={15} />
-                </button>
-              </div>
-            ))
-          )}
-
-          {archivedSessions.length > 0 ? (
-            <section className="archived-session-section" aria-label="Archived tasks">
-              <button
-                type="button"
-                className="archive-section-toggle"
-                aria-expanded={showArchivedSessions}
-                onClick={() => setIsArchiveOpen((open) => !open)}
-              >
-                <Archive size={14} />
-                <span>已归档</span>
-                <small>{archivedSessions.length}</small>
-                {showArchivedSessions ? (
-                  <ChevronDown size={14} />
-                ) : (
-                  <ChevronRight size={14} />
-                )}
-              </button>
-              {showArchivedSessions ? (
-                <div className="archived-session-list">
-                  {archivedSessions.map((session) => (
-                    <div className="sidebar-session-row archived" key={session.name}>
-                      <div className="archived-session-copy">
-                        <span className="session-name">{session.name}</span>
-                        <span>{session.turns} turns</span>
-                      </div>
-                      <button
-                        type="button"
-                        className="session-row-action restore-action"
-                        title={`恢复任务 ${session.name}`}
-                        aria-label={`恢复任务 ${session.name}`}
-                        disabled={Boolean(sessionAction)}
-                        onClick={() => onRestoreSession(session.name)}
-                      >
-                        <ArchiveRestore size={15} />
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              ) : null}
-            </section>
-          ) : null}
-        </div>
-      </section>
-
-      <div className="sidebar-footer">
-        <div className="sidebar-footer-row">
-          <button
-            className="sidebar-settings"
-            type="button"
-            title="Open settings"
-            onClick={() => onOpenSettings()}
-          >
-            <Settings size={17} />
-            <span>Settings</span>
-          </button>
-          <div className="sidebar-footer-actions">
-            <MiniIconButton title="Refresh sessions" onClick={onRefresh}>
-              <RefreshCw size={16} />
-            </MiniIconButton>
-            <MiniIconButton title="Toggle theme" onClick={onThemeToggle}>
-              {theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}
-            </MiniIconButton>
-          </div>
-        </div>
-      </div>
-    </aside>
-  )
-}
-
-function SidebarAction({
-  icon,
-  label,
-  badge,
-  disabled = false,
-  onClick,
-}: {
-  icon: ReactNode
-  label: string
-  badge?: string
-  disabled?: boolean
-  onClick?: () => void
-}) {
-  return (
-    <button
-      className="sidebar-action"
-      type="button"
-      title={disabled ? `${label} coming soon` : label}
-      disabled={disabled}
-      onClick={onClick}
-    >
-      {icon}
-      <span>{label}</span>
-      {badge ? <small>{badge}</small> : null}
-    </button>
   )
 }
 
@@ -1288,6 +1004,7 @@ function ChatView({
   onToggleRun,
   messageScrollRef,
   onMessageScroll,
+  onScrollToBottom,
 }: {
   selected: string | null
   status: StatusResponse | null
@@ -1328,6 +1045,7 @@ function ChatView({
   onToggleRun: (id: string) => void
   messageScrollRef: React.RefObject<HTMLDivElement | null>
   onMessageScroll: (event: UIEvent<HTMLDivElement>) => void
+  onScrollToBottom: () => void
 }) {
   const isEmpty = timeline.length === 0
   const composer = selected ? (
@@ -1369,18 +1087,17 @@ function ChatView({
         onRetrySession={onRetrySession}
         onDismiss={onDismissStatus}
       />
+      <ConversationHeader
+        selected={selected}
+        connection={connection}
+        runningTurn={runningTurn}
+        pendingApproval={pendingApproval}
+        isSidebarOpen={isSidebarOpen}
+        onOpenSidebar={onOpenSidebar}
+        onOpenInspector={onOpenInspector}
+      />
       {isEmpty ? (
         <>
-          <button
-            className="mobile-menu-button home-menu-button"
-            type="button"
-            aria-label="Open task navigation"
-            aria-controls="task-navigation"
-            aria-expanded={isSidebarOpen}
-            onClick={onOpenSidebar}
-          >
-            <PanelLeft size={19} />
-          </button>
           <HomePrompt
             status={status}
             hasSelection={selected !== null}
@@ -1392,16 +1109,9 @@ function ChatView({
         </>
       ) : (
         <>
-          <ConversationHeader
-            selected={selected}
-            connection={connection}
-            runningTurn={runningTurn}
-            pendingApproval={pendingApproval}
-            isSidebarOpen={isSidebarOpen}
-            onOpenSidebar={onOpenSidebar}
-            onOpenInspector={onOpenInspector}
-          />
           <ConversationTimeline
+            key={selected}
+            onScrollToBottom={onScrollToBottom}
             items={timeline}
             messageScrollRef={messageScrollRef}
             onMessageScroll={onMessageScroll}
@@ -1448,36 +1158,36 @@ function SessionStatusBanner({
         tone: 'error',
         message: sessionError,
         action: hasSelection ? onRetrySession : undefined,
-        actionLabel: hasSelection ? 'Retry task' : undefined,
+        actionLabel: hasSelection ? '重新连接' : undefined,
       } as const
     }
     if (directoryError) {
       return {
         tone: 'error',
-        message: `Could not load tasks: ${directoryError}`,
+        message: `无法加载会话列表： ${directoryError}`,
         action: onRetryDirectory,
-        actionLabel: 'Retry list',
+        actionLabel: '重新加载',
       } as const
     }
     if (selectionStatus === 'reconnecting') {
       return {
         tone: 'warning',
-        message: 'Connection interrupted. Reconnecting with a fresh snapshot…',
+        message: '连接已中断，正在恢复会话…',
       } as const
     }
     if (selectionStatus === 'subscribing') {
       return {
         tone: 'neutral',
-        message: 'Opening task and waiting for its snapshot…',
+        message: '正在打开会话…',
       } as const
     }
     if (workspaceStatus === 'loading') {
-      return { tone: 'neutral', message: 'Loading task directory…' } as const
+      return { tone: 'neutral', message: '正在加载会话…' } as const
     }
     if (workspaceStatus === 'degraded' && diagnosticCount > 0) {
       return {
         tone: 'warning',
-        message: `${diagnosticCount} damaged task log${diagnosticCount === 1 ? '' : 's'} were skipped. Other tasks remain available.`,
+        message: `已跳过 ${diagnosticCount} 个损坏的会话记录，其余会话仍可使用。`,
         dismissible: true,
       } as const
     }
@@ -1505,7 +1215,7 @@ function SessionStatusBanner({
         </button>
       ) : null}
       {'dismissible' in status && status.dismissible ? (
-        <MiniIconButton title="Dismiss message" onClick={onDismiss}>
+        <MiniIconButton title="关闭提示" onClick={onDismiss}>
           <X size={14} />
         </MiniIconButton>
       ) : null}
@@ -1549,21 +1259,20 @@ function HomePrompt({
   onPickHint?: (prompt: string) => void
   children: ReactNode
 }) {
-  const workspace = status ? workspaceName(status.workspace_root) : 'this workspace'
+  const workspace = status ? workspaceName(status.workspace_root) : '当前工作区'
 
   return (
     <div className="home-prompt">
       <div className="home-copy">
         <div className="home-mark" aria-hidden="true">
-          <Bot size={29} />
+          <GitBranch size={32} strokeWidth={1.5} />
         </div>
         <h1>
-          {hasSelection ? (
-            <>What should we build in <span>{workspace}</span>?</>
-          ) : (
-            <>Create a task to start in <span>{workspace}</span>.</>
-          )}
+          {hasSelection ? '今天想一起完成什么？' : '从一个想法开始。'}
         </h1>
+        <span className="home-workspace" title={status?.workspace_root}>
+          <Folder size={14} />{workspace}
+        </span>
       </div>
       {children}
       {!hasSelection ? (
@@ -1573,7 +1282,7 @@ function HomePrompt({
           onClick={onCreateSession}
         >
           <Plus size={17} />
-          <span>New task</span>
+          <span>新建会话</span>
         </button>
       ) : null}
       {onPickHint ? (
@@ -1619,7 +1328,8 @@ function ConversationHeader({
   onOpenSidebar: () => void
   onOpenInspector: (panel: InspectorPanel) => void
 }) {
-  const connectionState = runningTurn ? 'running' : connection
+  const connectionState = pendingApproval ? 'approval' : runningTurn ? 'running' : connection
+  const connectionLabels = { connected: '已连接', connecting: '连接中', disconnected: '未连接', running: '正在执行', approval: '等待确认' }
 
   return (
     <header className="conversation-header">
@@ -1627,24 +1337,24 @@ function ConversationHeader({
         <button
           className="mobile-menu-button"
           type="button"
-          aria-label="Open task navigation"
+          aria-label="打开会话导航"
           aria-controls="task-navigation"
           aria-expanded={isSidebarOpen}
           onClick={onOpenSidebar}
         >
           <PanelLeft size={19} />
         </button>
-        <h1 title={selected ?? 'No task'}>{selected ?? 'No task'}</h1>
+        <h1 title={selected ?? '新会话'}>{selected ?? '新会话'}</h1>
       </div>
       <div className="conversation-actions">
-        <span className={`connection-badge ${connectionState}`}>
+        <span className={`connection-badge ${connectionState}`} title={connectionLabels[connectionState]} aria-label={connectionLabels[connectionState]}>
           <span />
-          {pendingApproval ? 'approval' : connectionState}
+          {connectionLabels[connectionState]}
         </span>
-        <MiniIconButton title="Open run status" onClick={() => onOpenInspector('run')}>
+        <MiniIconButton title="查看执行详情" onClick={() => onOpenInspector('run')}>
           <Shield size={16} />
         </MiniIconButton>
-        <MiniIconButton title="Open subagents" onClick={() => onOpenInspector('subagents')}>
+        <MiniIconButton title="查看子智能体" onClick={() => onOpenInspector('subagents')}>
           <Bot size={16} />
         </MiniIconButton>
       </div>
@@ -1657,35 +1367,63 @@ function ConversationTimeline({
   messageScrollRef,
   onMessageScroll,
   onToggleRun,
+  onScrollToBottom,
 }: {
   items: TimelineItem[]
   messageScrollRef: React.RefObject<HTMLDivElement | null>
   onMessageScroll: (event: UIEvent<HTMLDivElement>) => void
   onToggleRun: (id: string) => void
+  onScrollToBottom: () => void
 }) {
+  const [showScrollButton, setShowScrollButton] = useState(false)
+  useLayoutEffect(() => {
+    const scroller = messageScrollRef.current
+    if (!scroller) return
+    const update = () => setShowScrollButton(!isMessageScrollNearBottom(scroller))
+    update()
+    if (typeof ResizeObserver === 'undefined') return
+    const observer = new ResizeObserver(update)
+    observer.observe(scroller)
+    return () => observer.disconnect()
+  }, [items, messageScrollRef])
+
   return (
+    <div className="conversation-body">
     <div
       ref={messageScrollRef}
       className="message-scroll main-scroll"
-      onScroll={onMessageScroll}
+      onScroll={(event) => {
+        onMessageScroll(event)
+        setShowScrollButton(!isMessageScrollNearBottom(event.currentTarget))
+      }}
     >
       <div className="message-column">
-        {items.map((item) => {
+        {groupTimelineNotices(items).map((item) => {
           if (item.kind === 'message') {
             return <TimelineMessage key={item.id} message={item} />
           }
           if (item.kind === 'run') {
             return (
-              <RunTraceCard
+              <ExecutionTrace
                 key={item.id}
                 trace={item.trace}
                 onToggle={() => onToggleRun(item.id)}
+                renderSpecialStep={(step) => <RunStepRow step={step} />}
               />
             )
           }
-          return <TimelineNotice key={item.id} notice={item} />
+          return <TimelineNotices key={item.id} notices={item.notices} />
         })}
       </div>
+    </div>
+    {showScrollButton ? (
+      <button className="scroll-to-bottom" type="button" aria-label="回到底部" title="回到底部" onClick={() => {
+        onScrollToBottom()
+        setShowScrollButton(false)
+      }}>
+        <ArrowDown size={17} />
+      </button>
+    ) : null}
     </div>
   )
 }
@@ -1693,7 +1431,7 @@ function ConversationTimeline({
 function TimelineMessage({ message }: { message: TimelineMessageItem }) {
   return (
     <article className={`message-row ${message.role}`}>
-      <div className="message-role">{message.role}</div>
+      <div className={`message-role ${message.role}`}>{message.role === 'user' ? '你' : message.role === 'assistant' ? 'Morrow' : message.role}</div>
       {message.role === 'assistant' ? (
         <MarkdownMessage content={message.content} />
       ) : (
@@ -1705,95 +1443,6 @@ function TimelineMessage({ message }: { message: TimelineMessageItem }) {
 
 function MarkdownMessage({ content }: { content: string }) {
   return <MarkdownContent content={content} className="message-bubble" />
-}
-
-function MarkdownContent({
-  content,
-  className = '',
-}: {
-  content: string
-  className?: string
-}) {
-  return (
-    <div className={`markdown-message${className ? ` ${className}` : ''}`}>
-      <ReactMarkdown
-        remarkPlugins={markdownPlugins}
-        skipHtml
-        components={{
-          a: ({ node: _node, ...props }) => (
-            <a {...props} target="_blank" rel="noreferrer" />
-          ),
-          table: ({ node: _node, ...props }) => (
-            <div className="markdown-table-scroll">
-              <table {...props} />
-            </div>
-          ),
-        }}
-      >
-        {content}
-      </ReactMarkdown>
-    </div>
-  )
-}
-
-function TimelineNotice({ notice }: { notice: TimelineNoticeItem }) {
-  return (
-    <article className={`timeline-notice ${notice.tone}`}>
-      {noticeIcon(notice.tone)}
-      <div>
-        <strong>{notice.title}</strong>
-        {notice.detail ? <p>{notice.detail}</p> : null}
-      </div>
-    </article>
-  )
-}
-
-function RunTraceCard({
-  trace,
-  onToggle,
-}: {
-  trace: RunTrace
-  onToggle: () => void
-}) {
-  const summary = runTraceSummary(trace)
-  return (
-    <article
-      className={`run-card ${trace.status}${trace.collapsed ? ' collapsed' : ' expanded'}`}
-    >
-      <header className="run-card-head">
-        <button
-          type="button"
-          className="run-toggle"
-          title={trace.collapsed ? 'Expand run' : 'Collapse run'}
-          aria-expanded={!trace.collapsed}
-          onClick={onToggle}
-        >
-          {trace.collapsed ? (
-            <ChevronRight size={18} />
-          ) : (
-            <ChevronDown size={18} />
-          )}
-        </button>
-        <div className="run-heading">
-          <p className="eyebrow">Run</p>
-          <h2>{runTraceTitle(trace)}</h2>
-          {summary ? <p>{summary}</p> : null}
-        </div>
-        <div className="run-meta">
-          <span>{trace.steps.length} steps</span>
-          <span>{trace.toolCount} tools</span>
-          <span>{trace.status}</span>
-        </div>
-      </header>
-      {!trace.collapsed ? (
-        <div className="run-step-list">
-          {trace.steps.map((step) => (
-            <RunStepRow key={step.id} step={step} />
-          ))}
-        </div>
-      ) : null}
-    </article>
-  )
 }
 
 function RunStepRow({ step }: { step: RunStep }) {
@@ -1821,7 +1470,7 @@ function RunStepRow({ step }: { step: RunStep }) {
           <>
             <div className="run-step-head">
               <strong>{step.title}</strong>
-              <span>{step.status}</span>
+              <span>{{ running: '执行中', ok: '已完成', error: '失败', approval: '待确认' }[step.status]}</span>
             </div>
             {step.detail ? <p>{step.detail}</p> : null}
             <RunStepDetails step={step} />
@@ -2166,9 +1815,9 @@ function RunStepDetails({ step }: { step: RunStep }) {
             summary.shell.exit_code == null
               ? 'exit: unavailable'
               : `exit: ${summary.shell.exit_code}`,
-            `timed out: ${summary.shell.timed_out ? 'yes' : 'no'}`,
-            `stdout truncated: ${summary.shell.stdout_truncated ? 'yes' : 'no'}`,
-            `stderr truncated: ${summary.shell.stderr_truncated ? 'yes' : 'no'}`,
+            `timed out: ${summary.shell.timed_out ? '已压缩' : '未压缩'}`,
+            `stdout truncated: ${summary.shell.stdout_truncated ? '已压缩' : '未压缩'}`,
+            `stderr truncated: ${summary.shell.stderr_truncated ? '已压缩' : '未压缩'}`,
           ].join('\n')}
         </pre>
           ) : null}
@@ -2230,6 +1879,13 @@ function Composer({
   onModelSelectionChange: (selection: ModelSelection) => void
   onManageModels: () => void
 }) {
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null)
+  useLayoutEffect(() => {
+    const input = textareaRef.current
+    if (!input) return
+    input.style.height = 'auto'
+    input.style.height = `${Math.min(input.scrollHeight, 220)}px`
+  }, [prompt])
   const [commandIndex, setCommandIndex] = useState(0)
   const [dismissedCommandPrompt, setDismissedCommandPrompt] = useState('')
   const commandQuery = slashCommandQuery(prompt)
@@ -2269,6 +1925,7 @@ function Composer({
   const handleComposerKeyDown = (
     event: KeyboardEvent<HTMLTextAreaElement>,
   ) => {
+    if (event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return
     if (commandMenuOpen) {
       if (event.key === 'ArrowDown') {
         event.preventDefault()
@@ -2285,7 +1942,7 @@ function Composer({
         return
       }
       if (
-        (event.key === 'Enter' && !event.metaKey && !event.ctrlKey) ||
+        (event.key === 'Enter' && !event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey) ||
         event.key === 'Tab'
       ) {
         event.preventDefault()
@@ -2302,28 +1959,21 @@ function Composer({
   }
 
   const primaryLabel = isRunning
-    ? 'Stop turn'
+    ? '停止执行'
     : isResolvingCommand
-      ? 'Resolving command'
-      : 'Send'
+      ? '解析命令中'
+      : '发送'
   const primaryDisabled = isRunning ? !canCancel : !canSend
-  const workspace = status ? workspaceName(status.workspace_root) : 'loading'
+  const workspace = status ? workspaceName(status.workspace_root) : '加载中'
 
   return (
     <form className={`composer ${variant}`} onSubmit={onSubmit}>
       <div className="composer-shell">
-        <div className="composer-context" aria-label="Project context">
-          <span title={status?.workspace_root || ''}>
-            <Folder size={14} />
-            {workspace}
-          </span>
-        </div>
         <div className="composer-card">
           {commandMenuOpen ? (
             <div className="command-suggestion-menu" role="listbox" aria-label="命令建议">
               <div className="command-suggestion-heading">
                 <span>命令</span>
-                <small>Enter 选择 · Esc 关闭</small>
               </div>
               {commandSuggestions.map((command, index) => (
                 <button
@@ -2338,7 +1988,7 @@ function Composer({
                   <span className="command-suggestion-icon"><Terminal size={16} /></span>
                   <span>
                     <strong>/{command.name}</strong>
-                    <small>{command.description || '自定义 Markdown 命令'}</small>
+                    {command.description ? <small>{command.description}</small> : null}
                   </span>
                   {command.argument_hint ? <em>{command.argument_hint}</em> : null}
                 </button>
@@ -2346,11 +1996,13 @@ function Composer({
             </div>
           ) : null}
           <textarea
+            ref={textareaRef}
+            aria-label="消息"
             value={prompt}
             rows={variant === 'home' ? 3 : 2}
             disabled={!enabled || isRunning || isResolvingCommand}
-            placeholder="Ask Morrow to edit, inspect, or explain this workspace"
-            title="Enter 发送·Ctrl + Enter 换行"
+            placeholder="描述你想完成的工作，输入 / 使用命令"
+            title="Enter 发送 · Shift / Ctrl + Enter 换行"
             onChange={(event) => {
               setDismissedCommandPrompt('')
               setCommandIndex(0)
@@ -2360,14 +2012,6 @@ function Composer({
           />
           <div className="composer-bar">
             <div className="composer-left">
-              <button
-                className="composer-chip icon-only"
-                type="button"
-                title="Attachments coming soon"
-                disabled
-              >
-                <Plus size={16} />
-              </button>
               <PermissionPicker
                 mode={permissionMode}
                 disabled={!enabled || isRunning || isResolvingCommand}
@@ -2394,11 +2038,14 @@ function Composer({
                 ) : isResolvingCommand ? (
                   <RefreshCw size={17} className="spinning" />
                 ) : (
-                  <Send size={17} />
+                  <ArrowUp size={18} />
                 )}
               </button>
             </div>
           </div>
+        </div>
+        <div className="composer-context" aria-label="工作区">
+          <span title={status?.workspace_root || ''}><Folder size={13} />{workspace}</span>
         </div>
       </div>
     </form>
@@ -2528,6 +2175,8 @@ function ModelPicker({
     }
     const handleKeyDown = (event: globalThis.KeyboardEvent) => {
       if (event.key === 'Escape') {
+        event.stopPropagation()
+        pickerRef.current?.querySelector('button')?.focus()
         setOpen(false)
         setModelListOpen(false)
       }
@@ -2676,7 +2325,7 @@ function ModelPicker({
 }
 
 function permissionOptionIcon(
-  id: PermissionMode | 'plan',
+  id: PermissionMode,
   size = 17,
 ): ReactNode {
   switch (id) {
@@ -2684,8 +2333,6 @@ function permissionOptionIcon(
       return <Eye size={size} />
     case 'workspace_write':
       return <PencilLine size={size} />
-    case 'plan':
-      return <ListTree size={size} />
     case 'danger_full_access':
       return <ShieldCheck size={size} />
   }
@@ -2699,6 +2346,7 @@ export function InspectorDrawer({
   open,
   panel,
   selectedEntry,
+  timeline = [],
   runningTurn,
   pendingApproval,
   approvalQueue,
@@ -2715,6 +2363,7 @@ export function InspectorDrawer({
   open: boolean
   panel: InspectorPanel
   selectedEntry?: SessionEntryResponse
+  timeline?: TimelineItem[]
   runningTurn: RunningTurnSnapshot | null
   pendingApproval: ApprovalRequest | null
   approvalQueue: ApprovalRequest[]
@@ -2728,6 +2377,8 @@ export function InspectorDrawer({
   onDeleteSubagent: (instanceId: string) => void
   commandsEnabled?: boolean
 }) {
+  const panelRef = useRef<HTMLElement | null>(null)
+  useDialogFocus(panelRef, open ? 'inspector' : null, true)
   return (
     <aside
       className={`inspector-drawer${open ? ' open' : ''}`}
@@ -2737,36 +2388,36 @@ export function InspectorDrawer({
       <button
         className="drawer-backdrop"
         type="button"
-        aria-label="Close inspector"
+        aria-label="关闭详情"
         onClick={onClose}
       />
-      <section className="drawer-panel main-scroll" aria-label="Inspector">
+      <section className="drawer-panel main-scroll" aria-label={inspectorPanelTitle(panel)} ref={panelRef} tabIndex={-1}>
         <header className="drawer-header">
           <div>
-            <p className="eyebrow">Inspector</p>
             <h2>{inspectorPanelTitle(panel)}</h2>
           </div>
-          <MiniIconButton title="Close inspector" onClick={onClose}>
+          <MiniIconButton title="关闭详情" onClick={onClose}>
             <X size={18} />
           </MiniIconButton>
         </header>
-        <nav className="drawer-tabs" aria-label="Inspector panels">
+        <nav className="drawer-tabs" aria-label="详情分类">
           <DrawerTab
             active={panel === 'run'}
             icon={<Shield size={16} />}
-            label="Run"
+            label="执行"
             onClick={() => onPanelChange('run')}
           />
           <DrawerTab
             active={panel === 'subagents'}
             icon={<Bot size={16} />}
-            label="Agents"
+            label="子智能体"
             onClick={() => onPanelChange('subagents')}
           />
         </nav>
         <InspectorPanelContent
           panel={panel}
           selectedEntry={selectedEntry}
+          timeline={timeline}
           runningTurn={runningTurn}
           pendingApproval={pendingApproval}
           approvalQueue={approvalQueue}
@@ -2809,6 +2460,7 @@ function DrawerTab({
 function InspectorPanelContent({
   panel,
   selectedEntry,
+  timeline = [],
   runningTurn,
   pendingApproval,
   approvalQueue,
@@ -2822,6 +2474,7 @@ function InspectorPanelContent({
 }: {
   panel: InspectorPanel
   selectedEntry?: SessionEntryResponse
+  timeline?: TimelineItem[]
   runningTurn: RunningTurnSnapshot | null
   pendingApproval: ApprovalRequest | null
   approvalQueue: ApprovalRequest[]
@@ -2848,302 +2501,28 @@ function InspectorPanelContent({
   }
 
   return (
-    <div className="drawer-run">
-      <div className="inspector-metrics">
-        <InspectorMetric label="turns" value={String(selectedEntry?.turns ?? 0)} />
-        <InspectorMetric
-          label="active"
-          value={String(selectedEntry?.active_messages ?? 0)}
-        />
-        <InspectorMetric
-          label="summary"
-          value={selectedEntry?.has_summary ? 'yes' : 'no'}
-        />
-      </div>
-      <div className="status-card">
-        <p className="eyebrow">Turn</p>
-        <strong>{pendingApproval ? 'approval' : runningTurn ? 'running' : 'idle'}</strong>
-        {runningTurn ? <small>{runningTurn.turn_id}</small> : null}
-        {pendingApproval ? (
-          <span className="notice-pill approval">approval pending</span>
-        ) : null}
-      </div>
-      {approvalQueue.length > 0 ? (
-        <div className="approval-queue-card">
-          <p className="eyebrow">Approval queue</p>
-          {approvalQueue.map((request, index) => (
-            <span key={request.id}>
-              <strong>{index === 0 ? 'Current' : `Queued ${index}`}</strong>
-              <small>{approvalSource(request)}</small>
-            </span>
-          ))}
-        </div>
-      ) : null}
-    </div>
+    <RunInspector
+      timeline={timeline}
+      selectedEntry={selectedEntry}
+      runningTurn={runningTurn}
+      approvalQueue={approvalQueue.length ? approvalQueue : pendingApproval ? [pendingApproval] : []}
+      renderApproval={(request) => <ApprovalBody request={request} />}
+    />
   )
 }
 
-function InspectorMetric({ label, value }: { label: string; value: string }) {
-  return (
-    <span className="inspector-metric">
-      <strong>{value}</strong>
-      <span>{label}</span>
-    </span>
-  )
-}
-
-export function PersistentSubagentPanel({
-  instances,
-  transcript,
-  onSend,
-  onInspect,
-  onCancel,
-  onDelete,
-  commandsEnabled = true,
-}: {
-  instances: SubagentInstanceSnapshot[]
-  transcript: SubagentTranscriptSnapshot | null
-  onSend: (instanceId: string, message: string) => void
-  onInspect: (instanceId: string) => void
-  onCancel: (instanceId: string) => void
-  onDelete: (instanceId: string) => void
-  commandsEnabled?: boolean
-}) {
+export function PersistentSubagentPanel(props: SubagentInspectorProps) {
   const profiles = useContext(SubagentProfilesContext)
-  const [followup, setFollowup] = useState('')
-  const selected = transcript?.instance
-  const selectedProfile = selected
-    ? findSubagentProfile(profiles, selected.identity.id, selected.identity.name)
-    : undefined
-  const latestRun = transcript?.runs.at(-1)
-  const latestSummary =
-    latestRun?.summary ?? transcript?.instance.latest_summary
-  const latestTask = latestRun?.task
-    ?? transcript?.instance.latest_task
-    ?? 'No task assigned.'
-  const latestResult = latestSummary?.result?.trim()
-  const resultPreview = latestResult
-    ? compactText(
-        latestResult.replace(/[`*_#>]/g, '').replace(/\s+/g, ' '),
-        160,
-      )
-    : undefined
-  const send = (event: FormEvent) => {
-    event.preventDefault()
-    const value = followup.trim()
-    if (!commandsEnabled || !selected || !value) return
-    onSend(selected.id, value)
-    setFollowup('')
-  }
-
-  return (
-    <div className="persistent-subagent-panel">
-      <section className="subagent-instance-section">
-        <header className="subagent-section-heading">
-          <span>
-            <strong>Current agents</strong>
-            <small>由主 Agent 创建的会话级后台实例</small>
-          </span>
-          <span className="subagent-instance-count">{instances.length}</span>
-        </header>
-        <div className="subagent-instance-list">
-          {instances.length === 0 ? (
-            <div className="subagent-empty-state">
-              <Bot size={20} />
-              <span>
-                <strong>No agents yet</strong>
-                <small>主 Agent 启动后台任务后，子 Agent 会显示在这里。</small>
-              </span>
-            </div>
-          ) : null}
-          {instances.map((instance) => {
-            const profile = findSubagentProfile(
-              profiles,
-              instance.identity.id,
-              instance.identity.name,
-            )
-            return (
-              <button
-                className={`subagent-instance-card${selected?.id === instance.id ? ' selected' : ''}`}
-                type="button"
-                key={instance.id}
-                disabled={!commandsEnabled}
-                onClick={() => onInspect(instance.id)}
-              >
-                <span className="subagent-instance-avatar">
-                  <SubagentIdentityAvatar avatar={profile?.avatar_data_url} />
-                </span>
-                <span className="subagent-instance-content">
-                  <span className="subagent-instance-heading">
-                    <strong>{instance.identity.name}</strong>
-                    <span className={`subagent-status-badge ${instance.status}`}>
-                      {instance.role} · {instance.status.replace('_', ' ')}
-                    </span>
-                  </span>
-                  <small>{compactText(instance.latest_task ?? 'No task', 72)}</small>
-                  {instance.queue_reason ? <em>{instance.queue_reason}</em> : null}
-                </span>
-              </button>
-            )
-          })}
-        </div>
-      </section>
-
-      {transcript ? (
-        <section className="subagent-detail-card">
-          <header className="subagent-detail-header">
-            <span className="subagent-detail-avatar">
-              <SubagentIdentityAvatar avatar={selectedProfile?.avatar_data_url} />
-            </span>
-            <div>
-              <p className="eyebrow">Agent details</p>
-              <h3>{transcript.instance.identity.name}</h3>
-              <small>
-                {subagentRoleLabel(transcript.instance.role)} ·{' '}
-                {subagentRoleResponsibility(transcript.instance.role)}
-              </small>
-            </div>
-            <span className={`subagent-status-badge ${transcript.instance.status}`}>
-              {transcript.instance.status.replace('_', ' ')}
-            </span>
-          </header>
-          <div className="subagent-runtime-meta">
-            <span>{transcript.instance.role}</span>
-            <span>{transcript.permission_ceiling.mode.replace('_', ' ')}</span>
-            <span>shell {transcript.permission_ceiling.shell}</span>
-            <span>{transcript.role_config.timeout_secs}s</span>
-            <span>{transcript.role_config.max_tool_rounds} rounds</span>
-          </div>
-          <div className="subagent-detail-grid">
-            <span>
-              <small>Model</small>
-              <strong>{transcript.model.model_name}</strong>
-              <em>{transcript.model.provider_name} · {transcript.model.reasoning}</em>
-            </span>
-            <span>
-              <small>Instance</small>
-              <strong>
-                {transcript.runs.length} run
-                {transcript.runs.length === 1 ? '' : 's'}
-              </strong>
-              <em>{compactText(transcript.instance.id, 30)}</em>
-            </span>
-          </div>
-          <section className="subagent-latest-task">
-            <header>
-              <strong>Latest task</strong>
-              {latestRun ? (
-                <span className={`subagent-status-badge ${latestRun.status}`}>
-                  {latestRun.status.replace('_', ' ')}
-                </span>
-              ) : null}
-            </header>
-            <p>{compactText(latestTask.replace(/\s+/g, ' '), 160)}</p>
-            {latestRun ? (
-              <small>{new Date(latestRun.started_at_ms).toLocaleString()}</small>
-            ) : null}
-          </section>
-          {latestSummary ? (
-            <div className="subagent-summary-metrics">
-              <span>
-                <strong>{latestSummary.model_calls}</strong>
-                <small>model calls</small>
-              </span>
-              <span>
-                <strong>{latestSummary.tool_calls}</strong>
-                <small>tool calls</small>
-              </span>
-              <span>
-                <strong>{latestSummary.file_changes?.length ?? 0}</strong>
-                <small>files</small>
-              </span>
-              <span>
-                <strong>{latestSummary.shell_commands?.length ?? 0}</strong>
-                <small>commands</small>
-              </span>
-            </div>
-          ) : null}
-          <section
-            className={`subagent-result-preview${latestSummary?.error ? ' failed' : ''}`}
-          >
-            <header>
-              <strong>{latestSummary?.error ? 'Latest error' : 'Latest result'}</strong>
-              {latestSummary?.truncated ? <span>truncated</span> : null}
-            </header>
-            <p>
-              {latestSummary?.error?.trim()
-                || resultPreview
-                || (isActiveSubagentStatus(transcript.instance.status)
-                  ? 'The agent is still working on this task.'
-                  : 'No result summary is available for the latest run.')}
-            </p>
-          </section>
-          {transcript.instance.event_log_truncated ? (
-            <p className="subagent-log-warning">
-              The event log reached its 16 MiB limit; streaming deltas were
-              truncated.
-            </p>
-          ) : null}
-          <div className="subagent-instance-actions">
-            {isActiveSubagentStatus(transcript.instance.status) ? (
-              <button
-                className="danger-button subtle"
-                type="button"
-                disabled={!commandsEnabled}
-                onClick={() => onCancel(transcript.instance.id)}
-              >
-                <Square size={14} /> Cancel
-              </button>
-            ) : (
-              <button
-                className="danger-button subtle"
-                type="button"
-                disabled={!commandsEnabled}
-                onClick={() => {
-                  if (window.confirm(`Delete ${transcript.instance.identity.name} and its transcript?`)) {
-                    onDelete(transcript.instance.id)
-                  }
-                }}
-              >
-                <X size={14} /> Delete
-              </button>
-            )}
-          </div>
-          {!isActiveSubagentStatus(transcript.instance.status) ? (
-            <details className="subagent-followup-disclosure">
-              <summary><Send size={14} /> Continue this agent</summary>
-              <form className="subagent-followup-form" onSubmit={send}>
-                <textarea
-                  value={followup}
-                  disabled={!commandsEnabled}
-                  maxLength={4000}
-                  placeholder="Continue this instance with preserved context…"
-                  onChange={(event) => setFollowup(event.target.value)}
-                />
-                <button
-                  className="approve-button"
-                  type="submit"
-                  disabled={!commandsEnabled || !followup.trim()}
-                >
-                  <Send size={14} /> Continue
-                </button>
-              </form>
-            </details>
-          ) : null}
-        </section>
-      ) : null}
-    </div>
-  )
+  return <SubagentInspector {...props} renderAvatar={(instance) => {
+    const profile = findSubagentProfile(profiles, instance.identity.id, instance.identity.name)
+    return <SubagentIdentityAvatar avatar={profile?.avatar_data_url} />
+  }} />
 }
 
 export function subagentTranscriptMessages(
   session: import('./types').SessionProjection,
 ): Message[] {
   return session.turns.flatMap((turn) => turn.messages)
-}
-
-function isActiveSubagentStatus(status: SubagentInstanceSnapshot['status']): boolean {
-  return status === 'queued' || status === 'running' || status === 'waiting_approval'
 }
 
 function ToolList({
@@ -3154,7 +2533,7 @@ function ToolList({
   compact?: boolean
 }) {
   if (tools.length === 0) {
-    return <p className="muted-line">No tool calls.</p>
+    return <p className="muted-line">还没有工具调用。</p>
   }
 
   return (
@@ -3174,56 +2553,6 @@ function ToolList({
   )
 }
 
-function CreateSessionRow({
-  value,
-  error,
-  onChange,
-  onCancel,
-  onSubmit,
-}: {
-  value: string
-  error: string | null
-  onChange: (value: string) => void
-  onCancel: () => void
-  onSubmit: () => void
-}) {
-  const canSubmit = value.trim().length > 0
-
-  const handleSubmit = (event: FormEvent) => {
-    event.preventDefault()
-    if (canSubmit) onSubmit()
-  }
-
-  const handleKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
-    if (event.key === 'Escape') {
-      event.preventDefault()
-      onCancel()
-    }
-  }
-
-  return (
-    <form className="session-create-row" onSubmit={handleSubmit}>
-      <input
-        aria-label="New session name"
-        autoFocus
-        value={value}
-        placeholder="session name"
-        onChange={(event) => onChange(event.target.value)}
-        onKeyDown={handleKeyDown}
-      />
-      <div className="session-create-actions">
-        <MiniIconButton title="Create session" type="submit" disabled={!canSubmit}>
-          <Check size={17} />
-        </MiniIconButton>
-        <MiniIconButton title="Cancel" onClick={onCancel}>
-          <X size={17} />
-        </MiniIconButton>
-      </div>
-      {error ? <p>{error}</p> : null}
-    </form>
-  )
-}
-
 function ApprovalDialog({
   request,
   disabled,
@@ -3235,21 +2564,23 @@ function ApprovalDialog({
   onApprove: () => void
   onDeny: () => void
 }) {
+  const panelRef = useRef<HTMLElement | null>(null)
+  useDialogFocus(panelRef, request?.id ?? null)
   if (!request) return null
 
   return (
-    <div className="approval-overlay" role="dialog" aria-modal="true">
-      <section className="approval-panel">
+    <div className="approval-overlay" role="dialog" aria-modal="true" aria-labelledby="approval-title">
+      <section className="approval-panel" ref={panelRef} tabIndex={-1}>
         <header>
           <div>
-            <p className="eyebrow">Approval</p>
-            <h2>{approvalTitle(request)}</h2>
+            <p className="eyebrow">操作确认</p>
+            <h2 id="approval-title">{approvalTitle(request)}</h2>
           </div>
-          <IconButton title="Deny" disabled={disabled} onClick={onDeny}>
+          <IconButton title="拒绝" disabled={disabled} onClick={onDeny}>
             <X size={20} />
           </IconButton>
         </header>
-        <p className="approval-source">Source: {approvalSource(request)}</p>
+        <p className="approval-source">来源：{approvalSource(request)}</p>
         <p className="approval-reason">{request.reason}</p>
         <ApprovalBody request={request} />
         <footer>
@@ -3259,7 +2590,7 @@ function ApprovalDialog({
             disabled={disabled}
             onClick={onDeny}
           >
-            Deny
+            拒绝
           </button>
           <button
             className="approve-button"
@@ -3268,7 +2599,7 @@ function ApprovalDialog({
             onClick={onApprove}
           >
             <CheckCircle2 size={18} />
-            <span>Approve</span>
+            <span>批准</span>
           </button>
         </footer>
       </section>
@@ -3315,58 +2646,6 @@ function ApprovalBody({ request }: { request: ApprovalRequest }) {
   )
 }
 
-function IconButton({
-  title,
-  disabled = false,
-  onClick,
-  children,
-}: {
-  title: string
-  disabled?: boolean
-  onClick: () => void
-  children: ReactNode
-}) {
-  return (
-    <button
-      className="icon-button"
-      type="button"
-      title={title}
-      disabled={disabled}
-      onClick={onClick}
-    >
-      <span className="sr-only">{title}</span>
-      {children}
-    </button>
-  )
-}
-
-function MiniIconButton({
-  title,
-  type = 'button',
-  disabled = false,
-  onClick,
-  children,
-}: {
-  title: string
-  type?: 'button' | 'submit'
-  disabled?: boolean
-  onClick?: () => void
-  children: ReactNode
-}) {
-  return (
-    <button
-      className="mini-icon-button"
-      type={type}
-      title={title}
-      disabled={disabled}
-      onClick={onClick}
-    >
-      <span className="sr-only">{title}</span>
-      {children}
-    </button>
-  )
-}
-
 function formatToolSummary(summary?: ToolExecutionSummary): string {
   if (!summary) return 'running'
   if (summary.error) return summary.error
@@ -3391,41 +2670,6 @@ function formatToolSummary(summary?: ToolExecutionSummary): string {
     parts.push('diff available')
   }
   return parts.join(' / ') || 'finished'
-}
-
-function runTraceTitle(trace: RunTrace): string {
-  switch (trace.status) {
-    case 'approval':
-      return 'Waiting for approval'
-    case 'completed':
-      return 'Execution complete'
-    case 'failed':
-      return 'Execution failed'
-    case 'running':
-      return 'Executing task'
-  }
-}
-
-function runTraceSummary(trace: RunTrace): string {
-  const lastStep = trace.steps.at(-1)
-  if (!lastStep) return trace.completedAt || trace.startedAt
-  const detail = lastStep.detail ? ` - ${compactText(lastStep.detail, 90)}` : ''
-  return `${lastStep.title}${detail}`
-}
-
-function noticeIcon(tone: TimelineNoticeItem['tone']): ReactNode {
-  switch (tone) {
-    case 'running':
-      return <Clock3 size={18} />
-    case 'ok':
-      return <CheckCircle2 size={18} />
-    case 'error':
-      return <CircleAlert size={18} />
-    case 'approval':
-      return <Shield size={18} />
-    case 'neutral':
-      return <Activity size={18} />
-  }
 }
 
 function RunStepIcon({ step }: { step: RunStep }) {
@@ -3499,15 +2743,15 @@ function runStepIcon(step: RunStep): ReactNode {
 function inspectorPanelTitle(panel: InspectorPanel): string {
   switch (panel) {
     case 'run':
-      return 'Run'
+      return '执行详情'
     case 'subagents':
-      return 'Agents'
+      return '子智能体'
   }
 }
 
 function approvalSource(request: ApprovalRequest): string {
   const origin = request.origin
-  if (!origin || origin.kind === 'unknown') return 'parent agent'
+  if (!origin || origin.kind === 'unknown') return '主智能体'
   if (origin.kind === 'parent_turn') return origin.turn_id ?? 'parent turn'
   return `${origin.identity_name ?? origin.role} · ${origin.role} · ${origin.run_id}`
 }
@@ -3515,11 +2759,11 @@ function approvalSource(request: ApprovalRequest): string {
 function approvalTitle(request: ApprovalRequest): string {
   switch (request.action.kind) {
     case 'shell_command':
-      return 'Shell command'
+      return '执行命令'
     case 'mcp_tool':
-      return 'MCP tool'
+      return '调用 MCP 工具'
     default:
-      return 'File changes'
+      return '修改文件'
   }
 }
 
@@ -3577,8 +2821,9 @@ export function shouldSubmitPromptOnEnter(
   key: string,
   ctrlKey: boolean,
   isComposing: boolean,
+  modified = false,
 ): boolean {
-  return key === 'Enter' && !ctrlKey && !isComposing
+  return key === 'Enter' && !ctrlKey && !isComposing && !modified
 }
 
 function slashCommandQuery(prompt: string): string | null {

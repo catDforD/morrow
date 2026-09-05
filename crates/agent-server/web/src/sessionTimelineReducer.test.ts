@@ -81,6 +81,37 @@ function event(sequence: number, update: SessionUpdate): SessionStreamFrame {
 }
 
 describe('session timeline reducer', () => {
+  it('projects live reasoning, intermediate commentary and complete tool details without duplicating the final answer', () => {
+    const value = snapshot()
+    const call = { id: 'read-1', type: 'function' as const, function: { name: 'read_file', arguments: '{"path":"App.tsx"}' } }
+    value.session.turns[0].steps = [
+      { id: 'model-call-1', kind: 'model_call', status: 'running' },
+      { id: 'model-call-2', kind: 'model_call', status: 'completed', model_message: { role: 'assistant', content: '先查看入口。', tool_calls: [call] } },
+      { id: 'tool-1', kind: 'tool_call', status: 'completed', tool_call: call, tool_result: { role: 'tool', content: 'not found' }, tool_summary: { error: 'file not found' } },
+      { id: 'model-call-3', kind: 'model_call', status: 'completed', model_message: { role: 'assistant', content: '正式回答。' } },
+    ]
+    const item = timelineFromSnapshot(value).find((item) => item.kind === 'run')
+    if (item?.kind !== 'run') throw new Error('Missing execution trace')
+    expect(item.trace.steps[0].reasoning).toBe('thinking')
+    expect(item.trace.steps[1].commentary).toBe('先查看入口。')
+    expect(item.trace.steps[2]).toMatchObject({ toolCall: call, output: 'not found', status: 'error' })
+    expect(item.trace.steps[3].commentary).toBeUndefined()
+  })
+
+  it('expands failed execution details and collapses successful runs', () => {
+    const value = snapshot()
+    value.active_operation = null
+    value.session.turns = [{ ...turn('failed'), error: 'command exited with code 1' }]
+    const failed = timelineFromSnapshot(value).find((item) => item.kind === 'run')
+    expect(failed?.kind === 'run' && failed.trace.collapsed).toBe(false)
+    expect(failed?.kind === 'run' && failed.trace.steps.at(-1)?.detail)
+      .toBe('command exited with code 1')
+
+    value.session.turns = [{ ...turn('completed'), steps: [{ id: 'model-1', kind: 'model_call', status: 'completed' }] }]
+    const completed = timelineFromSnapshot(value).find((item) => item.kind === 'run')
+    expect(completed?.kind === 'run' && completed.trace.collapsed).toBe(true)
+  })
+
   it('replaces state from a snapshot and applies only the next event', () => {
     const initial = reduceSessionFrame(emptySessionTimelineState(), {
       type: 'snapshot',

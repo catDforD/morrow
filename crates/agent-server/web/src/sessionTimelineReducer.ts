@@ -294,7 +294,7 @@ function projectionRunTrace(
             ? 'approval'
             : 'running'
           : 'failed',
-    collapsed: turn.status !== 'running',
+    collapsed: turn.status === 'completed',
     startedAt: `turn ${turn.index + 1}`,
     ...(turn.completed_at_ms
       ? { completedAt: new Date(turn.completed_at_ms).toLocaleTimeString() }
@@ -312,11 +312,13 @@ function projectionRunStep(
   const pendingApproval = step.approval && !step.approval_decision
   const status = pendingApproval
     ? 'approval'
-    : step.status === 'completed'
-      ? 'ok'
-      : step.status === 'running'
-        ? 'running'
-        : 'error'
+    : step.error || step.tool_summary?.error
+      ? 'error'
+      : step.status === 'completed'
+        ? 'ok'
+        : step.status === 'running'
+          ? 'running'
+          : 'error'
   const streaming =
     snapshot.active_operation?.turn_id === turn.id &&
     snapshot.active_operation.streaming?.model_call_id === step.id
@@ -331,6 +333,9 @@ function projectionRunStep(
       detail: step.error || `${turn.model.provider_name} · ${turn.model.reasoning}`,
       reasoning:
         streaming?.reasoning || step.model_message?.reasoning_content || undefined,
+      commentary: step.model_message?.tool_calls?.length
+        ? step.model_message.content || undefined
+        : undefined,
     }
   }
   return {
@@ -346,6 +351,8 @@ function projectionRunStep(
         ? 'Tool side effect may have completed; outcome is unknown after recovery.'
         : step.tool_call?.id),
     summary: step.tool_summary || undefined,
+    toolCall: step.tool_call || undefined,
+    output: step.tool_result?.content ?? undefined,
   }
 }
 

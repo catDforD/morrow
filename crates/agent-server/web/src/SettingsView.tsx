@@ -2,24 +2,19 @@ import type { ReactNode } from 'react'
 import { useEffect, useRef, useState } from 'react'
 import {
   ArrowLeft,
-  BarChart3,
   Bot,
   Check,
   ChevronDown,
-  Database,
   Eye,
   Info,
-  Languages,
   Monitor,
   Moon,
   Network,
   PanelLeft,
   PencilLine,
-  Plug,
   Server,
   Settings2,
   ShieldCheck,
-  Sparkles,
   Sun,
   Terminal,
   TriangleAlert,
@@ -33,6 +28,7 @@ import type {
   ModelSettingsResponse,
   SubagentSettingsResponse,
 } from './types'
+import { useDialogFocus } from './useDialogFocus'
 import CommandSettingsPanel from './CommandSettingsPanel'
 import HookSettingsPanel from './HookSettingsPanel'
 import McpSettingsPanel from './McpSettingsPanel'
@@ -80,7 +76,7 @@ const permissionSettingOptions: SettingsSelectOption<PermissionMode>[] = [
 type SettingsNavigationItem = {
   label: string
   icon: ReactNode
-  section: SettingsSection | null
+  section: SettingsSection
 }
 
 const navigationItems: SettingsNavigationItem[] = [
@@ -90,14 +86,10 @@ const navigationItems: SettingsNavigationItem[] = [
     section: 'general',
   },
   { label: '模型设置', icon: <Bot size={18} />, section: 'models' },
-  { label: '技能', icon: <Sparkles size={18} />, section: null },
   { label: '子智能体', icon: <Network size={18} />, section: 'subagents' },
   { label: 'MCP 服务器', icon: <Server size={18} />, section: 'mcp' },
-  { label: '插件管理', icon: <Plug size={18} />, section: null },
   { label: '命令', icon: <Terminal size={18} />, section: 'commands' },
   { label: 'Hooks', icon: <Webhook size={18} />, section: 'hooks' },
-  { label: '索引库', icon: <Database size={18} />, section: null },
-  { label: '使用统计', icon: <BarChart3 size={18} />, section: null },
   { label: '关于', icon: <Info size={18} />, section: 'about' },
 ]
 
@@ -144,6 +136,8 @@ export default function SettingsView({
   onHookSettingsChange: () => Promise<void>
   onSubagentSettingsChange: () => Promise<void>
 }) {
+  const sidebarRef = useRef<HTMLElement | null>(null)
+  useDialogFocus(sidebarRef, isSidebarOpen ? 'settings-navigation' : null)
   const title =
     section === 'about'
       ? '关于'
@@ -174,6 +168,8 @@ export default function SettingsView({
 
       <aside
         id="settings-navigation"
+        ref={sidebarRef}
+        tabIndex={-1}
         className="app-sidebar settings-sidebar"
         aria-label="设置导航"
         aria-hidden={isSidebarHidden}
@@ -183,7 +179,7 @@ export default function SettingsView({
           <div className="brand-mark">M</div>
           <div className="sidebar-brand-copy">
             <strong>Morrow</strong>
-            <span>Settings</span>
+            <span>设置</span>
           </div>
           <SettingsIconButton title="关闭设置导航" onClick={onCloseSidebar}>
             <X size={17} />
@@ -205,30 +201,25 @@ export default function SettingsView({
         >
           {navigationItems.map((item) => {
             const active = item.section === section
-            const disabled = item.section === null
 
             return (
               <button
                 className={`settings-nav-item${active ? ' active' : ''}`}
                 type="button"
                 key={item.label}
-                title={disabled ? `${item.label}后续开放` : item.label}
-                disabled={disabled}
+                title={item.label}
                 aria-current={active ? 'page' : undefined}
-                onClick={() => {
-                  if (item.section) onSectionChange(item.section)
-                }}
+                onClick={() => onSectionChange(item.section)}
               >
                 {item.icon}
                 <span>{item.label}</span>
-                {disabled ? <small>Soon</small> : null}
               </button>
             )
           })}
         </nav>
 
         <div className="settings-sidebar-footer">
-          <span>Local settings</span>
+          <span>本地设置</span>
           <strong>{status ? `v${status.version}` : '—'}</strong>
         </div>
       </aside>
@@ -246,7 +237,6 @@ export default function SettingsView({
             <PanelLeft size={19} />
           </button>
           <div>
-            <p className="eyebrow">Settings</p>
             <strong>{title}</strong>
           </div>
           <SettingsIconButton title="返回工作区" onClick={onBack}>
@@ -307,27 +297,16 @@ function GeneralSettings({
 }) {
   return (
     <section className="settings-page" aria-labelledby="general-settings-title">
-      <SettingsPageHeader
-        eyebrow="Settings"
-        title="常规"
-        description="管理当前浏览器中的界面偏好和 Agent 默认行为。"
-      />
-
-      <div className="settings-page-badges" aria-label="保存方式">
-        <span>浏览器本地</span>
-        <span>自动保存</span>
-      </div>
+      <SettingsPageHeader title="常规" />
 
       <div className="settings-section">
         <div className="settings-section-heading">
           <h2>界面</h2>
-          <p>设置仅保存在当前浏览器，不会写入 morrow.toml。</p>
         </div>
         <div className="settings-card">
           <SettingsRow
             icon={<Monitor size={20} />}
             title="界面主题"
-            description="选择固定主题，或跟随操作系统的浅色与深色外观。"
           >
             <SettingsSelect
               label="界面主题"
@@ -337,31 +316,17 @@ function GeneralSettings({
             />
           </SettingsRow>
 
-          <SettingsRow
-            icon={<Languages size={20} />}
-            title="界面语言"
-            description="后续将支持在中文、英文和系统语言之间切换。"
-            disabled
-          >
-            <div className="settings-disabled-control" aria-disabled="true">
-              <Languages size={17} />
-              <span>系统默认</span>
-              <small>Soon</small>
-            </div>
-          </SettingsRow>
         </div>
       </div>
 
       <div className="settings-section">
         <div className="settings-section-heading">
           <h2>Agent 行为</h2>
-          <p>默认权限会同步到工作区输入框，并从下一次 turn 开始使用。</p>
         </div>
         <div className="settings-card">
           <SettingsRow
             icon={<ShieldCheck size={20} />}
             title="默认权限"
-            description="正在运行的 turn 不受修改影响，完全访问模式应谨慎使用。"
           >
             <SettingsSelect
               label="默认权限"
@@ -380,16 +345,11 @@ function GeneralSettings({
 function AboutSettings({ status }: { status: StatusResponse | null }) {
   return (
     <section className="settings-page" aria-labelledby="about-settings-title">
-      <SettingsPageHeader
-        eyebrow="Settings"
-        title="关于"
-        description="查看当前 Morrow 服务、工作区和本地配置位置。"
-      />
+      <SettingsPageHeader title="关于" />
 
       <div className="settings-section">
         <div className="settings-section-heading">
           <h2>应用信息</h2>
-          <p>这些信息来自当前服务的只读状态接口。</p>
         </div>
         <dl className="settings-card settings-info-list">
           <SettingsInfo
@@ -405,7 +365,7 @@ function AboutSettings({ status }: { status: StatusResponse | null }) {
             label="配置文件"
             value={
               status
-                ? status.config_path ?? '未加载（Web 可独立配置模型）'
+                ? status.config_path ?? '未加载'
                 : '加载中…'
             }
             path
@@ -442,36 +402,16 @@ function AboutSettings({ status }: { status: StatusResponse | null }) {
         </div>
       ) : null}
 
-      <div className="settings-safety-note">
-        <ShieldCheck size={24} />
-        <div>
-          <strong>Local-first</strong>
-          <p>
-            设置页不会回传已保存的 API Key。Web 模型可即时更新；MCP
-            和上下文设置仍需手动编辑配置并重启服务。
-          </p>
-        </div>
-      </div>
     </section>
   )
 }
 
-function SettingsPageHeader({
-  eyebrow,
-  title,
-  description,
-}: {
-  eyebrow: string
-  title: string
-  description: string
-}) {
+function SettingsPageHeader({ title }: { title: string }) {
   return (
     <header className="settings-page-header">
-      <p className="eyebrow">{eyebrow}</p>
       <h1 id={`${title === '关于' ? 'about' : 'general'}-settings-title`}>
         {title}
       </h1>
-      <p>{description}</p>
     </header>
   )
 }
@@ -479,13 +419,11 @@ function SettingsPageHeader({
 function SettingsRow({
   icon,
   title,
-  description,
   disabled = false,
   children,
 }: {
   icon: ReactNode
   title: string
-  description: string
   disabled?: boolean
   children: ReactNode
 }) {
@@ -496,7 +434,6 @@ function SettingsRow({
       </div>
       <div className="settings-row-copy">
         <strong>{title}</strong>
-        <p>{description}</p>
       </div>
       <div className="settings-row-control">{children}</div>
     </div>

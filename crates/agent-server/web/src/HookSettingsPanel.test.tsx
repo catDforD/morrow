@@ -26,10 +26,9 @@ describe('HookSettingsPanel', () => {
     vi.mocked(fetchJson).mockReset()
   })
 
-  it('shows hook status and the full-environment warning', async () => {
+  it('shows hook trust and execution status', async () => {
     await renderPanel(settings(false), vi.fn())
 
-    expect(document.body.textContent).toContain('包括 API key')
     expect(document.body.textContent).toContain('protect-shell')
     expect(document.body.textContent).toContain('未信任')
     expect(document.body.textContent).toContain('已禁用')

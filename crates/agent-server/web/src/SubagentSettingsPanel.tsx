@@ -181,9 +181,7 @@ export default function SubagentSettingsPanel({
     <section className="settings-page resource-settings-page subagent-settings-page" aria-labelledby="subagent-settings-title">
       <header className="settings-page-header resource-settings-header subagent-settings-header">
         <div>
-          <p className="eyebrow">Settings</p>
           <h1 id="subagent-settings-title">子智能体</h1>
-          <p>角色能力决定工具与权限上限；身份只负责姓名和头像，两者互不耦合。</p>
         </div>
         {!draft ? (
           <div className="resource-header-actions">
@@ -213,9 +211,7 @@ export default function SubagentSettingsPanel({
           <form className="resource-form-card subagent-profile-form" onSubmit={(event) => { event.preventDefault(); void saveProfile() }}>
             <div className="resource-form-heading">
               <div>
-                <p className="eyebrow">Subagent profile</p>
                 <h2>{draft.id ? `编辑 ${draft.name}` : '新建子智能体'}</h2>
-                <p>头像仅用于界面展示，不会写入提示词，也不会传给模型。</p>
               </div>
               <span className="scope-badge">全局</span>
             </div>
@@ -224,7 +220,6 @@ export default function SubagentSettingsPanel({
               <SubagentAvatar profile={{ id: draft.id ?? 'new', name: draft.name || '新成员', avatar_data_url: draft.avatarDataUrl }} size="large" />
               <div className="subagent-avatar-actions">
                 <strong>{draft.avatarDataUrl ? '已配置头像' : '使用默认机器人图标'}</strong>
-                <p>PNG、JPEG 或 WebP，原文件不超过 5 MiB。保存前会居中裁切为 256×256。</p>
                 <div>
                   <button className="secondary-button" type="button" disabled={processingAvatar || saving} onClick={() => fileInputRef.current?.click()}>
                     {draft.avatarDataUrl ? <Upload size={15} /> : <ImagePlus size={15} />}
@@ -258,9 +253,6 @@ export default function SubagentSettingsPanel({
               </label>
             </div>
 
-            <div className="resource-form-note">
-              同一父 Turn 内会从当前名单随机分配且四路并发不重名；正在执行的 Turn 保留启动时快照。
-            </div>
             <div className="resource-form-actions split">
               {draft.id ? (
                 <button
@@ -284,7 +276,6 @@ export default function SubagentSettingsPanel({
           <section className="subagent-role-settings" aria-label="角色能力">
             <div className="resource-list-heading">
               <strong>角色能力</strong>
-              <span>仅影响新实例</span>
             </div>
             <div className="subagent-role-grid">
               {(settings?.roles ?? []).map((role) => (
@@ -299,7 +290,6 @@ export default function SubagentSettingsPanel({
           </section>
           <div className="resource-list-heading subagent-identity-heading">
             <strong>身份外观</strong>
-            <span>不写入提示词</span>
           </div>
           <label className="resource-search">
             <Search size={17} />
@@ -320,7 +310,6 @@ export default function SubagentSettingsPanel({
               <div className="resource-empty">
                 <Bot size={28} />
                 <strong>没有匹配的子智能体</strong>
-                <span>清除搜索条件后再试。</span>
               </div>
             ) : null}
             {profiles.map((profile) => (
@@ -334,11 +323,6 @@ export default function SubagentSettingsPanel({
               </button>
             ))}
           </div>
-          {settings ? (
-            <div className="resource-form-note subagent-store-note">
-              名单限制 {settings.min_profiles}–{settings.max_profiles} 人 · 保存在 {settings.store_path}
-            </div>
-          ) : null}
           {error ? <SubagentSettingsError message={error} /> : null}
         </div>
       )}
@@ -384,7 +368,6 @@ function SubagentRoleCard({
     <article className="subagent-role-card">
       <header>
         <span className={`subagent-role-badge ${role.role}`}>{role.display_name}</span>
-        <small>{role.description}</small>
       </header>
       <div className="subagent-role-ceiling">
         <ShieldCheck size={15} />
