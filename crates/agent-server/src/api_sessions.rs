@@ -3,7 +3,6 @@ use super::*;
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct StatusResponse {
     workspace_root: String,
-    workspace_location: WorkspaceLocation,
     config_path: Option<String>,
     permissions: PermissionProfile,
     version: &'static str,
@@ -49,7 +48,6 @@ pub(crate) async fn status(State(state): State<AppState>) -> Json<StatusResponse
     let settings = state.inner.model_registry.settings().await;
     Json(StatusResponse {
         workspace_root: state.inner.options.workspace_root.display().to_string(),
-        workspace_location: state.inner.options.workspace_location.clone(),
         config_path: state
             .inner
             .options

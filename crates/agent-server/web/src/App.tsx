@@ -47,13 +47,6 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { fetchJson } from './api'
 import {
-  getDesktopPlatform,
-  getDesktopShellState,
-  runDesktopAction,
-} from './desktop'
-import type { DesktopPlatform, DesktopShellState } from './desktop'
-import DesktopShell from './DesktopShell'
-import {
   isMessageScrollNearBottom,
   scrollMessageListToBottom,
 } from './messageScroll'
@@ -68,11 +61,6 @@ import type {
   SessionSelectionStatus,
   WorkspaceSessionStatus,
 } from './useSessionController'
-import {
-  ProjectsDialog,
-  RemoteConnectionDialog,
-  WorkspaceMenu,
-} from './WorkspaceManager'
 import type {
   ApprovalRequest,
   ClientMessage,
@@ -166,7 +154,7 @@ export default function App() {
   const [sessionFilter, setSessionFilter] = useState('')
   const [isSearchOpen, setIsSearchOpen] = useState(false)
   const [isSidebarOpen, setIsSidebarOpen] = useState(false)
-  const [isDesktopSidebarCollapsed, setIsDesktopSidebarCollapsed] =
+  const [isSidebarCollapsed, setIsSidebarCollapsed] =
     useState(false)
   const [isNarrowViewport, setIsNarrowViewport] = useState(() =>
     window.matchMedia('(max-width: 900px)').matches,
@@ -201,10 +189,6 @@ export default function App() {
     savedPermissionModeRef.current ?? 'read_only',
   )
   const [sessionAction, setSessionAction] = useState<string | null>(null)
-  const desktopPlatform = getDesktopPlatform()
-  const [desktopState, setDesktopState] = useState<DesktopShellState | null>(null)
-  const [workspaceDialog, setWorkspaceDialog] = useState<'projects' | 'remote' | null>(null)
-  const [workspaceAction, setWorkspaceAction] = useState<number | null>(null)
 
   const selectedRef = useRef<string | null>(initialLocationRef.current.session)
   const appViewRef = useRef(appView)
@@ -220,39 +204,6 @@ export default function App() {
     idRef.current += 1
     return `${prefix}-${Date.now()}-${idRef.current}`
   }, [])
-
-  const refreshDesktopState = useCallback(async () => {
-    if (!desktopPlatform) return
-    try {
-      setDesktopState(await getDesktopShellState())
-    } catch (error) {
-      console.error('Could not read desktop project state', error)
-    }
-  }, [desktopPlatform])
-
-  useEffect(() => {
-    void refreshDesktopState()
-  }, [refreshDesktopState])
-
-  const openLocalWorkspace = () => {
-    setWorkspaceDialog(null)
-    void runDesktopAction({ type: 'open_folder' })
-  }
-
-  const openRemoteWorkspace = () => {
-    setWorkspaceDialog('remote')
-  }
-
-  const reconnectWorkspace = async (index: number) => {
-    setWorkspaceAction(index)
-    try {
-      await runDesktopAction({ type: 'open_recent', index })
-    } catch (error) {
-      showError(error)
-    } finally {
-      setWorkspaceAction(null)
-    }
-  }
 
   const showError = useCallback(
     (error: unknown) => {
@@ -537,7 +488,7 @@ export default function App() {
       runningTurn.turn_id !== 'pending',
   )
   const isWorkspaceSidebarCollapsed =
-    !isNarrowViewport && isDesktopSidebarCollapsed
+    !isNarrowViewport && isSidebarCollapsed
   const isWorkspaceSidebarVisible = isNarrowViewport
     ? isSidebarOpen
     : !isWorkspaceSidebarCollapsed
@@ -553,7 +504,7 @@ export default function App() {
     if (isNarrowViewport) {
       setIsSidebarOpen(true)
     } else {
-      setIsDesktopSidebarCollapsed(false)
+      setIsSidebarCollapsed(false)
     }
   }
 
@@ -836,8 +787,7 @@ export default function App() {
     <SubagentProfilesContext.Provider value={subagentSettings?.profiles ?? []}>
       <PersistentSubagentsContext.Provider value={subagents}>
       <>
-      <DesktopShell onOpenAbout={() => openSettings('about')}>
-        {appView === 'settings' ? (
+      {appView === 'settings' ? (
           <SettingsView
             section={settingsSection}
             status={status}
@@ -915,15 +865,10 @@ export default function App() {
                 if (isNarrowViewport) {
                   setIsSidebarOpen(false)
                 } else {
-                  setIsDesktopSidebarCollapsed(true)
+                  setIsSidebarCollapsed(true)
                 }
               }}
               onOpenSettings={openSettings}
-              projectsEnabled={desktopPlatform !== null}
-              onOpenProjects={() => {
-                void refreshDesktopState()
-                setWorkspaceDialog('projects')
-              }}
               onThemeToggle={() =>
                 setThemePreference(resolvedTheme === 'dark' ? 'light' : 'dark')
               }
@@ -966,15 +911,6 @@ export default function App() {
                   void changeModelSelection(selection)
                 }
                 onManageModels={() => openSettings('models')}
-                desktopPlatform={desktopPlatform}
-                desktopState={desktopState}
-                onOpenLocalWorkspace={openLocalWorkspace}
-                onOpenRemoteWorkspace={openRemoteWorkspace}
-                onOpenProjects={() => {
-                  void refreshDesktopState()
-                  setWorkspaceDialog('projects')
-                }}
-                onReconnectWorkspace={(index) => void reconnectWorkspace(index)}
                 onOpenSidebar={openSidebar}
                 onStartCreateSession={startCreateSessionFromWorkspace}
                 onRetryDirectory={() => void refresh()}
@@ -1018,31 +954,12 @@ export default function App() {
             />
           </div>
         )}
-      </DesktopShell>
       <ApprovalDialog
         request={pendingApproval}
         disabled={!sessionCommandsEnabled}
         onApprove={() => sendApproval(true)}
         onDeny={() => sendApproval(false)}
       />
-      {desktopPlatform ? (
-        <>
-          <ProjectsDialog
-            open={workspaceDialog === 'projects'}
-            state={desktopState}
-            busyIndex={workspaceAction}
-            onClose={() => setWorkspaceDialog(null)}
-            onOpenLocal={openLocalWorkspace}
-            onOpenRemote={openRemoteWorkspace}
-            onReconnect={(index) => void reconnectWorkspace(index)}
-          />
-          <RemoteConnectionDialog
-            open={workspaceDialog === 'remote'}
-            platform={desktopPlatform}
-            onClose={() => setWorkspaceDialog(null)}
-          />
-        </>
-      ) : null}
       </>
       </PersistentSubagentsContext.Provider>
     </SubagentProfilesContext.Provider>
@@ -1076,8 +993,6 @@ function AppSidebar({
   onRefresh,
   onClose,
   onOpenSettings,
-  projectsEnabled,
-  onOpenProjects,
   onThemeToggle,
 }: {
   sessions: SessionEntryResponse[]
@@ -1106,8 +1021,6 @@ function AppSidebar({
   onRefresh: () => void
   onClose: () => void
   onOpenSettings: () => void
-  projectsEnabled: boolean
-  onOpenProjects: () => void
   onThemeToggle: () => void
 }) {
   const [isArchiveOpen, setIsArchiveOpen] = useState(false)
@@ -1146,13 +1059,6 @@ function AppSidebar({
           icon={<Search size={18} />}
           label="Search"
           onClick={onToggleSearch}
-        />
-        <SidebarAction
-          icon={<Folder size={18} />}
-          label="Projects"
-          badge={projectsEnabled ? undefined : 'Desktop'}
-          disabled={!projectsEnabled}
-          onClick={onOpenProjects}
         />
         <SidebarAction
           icon={<CalendarClock size={18} />}
@@ -1373,12 +1279,6 @@ function ChatView({
   onPermissionModeChange,
   onModelSelectionChange,
   onManageModels,
-  desktopPlatform,
-  desktopState,
-  onOpenLocalWorkspace,
-  onOpenRemoteWorkspace,
-  onOpenProjects,
-  onReconnectWorkspace,
   onOpenSidebar,
   onStartCreateSession,
   onRetryDirectory,
@@ -1419,12 +1319,6 @@ function ChatView({
   onPermissionModeChange: (mode: PermissionMode) => void
   onModelSelectionChange: (selection: ModelSelection) => void
   onManageModels: () => void
-  desktopPlatform: DesktopPlatform | null
-  desktopState: DesktopShellState | null
-  onOpenLocalWorkspace: () => void
-  onOpenRemoteWorkspace: () => void
-  onOpenProjects: () => void
-  onReconnectWorkspace: (index: number) => void
   onOpenSidebar: () => void
   onStartCreateSession: () => void
   onRetryDirectory: () => void
@@ -1457,12 +1351,6 @@ function ChatView({
       onPermissionModeChange={onPermissionModeChange}
       onModelSelectionChange={onModelSelectionChange}
       onManageModels={onManageModels}
-      desktopPlatform={desktopPlatform}
-      desktopState={desktopState}
-      onOpenLocalWorkspace={onOpenLocalWorkspace}
-      onOpenRemoteWorkspace={onOpenRemoteWorkspace}
-      onOpenProjects={onOpenProjects}
-      onReconnectWorkspace={onReconnectWorkspace}
     />
   ) : null
 
@@ -2321,12 +2209,6 @@ function Composer({
   onPermissionModeChange,
   onModelSelectionChange,
   onManageModels,
-  desktopPlatform,
-  desktopState,
-  onOpenLocalWorkspace,
-  onOpenRemoteWorkspace,
-  onOpenProjects,
-  onReconnectWorkspace,
 }: {
   prompt: string
   enabled: boolean
@@ -2347,12 +2229,6 @@ function Composer({
   onPermissionModeChange: (mode: PermissionMode) => void
   onModelSelectionChange: (selection: ModelSelection) => void
   onManageModels: () => void
-  desktopPlatform: DesktopPlatform | null
-  desktopState: DesktopShellState | null
-  onOpenLocalWorkspace: () => void
-  onOpenRemoteWorkspace: () => void
-  onOpenProjects: () => void
-  onReconnectWorkspace: (index: number) => void
 }) {
   const [commandIndex, setCommandIndex] = useState(0)
   const [dismissedCommandPrompt, setDismissedCommandPrompt] = useState('')
@@ -2437,23 +2313,10 @@ function Composer({
     <form className={`composer ${variant}`} onSubmit={onSubmit}>
       <div className="composer-shell">
         <div className="composer-context" aria-label="Project context">
-          {desktopPlatform ? (
-            <WorkspaceMenu
-              name={workspace}
-              path={status?.workspace_root || ''}
-              recentWorkspaces={desktopState?.recentWorkspaces ?? []}
-              disabled={false}
-              onOpenLocal={onOpenLocalWorkspace}
-              onOpenRemote={onOpenRemoteWorkspace}
-              onOpenProjects={onOpenProjects}
-              onReconnect={onReconnectWorkspace}
-            />
-          ) : (
-            <span title={status?.workspace_root || ''}>
-              <Folder size={14} />
-              {workspace}
-            </span>
-          )}
+          <span title={status?.workspace_root || ''}>
+            <Folder size={14} />
+            {workspace}
+          </span>
         </div>
         <div className="composer-card">
           {commandMenuOpen ? (

@@ -19,7 +19,6 @@ pub struct ServerOptions {
     pub workspace_instructions: Arc<WorkspaceInstructionsCache>,
     pub context_config: ContextConfig,
     pub workspace_root: PathBuf,
-    pub workspace_location: WorkspaceLocation,
     pub config_path: Option<PathBuf>,
     pub config_diagnostics: Vec<String>,
     /// Default for legacy clients that do not select a permission mode per turn.
@@ -68,9 +67,6 @@ pub fn server_options_from_loaded_config(
         })
         .transpose()?;
 
-    let workspace_location = WorkspaceLocation::Local {
-        path: workspace_root.clone(),
-    };
     Ok(ServerOptions {
         host,
         port,
@@ -84,7 +80,6 @@ pub fn server_options_from_loaded_config(
         workspace_instructions,
         context_config: loaded.config.context,
         workspace_root,
-        workspace_location,
         config_path: loaded.path,
         config_diagnostics,
         permissions: PermissionProfile::for_mode(DEFAULT_WEB_PERMISSION_MODE),
@@ -113,126 +108,6 @@ impl ServerActivity {
     pub fn is_idle(self) -> bool {
         self.running_turns == 0
     }
-}
-
-pub struct EmbeddedSessionSubscription {
-    pub snapshot: SessionStreamFrame,
-    subscription: SessionSubscription,
-    service: WorkspaceService,
-    session_name: String,
-}
-
-impl EmbeddedSessionSubscription {
-    pub async fn recv(&mut self) -> Result<SessionStreamFrame, String> {
-        self.subscription
-            .recv()
-            .await
-            .map(|event| SessionStreamFrame::Event(Box::new(event)))
-            .map_err(|error| error.to_string())
-    }
-}
-
-impl Drop for EmbeddedSessionSubscription {
-    fn drop(&mut self) {
-        let service = self.service.clone();
-        let session_name = self.session_name.clone();
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                release_session_subscription(&service, &session_name).await;
-            });
-        }
-    }
-}
-
-impl WorkspaceService {
-    pub async fn subscribe_session(
-        &self,
-        session_name: &str,
-    ) -> Result<EmbeddedSessionSubscription, String> {
-        let resources = register_session_subscription(self, session_name).await?;
-        let snapshots = resources.supervisor.snapshots().await;
-        resources.handle.replace_subagents(snapshots).await;
-        resources
-            .handle
-            .set_approvals(approval_snapshots(self, session_name).await)
-            .await;
-        let subscription = match resources.handle.subscribe().await {
-            Ok(subscription) => subscription,
-            Err(error) => {
-                release_session_subscription(self, session_name).await;
-                return Err(error.to_string());
-            }
-        };
-        let snapshot = SessionStreamFrame::Snapshot(Box::new(subscription.snapshot.clone()));
-        Ok(EmbeddedSessionSubscription {
-            snapshot,
-            subscription,
-            service: self.clone(),
-            session_name: session_name.to_string(),
-        })
-    }
-
-    pub async fn send_session_message(
-        &self,
-        session_name: &str,
-        value: serde_json::Value,
-    ) -> Result<Option<SessionStreamFrame>, String> {
-        let message = serde_json::from_value::<ClientMessage>(value)
-            .map_err(|error| format!("invalid session message: {error}"))?;
-        let tx = session_sender(self, session_name).await;
-        Ok(dispatch_client_message(message, self, session_name, &tx).await)
-    }
-
-    pub async fn activity(&self) -> ServerActivity {
-        server_activity(self).await
-    }
-
-    pub async fn shutdown(&self, cancel_running: bool) {
-        self.inner.shutting_down.store(true, Ordering::Release);
-        if cancel_running {
-            cancel_all_turns(self, Duration::from_secs(5)).await;
-        }
-        reset_mcp_cache(self).await;
-    }
-}
-
-pub(crate) fn resolved_model_from_remote(spec: RemoteModelSpec) -> Result<ResolvedModel, String> {
-    if spec.context_window_tokens == 0
-        || spec.reserved_output_tokens == 0
-        || spec.reserved_output_tokens >= spec.context_window_tokens
-    {
-        return Err("remote model context limits are invalid".to_string());
-    }
-    if !(1..=600).contains(&spec.timeout_secs) {
-        return Err("remote model timeout must be between 1 and 600 seconds".to_string());
-    }
-    let selection = ModelSelection {
-        provider_id: spec.invocation.provider_id.clone(),
-        model_id: spec.invocation.model_id.clone(),
-        reasoning: spec.invocation.reasoning,
-    };
-    let client = OpenAiCompatClient::new(OpenAiCompatConfig {
-        base_url: spec.base_url,
-        model: spec.model,
-        api_key: spec.api_key,
-        timeout: Duration::from_secs(spec.timeout_secs),
-        max_retries: DEFAULT_MAX_RETRIES,
-    })
-    .map_err(|error| error.to_string())?
-    .with_request_options(agent_model::OpenAiCompatRequestOptions {
-        reasoning_profile: spec.reasoning_profile,
-        reasoning: selection.reasoning,
-        supports_tools: spec.supports_tools,
-    });
-    Ok(ResolvedModel {
-        selection,
-        invocation: spec.invocation,
-        client,
-        limits: agent_config::ModelContextLimits {
-            context_window_tokens: spec.context_window_tokens,
-            reserved_output_tokens: spec.reserved_output_tokens,
-        },
-    })
 }
 
 #[derive(Clone)]
@@ -516,6 +391,7 @@ pub(crate) fn release_idle_session_handle(runtime: &mut SessionRuntime) {
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn session_sender(
     state: &AppState,
     session_name: &str,

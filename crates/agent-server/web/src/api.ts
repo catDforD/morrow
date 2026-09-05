@@ -1,9 +1,3 @@
-import {
-  getDesktopPlatform,
-  getDesktopShellState,
-  listenRemoteEvents,
-  remoteRequest,
-} from './desktop'
 import type {
   ClientMessage,
   ModelSelection,
@@ -89,165 +83,10 @@ export class BrowserTransport implements AppTransport {
   }
 }
 
-export class DesktopTransport implements AppTransport {
-  async fetchJson<T>(url: string, options?: RequestInit): Promise<T> {
-    const rawBody = options?.body
-    const body =
-      typeof rawBody === 'string' && rawBody.length > 0
-        ? JSON.parse(rawBody)
-        : undefined
-    const response = await remoteRequest<{
-      type: 'http'
-      data: { status: number; body?: unknown }
-    }>({
-      type: 'http',
-      data: {
-        method: options?.method ?? 'GET',
-        path: url,
-        body,
-      },
-    })
-    if (response.data.status < 200 || response.data.status >= 300) {
-      const errorBody = response.data.body as { error?: string } | undefined
-      throw new Error(errorBody?.error ?? `Remote request failed: ${response.data.status}`)
-    }
-    return response.data.body as T
-  }
-
-  async openSessionConnection(
-    name: string,
-    handlers: SessionConnectionHandlers,
-  ): Promise<SessionConnection> {
-    let open = false
-    let closedByUser = false
-    let closeNotified = false
-    let subscriptionId = ''
-    let snapshotApplied = false
-    let earlyFrames: unknown[] = []
-    const notifyClose = () => {
-      if (closeNotified) return
-      closeNotified = true
-      handlers.onClose()
-    }
-    const unsubscribe = (id: string) => {
-      if (!id) return
-      void remoteRequest({
-        type: 'unsubscribe_session',
-        data: { subscription_id: id },
-      }).catch(() => undefined)
-    }
-    const subscribe = async () => {
-      const nextSubscriptionId = createSubscriptionId()
-      subscriptionId = nextSubscriptionId
-      snapshotApplied = false
-      earlyFrames = []
-      const response = await remoteRequest<{
-        type: 'session_subscribed'
-        data: { subscription_id: string; snapshot: unknown }
-      }>({
-        type: 'subscribe_session',
-        data: { session: name, subscription_id: nextSubscriptionId },
-      })
-      if (closedByUser) {
-        unsubscribe(nextSubscriptionId)
-        return
-      }
-      if (response.data.subscription_id !== nextSubscriptionId) {
-        throw new Error('Remote returned a mismatched session subscription')
-      }
-      handlers.onMessage(parseSessionStreamFrame(response.data.snapshot, name))
-      snapshotApplied = true
-      for (const frame of earlyFrames) {
-        handlers.onMessage(parseSessionStreamFrame(frame, name))
-      }
-      earlyFrames = []
-      open = true
-      handlers.onOpen()
-    }
-    const unlisten = await listenRemoteEvents((envelope) => {
-      const event = envelope.message.data
-      if (
-        event.type === 'session_message' &&
-        event.data.subscription_id === subscriptionId
-      ) {
-        if (snapshotApplied) {
-          try {
-            handlers.onMessage(parseSessionStreamFrame(event.data.message, name))
-          } catch (error) {
-            handlers.onError(error)
-          }
-        } else earlyFrames.push(event.data.message)
-      } else if (event.type === 'worker_exited') {
-        open = false
-        snapshotApplied = false
-        notifyClose()
-      }
-    })
-    try {
-      await subscribe()
-    } catch (error) {
-      unlisten()
-      unsubscribe(subscriptionId)
-      throw error
-    }
-
-    return {
-      get isOpen() {
-        return open
-      },
-      send(message) {
-        if (!open) throw new Error('remote session is not connected')
-        void remoteRequest<
-          | { type: 'ack' }
-          | { type: 'session_command'; data: { message: unknown } }
-        >({
-          type: 'session_message',
-          data: { session: name, message },
-        })
-          .then((response) => {
-            if (response.type === 'session_command') {
-              handlers.onMessage(
-                parseSessionStreamFrame(response.data.message, name),
-              )
-            }
-          })
-          .catch(handlers.onError)
-      },
-      close() {
-        if (closedByUser) return
-        closedByUser = true
-        open = false
-        snapshotApplied = false
-        unlisten()
-        unsubscribe(subscriptionId)
-        notifyClose()
-      },
-    }
-  }
-}
-
-function createSubscriptionId(): string {
-  return typeof globalThis.crypto?.randomUUID === 'function'
-    ? `subscription-${globalThis.crypto.randomUUID()}`
-    : `subscription-${Date.now()}-${Math.random().toString(16).slice(2)}`
-}
-
 const browserTransport = new BrowserTransport()
-const desktopTransport = new DesktopTransport()
-
-async function currentTransport(): Promise<AppTransport> {
-  if (!getDesktopPlatform()) return browserTransport
-  try {
-    return (await getDesktopShellState()).activeWorkspace?.kind === 'wsl'
-      ? desktopTransport
-      : browserTransport
-  } catch {
-    return browserTransport
-  }
-}
 
 export async function fetchJson<T>(url: string, options?: RequestInit): Promise<T> {
-  return (await currentTransport()).fetchJson<T>(url, options)
+  return browserTransport.fetchJson<T>(url, options)
 }
 
 export function sessionSocketUrl(name: string): string {
@@ -259,14 +98,14 @@ export async function openSessionConnection(
   name: string,
   handlers: SessionConnectionHandlers,
 ): Promise<SessionConnection> {
-  return (await currentTransport()).openSessionConnection(name, handlers)
+  return browserTransport.openSessionConnection(name, handlers)
 }
 
 export class SessionClient {
   constructor(private readonly transport?: AppTransport) {}
 
   private async fetch<T>(url: string, options?: RequestInit): Promise<T> {
-    const transport = this.transport ?? (await currentTransport())
+    const transport = this.transport ?? browserTransport
     return transport.fetchJson<T>(url, options)
   }
 

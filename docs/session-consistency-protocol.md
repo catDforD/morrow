@@ -2,11 +2,11 @@
 
 ## 1. 目的与范围
 
-本文定义 Morrow CLI、Web Server/Web UI、Desktop/WSL 与持久化 Subagent 共用的 Session 恢复与一致性协议。协议以 append-only Session Facts 作为唯一持久化事实源，由 `agent-runtime` 的纯投影器派生：
+本文定义 Morrow CLI、Web Server/Web UI 与持久化 Subagent 共用的 Session 恢复与一致性协议。协议以 append-only Session Facts 作为唯一持久化事实源，由 `agent-runtime` 的纯投影器派生：
 
 - 模型请求上下文；
 - 审计历史与稳定 Turn/Step 结构；
-- Web/Desktop timeline；
+- Web timeline；
 - 当前连接可恢复的 Operation、审批和 Subagent 快照。
 
 协议不覆盖 TUI、会话树或分支、Provider 流跨进程续传、durable tool 自动重试、补偿事务、逐 token 持久化以及跨连接事件 replay。
@@ -18,7 +18,6 @@
 | Session fact log | v7 | canonical 接受 v7；v5/v6 header 就地升级为 v7，其余版本拒绝 |
 | Agent execution event | v8 | 消费者必须认识完整模型消息和 tool result checkpoint 事件 |
 | Session stream | v3 | Snapshot/Event 的 schema 不匹配时重新订阅或拒绝 |
-| Remote protocol | v5 | Desktop 与 Workspace Agent 握手版本不同则拒绝连接 |
 
 实现不同时生产新旧两套实时协议。旧聚合 Session 文档只作为迁移输入或兼容缓存，不能作为模型上下文或 timeline 的事实源。
 
@@ -219,15 +218,15 @@ client                         SessionHandle / Hub
 - `sequence <= cursor.sequence`：重复事件，忽略。
 - `sequence == cursor.sequence + 1`：应用 Update。
 - `sequence > cursor.sequence + 1`：事件缺口，停止订阅并获取新 Snapshot。
-- broadcast lag、WSL worker 断线或 Tauri/JS 转发失败不得静默跳过。
+- broadcast lag 或 WebSocket 转发失败不得静默跳过。
 
 协议不支持从旧 cursor 跨连接 replay。任何重连都从新 Snapshot 收敛。
 
-## 9. Web 与 Desktop
+## 9. Web 与 CLI
 
 Web 选择 Session 时直接打开 v3 订阅，不再先通过 REST 拉聚合历史。REST 只负责 Session 管理、列表和 canonical fact log 导出。
 
-Desktop 在发出 Remote v5 `SubscribeSession` 前生成 `subscription_id`。订阅响应返回前到达的相同 ID 事件先缓存；Snapshot 应用完成后再按到达顺序交给 reducer。Browser、Embedded Server、WSL、Tauri 和 JS 转发相同的 `SessionStreamFrame`。
+Browser WebSocket 订阅直接建立 v3 `SessionStreamFrame` 流。订阅响应返回前到达的事件由 server 的 Hub 保证顺序；Snapshot 应用完成后客户端再按序处理后续 Update。CLI 的 JSONL 输出与浏览器 WebSocket 使用相同的事件 envelope。
 
 命令接受/拒绝使用 `CommandResult`，`inspect_subagent` 等请求数据使用 `CommandData`。命令帧不参与 Session sequence；所有可恢复状态变化仍必须通过 ordered Update 表达。
 

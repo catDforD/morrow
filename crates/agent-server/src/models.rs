@@ -4,10 +4,7 @@ use agent_model::{
     DEFAULT_MAX_RETRIES, ModelError, OpenAiCompatClient, OpenAiCompatConfig,
     OpenAiCompatRequestOptions,
 };
-use agent_protocol::{
-    ModelInvocation, ModelSelection, ReasoningLevel, ReasoningProfile, RemoteFallbackModelSpec,
-    RemoteModelConnectionSpec, RemoteModelSpec, RemoteTurnModel,
-};
+use agent_protocol::{ModelInvocation, ModelSelection, ReasoningLevel, ReasoningProfile};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -30,22 +27,6 @@ pub struct FallbackModel {
     pub client: Option<OpenAiCompatClient>,
     pub limits: ModelContextLimits,
     pub reasoning_profile: ReasoningProfile,
-}
-
-impl FallbackModel {
-    pub fn remote(spec: RemoteFallbackModelSpec) -> Self {
-        Self {
-            provider_name: spec.provider_name,
-            model_id: spec.model_id,
-            model_name: spec.model_name,
-            client: None,
-            limits: ModelContextLimits {
-                context_window_tokens: spec.context_window_tokens,
-                reserved_output_tokens: spec.reserved_output_tokens,
-            },
-            reasoning_profile: spec.reasoning_profile,
-        }
-    }
 }
 
 impl std::fmt::Debug for FallbackModel {
@@ -302,21 +283,6 @@ impl ModelRegistry {
         })
     }
 
-    pub fn in_memory(
-        workspace_root: &Path,
-        fallback: Option<FallbackModel>,
-    ) -> Result<Self, ModelRegistryError> {
-        let store = PersistedModelStore::default();
-        let clients = build_clients(&store)?;
-        Ok(Self {
-            path: PathBuf::from("<memory>"),
-            persistent: false,
-            workspace_scope: hex_encode(workspace_root.as_os_str().as_encoded_bytes()),
-            fallback,
-            state: RwLock::new(RegistryState { store, clients }),
-        })
-    }
-
     pub async fn settings(&self) -> ModelSettingsResponse {
         let state = self.state.read().await;
         let mut providers = Vec::new();
@@ -536,50 +502,12 @@ impl ModelRegistry {
         resolve_from_state(&state, self.fallback.as_ref(), &selection)
     }
 
-    pub async fn resolve_remote_for_turn(
-        &self,
-        session: &str,
-        requested: Option<ModelSelection>,
-    ) -> Result<RemoteTurnModel, ModelRegistryError> {
-        let selection = match requested {
-            Some(selection) => selection,
-            None => self
-                .session_selection(session)
-                .await
-                .selection
-                .ok_or_else(|| {
-                    ModelRegistryError::SelectionUnavailable(
-                        "no default model is configured".to_string(),
-                    )
-                })?,
-        };
-        let state = self.state.read().await;
-        remote_model_from_state(&state, self.fallback.as_ref(), &selection)
-    }
-
-    pub async fn discovery_spec(
-        &self,
-        request: DiscoverModelsRequest,
-    ) -> Result<RemoteModelConnectionSpec, ModelRegistryError> {
-        let (base_url, api_key, timeout_secs) = self.discovery_connection(request).await?;
-        Ok(RemoteModelConnectionSpec {
-            base_url,
-            api_key,
-            timeout_secs,
-        })
-    }
-
     pub async fn discover(
         &self,
         request: DiscoverModelsRequest,
     ) -> Result<DiscoverModelsResponse, ModelRegistryError> {
         let (base_url, api_key, timeout_secs) = self.discovery_connection(request).await?;
-        discover_models(RemoteModelConnectionSpec {
-            base_url,
-            api_key,
-            timeout_secs,
-        })
-        .await
+        discover_models(base_url, api_key, timeout_secs).await
     }
 
     async fn discovery_connection(
@@ -615,17 +543,19 @@ impl ModelRegistry {
     }
 }
 
-pub async fn discover_models(
-    spec: RemoteModelConnectionSpec,
+async fn discover_models(
+    base_url: String,
+    api_key: String,
+    timeout_secs: u64,
 ) -> Result<DiscoverModelsResponse, ModelRegistryError> {
     let client = OpenAiCompatClient::new(OpenAiCompatConfig {
-        base_url: normalize_base_url(&spec.base_url)?,
+        base_url: normalize_base_url(&base_url)?,
         model: "discovery".to_string(),
-        api_key: spec.api_key,
-        timeout: Duration::from_secs(spec.timeout_secs),
+        api_key,
+        timeout: Duration::from_secs(timeout_secs),
         max_retries: DEFAULT_MAX_RETRIES,
     })?;
-    validate_timeout(spec.timeout_secs)?;
+    validate_timeout(timeout_secs)?;
     let models = client
         .list_models()
         .await?
@@ -963,7 +893,7 @@ fn resolve_from_state(
             .as_ref()
             .ok_or_else(|| {
                 ModelRegistryError::SelectionUnavailable(
-                    "the current config model can only run in its remote workspace".to_string(),
+                    "the current config model client is unavailable".to_string(),
                 )
             })?
             .clone()
@@ -1026,48 +956,6 @@ fn resolve_from_state(
             reserved_output_tokens: model.reserved_output_tokens,
         },
     })
-}
-
-fn remote_model_from_state(
-    state: &RegistryState,
-    fallback: Option<&FallbackModel>,
-    selection: &ModelSelection,
-) -> Result<RemoteTurnModel, ModelRegistryError> {
-    validate_selection_from_state(state, fallback, selection)?;
-    if selection.provider_id == FALLBACK_PROVIDER_ID {
-        return Ok(RemoteTurnModel::WorkspaceFallback {
-            selection: selection.clone(),
-        });
-    }
-
-    let provider = state
-        .store
-        .providers
-        .iter()
-        .find(|provider| provider.id == selection.provider_id)
-        .expect("validated provider must exist");
-    let model = provider
-        .models
-        .iter()
-        .find(|model| model.id == selection.model_id)
-        .expect("validated model must exist");
-    Ok(RemoteTurnModel::Managed(RemoteModelSpec {
-        base_url: provider.base_url.clone(),
-        model: model.id.clone(),
-        api_key: provider.api_key.expose().to_string(),
-        timeout_secs: provider.timeout_secs,
-        context_window_tokens: model.context_window_tokens,
-        reserved_output_tokens: model.reserved_output_tokens,
-        reasoning_profile: model.reasoning_profile,
-        supports_tools: model.supports_tools,
-        invocation: ModelInvocation {
-            provider_id: provider.id.clone(),
-            provider_name: provider.name.clone(),
-            model_id: model.id.clone(),
-            model_name: model.name.clone(),
-            reasoning: selection.reasoning,
-        },
-    }))
 }
 
 fn effective_default(
@@ -1453,41 +1341,5 @@ mod tests {
         save_store(&path, &PersistedModelStore::default()).expect_err("save must fail");
 
         assert_eq!(fs::read(path).expect("read original"), original);
-    }
-
-    #[tokio::test]
-    async fn remote_fallback_can_be_selected_without_exposing_a_local_client() {
-        let path = unique_path("remote-fallback");
-        let fallback = FallbackModel::remote(RemoteFallbackModelSpec {
-            provider_name: "Remote config".to_string(),
-            model_id: "remote-model".to_string(),
-            model_name: "Remote model".to_string(),
-            context_window_tokens: 32_000,
-            reserved_output_tokens: 4_000,
-            reasoning_profile: ReasoningProfile::None,
-        });
-        let registry =
-            ModelRegistry::load(path, Path::new("workspace"), Some(fallback)).expect("registry");
-        let selection = registry
-            .session_selection("default")
-            .await
-            .selection
-            .expect("fallback selection");
-
-        assert!(matches!(
-            registry
-                .resolve_remote_for_turn("default", Some(selection.clone()))
-                .await
-                .expect("remote resolution"),
-            RemoteTurnModel::WorkspaceFallback { .. }
-        ));
-        assert!(
-            registry
-                .resolve_for_turn("default", Some(selection))
-                .await
-                .expect_err("remote fallback must not execute locally")
-                .to_string()
-                .contains("remote workspace")
-        );
     }
 }

@@ -1,9 +1,7 @@
 use super::*;
 use agent_config::{AgentConfig, ModelContextLimits, ServerAppConfig, ServerConfig};
 use agent_model::{OpenAiCompatClient, OpenAiCompatConfig};
-use agent_protocol::{
-    ModelInvocation, PermissionMode, ReasoningLevel, ReasoningProfile, ShellPolicy,
-};
+use agent_protocol::{PermissionMode, ReasoningProfile, ShellPolicy};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -84,7 +82,6 @@ fn test_options() -> ServerOptions {
             max_context_tokens: Some(300_000),
         },
         workspace_root: root.clone(),
-        workspace_location: WorkspaceLocation::Local { path: root.clone() },
         config_path: Some(root.join("morrow.toml")),
         config_diagnostics: Vec::new(),
         permissions: PermissionProfile::for_mode(DEFAULT_WEB_PERMISSION_MODE),
@@ -241,128 +238,12 @@ async fn status_response_includes_workspace_instruction_diagnostics() {
 }
 
 #[tokio::test]
-async fn embedded_subagent_settings_routes_manage_the_global_profile_list() {
-    let server = EmbeddedServer::new(test_options()).expect("embedded server");
-
-    let settings = server
-        .request("GET", "/api/subagent-settings", None)
-        .await
-        .expect("read subagent settings");
-    assert_eq!(settings.status, 200);
-    let settings = settings.body.expect("settings body");
-    assert_eq!(settings["profiles"].as_array().map(Vec::len), Some(22));
-    assert_eq!(settings["profiles"][0]["id"], "builtin-01");
-
-    let created = server
-        .request(
-            "POST",
-            "/api/subagents",
-            Some(json!({"name": "测试成员", "avatar_data_url": null})),
-        )
-        .await
-        .expect("create subagent");
-    assert_eq!(created.status, 200);
-    let id = created.body.expect("created body")["id"]
-        .as_str()
-        .expect("created id")
-        .to_string();
-
-    let updated = server
-        .request(
-            "PUT",
-            &format!("/api/subagents/{id}"),
-            Some(json!({"name": "更新成员", "avatar_data_url": null})),
-        )
-        .await
-        .expect("update subagent");
-    assert_eq!(updated.status, 200);
-    assert_eq!(updated.body.expect("updated body")["name"], "更新成员");
-
-    let duplicate = server
-        .request(
-            "POST",
-            "/api/subagents",
-            Some(json!({"name": "后藤一里", "avatar_data_url": null})),
-        )
-        .await
-        .expect("duplicate response");
-    assert_eq!(duplicate.status, 409);
-
-    let deleted = server
-        .request("DELETE", &format!("/api/subagents/{id}"), None)
-        .await
-        .expect("delete subagent");
-    assert_eq!(deleted.status, 204);
-
-    let reset = server
-        .request("POST", "/api/subagent-settings/reset", None)
-        .await
-        .expect("reset subagents");
-    assert_eq!(reset.status, 200);
-    assert_eq!(
-        reset.body.expect("reset body")["profiles"]
-            .as_array()
-            .map(Vec::len),
-        Some(22)
-    );
-}
-
-#[tokio::test]
-async fn embedded_hooks_routes_list_trust_and_revoke_project_configuration() {
-    let mut options = test_options();
-    options.workspace_root = unique_test_dir("hooks-api-workspace");
-    options.workspace_location = WorkspaceLocation::Local {
-        path: options.workspace_root.clone(),
-    };
-    let hook_home = unique_test_dir("hooks-api-home");
-    options.hook_home_dir = hook_home.clone();
-    let project_config = options.workspace_root.join(".morrow").join("hooks.toml");
-    fs::create_dir_all(project_config.parent().expect("project hook parent"))
-        .expect("create project hook parent");
-    fs::write(
-            &project_config,
-            "schema_version = 1\n[[hooks]]\nid = \"project\"\nevent = \"before_prompt\"\ncommand = [\"true\"]\n",
-        )
-        .expect("write project hooks");
-    let server = EmbeddedServer::new(options).expect("embedded server");
-
-    let listed = server
-        .request("GET", "/api/hooks", None)
-        .await
-        .expect("list hooks");
-    assert_eq!(listed.status, 200);
-    let listed = listed.body.expect("list body");
-    assert_eq!(listed["project_trusted"], false);
-    assert_eq!(listed["hooks"][0]["active"], false);
-
-    let trusted = server
-        .request("POST", "/api/hooks/trust", None)
-        .await
-        .expect("trust hooks");
-    assert_eq!(trusted.status, 200);
-    let trusted = trusted.body.expect("trust body");
-    assert_eq!(trusted["project_trusted"], true);
-    assert_eq!(trusted["hooks"][0]["active"], true);
-    assert!(hook_home.join(".morrow/hook-trust.json").is_file());
-
-    let revoked = server
-        .request("POST", "/api/hooks/revoke", None)
-        .await
-        .expect("revoke hooks");
-    assert_eq!(revoked.status, 200);
-    assert_eq!(revoked.body.expect("revoke body")["project_trusted"], false);
-}
-
-#[tokio::test]
 async fn before_prompt_hook_denial_persists_audit_without_creating_turn() {
     let _lock = ENV_LOCK.get_or_init(|| AsyncMutex::new(())).lock().await;
     let session_home = unique_test_dir("before-prompt-deny-session-home");
     let _home = HomeGuard::set(&session_home);
     let mut options = test_options();
     options.workspace_root = unique_test_dir("before-prompt-deny-workspace");
-    options.workspace_location = WorkspaceLocation::Local {
-        path: options.workspace_root.clone(),
-    };
     let hook_home = unique_test_dir("before-prompt-deny-home");
     options.hook_home_dir = hook_home.clone();
     let script = options.workspace_root.join("deny-prompt-hook.sh");
@@ -455,7 +336,7 @@ fn router_registers_model_routes_without_conflicts() {
 }
 
 #[test]
-fn embedded_index_references_assets_present_at_the_tauri_root() {
+fn index_references_assets() {
     let html = include_str!("../assets/index.html");
 
     assert!(html.contains(r#"src="/app.js""#));
@@ -489,293 +370,6 @@ async fn browser_router_serves_root_and_legacy_asset_paths() {
             "{path}"
         );
     }
-}
-
-#[tokio::test]
-async fn embedded_settings_prepare_ephemeral_remote_turn_runtime() {
-    let server = EmbeddedServer::new(test_options()).expect("embedded server");
-    let provider = server
-        .request(
-            "POST",
-            "/api/model-providers",
-            Some(serde_json::json!({
-                "name": "Managed",
-                "base_url": "https://models.example/v1",
-                "api_key": "managed-model-secret",
-                "enabled": true,
-                "timeout_secs": 30,
-                "models": [{
-                    "id": "managed-model",
-                    "name": "Managed model",
-                    "context_window_tokens": 32_000,
-                    "reserved_output_tokens": 4_000,
-                    "supports_tools": true,
-                    "reasoning_profile": "none"
-                }]
-            })),
-        )
-        .await
-        .expect("create provider");
-    assert_eq!(provider.status, 200);
-    let provider_id = provider.body.expect("provider body")["id"]
-        .as_str()
-        .expect("provider id")
-        .to_string();
-    let mcp = server
-        .request(
-            "POST",
-            "/api/mcp-servers",
-            Some(serde_json::json!({
-                "name": "managed-mcp",
-                "transport": "stdio",
-                "command": "managed-mcp",
-                "args": [],
-                "env": {"TOKEN": "managed-mcp-secret"},
-                "enabled": true,
-                "startup_timeout_sec": 10,
-                "tool_timeout_sec": 60
-            })),
-        )
-        .await
-        .expect("create MCP server");
-    assert_eq!(mcp.status, 200);
-
-    let turn = server
-        .prepare_remote_turn(
-            "default",
-            serde_json::json!({
-                "type": "start_turn",
-                "data": {
-                    "request_id": "request-1",
-                    "prompt": "hello",
-                    "prompt_resolved": true,
-                    "permission_mode": "workspace_write",
-                    "model_selection": {
-                        "provider_id": provider_id,
-                        "model_id": "managed-model",
-                        "reasoning": "off"
-                    }
-                }
-            }),
-        )
-        .await
-        .expect("prepare remote turn");
-
-    let RemoteTurnModel::Managed(model) = turn.model else {
-        panic!("managed model expected");
-    };
-    assert_eq!(model.api_key, "managed-model-secret");
-    assert_eq!(turn.managed_mcp_servers.len(), 1);
-    assert_eq!(turn.subagent_identities.len(), 22);
-    assert_eq!(turn.subagent_identities[0].id, "builtin-01");
-    assert_eq!(
-        turn.managed_mcp_servers[0]
-            .env
-            .get("TOKEN")
-            .map(String::as_str),
-        Some("managed-mcp-secret")
-    );
-
-    let command = server
-        .prepare_remote_subagent_message(
-            "default",
-            serde_json::json!({
-                "type": "send_subagent",
-                "data": {
-                    "request_id": "request-2",
-                    "instance_id": "subagent-1",
-                    "message": "continue",
-                    "model_selection": {
-                        "provider_id": provider_id,
-                        "model_id": "managed-model",
-                        "reasoning": "off"
-                    }
-                }
-            }),
-        )
-        .await
-        .expect("prepare remote subagent follow-up");
-    assert_eq!(command.subagent_roles.len(), SubagentRole::ALL.len());
-    let Some(RemoteTurnModel::Managed(resume_model)) = command.resume_model else {
-        panic!("managed resume model expected");
-    };
-    assert_eq!(resume_model.api_key, "managed-model-secret");
-    assert!(!format!("{resume_model:?}").contains("managed-model-secret"));
-}
-
-#[tokio::test]
-async fn workspace_accepts_managed_model_resolved_by_desktop() {
-    let _lock = ENV_LOCK.get_or_init(|| AsyncMutex::new(())).lock().await;
-    let home = unique_test_dir("managed-workspace-home");
-    let _home = HomeGuard::set(&home);
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind model listener");
-    let mut options = test_options();
-    options.fallback_model = None;
-    let server = EmbeddedServer::new_workspace(options).expect("workspace server");
-    let created = server
-        .request("POST", "/api/sessions", Some(json!({ "name": "remote" })))
-        .await
-        .expect("create session");
-    assert_eq!(created.status, StatusCode::CREATED.as_u16());
-    let mut subscription = server
-        .subscribe_session("remote")
-        .await
-        .expect("subscribe session");
-    let remote_model = RemoteModelSpec {
-        base_url: format!(
-            "http://{}/v1",
-            listener.local_addr().expect("model address")
-        ),
-        model: "deepseek-v4-pro".to_string(),
-        api_key: "remote-model-secret".to_string(),
-        timeout_secs: 30,
-        context_window_tokens: 65_536,
-        reserved_output_tokens: 8_192,
-        reasoning_profile: ReasoningProfile::Deepseek,
-        supports_tools: true,
-        invocation: ModelInvocation {
-            provider_id: "opencode".to_string(),
-            provider_name: "opencode".to_string(),
-            model_id: "deepseek-v4-pro".to_string(),
-            model_name: "DeepSeek V4 Pro".to_string(),
-            reasoning: ReasoningLevel::High,
-        },
-    };
-    let subagent_roles = SubagentRole::ALL
-        .into_iter()
-        .map(|role| RemoteSubagentRoleSpec {
-            role,
-            overrides: SubagentRoleOverride::default(),
-            model: RemoteTurnModel::Managed(remote_model.clone()),
-        })
-        .collect();
-
-    server
-        .start_remote_turn(RemoteTurnSpec {
-            session: "remote".to_string(),
-            request_id: "request-remote-model".to_string(),
-            prompt: "hello".to_string(),
-            permission_mode: Some(PermissionMode::WorkspaceWrite),
-            model: RemoteTurnModel::Managed(remote_model),
-            managed_mcp_servers: Vec::new(),
-            subagent_identities: agent_protocol::default_subagent_identities(),
-            subagent_roles,
-        })
-        .await
-        .expect("start remote turn");
-
-    let accepted = tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                let message = subscription.recv().await.map_err(|error| error.to_string())?;
-                if matches!(
-                    message,
-                    SessionStreamFrame::Event(event)
-                        if matches!(event.update, agent_protocol::SessionUpdate::OperationReplaced(Some(_)))
-                ) {
-                    return Ok::<(), String>(());
-                }
-            }
-        })
-        .await
-        .expect("remote turn acceptance event");
-
-    assert!(accepted.is_ok(), "remote turn was rejected: {accepted:?}");
-    server.shutdown(true).await;
-}
-
-#[tokio::test]
-async fn workspace_embedded_server_keeps_managed_settings_in_memory() {
-    let options = test_options();
-    let model_store = options.model_store_path.clone();
-    let mcp_store = options.mcp_store_path.clone();
-    let server = EmbeddedServer::new_workspace(options).expect("workspace server");
-
-    let response = server
-        .request("GET", "/api/model-settings", None)
-        .await
-        .expect("embedded response");
-
-    assert_eq!(response.status, 404);
-    assert!(!model_store.exists());
-    assert!(!mcp_store.exists());
-}
-
-#[tokio::test]
-async fn desktop_access_bootstraps_cookie_and_rejects_unauthorized_requests() {
-    let mut options = test_options();
-    options.port = 43123;
-    let (router, _) = build_router(options, ServerAccessPolicy::desktop("desktop-test-token"))
-        .expect("desktop router");
-    let host = "127.0.0.1:43123";
-
-    let unauthorized = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/api/status")
-                .header(header::HOST, host)
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
-    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
-
-    let wrong_host = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/api/status")
-                .header(header::HOST, "localhost:43123")
-                .header(header::COOKIE, "morrow_session=desktop-test-token")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
-    assert_eq!(wrong_host.status(), StatusCode::UNAUTHORIZED);
-
-    let bootstrap = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/?bootstrap=desktop-test-token")
-                .header(header::HOST, host)
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
-    assert_eq!(bootstrap.status(), StatusCode::SEE_OTHER);
-    let cookie = bootstrap
-        .headers()
-        .get(header::SET_COOKIE)
-        .expect("session cookie")
-        .to_str()
-        .expect("cookie text")
-        .to_string();
-    assert!(cookie.contains("HttpOnly"));
-    assert!(cookie.contains("SameSite=Strict"));
-
-    let authorized = router
-        .oneshot(
-            Request::builder()
-                .uri("/api/status")
-                .header(header::HOST, host)
-                .header(header::COOKIE, "morrow_session=desktop-test-token")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
-    assert_eq!(authorized.status(), StatusCode::OK);
-    assert!(
-        authorized
-            .headers()
-            .contains_key(header::CONTENT_SECURITY_POLICY)
-    );
 }
 
 #[tokio::test]
@@ -983,36 +577,6 @@ async fn browser_access_without_token_passes_through_for_no_auth() {
         .expect("response");
 
     assert_eq!(response.status(), StatusCode::OK);
-}
-
-#[tokio::test]
-async fn desktop_access_rejects_cross_origin_mutations_and_websockets() {
-    let mut options = test_options();
-    options.port = 43124;
-    let (router, _) =
-        build_router(options, ServerAccessPolicy::desktop("token")).expect("desktop router");
-    let request = Request::builder()
-        .method(Method::POST)
-        .uri("/api/commands/resolve")
-        .header(header::HOST, "127.0.0.1:43124")
-        .header(header::ORIGIN, "https://example.com")
-        .header(header::COOKIE, "morrow_session=token")
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(r#"{"input":"hello"}"#))
-        .expect("request");
-
-    let response = router.clone().oneshot(request).await.expect("response");
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-
-    let websocket = Request::builder()
-        .uri("/api/sessions/default/ws")
-        .header(header::HOST, "127.0.0.1:43124")
-        .header(header::ORIGIN, "https://example.com")
-        .header(header::COOKIE, "morrow_session=token")
-        .body(Body::empty())
-        .expect("request");
-    let response = router.oneshot(websocket).await.expect("response");
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -1370,7 +934,6 @@ async fn missing_subscription_and_lifecycle_calls_do_not_create_session_files() 
         SessionStore::for_workspace(&state.inner.options.workspace_root, "missing").expect("store");
     let lock_path = store.path().with_extension("lock");
 
-    assert!(state.subscribe_session("missing").await.is_err());
     assert!(matches!(
         reset_session(State(state.clone()), Path("missing".to_string())).await,
         Err(ApiError {
@@ -1414,7 +977,6 @@ async fn corrupt_session_is_reported_without_blocking_other_sessions() {
     assert!(directory.sessions.is_empty());
     assert_eq!(directory.diagnostics.len(), 1);
     assert_eq!(directory.diagnostics[0].name.as_deref(), Some("broken"));
-    assert!(state.subscribe_session("broken").await.is_err());
 
     let created = create_session(
         State(state.clone()),
@@ -1470,14 +1032,19 @@ async fn archive_and_restore_session_updates_session_listing() {
     let store =
         SessionStore::for_workspace(&state.inner.options.workspace_root, "work").expect("store");
     store.save(&Session::new()).expect("save session");
-    let mut subscription = state
-        .subscribe_session("work")
+    let resources = register_session_subscription(&state, "work")
         .await
         .expect("subscribe before archive");
-    let snapshot_stream_id = match &subscription.snapshot {
-        SessionStreamFrame::Snapshot(snapshot) => snapshot.cursor.stream_id.clone(),
-        _ => panic!("expected snapshot"),
-    };
+    resources
+        .handle
+        .replace_subagents(resources.supervisor.snapshots().await)
+        .await;
+    resources
+        .handle
+        .set_approvals(approval_snapshots(&state, "work").await)
+        .await;
+    let mut subscription = resources.handle.subscribe().await.expect("session stream");
+    let snapshot_stream_id = subscription.snapshot.cursor.stream_id.clone();
     let exported = export_session(State(state.clone()), Path("work".to_string()))
         .await
         .expect("export subscribed session");
@@ -1504,9 +1071,6 @@ async fn archive_and_restore_session_updates_session_listing() {
         .await
         .expect("archive session");
     let invalidation = subscription.recv().await.expect("archive invalidation");
-    let SessionStreamFrame::Event(invalidation) = invalidation else {
-        panic!("expected invalidation event");
-    };
     let entries = list_sessions(State(state.clone()))
         .await
         .expect("list sessions");
@@ -1514,7 +1078,7 @@ async fn archive_and_restore_session_updates_session_listing() {
     assert!(archived.0.archived);
     assert_ne!(invalidation.stream_id, snapshot_stream_id);
     assert!(store.is_archived());
-    assert!(state.subscribe_session("work").await.is_err());
+    release_session_subscription(&state, "work").await;
     assert!(matches!(
         get_session_model_selection(State(state.clone()), Path("work".to_string())).await,
         Err(ApiError {

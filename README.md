@@ -2,7 +2,7 @@
 
 # Morrow
 
-**A local-first coding agent — CLI, interactive REPL, web dashboard, and desktop app, backed by any OpenAI-compatible API.**
+**A local-first coding agent — CLI, interactive REPL, and browser Web Dashboard, backed by any OpenAI-compatible API.**
 
 [![Release](https://img.shields.io/github/v/release/catDforD/morrow?style=flat-square)](https://github.com/catDforD/morrow/releases)
 [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
@@ -18,7 +18,7 @@ Morrow reads and edits files, applies patches, runs shell commands behind explic
 
 ## Features
 
-- **Several faces, one runtime** — CLI one-shots, interactive REPL, local web dashboard, and Tauri 2 desktop app.
+- **Two entry points, one runtime** — CLI one-shots and interactive REPL, plus a local browser Web Dashboard.
 - **Bring your own model** — any OpenAI-compatible endpoint, configured per provider and per session.
 - **Real tools** — file reads/edits, patches, search, directory listing, and shell commands.
 - **Permission profiles** — read-only, workspace-write, and full-access modes, with shell controlled separately.
@@ -29,18 +29,6 @@ Morrow reads and edits files, applies patches, runs shell commands behind explic
 - **Scriptable** — JSONL event output for automation.
 
 ## Installation
-
-### Desktop app (early access)
-
-Download the installer from [GitHub Releases](https://github.com/catDforD/morrow/releases):
-
-| Platform | Installer |
-| --- | --- |
-| Windows 10 22H2 / Windows 11 x64 | `Morrow_<version>_x64-setup.exe` |
-| macOS 14+ (Apple Silicon) | `Morrow_<version>_aarch64.dmg` |
-| macOS 14+ (Intel) | `Morrow_<version>_x64.dmg` |
-
-Early builds are unsigned — download only from this project's Releases page, and confirm the OS security prompt on first launch. The desktop app bundles the same runtime as `morrow server` but does not include the CLI; settings and sessions live in `~/.morrow`.
 
 ### CLI
 
@@ -120,7 +108,7 @@ command = ["/bin/sh", "-c", "cargo test --workspace >/dev/null 2>&1 && printf '%
 
 ### Subagents
 
-Web/Desktop sessions can spawn persistent background subagents (`spawn_subagent`, `send_subagent`, `wait_subagents`, …) and inspect, continue, cancel, or delete them from the Subagents inspector. A parent turn can end while its subagents keep running.
+Web sessions can spawn persistent background subagents (`spawn_subagent`, `send_subagent`, `wait_subagents`, …) and inspect, continue, cancel, or delete them from the Subagents inspector. A parent turn can end while its subagents keep running.
 
 | Role | Built-in tools | Permission ceiling |
 | --- | --- | --- |
@@ -200,16 +188,14 @@ Crate boundaries, turn lifecycle, and extension points: [`ARCHITECTURE.md`](ARCH
 | Crate | Responsibility |
 | --- | --- |
 | `agent-cli` | CLI, REPL, JSONL, session/hooks commands, server wiring |
-| `agent-desktop` | Tauri 2 shell, embedded server lifecycle, WSL |
 | `agent-config` | Config loading |
 | `agent-core` | Turn execution, ports, middleware, event streams |
 | `agent-eval` | Deterministic regression suite for the agent loop |
 | `agent-hooks` | Command hooks and middleware adapters |
 | `agent-model` | OpenAI-compatible client and streaming |
 | `agent-protocol` | Shared protocol types |
-| `agent-remote` | Desktop/WSL remote protocol and forwarding |
 | `agent-runtime` | Sessions, compaction, workspace, turn helpers |
-| `agent-server` | HTTP/WebSocket and embedded dashboard |
+| `agent-server` | HTTP/WebSocket browser dashboard |
 | `agent-sandbox` | Permission evaluation |
 | `agent-tools` | Built-in file and shell tools |
 
@@ -230,19 +216,11 @@ Web dashboard (with the server running in a separate terminal):
 cd crates/agent-server/web && pnpm install && pnpm dev
 ```
 
-Desktop app:
-
-```bash
-pnpm --dir crates/agent-server/web install
-pnpm --dir crates/agent-desktop install
-pnpm --dir crates/agent-desktop dev
-```
-
-Tagging the workspace version (e.g. `v0.3.1`) triggers GitHub Actions to publish CLI archives and desktop installers.
+Tagging the workspace version (e.g. `v0.4.0`) triggers GitHub Actions to publish CLI archives and checksums.
 
 ## Uninstall
 
-Remove the CLI binary or delete the desktop app; local state under `~/.morrow` is retained intentionally:
+Remove the CLI binary; local state under `~/.morrow` is retained intentionally:
 
 ```bash
 rm -f ~/.local/bin/morrow

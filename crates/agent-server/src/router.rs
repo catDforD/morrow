@@ -6,13 +6,7 @@ pub const DEFAULT_WEB_PERMISSION_MODE: PermissionMode = PermissionMode::Workspac
 pub enum ServerAccessPolicy {
     /// Web dashboard access. `Some(token)` requires the bootstrap/cookie flow;
     /// `None` disables authentication (only via explicit `--no-auth`).
-    Browser {
-        token: Option<String>,
-    },
-    Desktop {
-        token: Arc<str>,
-    },
-    Embedded,
+    Browser { token: Option<String> },
 }
 
 impl Default for ServerAccessPolicy {
@@ -25,12 +19,6 @@ impl ServerAccessPolicy {
     pub fn browser(token: Option<String>) -> Self {
         Self::Browser { token }
     }
-
-    pub fn desktop(token: impl Into<String>) -> Self {
-        Self::Desktop {
-            token: Arc::from(token.into()),
-        }
-    }
 }
 
 impl std::fmt::Debug for ServerAccessPolicy {
@@ -40,11 +28,6 @@ impl std::fmt::Debug for ServerAccessPolicy {
                 .debug_struct("Browser")
                 .field("token", &token.as_ref().map(|_| "<redacted>"))
                 .finish(),
-            Self::Desktop { .. } => formatter
-                .debug_struct("Desktop")
-                .field("token", &"<redacted>")
-                .finish(),
-            Self::Embedded => formatter.write_str("Embedded"),
         }
     }
 }
@@ -64,49 +47,21 @@ pub(crate) fn build_router(
     options: ServerOptions,
     access_policy: ServerAccessPolicy,
 ) -> Result<(Router, AppState), ModelRegistryError> {
-    build_router_with_settings(options, access_policy, true)
-}
-
-pub(crate) fn build_workspace_router(
-    options: ServerOptions,
-    access_policy: ServerAccessPolicy,
-) -> Result<(Router, AppState), ModelRegistryError> {
-    build_router_with_settings(options, access_policy, false)
-}
-
-fn build_router_with_settings(
-    options: ServerOptions,
-    access_policy: ServerAccessPolicy,
-    persistent_settings: bool,
-) -> Result<(Router, AppState), ModelRegistryError> {
-    let model_registry = if persistent_settings {
-        ModelRegistry::load(
-            options.model_store_path.clone(),
-            &options.workspace_root,
-            options.fallback_model.clone(),
-        )?
-    } else {
-        ModelRegistry::in_memory(&options.workspace_root, options.fallback_model.clone())?
-    };
-    let mcp_registry = if persistent_settings {
+    let model_registry = ModelRegistry::load(
+        options.model_store_path.clone(),
+        &options.workspace_root,
+        options.fallback_model.clone(),
+    )?;
+    let mcp_registry =
         McpRegistry::load(options.mcp_store_path.clone(), options.mcp_servers.clone())
-    } else {
-        McpRegistry::in_memory(options.mcp_servers.clone())
-    }
-    .map_err(|error| ModelRegistryError::Validation(error.to_string()))?;
+            .map_err(|error| ModelRegistryError::Validation(error.to_string()))?;
     let command_registry = CommandRegistry::new(options.command_store_path.clone());
     let hook_manager = HookManager::new(
         options.hook_home_dir.clone(),
         options.workspace_root.clone(),
     );
-    let subagent_registry = if persistent_settings {
-        SubagentRegistry::load(options.subagent_store_path.clone())
-    } else {
-        Ok(SubagentRegistry::in_memory(
-            options.subagent_store_path.clone(),
-        ))
-    }
-    .map_err(|error| ModelRegistryError::Validation(error.to_string()))?;
+    let subagent_registry = SubagentRegistry::load(options.subagent_store_path.clone())
+        .map_err(|error| ModelRegistryError::Validation(error.to_string()))?;
     let state = AppState {
         inner: Arc::new(ServerState {
             options,
@@ -137,53 +92,51 @@ fn build_router_with_settings(
         .route("/api/sessions/{name}/restore", post(restore_session))
         .route("/api/sessions/{name}/export", get(export_session))
         .route("/api/sessions/{name}/ws", get(session_ws));
-    if persistent_settings {
-        router = router
-            .route("/api/model-settings", get(model_settings))
-            .route("/api/model-providers", post(create_model_provider))
-            .route(
-                "/api/model-providers/{provider_id}",
-                put(update_model_provider).delete(delete_model_provider),
-            )
-            .route(
-                "/api/model-providers/discover",
-                post(discover_model_provider),
-            )
-            .route("/api/model-default", put(set_default_model))
-            .route("/api/mcp-settings", get(mcp_settings))
-            .route("/api/mcp-servers", post(create_mcp_server))
-            .route("/api/mcp-servers/import", post(import_mcp_servers))
-            .route("/api/mcp-servers/test", post(test_mcp_server))
-            .route(
-                "/api/mcp-servers/{name}",
-                put(update_mcp_server).delete(delete_mcp_server),
-            )
-            .route("/api/commands", get(command_settings).post(create_command))
-            .route("/api/commands/resolve", post(resolve_command))
-            .route(
-                "/api/commands/{name}",
-                put(update_command).delete(delete_command),
-            )
-            .route("/api/subagent-settings", get(subagent_settings))
-            .route(
-                "/api/subagent-settings/roles/{role}",
-                put(update_subagent_role),
-            )
-            .route(
-                "/api/subagent-settings/roles/reset",
-                post(reset_subagent_roles),
-            )
-            .route("/api/subagents", post(create_subagent))
-            .route(
-                "/api/subagents/{id}",
-                put(update_subagent).delete(delete_subagent),
-            )
-            .route("/api/subagent-settings/reset", post(reset_subagents))
-            .route(
-                "/api/sessions/{name}/model-selection",
-                get(get_session_model_selection).put(set_session_model_selection),
-            );
-    }
+    router = router
+        .route("/api/model-settings", get(model_settings))
+        .route("/api/model-providers", post(create_model_provider))
+        .route(
+            "/api/model-providers/{provider_id}",
+            put(update_model_provider).delete(delete_model_provider),
+        )
+        .route(
+            "/api/model-providers/discover",
+            post(discover_model_provider),
+        )
+        .route("/api/model-default", put(set_default_model))
+        .route("/api/mcp-settings", get(mcp_settings))
+        .route("/api/mcp-servers", post(create_mcp_server))
+        .route("/api/mcp-servers/import", post(import_mcp_servers))
+        .route("/api/mcp-servers/test", post(test_mcp_server))
+        .route(
+            "/api/mcp-servers/{name}",
+            put(update_mcp_server).delete(delete_mcp_server),
+        )
+        .route("/api/commands", get(command_settings).post(create_command))
+        .route("/api/commands/resolve", post(resolve_command))
+        .route(
+            "/api/commands/{name}",
+            put(update_command).delete(delete_command),
+        )
+        .route("/api/subagent-settings", get(subagent_settings))
+        .route(
+            "/api/subagent-settings/roles/{role}",
+            put(update_subagent_role),
+        )
+        .route(
+            "/api/subagent-settings/roles/reset",
+            post(reset_subagent_roles),
+        )
+        .route("/api/subagents", post(create_subagent))
+        .route(
+            "/api/subagents/{id}",
+            put(update_subagent).delete(delete_subagent),
+        )
+        .route("/api/subagent-settings/reset", post(reset_subagents))
+        .route(
+            "/api/sessions/{name}/model-selection",
+            get(get_session_model_selection).put(set_session_model_selection),
+        );
     let router = router
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(
@@ -200,8 +153,7 @@ async fn access_middleware(
 ) -> Response {
     let token: &str = match &state.inner.access_policy {
         ServerAccessPolicy::Browser { token: Some(token) } => token.as_str(),
-        ServerAccessPolicy::Desktop { token } => token.as_ref(),
-        ServerAccessPolicy::Browser { token: None } | ServerAccessPolicy::Embedded => {
+        ServerAccessPolicy::Browser { token: None } => {
             return with_security_headers(next.run(request).await);
         }
     };
@@ -363,5 +315,48 @@ fn with_security_headers(mut response: Response) -> Response {
     response
         .headers_mut()
         .insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    response
+}
+
+pub(crate) async fn index() -> Response {
+    no_store(Html(include_str!("../assets/index.html")).into_response())
+}
+
+pub(crate) async fn app_js() -> Response {
+    asset_response("app.js")
+}
+
+pub(crate) async fn style_css() -> Response {
+    asset_response("style.css")
+}
+
+pub(crate) async fn asset(Path(path): Path<String>) -> Response {
+    asset_response(&path)
+}
+
+fn asset_response(path: &str) -> Response {
+    let response = match path {
+        "app.js" => (
+            [(
+                header::CONTENT_TYPE,
+                "application/javascript; charset=utf-8",
+            )],
+            include_str!("../assets/app.js"),
+        )
+            .into_response(),
+        "style.css" => (
+            [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+            include_str!("../assets/style.css"),
+        )
+            .into_response(),
+        _ => StatusCode::NOT_FOUND.into_response(),
+    };
+    no_store(response)
+}
+
+fn no_store(mut response: Response) -> Response {
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
 }

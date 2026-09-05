@@ -2,7 +2,7 @@
 
 # Morrow
 
-**本地优先的编码 Agent —— 集 CLI、交互式 REPL、Web 仪表盘和桌面应用于一体，兼容任意 OpenAI 风格 API。**
+**本地优先的编码 Agent —— CLI、交互式 REPL 与浏览器 Web 仪表盘，兼容任意 OpenAI 风格 API。**
 
 [![Release](https://img.shields.io/github/v/release/catDforD/morrow?style=flat-square)](https://github.com/catDforD/morrow/releases)
 [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
@@ -18,34 +18,18 @@ Morrow 以流式方式输出模型结果，按项目持久化会话，可以读�
 
 ## 功能特性
 
-- **一个运行时，多种形态** —— CLI 单次执行、交互式 REPL、本地浏览器仪表盘，以及 Tauri 2 桌面应用。
+- **两个入口，一个运行时** —— CLI 单次执行、交互式 REPL，以及本地浏览器 Web 仪表盘。
 - **自带模型** —— 通过 `--config`、本地 `morrow.toml` 或 `~/.morrow/config.toml` 配置 OpenAI 兼容模型；Web 端可独立管理服务商，并按会话选择模型与推理档位。
 - **持久化会话** —— 按项目划分的命名会话，支持列表、重命名、导出和续接。
 - **真实工具** —— 文件读写、补丁、搜索、目录列举与 shell 命令。
 - **权限档案** —— 只读、工作区写入、完全访问；shell 单独控制。
 - **策略 Hook** —— 在 `before_prompt`、`before_tool`、`permission_request`、`after_tool`、`after_turn` 与压缩前后运行受信命令 Hook；项目 Hook 需要显式 `morrow hooks trust` 后才生效。
 - **MCP 支持** —— 通过 TOML 或仪表盘配置 stdio 与 Streamable HTTP MCP 服务器。
-- **会话级 Subagent** —— 在后台运行持久化的 `explore`、`plan`、`worker`、`reviewer` 实例，并可在 Web/Desktop 中查看、继续、取消或删除。
+- **会话级 Subagent** —— 在后台运行持久化的 `explore`、`plan`、`worker`、`reviewer` 实例，并可在 Web 中查看、继续、取消或删除。
 - **长会话友好** —— 自动上下文压缩。
 - **可脚本化** —— JSONL 事件输出，便于自动化与集成。
 
 ## 安装
-
-### 桌面应用（早期体验）
-
-Tauri 2 桌面应用与 `morrow server` 共用同一套仪表盘和本地 Agent 运行时，但不会安装 `morrow` CLI。
-
-从 [GitHub Releases](https://github.com/catDforD/morrow/releases) 下载对应平台的安装包：
-
-| 平台 | 安装包 |
-| --- | --- |
-| Windows 10 22H2 / Windows 11 x64 | `Morrow_<version>_x64-setup.exe` |
-| macOS 14+（Apple Silicon） | `Morrow_<version>_aarch64.dmg` |
-| macOS 14+（Intel） | `Morrow_<version>_x64.dmg` |
-
-早期构建未做正式签名与公证，请只从本项目的 GitHub Release 页面下载。Windows 若被 SmartScreen 拦截，确认来源后选择 **仍要运行**；macOS 首次启动可在 Finder 中右键 **打开**，或在 **系统设置 → 隐私与安全性** 中允许。
-
-应用会恢复最近一次工作区，并提供 **File → Open Folder** / **Open Recent**。更新需手动进行（**Help → Download Latest Version** 或访问 Releases）。模型、MCP、命令与会话等数据保留在 `~/.morrow`。
 
 ### CLI
 
@@ -161,7 +145,7 @@ command = ["/bin/sh", "-c", "cargo test --workspace >/dev/null 2>&1 && printf '%
 
 ### Subagent
 
-Web/Desktop 会话通过 `spawn_subagent`、`send_subagent`、`inspect_subagent`、`wait_subagents` 和 `cancel_subagent` 管理可后台运行的持久 Subagent。父 turn 结束后子任务仍可继续。用户可以在 Subagents 检查器中查看完整消息与事件日志、使用保留的上下文继续空闲或中断实例、取消活跃任务，或删除终态实例。
+Web 会话通过 `spawn_subagent`、`send_subagent`、`inspect_subagent`、`wait_subagents` 和 `cancel_subagent` 管理可后台运行的持久 Subagent。父 turn 结束后子任务仍可继续。用户可以在 Subagents 检查器中查看完整消息与事件日志、使用保留的上下文继续空闲或中断实例、取消活跃任务，或删除终态实例。
 
 | 角色 | 内置工具 | 权限上限 |
 | --- | --- | --- |
@@ -174,9 +158,9 @@ Web/Desktop 会话通过 `spawn_subagent`、`send_subagent`、`inspect_subagent`
 
 每个会话最多保留 8 个持久实例，同时最多执行 4 个 Subagent run。父智能体的文件写入与 shell、`worker` run、获批的 `reviewer` shell 共用一个 workspace writer lease；读取仍可并行。父子审批请求进入同一个 FIFO 队列并显示来源。文件修改获批后会在真正写入前重新验证预览，工作区已变化时旧审批会被拒绝。
 
-持久实例保存在 `~/.morrow/subagent-sessions/<workspace-scope>/<session>/`。事件日志达到 16 MiB 后停止保存流式 delta，但继续保存消息、工具、审批和终态事件。应用重启时，排队中、运行中和等待审批的 run 会转为 `interrupted`，旧审批与锁被清除，未完成操作绝不会自动重放。远程模型凭据仅在创建或继续任务时临时传输并驻留内存，不会写入实例 sidecar。
+持久实例保存在 `~/.morrow/subagent-sessions/<workspace-scope>/<session>/`。事件日志达到 16 MiB 后停止保存流式 delta，但继续保存消息、工具、审批和终态事件。应用重启时，排队中、运行中和等待审批的 run 会转为 `interrupted`，旧审批与锁被清除，未完成操作绝不会自动重放。模型凭据仅在创建或继续任务时驻留内存，不会写入实例 sidecar。
 
-兼容工具 `delegate_task({task})` 仍保持同步、严格只读：它创建临时 `explore`，随父 turn 取消，且不占持久实例容量。CLI 目前只提供该兼容工具；持久生命周期控制面向 Web/Desktop 和远程 workspace。姓名与头像仍在 **Settings → Subagents** 中独立管理（`~/.morrow/subagents.json`）。
+兼容工具 `delegate_task({task})` 仍保持同步、严格只读：它创建临时 `explore`，随父 turn 取消，且不占持久实例容量。CLI 目前只提供该兼容工具；持久生命周期控制面向 Web。姓名与头像仍在 **Settings → Subagents** 中独立管理（`~/.morrow/subagents.json`）。
 
 ### Web 自定义命令
 
@@ -246,16 +230,14 @@ crate 边界、turn 生命周期与扩展点见 [`ARCHITECTURE.md`](ARCHITECTURE
 | Crate | 职责 |
 | --- | --- |
 | `agent-cli` | CLI、REPL、JSONL、`session`/`hooks` 子命令与服务装配 |
-| `agent-desktop` | Tauri 2 桌面外壳、嵌入式 server 生命周期、WSL |
 | `agent-config` | 配置加载 |
 | `agent-core` | Turn 执行、端口、中间件与事件流 |
 | `agent-eval` | Agent 循环确定性回归套件 |
 | `agent-hooks` | 命令 Hook 与中间件适配器 |
 | `agent-model` | OpenAI 兼容客户端与流式解析 |
 | `agent-protocol` | 共享协议类型 |
-| `agent-remote` | Desktop/WSL 远程协议与转发 |
 | `agent-runtime` | 会话、压缩、工作区与 turn 辅助 |
-| `agent-server` | HTTP/WebSocket 与内嵌仪表盘 |
+| `agent-server` | HTTP/WebSocket 浏览器仪表盘 |
 | `agent-sandbox` | 权限判定 |
 | `agent-tools` | 内置文件与 shell 工具 |
 
@@ -277,19 +259,11 @@ cd crates/agent-server/web && pnpm install && pnpm dev
 # 另开终端：cargo run -p agent-cli -- server
 ```
 
-桌面开发：
-
-```bash
-pnpm --dir crates/agent-server/web install
-pnpm --dir crates/agent-desktop install
-pnpm --dir crates/agent-desktop dev
-```
-
-原生安装包需在目标 OS 上构建，并将匹配的 ripgrep 二进制放入 `crates/agent-desktop/src-tauri/binaries/` 后执行 `pnpm --dir crates/agent-desktop build:windows` 或 `build:macos`。打与 workspace 版本一致的 tag（如 `v0.3.1`）会触发 GitHub Actions 发布 CLI 与桌面安装包。
+打与 workspace 版本一致的 tag（如 `v0.4.0`）会触发 GitHub Actions 发布 CLI 压缩包与校验文件。
 
 ## 卸载
 
-删除 CLI 二进制或卸载桌面应用即可。本地数据会有意保留：
+删除 CLI 二进制即可。本地数据会有意保留：
 
 ```bash
 rm -f ~/.local/bin/morrow

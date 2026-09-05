@@ -77,10 +77,9 @@ async function renderAbout(currentStatus: StatusResponse) {
 function status(): StatusResponse {
   return {
     workspace_root: '/workspace/morrow',
-    workspace_location: { kind: 'local', path: '/workspace/morrow' },
     config_path: null,
     permissions: { mode: 'workspace_write', shell: 'prompt' },
-    version: '0.3.1',
+    version: '0.4.0',
     model_ready: true,
     model_store_path: '/models.json',
     mcp_store_path: '/mcp.json',
